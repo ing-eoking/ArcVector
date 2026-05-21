@@ -1,0 +1,13 @@
+[package]
+name = "arcusv"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.72.1"
+cc = "1.0"
