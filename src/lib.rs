@@ -61,7 +61,7 @@ fn compute_distance(q: &[f32], v: &[f32], metric: MetricType) -> f32 {
             if norm_q == 0.0 || norm_v == 0.0 {
                 return 1.0;
             }
-            1.0 - (dot / (norm_q.sqrt() * norm_v.sqrt()))
+            (1.0 - (dot / (norm_q.sqrt() * norm_v.sqrt()))).max(0.0)
         }
         MetricType::IP => {
             let mut dot = 0.0f32;
@@ -82,6 +82,7 @@ struct HnswIdState {
 struct HnswWrapper {
     inner: Hnsw<'static, f32, ArcDist>,
     id_state: Mutex<HnswIdState>,
+    metric: MetricType,
 }
 
 impl HnswWrapper {
@@ -93,18 +94,36 @@ impl HnswWrapper {
                 str_map: HashMap::new(),
                 deleted: HashSet::new(),
             }),
+            metric,
         }
     }
 
-    fn insert(&self, id: &str, vec: &[f32]) {
+    fn prepare_vec<'a>(&self, vec: &'a [f32]) -> std::borrow::Cow<'a, [f32]> {
+        if self.metric == MetricType::Cosine {
+            std::borrow::Cow::Owned(normalize_vector(vec))
+        } else {
+            std::borrow::Cow::Borrowed(vec)
+        }
+    }
+
+    // Returns Err on allocation failure so the caller can answer SERVER_ERROR
+    // instead of letting the default (infallible) allocator abort the daemon.
+    // NOTE: the inner hnsw_rs graph allocates internally and is not fallible;
+    // the try_reserve calls below act as an out-of-memory canary that trips
+    // before we reach that uncatchable allocation.
+    fn insert(&self, id: &str, vec: &[f32]) -> Result<(), ()> {
+        let vec = self.prepare_vec(vec);
         let numeric_id = {
             let mut state = self.id_state.lock().unwrap();
+            state.id_map.try_reserve(1).map_err(|_| ())?;
+            state.str_map.try_reserve(1).map_err(|_| ())?;
             let nid = state.id_map.len();
             state.id_map.push(id.to_string());
             state.str_map.insert(id.to_string(), nid);
             nid
         };
-        self.inner.insert((vec, numeric_id));
+        self.inner.insert((vec.as_ref(), numeric_id));
+        Ok(())
     }
 
     fn delete(&self, id: &str) -> bool {
@@ -117,20 +136,26 @@ impl HnswWrapper {
         }
     }
 
-    fn search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
+    fn search(&self, query: &[f32], k: usize, ef: Option<usize>) -> Result<Vec<(String, f32)>, ()> {
         let (fetch_k, deleted_snapshot) = {
             let state = self.id_state.lock().unwrap();
             (k + state.deleted.len(), state.deleted.clone())
         };
-        let ef_search = (k * 10).max(50);
-        let results = self.inner.search(query, fetch_k, ef_search);
+        // ef_search: 클라이언트가 지정하면 그 값, 없으면 기존 기본식.
+        // (hnsw_rs 는 ef >= 요청 개수여야 하므로 fetch_k 미만이면 끌어올린다)
+        let ef_search = ef.unwrap_or((k * 10).max(50)).max(fetch_k);
+        let inner = &self.inner;
+        let query_owned = self.prepare_vec(query).into_owned();
+        let raw_results = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            inner.search(&query_owned, fetch_k, ef_search)
+        })).map_err(|_| ())?;
         let state = self.id_state.lock().unwrap();
-        results
+        Ok(raw_results
             .into_iter()
             .filter(|n| !deleted_snapshot.contains(&n.d_id))
             .take(k)
             .map(|n| (state.id_map[n.d_id].clone(), n.distance))
-            .collect()
+            .collect())
     }
 }
 
@@ -186,18 +211,29 @@ fn ensure_engine() -> *mut engine_interface_v1 {
 static INDICES: LazyLock<IndexRegistry> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
-struct VaddPendingState {
-    index_name: String,
-    vector_id: String,
-    vector_floats: Vec<f32>,
-    payload_len: usize,
-    buffer: *mut u8,
+// Sanity caps to bound the per-connection nread allocation.
+const MAX_VEC_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
+
+// Fallback if the engine config can't be queried.
+const DEFAULT_MAX_ELEMENT_BYTES: u32 = 16 * 1024;
+
+enum PendingCmd {
+    Vadd { index_name: String, vector_id: String, vec_bytes: usize },
+    Vsearch { index_name: String, k: usize, vec_bytes: usize, threshold: Option<f32>, ef: Option<usize> },
 }
 
-unsafe impl Send for VaddPendingState {}
-unsafe impl Sync for VaddPendingState {}
+// Per-connection state for a command whose vector/payload arrives via nread.
+struct PendingState {
+    cmd: PendingCmd,
+    buffer: *mut u8,
+    data_len: usize, // meaningful bytes in buffer (excludes trailing \r\n)
+}
 
-static VADD_PENDING: LazyLock<Mutex<HashMap<usize, VaddPendingState>>> =
+unsafe impl Send for PendingState {}
+unsafe impl Sync for PendingState {}
+
+static PENDING: LazyLock<Mutex<HashMap<usize, PendingState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn get_token_string(token: &token_t) -> String {
@@ -215,15 +251,26 @@ fn send_response(response_handler: EXTENSION_RESPONSE_HANDLER, cookie: *const c_
     }
 }
 
-fn parse_vector(token_str: &str) -> Vec<f32> {
-    let trimmed = token_str.trim_matches(|c| c == '[' || c == ']');
-    trimmed
-        .split(',')
-        .filter_map(|s| s.trim().parse::<f32>().ok())
+// Decode a little-endian float32 blob (wire format) into a vector.
+fn bytes_to_floats(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect()
 }
 
-const META_FIELD: &[u8] = b"_meta";
+fn is_valid_vector(v: &[f32]) -> bool {
+    !v.is_empty() && v.iter().all(|x| x.is_finite())
+}
+
+fn normalize_vector(v: &[f32]) -> Vec<f32> {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm == 0.0 {
+        return v.to_vec();
+    }
+    v.iter().map(|x| x / norm).collect()
+}
+
 const ITEM_TYPE_MAP: c_int = 3;
 
 enum MapInsertResult {
@@ -327,16 +374,18 @@ unsafe fn execute_vcreate(
         }
     };
 
-    // vcreate <name> <dim> <metric>              → FLAT (default)
-    // vcreate <name> <dim> <metric> FLAT         → FLAT
-    // vcreate <name> <dim> <metric> HNSW         → HNSW, max_elements=1_000_000
-    // vcreate <name> <dim> <metric> HNSW <max>   → HNSW, max_elements=<max>
-    let storage = if argc >= 5 {
+    let hnsw_max_elements: Option<u32> = if argc >= 5 {
         match get_token_string(&tokens[4]).to_uppercase().as_str() {
             "HNSW" => {
-                let max_elements = if argc == 6 {
+                let max: u32 = if argc == 6 {
                     match get_token_string(&tokens[5]).parse::<usize>() {
-                        Ok(n) if n > 0 => n,
+                        Ok(n) if n > 0 => match u32::try_from(n) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                send_response(response_handler, cookie, "CLIENT_ERROR max_elements too large\r\n");
+                                return true;
+                            }
+                        },
                         _ => {
                             send_response(response_handler, cookie, "CLIENT_ERROR bad max_elements\r\n");
                             return true;
@@ -345,14 +394,14 @@ unsafe fn execute_vcreate(
                 } else {
                     1_000_000
                 };
-                IndexStorage::Hnsw(HnswWrapper::new(metric, max_elements))
+                Some(max)
             }
             "FLAT" => {
                 if argc == 6 {
                     send_response(response_handler, cookie, "CLIENT_ERROR FLAT does not take max_elements\r\n");
                     return true;
                 }
-                IndexStorage::Flat
+                None
             }
             _ => {
                 send_response(response_handler, cookie, "CLIENT_ERROR unsupported index type (use FLAT or HNSW)\r\n");
@@ -360,7 +409,7 @@ unsafe fn execute_vcreate(
             }
         }
     } else {
-        IndexStorage::Flat
+        None
     };
 
     {
@@ -380,9 +429,14 @@ unsafe fn execute_vcreate(
         send_response(response_handler, cookie, "SERVER_ERROR map not supported\r\n");
         return true;
     }};
+
     let mut attrp = std::mem::zeroed::<item_attr>();
     attrp.readable = 1;
-    let create_ret = map_struct_create_fn(
+    if let Some(max) = hnsw_max_elements {
+        attrp.maxcount = max as i32;
+    }
+
+    let mut create_ret = map_struct_create_fn(
         eng as *mut ENGINE_HANDLE,
         cookie,
         index_name.as_ptr() as *const c_void,
@@ -391,18 +445,38 @@ unsafe fn execute_vcreate(
         0,
     );
     if create_ret != ENGINE_ERROR_CODE_ENGINE_SUCCESS {
-        send_response(response_handler, cookie, "CLIENT_ERROR index already exists\r\n");
-        return true;
+        // 엔진엔 Map이 있는데 모듈 레지스트리(INDICES)엔 없는 'orphan' 상태일 수 있다.
+        // (예: 데몬 재시작 후 Arcus가 컬렉션을 영속 복구했으나 모듈 상태는 초기화된 경우)
+        // 이때는 stale Map을 지우고 다시 생성해 desync 를 자가 치유한다.
+        let orphan = !INDICES.read().unwrap().contains_key(&index_name);
+        if orphan {
+            if let Some(remove) = (*eng).remove {
+                remove(
+                    eng as *mut ENGINE_HANDLE,
+                    cookie,
+                    index_name.as_ptr() as *const c_void,
+                    index_name.len(),
+                    0,
+                    0,
+                );
+            }
+            create_ret = map_struct_create_fn(
+                eng as *mut ENGINE_HANDLE,
+                cookie,
+                index_name.as_ptr() as *const c_void,
+                index_name.len() as c_int,
+                &mut attrp,
+                0,
+            );
+        }
+        if create_ret != ENGINE_ERROR_CODE_ENGINE_SUCCESS {
+            send_response(response_handler, cookie, "CLIENT_ERROR index already exists or max_elements exceeds engine limit\r\n");
+            return true;
+        }
     }
-
-    let mut meta_bytes = [0u8; 9];
-    meta_bytes[0..8].copy_from_slice(&(dimension as u64).to_ne_bytes());
-    meta_bytes[8] = metric as u8;
-    map_insert_elem(cookie, &index_name, META_FIELD, &meta_bytes, false);
 
     let mut indices = INDICES.write().unwrap();
     if indices.contains_key(&index_name) {
-        // map_struct_create는 성공했으므로 ARCUS에 생성된 맵을 제거
         if let Some(remove) = (*eng).remove {
             remove(
                 eng as *mut ENGINE_HANDLE,
@@ -416,6 +490,12 @@ unsafe fn execute_vcreate(
         send_response(response_handler, cookie, "CLIENT_ERROR index already exists\r\n");
         return true;
     }
+
+    let storage = match hnsw_max_elements {
+        Some(max) => IndexStorage::Hnsw(HnswWrapper::new(metric, max as usize)),
+        None => IndexStorage::Flat,
+    };
+
     indices.insert(
         index_name,
         Arc::new(VectorIndex {
@@ -493,6 +573,26 @@ unsafe fn map_get_payload(
     payload
 }
 
+// Query the engine's configured max_element_bytes (per-collection-element limit).
+unsafe fn get_max_element_bytes(cookie: *const c_void) -> u32 {
+    let eng = ensure_engine();
+    if eng.is_null() { return DEFAULT_MAX_ELEMENT_BYTES; }
+    let get_config = match (*eng).get_config { Some(f) => f, None => return DEFAULT_MAX_ELEMENT_BYTES };
+    let mut maxbytes: u32 = 0;
+    let key = b"max_element_bytes\0";
+    let ret = get_config(
+        eng as *mut ENGINE_HANDLE,
+        cookie,
+        key.as_ptr() as *const c_char,
+        &mut maxbytes as *mut u32 as *mut c_void,
+    );
+    if ret == ENGINE_ERROR_CODE_ENGINE_SUCCESS && maxbytes > 0 {
+        maxbytes
+    } else {
+        DEFAULT_MAX_ELEMENT_BYTES
+    }
+}
+
 unsafe fn execute_vadd_with_payload(
     cookie: *const c_void,
     index_name: &str,
@@ -517,10 +617,45 @@ unsafe fn execute_vadd_with_payload(
         return true;
     }
 
-    let mut value_bytes: Vec<u8> = vector_floats.iter()
-        .flat_map(|f| f.to_ne_bytes())
-        .collect();
+    // Build the engine wire bytes with a fallible reservation so an
+    // out-of-memory condition becomes a SERVER_ERROR rather than a daemon abort.
+    let mut value_bytes: Vec<u8> = Vec::new();
+    if value_bytes.try_reserve_exact(vector_floats.len() * 4 + payload.len()).is_err() {
+        send_response(response_handler, cookie, "SERVER_ERROR out of memory\r\n");
+        return true;
+    }
+    for f in vector_floats {
+        value_bytes.extend_from_slice(&f.to_ne_bytes());
+    }
     value_bytes.extend_from_slice(payload);
+
+    // Enforce the engine's per-element size limit. The normal protocol path
+    // (mop/bop/... insert) checks `max_element_bytes` before calling the engine,
+    // but the direct engine API (map_elem_alloc) does not. Without this guard an
+    // oversized element reaches the slab allocator and crashes the daemon
+    // (assert in do_smmgr_free, slabs.c).
+    let max_elem = get_max_element_bytes(cookie);
+    if value_bytes.len() > max_elem as usize {
+        send_response(response_handler, cookie,
+            &format!("CLIENT_ERROR vector+payload too large ({} bytes > max_element_bytes {})\r\n",
+                     value_bytes.len(), max_elem));
+        return true;
+    }
+
+    // The module-side search structures (HNSW graph + `vectors` map) live in the
+    // process heap, which is NOT bounded by `-m` and uses Rust's default
+    // *infallible* allocator: a shortage there would abort the whole daemon.
+    // Reserve the growable module allocations up front with try_reserve, before
+    // the engine store, so a memory shortage is reported as SERVER_ERROR with
+    // nothing stored anywhere.
+    let mut owned_vec: Vec<f32> = Vec::new();
+    let vectors_reserved = index_arc.vectors.write().unwrap().try_reserve(1).is_ok();
+    if !vectors_reserved || owned_vec.try_reserve_exact(vector_floats.len()).is_err() {
+        send_response(response_handler, cookie, "SERVER_ERROR out of memory\r\n");
+        return true;
+    }
+    owned_vec.extend_from_slice(vector_floats);
+
     match map_insert_elem(cookie, index_name, vector_id.as_bytes(), &value_bytes, true) {
         MapInsertResult::KeyEvicted => {
             let mut reg = INDICES.write().unwrap();
@@ -535,84 +670,32 @@ unsafe fn execute_vadd_with_payload(
         MapInsertResult::Ok => {}
     }
 
+    // Commit into the module index. The vectors-map slot was reserved above, and
+    // HNSW reports allocation failure instead of aborting.
     if let IndexStorage::Hnsw(ref hnsw) = index_arc.storage {
-        hnsw.insert(vector_id, vector_floats);
+        if hnsw.insert(vector_id, vector_floats).is_err() {
+            send_response(response_handler, cookie, "SERVER_ERROR out of memory\r\n");
+            return true;
+        }
     }
-    index_arc.vectors.write().unwrap().insert(vector_id.to_string(), vector_floats.to_vec());
+    index_arc.vectors.write().unwrap().insert(vector_id.to_string(), owned_vec);
 
     send_response(response_handler, cookie, "STORED\r\n");
     true
 }
 
-unsafe fn execute_vadd(
+unsafe fn execute_vsearch_core(
     cookie: *const c_void,
-    argc: c_int,
-    argv: *mut token_t,
+    index_name: &str,
+    k: usize,
+    query_vector: &[f32],
+    threshold: Option<f32>,
+    ef: Option<usize>,
     response_handler: EXTENSION_RESPONSE_HANDLER,
 ) -> bool {
-    let tokens = std::slice::from_raw_parts(argv, argc as usize);
-    if argc != 4 {
-        send_response(response_handler, cookie, "CLIENT_ERROR bad command line format\r\n");
-        return true;
-    }
-    let index_name = get_token_string(&tokens[1]);
-    let vector_id  = get_token_string(&tokens[2]);
-    let float_str  = get_token_string(&tokens[3]);
-    let vector_floats = parse_vector(&float_str);
-    execute_vadd_with_payload(cookie, &index_name, &vector_id, &vector_floats, &[], response_handler)
-}
-
-unsafe fn execute_vadd_nread(
-    cookie: *const c_void,
-    response_handler: EXTENSION_RESPONSE_HANDLER,
-) -> bool {
-    let state = VADD_PENDING.lock().unwrap().remove(&(cookie as usize));
-    let state = match state {
-        Some(s) => s,
-        None => {
-            send_response(response_handler, cookie, "SERVER_ERROR lost vadd state\r\n");
-            return true;
-        }
-    };
-    let payload = std::slice::from_raw_parts(state.buffer, state.payload_len).to_vec();
-    free(state.buffer as *mut c_void);
-
-    execute_vadd_with_payload(
-        cookie,
-        &state.index_name,
-        &state.vector_id,
-        &state.vector_floats,
-        &payload,
-        response_handler,
-    )
-}
-
-unsafe fn execute_vsearch(
-    cookie: *const c_void,
-    argc: c_int,
-    argv: *mut token_t,
-    response_handler: EXTENSION_RESPONSE_HANDLER,
-) -> bool {
-    let tokens = std::slice::from_raw_parts(argv, argc as usize);
-    if argc != 4 {
-        send_response(response_handler, cookie, "CLIENT_ERROR bad command line format\r\n");
-        return true;
-    }
-
-    let index_name = get_token_string(&tokens[1]);
-    let k: usize = match get_token_string(&tokens[2]).parse() {
-        Ok(v) => v,
-        Err(_) => {
-            send_response(response_handler, cookie, "CLIENT_ERROR bad k\r\n");
-            return true;
-        }
-    };
-    let float_str = get_token_string(&tokens[3]);
-    let query_vector = parse_vector(&float_str);
-
     let index_arc = {
         let reg = INDICES.read().unwrap();
-        match reg.get(&index_name) {
+        match reg.get(index_name) {
             Some(arc) => Arc::clone(arc),
             None => {
                 send_response(response_handler, cookie, "CLIENT_ERROR index not found\r\n");
@@ -627,13 +710,19 @@ unsafe fn execute_vsearch(
     }
 
     let results: Vec<(String, f32)> = match &index_arc.storage {
-        IndexStorage::Hnsw(hnsw) => hnsw.search(&query_vector, k),
+        IndexStorage::Hnsw(hnsw) => match hnsw.search(query_vector, k, ef) {
+            Ok(r) => r,
+            Err(_) => {
+                send_response(response_handler, cookie, "SERVER_ERROR search failed (internal error)\r\n");
+                return true;
+            }
+        },
         IndexStorage::Flat => {
             let vectors = index_arc.vectors.read().unwrap();
             let mut flat_results: Vec<(String, f32)> = vectors
                 .iter()
                 .map(|(vid, v)| {
-                    let dist = compute_distance(&query_vector, v, index_arc.metric);
+                    let dist = compute_distance(query_vector, v, index_arc.metric);
                     (vid.clone(), dist)
                 })
                 .collect();
@@ -644,13 +733,13 @@ unsafe fn execute_vsearch(
     };
 
     let mut out = String::new();
-    for (vid, dist) in results {
-        let payload = map_get_payload(cookie, &index_name, &vid, index_arc.dimension);
+    for (vid, dist) in results.into_iter().filter(|(_, d)| threshold.map_or(true, |t| *d <= t)) {
+        let payload = map_get_payload(cookie, index_name, &vid, index_arc.dimension);
         if payload.is_empty() {
-            out.push_str(&format!("{} {}\r\n", vid, dist));
+            out.push_str(&format!("{} {} 0\r\n\r\n", vid, dist));
         } else {
             let payload_str = String::from_utf8_lossy(&payload);
-            out.push_str(&format!("{} {} {}\r\n", vid, dist, payload_str));
+            out.push_str(&format!("{} {} {}\r\n{}\r\n", vid, dist, payload.len(), payload_str));
         }
     }
     out.push_str("END\r\n");
@@ -739,20 +828,22 @@ unsafe fn execute_vdrop(
         let mut reg = INDICES.write().unwrap();
         reg.remove(&index_name).is_some()
     };
-    if removed {
-        let eng = ensure_engine();
-        if !eng.is_null() {
-            if let Some(remove) = (*eng).remove {
-                remove(
-                    eng as *mut ENGINE_HANDLE,
-                    cookie,
-                    index_name.as_ptr() as *const c_void,
-                    index_name.len(),
-                    0,
-                    0,
-                );
-            }
+    // INDICES 등록 여부와 무관하게 엔진 Map 삭제를 시도한다(orphan Map 정리).
+    // 모듈과 엔진이 어긋난 상태에서도 vdrop 으로 stale Map 을 청소할 수 있게 한다.
+    let eng = ensure_engine();
+    if !eng.is_null() {
+        if let Some(remove) = (*eng).remove {
+            remove(
+                eng as *mut ENGINE_HANDLE,
+                cookie,
+                index_name.as_ptr() as *const c_void,
+                index_name.len(),
+                0,
+                0,
+            );
         }
+    }
+    if removed {
         send_response(response_handler, cookie, "DROPPED\r\n");
     } else {
         send_response(response_handler, cookie, "NOT_FOUND\r\n");
@@ -793,6 +884,43 @@ unsafe fn execute_vlist(
     true
 }
 
+// Called once the vector (and optional payload) blob has been read via nread.
+unsafe fn execute_pending_nread(
+    cookie: *const c_void,
+    response_handler: EXTENSION_RESPONSE_HANDLER,
+) -> bool {
+    let state = PENDING.lock().unwrap().remove(&(cookie as usize));
+    let state = match state {
+        Some(s) => s,
+        None => {
+            send_response(response_handler, cookie, "SERVER_ERROR lost command state\r\n");
+            return true;
+        }
+    };
+    let data = std::slice::from_raw_parts(state.buffer, state.data_len).to_vec();
+    free(state.buffer as *mut c_void);
+
+    match state.cmd {
+        PendingCmd::Vadd { index_name, vector_id, vec_bytes } => {
+            let vector_floats = bytes_to_floats(&data[..vec_bytes]);
+            let payload = &data[vec_bytes..];
+            if !is_valid_vector(&vector_floats) {
+                send_response(response_handler, cookie, "CLIENT_ERROR invalid vector (NaN or infinite values)\r\n");
+                return true;
+            }
+            execute_vadd_with_payload(cookie, &index_name, &vector_id, &vector_floats, payload, response_handler)
+        }
+        PendingCmd::Vsearch { index_name, k, vec_bytes, threshold, ef } => {
+            let query_vector = bytes_to_floats(&data[..vec_bytes]);
+            if !is_valid_vector(&query_vector) {
+                send_response(response_handler, cookie, "CLIENT_ERROR invalid vector (NaN or infinite values)\r\n");
+                return true;
+            }
+            execute_vsearch_core(cookie, &index_name, k, &query_vector, threshold, ef, response_handler)
+        }
+    }
+}
+
 unsafe extern "C" fn accept_vector_cmd(
     _cmd_cookie: *const c_void,
     cookie: *mut c_void,
@@ -805,37 +933,86 @@ unsafe extern "C" fn accept_vector_cmd(
     let tokens = std::slice::from_raw_parts(argv, argc as usize);
     let cmd = get_token_string(&tokens[0]);
     match cmd.as_str() {
-        "vcreate" | "vsearch" | "vdel" | "vdrop" | "vlist" => true,
+        "vcreate" | "vdel" | "vdrop" | "vlist" => true,
+        // vadd <index> <id> <vec_bytes> [payload_len]
+        // then <float32 vector blob><payload>\r\n via nread
         "vadd" => {
-            if argc == 4 {
-                true
-            } else if argc == 5 {
-                let len_str = get_token_string(&tokens[4]);
-                let payload_len: usize = match len_str.parse() {
-                    Ok(n) => n,
-                    Err(_) => return false,
-                };
-                let buf_size = payload_len + 2;
-                let buf = malloc(buf_size) as *mut u8;
-                if buf.is_null() { return false; }
-
-                *ndata = buf_size;
-                *ptr = buf as *mut c_char;
-
-                let index_name    = get_token_string(&tokens[1]);
-                let vector_id     = get_token_string(&tokens[2]);
-                let vector_floats = parse_vector(&get_token_string(&tokens[3]));
-                VADD_PENDING.lock().unwrap().insert(cookie as usize, VaddPendingState {
-                    index_name,
-                    vector_id,
-                    vector_floats,
-                    payload_len,
-                    buffer: buf,
-                });
-                true
-            } else {
-                false
+            if argc != 4 && argc != 5 {
+                return true; // malformed: execute() reports the error
             }
+            let vec_bytes: usize = match get_token_string(&tokens[3]).parse() {
+                Ok(n) if n > 0 && n % 4 == 0 && n <= MAX_VEC_BYTES => n,
+                _ => return true,
+            };
+            let payload_len: usize = if argc == 5 {
+                match get_token_string(&tokens[4]).parse() {
+                    Ok(n) if n <= MAX_PAYLOAD_LEN => n,
+                    _ => return true,
+                }
+            } else {
+                0
+            };
+            let data_len = vec_bytes + payload_len;
+            let buf = malloc(data_len + 2) as *mut u8;
+            if buf.is_null() { return true; }
+            *ndata = data_len + 2;
+            *ptr = buf as *mut c_char;
+            let index_name = get_token_string(&tokens[1]);
+            let vector_id = get_token_string(&tokens[2]);
+            PENDING.lock().unwrap().insert(cookie as usize, PendingState {
+                cmd: PendingCmd::Vadd { index_name, vector_id, vec_bytes },
+                buffer: buf,
+                data_len,
+            });
+            true
+        }
+        // vsearch <index> <k> <vec_bytes> [threshold] [ef]
+        //   threshold 자리에 "-" 를 주면 임계값 없이 ef 만 지정할 수 있다.
+        // then <float32 query blob>\r\n via nread
+        "vsearch" => {
+            if argc < 4 || argc > 6 {
+                return true;
+            }
+            let k: usize = match get_token_string(&tokens[2]).parse() {
+                Ok(n) => n,
+                _ => return true,
+            };
+            let vec_bytes: usize = match get_token_string(&tokens[3]).parse() {
+                Ok(n) if n > 0 && n % 4 == 0 && n <= MAX_VEC_BYTES => n,
+                _ => return true,
+            };
+            let threshold: Option<f32> = if argc >= 5 {
+                let t = get_token_string(&tokens[4]);
+                if t == "-" {
+                    None
+                } else {
+                    match t.parse() {
+                        Ok(v) => Some(v),
+                        _ => return true,
+                    }
+                }
+            } else {
+                None
+            };
+            let ef: Option<usize> = if argc == 6 {
+                match get_token_string(&tokens[5]).parse() {
+                    Ok(n) => Some(n),
+                    _ => return true,
+                }
+            } else {
+                None
+            };
+            let buf = malloc(vec_bytes + 2) as *mut u8;
+            if buf.is_null() { return true; }
+            *ndata = vec_bytes + 2;
+            *ptr = buf as *mut c_char;
+            let index_name = get_token_string(&tokens[1]);
+            PENDING.lock().unwrap().insert(cookie as usize, PendingState {
+                cmd: PendingCmd::Vsearch { index_name, k, vec_bytes, threshold, ef },
+                buffer: buf,
+                data_len: vec_bytes,
+            });
+            true
         }
         _ => false,
     }
@@ -849,18 +1026,22 @@ unsafe extern "C" fn execute_vector_cmd(
     response_handler: EXTENSION_RESPONSE_HANDLER,
 ) -> bool {
     if argc == 0 {
-        return execute_vadd_nread(cookie, response_handler);
+        return execute_pending_nread(cookie, response_handler);
     }
 
     let tokens = std::slice::from_raw_parts(argv, argc as usize);
     let cmd = get_token_string(&tokens[0]);
     match cmd.as_str() {
         "vcreate" => execute_vcreate(cookie, argc, argv, response_handler),
-        "vadd" => execute_vadd(cookie, argc, argv, response_handler),
-        "vsearch" => execute_vsearch(cookie, argc, argv, response_handler),
         "vdel" => execute_vdel(cookie, argc, argv, response_handler),
         "vdrop" => execute_vdrop(cookie, argc, argv, response_handler),
         "vlist" => execute_vlist(cookie, argc, argv, response_handler),
+        "vadd" | "vsearch" => {
+            // Well-formed vadd/vsearch are completed via nread (argc == 0).
+            // Reaching here means the command line itself was malformed.
+            send_response(response_handler, cookie, "CLIENT_ERROR bad command line format\r\n");
+            true
+        }
         _ => {
             send_response(response_handler, cookie, "CLIENT_ERROR unknown command\r\n");
             true
@@ -869,7 +1050,7 @@ unsafe extern "C" fn execute_vector_cmd(
 }
 
 unsafe extern "C" fn abort_vector_cmd(_cmd_cookie: *const c_void, cookie: *const c_void) {
-    if let Some(state) = VADD_PENDING.lock().unwrap().remove(&(cookie as usize)) {
+    if let Some(state) = PENDING.lock().unwrap().remove(&(cookie as usize)) {
         free(state.buffer as *mut c_void);
     }
 }
@@ -956,11 +1137,11 @@ mod tests {
     #[test]
     fn test_hnsw_insert_search() {
         let hnsw = HnswWrapper::new(MetricType::L2, 100_000);
-        hnsw.insert("a", &[1.0, 0.0]);
-        hnsw.insert("b", &[0.0, 1.0]);
-        hnsw.insert("c", &[1.0, 1.0]);
+        hnsw.insert("a", &[1.0, 0.0]).unwrap();
+        hnsw.insert("b", &[0.0, 1.0]).unwrap();
+        hnsw.insert("c", &[1.0, 1.0]).unwrap();
 
-        let results = hnsw.search(&[1.0, 0.0], 1);
+        let results = hnsw.search(&[1.0, 0.0], 1, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "a");
         assert_eq!(results[0].1, 0.0);
@@ -969,11 +1150,11 @@ mod tests {
     #[test]
     fn test_hnsw_delete() {
         let hnsw = HnswWrapper::new(MetricType::L2, 100_000);
-        hnsw.insert("a", &[1.0, 0.0]);
-        hnsw.insert("b", &[0.9, 0.1]);
+        hnsw.insert("a", &[1.0, 0.0]).unwrap();
+        hnsw.insert("b", &[0.9, 0.1]).unwrap();
 
         hnsw.delete("a");
-        let results = hnsw.search(&[1.0, 0.0], 1);
+        let results = hnsw.search(&[1.0, 0.0], 1, None).unwrap();
         assert_eq!(results[0].0, "b");
     }
 
@@ -990,7 +1171,7 @@ mod tests {
                 for j in 0..10 {
                     let id = format!("vec_{}_{}", i, j);
                     let vec = vec![i as f32, j as f32];
-                    h.insert(&id, &vec);
+                    h.insert(&id, &vec).unwrap();
                 }
             })
         }).collect();
@@ -999,7 +1180,7 @@ mod tests {
             let h = Arc::clone(&hnsw);
             thread::spawn(move || {
                 for _ in 0..5 {
-                    let _ = h.search(&[1.0, 1.0], 3);
+                    let _ = h.search(&[1.0, 1.0], 3, None);
                 }
             })
         }).collect();
@@ -1007,7 +1188,7 @@ mod tests {
         for h in handles { h.join().unwrap(); }
         for h in search_handles { h.join().unwrap(); }
 
-        let results = hnsw.search(&[0.0, 0.0], 5);
+        let results = hnsw.search(&[0.0, 0.0], 5, None).unwrap();
         assert!(results.len() <= 5);
     }
 }
