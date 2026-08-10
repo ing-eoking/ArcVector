@@ -309,9 +309,9 @@ src/
 ```
 vcreate <index> <dim> [METRIC cos|l2|ip|hamming|tanimoto] [QUANT f32|f16|i8|b1]
                       [M n] [EFC n] [EFS n] [MAXCOUNT n] [EXPTIME n]
-vadd    <index> <id> <veclen> <dim> [ATTR <attrlen> <attr JSON>]\r\n<f32 LE 벡터>\r\n
+vadd    <index> <id> <veclen> <dim> [ATTR <attrlen> <attr JSON>]\r\n<좌표 텍스트>\r\n
 
-VSIM VECTOR <index> <num> <bytes> <dim> [FILTER <n> <term>...]\r\n<vec><vec>...\r\n
+VSIM VECTOR <index> <num> <bytes> <dim> [FILTER <n> <term>...]\r\n<좌표 텍스트>\r\n
 VSIM KEY    <index> <num> <key>         [FILTER <n> <term>...]\r\n
 vget    <index> <id>
 vdel    <index> <id>
@@ -383,8 +383,17 @@ END\r\n
 | ATTR이 JSON **객체**인지 | `vadd` — 필드로 질의하므로 배열·스칼라는 거부 |
 | `144 + 벡터 바이트 > max_element_bytes` | `vadd`마다 |
 
-`vadd`가 바이트 수와 차원을 **둘 다** 받는 이유는, 어긋났을 때 어느 쪽이 문제인지 지목할 수
-있기 때문이다. 바이트 수만 받으면 `7`이 7차원인지 7바이트인지 구분할 수 없다.
+### 좌표는 텍스트로 전송한다
+
+본문은 **공백으로 구분된 십진수 텍스트**다 (`0.1 0.2`). 저장은 여전히 양자화된 바이너리이므로
+요소 레이아웃과 `max_element_bytes` 계산에는 영향이 없다 — 전송 형식만 텍스트다.
+
+그래서 `vadd`가 바이트 수와 차원을 **둘 다** 받는 것이 필수다. 텍스트 길이에서 좌표 개수를
+유도할 수 없기 때문이다 — `0.1 0.2`는 7바이트에 2개, `1 2 3`은 5바이트에 3개다. `<veclen>`은
+본문을 얼마나 읽을지만 정하고, 좌표 개수가 `<dim>`과 맞는지는 파싱해서 확인한다.
+
+`VSIM VECTOR`도 같다. `<bytes>`로 본문을 읽고, 파싱한 좌표를 `<dim>`개씩 잘라 질의 벡터를
+만든다 — 나누어떨어지지 않으면 자르지 않고 거부한다.
 
 ### accept 단계에서 거부하지 않는다
 

@@ -15,42 +15,53 @@ use crate::quant::{self, Quant};
 use crate::registry::{self, VectorIndex};
 use crate::store::{Store, StoreError};
 
-fn to_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+/// Parse whitespace-separated decimal coordinates.
+///
+/// Vectors travel as text, so `<veclen>` is the byte length of that text and
+/// carries no information about how many coordinates it holds — which is exactly
+/// why the dimension is supplied alongside it.
+fn numbers(text: &[u8], what: &str) -> Result<Vec<f32>> {
+    let text = std::str::from_utf8(text)
+        .map_err(|_| Error::bad_request(format!("{what} is not valid UTF-8")))?;
+    text.split_ascii_whitespace()
+        .map(|token| {
+            token.parse::<f32>().map_err(|_| {
+                Error::bad_request(format!("{what} coordinate '{token}' is not a number"))
+            })
+        })
         .collect()
 }
 
-/// Check a body's byte count against the dimension the client declared.
-///
-/// Both are supplied so that a miscount is named rather than having the bytes
-/// silently reinterpreted as a different number of coordinates.
-fn check_length(len: usize, dim: usize) -> Result<()> {
-    let expected = dim * size_of::<f32>();
-    if len == expected {
-        return Ok(());
+/// Split `text` into whole `dim`-dimension vectors.
+fn coord_vectors(text: &[u8], dim: usize, what: &str) -> Result<Vec<Vec<f32>>> {
+    if dim == 0 {
+        return Err(Error::bad_request("dimension must be at least 1"));
     }
-    Err(Error::bad_request(format!(
-        "vector length {len} does not match dimension {dim} ({expected} bytes expected)"
-    )))
-}
-
-/// Decode and validate a client-supplied query or vector.
-fn coords(bytes: &[u8], expected_dim: usize, what: &str) -> Result<Vec<f32>> {
-    let v = to_f32(bytes);
-    if v.len() != expected_dim {
+    let all = numbers(text, what)?;
+    if all.is_empty() || all.len() % dim != 0 {
         return Err(Error::bad_request(format!(
-            "expected {expected_dim} dimensions, got {}",
-            v.len()
+            "{} coordinates is not a whole number of {dim}-dimension vectors",
+            all.len()
         )));
     }
-    if !v.iter().all(|x| x.is_finite()) {
+    if !all.iter().all(|x| x.is_finite()) {
         return Err(Error::bad_request(format!(
             "{what} contains NaN or infinity"
         )));
     }
-    Ok(v)
+    Ok(all.chunks(dim).map(<[f32]>::to_vec).collect())
+}
+
+/// Parse exactly one `dim`-dimension vector.
+fn coords(text: &[u8], dim: usize, what: &str) -> Result<Vec<f32>> {
+    let mut all = coord_vectors(text, dim, what)?;
+    if all.len() != 1 {
+        return Err(Error::bad_request(format!(
+            "expected {dim} coordinates, got {}",
+            all.len() * dim
+        )));
+    }
+    Ok(all.remove(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -204,9 +215,9 @@ pub fn vadd(store: &Store, spec: &AddSpec, body: &[u8]) -> Result<Reply> {
     } = spec;
     let attr = attr.as_slice();
 
-    // The body length was fixed by veclen, so this compares veclen against the
-    // declared dimension.
-    check_length(body.len(), *dim)?;
+    // veclen only sized the body; whether the text really holds `dim`
+    // coordinates is decided here.
+    let vector = coords(body, *dim, "vector")?;
 
     let index = registry::require(name)?;
     if *dim != index.ann.layout.dim {
@@ -216,9 +227,7 @@ pub fn vadd(store: &Store, spec: &AddSpec, body: &[u8]) -> Result<Reply> {
         )));
     }
     index.ensure_built(store)?;
-
     let layout = index.ann.layout;
-    let vector = coords(body, layout.dim, "vector")?;
 
     // ATTR must be a JSON object: it is stored as one and queried by field.
     if !attr.is_empty() {
@@ -352,18 +361,9 @@ pub fn vsim_vector(store: &Store, spec: &SimSpec, body: &[u8]) -> Result<Reply> 
     }
     index.ensure_built(store)?;
 
-    let stride = dim * size_of::<f32>();
-    if !body.len().is_multiple_of(stride) {
-        return Err(Error::bad_request(format!(
-            "{} bytes is not a whole number of {dim}-dimension vectors",
-            body.len()
-        )));
-    }
-
     let mut out = String::new();
-    for (query_no, chunk) in body.chunks_exact(stride).enumerate() {
-        let query = coords(chunk, dim, "query")?;
-        let quantized = quant::encode(&query, layout.quant);
+    for (query_no, query) in coord_vectors(body, dim, "query")?.iter().enumerate() {
+        let quantized = quant::encode(query, layout.quant);
         similar(store, &index, &quantized, k, filter, query_no, &mut out)?;
     }
     out.push_str("END\r\n");
@@ -493,31 +493,6 @@ pub fn vlist(tokens: &Tokens) -> Result<Reply> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn coords_decodes_little_endian_f32() {
-        let bytes: Vec<u8> = [1.0f32, -2.0, 0.5]
-            .iter()
-            .flat_map(|x| x.to_le_bytes())
-            .collect();
-        assert_eq!(coords(&bytes, 3, "vector").unwrap(), vec![1.0, -2.0, 0.5]);
-    }
-
-    #[test]
-    fn coords_rejects_a_dimension_mismatch() {
-        let bytes = [0u8; 8]; // two floats
-        let msg = coords(&bytes, 3, "vector").unwrap_err().to_string();
-        assert!(msg.contains("expected 3 dimensions, got 2"), "{msg}");
-    }
-
-    #[test]
-    fn coords_rejects_non_finite_values() {
-        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            let bytes = bad.to_le_bytes();
-            let msg = coords(&bytes, 1, "query").unwrap_err().to_string();
-            assert!(msg.contains("NaN or infinity"), "{bad}: {msg}");
-        }
-    }
-
     fn parse_options(args: &[&str]) -> Result<Options> {
         let raw: Vec<crate::engine_api::token_t> = args
             .iter()
@@ -564,18 +539,59 @@ mod tests {
     }
 
     #[test]
-    fn a_byte_count_must_match_the_declared_dimension() {
-        assert!(check_length(28, 7).is_ok());
-        assert!(check_length(4096, 1024).is_ok());
+    fn coordinates_are_parsed_from_text() {
+        // The reported line: "0.1 0.2" is 7 bytes of text holding 2 coordinates.
+        assert_eq!(coords(b"0.1 0.2", 2, "vector").unwrap(), vec![0.1, 0.2]);
+        assert_eq!(b"0.1 0.2".len(), 7);
 
-        // The case that started this: 7 read as a byte count, not a dimension.
-        let msg = check_length(7, 7).unwrap_err().to_string();
-        assert!(msg.contains("does not match dimension 7"), "{msg}");
-        assert!(msg.contains("28 bytes expected"), "{msg}");
+        // Any run of whitespace separates coordinates.
+        assert_eq!(
+            coords(b"1  -2.5\t3e2", 3, "vector").unwrap(),
+            vec![1.0, -2.5, 300.0]
+        );
+    }
 
-        // A count that is a multiple of four but the wrong multiple.
-        let msg = check_length(24, 7).unwrap_err().to_string();
-        assert!(msg.contains("28 bytes expected"), "{msg}");
+    #[test]
+    fn a_coordinate_count_that_disagrees_with_the_dimension_is_named() {
+        let msg = coords(b"0.1 0.2 0.3", 2, "vector").unwrap_err().to_string();
+        assert!(msg.contains("whole number of 2-dimension"), "{msg}");
+
+        let msg = coords(b"0.1", 2, "vector").unwrap_err().to_string();
+        assert!(msg.contains("whole number of 2-dimension"), "{msg}");
+
+        assert!(coords(b"", 2, "vector").is_err());
+    }
+
+    #[test]
+    fn a_non_numeric_coordinate_is_quoted_back() {
+        let msg = coords(b"0.1 abc", 2, "vector").unwrap_err().to_string();
+        assert!(msg.contains("'abc' is not a number"), "{msg}");
+    }
+
+    #[test]
+    fn non_finite_coordinates_are_rejected() {
+        for bad in ["NaN", "inf", "-inf"] {
+            let text = format!("0.1 {bad}");
+            let msg = coords(text.as_bytes(), 2, "query").unwrap_err().to_string();
+            assert!(msg.contains("NaN or infinity"), "{bad}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_batch_splits_into_whole_vectors() {
+        let batch = coord_vectors(b"1 2 3 4 5 6", 3, "query").unwrap();
+        assert_eq!(batch, vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]]);
+
+        // A partial trailing vector is refused rather than truncated.
+        let msg = coord_vectors(b"1 2 3 4", 3, "query")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("whole number of 3-dimension"), "{msg}");
+    }
+
+    #[test]
+    fn a_zero_dimension_does_not_divide_by_zero() {
+        assert!(coord_vectors(b"1 2", 0, "query").is_err());
     }
 
     #[test]
