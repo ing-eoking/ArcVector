@@ -218,6 +218,10 @@ REGISTRY  ->  build  ->  ann  ->  by_id  ->  [엔진 cache_lock]
 
 2단계 성공 후 4단계가 실패해도 Map이 진실이므로 정합성 규칙(4장)을 만족한다.
 
+인덱스는 `multi: false`로 만들므로 **usearch는 같은 key로의 두 번째 `add`를 거부한다.**
+따라서 기존 id의 갱신은 `remove` 후 `add`이다. 그 사이의 짧은 창에서 동시 검색이 해당 벡터를
+놓칠 수 있으나, Map이 진실의 원천이므로 데이터가 사라지지는 않는다.
+
 **vdel** — Map delete → permit + `ann` read 락으로 `remove` → `ids` 슬롯 tombstone.
 `remove` 실패 시 유령 키가 남지만, predicate가 `KEY_ENOENT`로 걸러내고 지연 삭제한다.
 
@@ -280,18 +284,24 @@ src/
 ## 7. 명령어
 
 ```
-vcreate <index> <dim> [METRIC cos|l2|ip] [QUANT f32|f16|i8|b1]
+vcreate <index> <dim> [METRIC cos|l2|ip|hamming|tanimoto] [QUANT f32|f16|i8|b1]
                       [FBYTES n] [THREADS n] [M n] [EFC n] [EFS n]
-vadd    <index> <id> <veclen> <jsonlen>\r\n<f32 LE 벡터><json>\r\n
-vsearch <index> <k> <veclen> [FILTER <expr>]\r\n<f32 LE 질의벡터>\r\n
+                      [MAXCOUNT n] [EXPTIME n]
+vadd    <index> <id> <veclen> [jsonlen]\r\n<f32 LE 벡터><json>\r\n
+vsearch <index> <k> <veclen> [filterlen]\r\n<f32 LE 질의벡터><필터식>\r\n
 vget    <index> <id>
 vdel    <index> <id>
 vdrop   <index>
 vlist
 ```
 
+필터식은 명령줄 토큰이 아니라 **본문으로 전달한다**. `cat = tech AND lang = ko`처럼 공백을
+포함하는 식이 토크나이저의 필드 수 제한에 걸리지 않게 하기 위해서다.
+
 필터 문법(베이스): `field op value`를 `AND` / `OR`로 결합. `op` = `=` `!=` `<` `<=` `>` `>=`.
-JSON 최상위 필드만 지원하며 중첩 경로는 후속 과제다.
+`AND`가 `OR`보다 강하게 결합하며 괄호는 없다. JSON 최상위 필드만 지원하고 중첩 경로는 후속
+과제다. **없는 필드에 대한 조건은 `!=`를 포함해 항상 거짓**이다 — 그렇지 않으면 `a != x`가
+`a`가 없다는 이유만으로 통과해 버린다.
 
 ---
 

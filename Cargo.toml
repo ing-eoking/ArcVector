@@ -1,13 +1,17 @@
 [package]
 name = "arcusv"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [lib]
-crate-type = ["cdylib"]
+# cdylib: memcached loads this as an ASCII protocol extension.
+# rlib:   lets `cargo test` exercise the pure modules (codec/quant/filter).
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-hnsw_rs = "0.3.4"
+usearch = "2.26"
+serde_json = "1"
+boxcar = "0.2"
 
 [build-dependencies]
 bindgen = "0.72.1"
