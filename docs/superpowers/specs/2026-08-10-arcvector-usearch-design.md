@@ -303,7 +303,9 @@ src/
 vcreate <index> <dim> [METRIC cos|l2|ip|hamming|tanimoto] [QUANT f32|f16|i8|b1]
                       [THREADS n] [M n] [EFC n] [EFS n] [MAXCOUNT n] [EXPTIME n]
 vadd    <index> <id> <veclen> [ATTR <attrlen> <attr JSON>]\r\n<f32 LE 벡터>\r\n
-vsearch <index> <k> <veclen> [filterlen]\r\n<f32 LE 질의벡터><필터식>\r\n
+
+VSIM VECTOR <index> <num> <bytes> <dim> [FILTER <n> <term>...]\r\n<vec><vec>...\r\n
+VSIM KEY    <index> <num> <key>         [FILTER <n> <term>...]\r\n
 vget    <index> <id>
 vdel    <index> <id>
 vdrop   <index>
@@ -335,7 +337,33 @@ ATTR은 128B로 짧고 상한이 정해져 있어 명령줄에 실어도 안전�
 
 즉 128B 한도가 보통 먼저 걸리고, 일반적인 직렬화기 출력은 영향이 없다.
 
-검색 필터식은 길이 상한이 없어 이 방법 자체를 쓸 수 없으므로 본문으로 보낸다.
+### VSIM
+
+`<num>`은 반환할 이웃 수(k), `<bytes>`는 본문 바이트 수, `<dim>`은 차원이다. 세 이름을 구분해
+쓴다 — `num`은 개수, `bytes`는 바이트 수다.
+
+- **`VSIM VECTOR`** — 본문에 `bytes`만큼의 f32 LE가 실린다. 질의 벡터 수는
+  `bytes / (dim × 4)`이므로 **여러 질의를 한 번에** 보낼 수 있다. `dim`은 인덱스 차원과
+  대조해 클라이언트/인덱스 불일치를 조기에 잡는다.
+- **`VSIM KEY`** — 이미 인덱스에 있는 벡터를 질의로 쓴다. 본문이 없으므로 단일 왕복으로
+  끝나고, 저장된 바이트가 이미 양자화되어 있어 **재인코딩이 없다**.
+
+응답은 질의별로 묶는다.
+
+```
+QUERY <query_no> <count>\r\n
+VALUE <id> <distance> <attrlen>\r\n<attr JSON>\r\n
+...
+END\r\n
+```
+
+`count`가 그룹 헤더에 있으므로, 검색 중 사라진 후보를 걸러낸 **뒤에** 행을 쓴다.
+
+`FILTER <n> <term>...`의 `n`은 **항목 개수**다. 항목 하나가 토큰 하나이므로
+(`cat=tech`, `ts>1700000000`) 토크나이저에 영향받지 않는다 — 자유형 표현식을 명령줄에 실을 때
+생기던 공백 문제가 구조적으로 사라진다. 대신 **항목 값에 공백을 넣을 수 없고**, 항목들은
+`AND`로 결합된다(`OR`나 괄호는 후속 과제). 선언한 `n`과 실제 항목 수가 다르면 거부한다 —
+항목이 조용히 누락되거나 딸려 들어가는 것을 막기 위해서다.
 
 `ATTR`은 생략 가능하고(속성 없이 저장), 다음을 검사한다.
 

@@ -231,67 +231,134 @@ pub fn vadd(store: &Store, name: &str, id: &str, attr: &[u8], body: &[u8]) -> Re
 }
 
 // ---------------------------------------------------------------------------
-// vsearch
+// vsim
 // ---------------------------------------------------------------------------
 
-pub fn vsearch(
+/// One similarity search, appended to `out` as a `QUERY` group.
+///
+/// Shared by both `VSIM` forms: the only difference between them is where the
+/// query coordinates come from.
+fn similar(
     store: &Store,
-    name: &str,
+    index: &VectorIndex,
+    query: &[u8],
     k: usize,
-    vec_bytes: usize,
-    body: &[u8],
-) -> Result<Reply> {
-    let index = registry::require(name)?;
-    index.ensure_built(store)?;
-
+    filter: Option<&Filter>,
+    query_no: usize,
+    out: &mut String,
+) -> Result<()> {
     let layout = index.ann.layout;
-    let query = coords(&body[..vec_bytes], layout.dim, "query")?;
-
-    let expression = &body[vec_bytes..];
-    let filter = if expression.is_empty() {
-        None
-    } else {
-        let text = std::str::from_utf8(expression)
-            .map_err(|_| Error::bad_request("filter expression is not valid UTF-8"))?;
-        Some(Filter::parse(text)?)
-    };
-
-    let quantized = quant::encode(&query, layout.quant);
 
     // Reused across predicate calls so the hot path allocates nothing after the
     // first visited node.
     let scratch = RefCell::new(Vec::with_capacity(codec::ATTR_BYTES));
     let accept = |key: u64| -> bool {
-        let Some(filter) = filter.as_ref() else {
+        let Some(filter) = filter else {
             return true;
         };
         let Some(id) = index.ann.id_of(key) else {
             return false;
         };
         let mut slot = scratch.borrow_mut();
-        match store.read_attr_slot(name, id, &layout, &mut slot) {
+        match store.read_attr_slot(&index.name, id, &layout, &mut slot) {
             Ok(()) => filter.matches(&slot),
             // Evicted or vanished mid-search: no longer a candidate.
             Err(_) => false,
         }
     };
 
-    let hits = index.ann.search(&quantized, k, accept)?;
+    let hits = index.ann.search(query, k, accept)?;
 
-    let mut out = String::new();
+    let mut rendered = Vec::with_capacity(hits.len());
     for (key, distance) in hits {
         let Some(id) = index.ann.id_of(key) else {
             continue;
         };
-        let Ok(stored) = store.get_elem(name, id) else {
+        let Ok(stored) = store.get_elem(&index.name, id) else {
             continue;
         };
-        let json = layout
+        let attr = layout
             .decode(&stored)
             .map(|e| String::from_utf8_lossy(e.attr).into_owned())
             .unwrap_or_default();
-        let _ = write!(out, "VALUE {id} {distance} {}\r\n{json}\r\n", json.len());
+        rendered.push((id.to_owned(), distance, attr));
     }
+
+    // The count goes on the group header, so it has to be known before the rows
+    // are written — hits that vanished mid-search are already excluded.
+    let _ = writeln!(out, "QUERY {query_no} {}\r", rendered.len());
+    for (id, distance, attr) in rendered {
+        let _ = write!(out, "VALUE {id} {distance} {}\r\n{attr}\r\n", attr.len());
+    }
+    Ok(())
+}
+
+/// `VSIM VECTOR <index> <num> <bytes> <dim> [FILTER <n> <term>...]`
+///
+/// The body holds `bytes` of little-endian `f32`, which is `bytes / (dim * 4)`
+/// query vectors searched in one round trip. Each contributes one `QUERY` group
+/// of up to `num` neighbours.
+pub fn vsim_vector(
+    store: &Store,
+    name: &str,
+    k: usize,
+    dim: usize,
+    filter: Option<&Filter>,
+    body: &[u8],
+) -> Result<Reply> {
+    let index = registry::require(name)?;
+    index.ensure_built(store)?;
+
+    let layout = index.ann.layout;
+    if dim != layout.dim {
+        return Err(Error::bad_request(format!(
+            "index {name} has dimension {}, got {dim}",
+            layout.dim
+        )));
+    }
+
+    let stride = dim * size_of::<f32>();
+    if !body.len().is_multiple_of(stride) {
+        return Err(Error::bad_request(format!(
+            "{} bytes is not a whole number of {dim}-dimension vectors",
+            body.len()
+        )));
+    }
+
+    let mut out = String::new();
+    for (query_no, chunk) in body.chunks_exact(stride).enumerate() {
+        let query = coords(chunk, dim, "query")?;
+        let quantized = quant::encode(&query, layout.quant);
+        similar(store, &index, &quantized, k, filter, query_no, &mut out)?;
+    }
+    out.push_str("END\r\n");
+    Ok(Reply::Body(out))
+}
+
+/// `VSIM KEY <index> <num> <key> [FILTER <n> <term>...]`
+///
+/// Searches using a vector already in the index, so no body is transferred. The
+/// stored bytes are handed to usearch as they are — already quantized, so there
+/// is no re-encoding step.
+pub fn vsim_key(
+    store: &Store,
+    name: &str,
+    k: usize,
+    key: &str,
+    filter: Option<&Filter>,
+) -> Result<Reply> {
+    let index = registry::require(name)?;
+    index.ensure_built(store)?;
+
+    let stored = match store.get_elem(name, key) {
+        Ok(v) => v,
+        Err(StoreError::ElemGone | StoreError::KeyGone) => return Ok(Reply::NotFound),
+        Err(e) => return Err(e.into()),
+    };
+    let query = index.ann.layout.decode(&stored)?.vector.to_vec();
+
+    let mut out = String::new();
+    similar(store, &index, &query, k, filter, 0, &mut out)?;
     out.push_str("END\r\n");
     Ok(Reply::Body(out))
 }

@@ -18,6 +18,58 @@ pub const MAX_BLOB_BYTES: usize = 8 * 1024 * 1024;
 /// undelimited piece.
 pub const MAX_TOKENS: usize = 30;
 
+/// The commands this extension answers. Names are matched case-insensitively so
+/// `VSIM` and `vsim` both work.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Cmd {
+    VCreate,
+    VAdd,
+    VSim,
+    VGet,
+    VDel,
+    VDrop,
+    VList,
+}
+
+impl Cmd {
+    pub fn parse(name: &str) -> Option<Cmd> {
+        const NAMES: [(&str, Cmd); 7] = [
+            ("vcreate", Cmd::VCreate),
+            ("vadd", Cmd::VAdd),
+            ("vsim", Cmd::VSim),
+            ("vget", Cmd::VGet),
+            ("vdel", Cmd::VDel),
+            ("vdrop", Cmd::VDrop),
+            ("vlist", Cmd::VList),
+        ];
+        NAMES
+            .iter()
+            .find(|(text, _)| name.eq_ignore_ascii_case(text))
+            .map(|(_, cmd)| *cmd)
+    }
+}
+
+/// Which query source a `VSIM` uses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SimSource {
+    /// Coordinates arrive in the body.
+    Vector,
+    /// The query is a vector already stored under a key.
+    Key,
+}
+
+impl SimSource {
+    pub fn parse(name: &str) -> Option<SimSource> {
+        if name.eq_ignore_ascii_case("VECTOR") {
+            Some(SimSource::Vector)
+        } else if name.eq_ignore_ascii_case("KEY") {
+            Some(SimSource::Key)
+        } else {
+            None
+        }
+    }
+}
+
 pub type ResponseHandler =
     Option<unsafe extern "C" fn(*const c_void, c_int, *const c_char) -> bool>;
 
@@ -54,9 +106,48 @@ impl<'a> Tokens<'a> {
         self.tokens.is_empty()
     }
 
-    /// The command name, or an empty string for a body-only invocation.
-    pub fn command(&self) -> &'a str {
-        self.text(0).unwrap_or("")
+    /// The command, or `None` for a body-only invocation or an unknown name.
+    pub fn command(&self) -> Option<Cmd> {
+        Cmd::parse(self.text(0).unwrap_or(""))
+    }
+
+    /// Parse an optional `FILTER <n> <term>...` clause starting at token `at`.
+    ///
+    /// Each term is one token, so a term must not contain spaces — that is what
+    /// keeps the clause immune to the tokenizer, unlike a free-form expression.
+    /// Terms are ANDed together and handed to the same parser a full expression
+    /// would use.
+    pub fn filter_clause(&self, at: usize) -> Result<Option<crate::filter::Filter>> {
+        if self.len() <= at {
+            return Ok(None);
+        }
+        let keyword = self.text(at)?;
+        if !keyword.eq_ignore_ascii_case("FILTER") {
+            return Err(Error::bad_request(format!(
+                "expected FILTER, got '{keyword}'"
+            )));
+        }
+        let count: usize = self.parse(at + 1, "filter term count")?;
+        if count == 0 {
+            return Ok(None);
+        }
+
+        let first = at + 2;
+        let supplied = self.len().saturating_sub(first);
+        if supplied != count {
+            return Err(Error::bad_request(format!(
+                "FILTER declares {count} terms but {supplied} were supplied"
+            )));
+        }
+
+        let mut expression = String::new();
+        for i in first..first + count {
+            if i > first {
+                expression.push_str(" AND ");
+            }
+            expression.push_str(self.text(i)?);
+        }
+        Ok(Some(crate::filter::Filter::parse(&expression)?))
     }
 
     /// Borrow token `i` as UTF-8.
@@ -238,10 +329,13 @@ pub enum PendingCmd {
         /// travels here and the handler reports it.
         attr: std::result::Result<Vec<u8>, Error>,
     },
-    Search {
+    /// `VSIM VECTOR`: the query coordinates follow in the body.
+    Sim {
         index: String,
         k: usize,
-        vec_bytes: usize,
+        dim: usize,
+        /// Filter taken off the command line, or the reason it could not be read.
+        filter: std::result::Result<Option<crate::filter::Filter>, Error>,
     },
 }
 
@@ -341,7 +435,7 @@ mod tests {
         // SAFETY: a zero count never dereferences the pointer.
         let t = unsafe { Tokens::new(ptr::null(), 0) };
         assert!(t.is_empty());
-        assert_eq!(t.command(), "");
+        assert_eq!(t.command(), None);
         // A negative argc must be treated as empty rather than wrapping.
         let t = unsafe { Tokens::new(ptr::null(), -1) };
         assert!(t.is_empty());
@@ -352,7 +446,7 @@ mod tests {
         let raw = tokens_from(&["vcreate", "docs", "1024"]);
         let t = view(&raw);
         assert_eq!(t.len(), 3);
-        assert_eq!(t.command(), "vcreate");
+        assert_eq!(t.command(), Some(Cmd::VCreate));
         assert_eq!(t.text(1).unwrap(), "docs");
         assert_eq!(t.parse::<usize>(2, "dimension").unwrap(), 1024);
     }
@@ -435,6 +529,85 @@ mod tests {
     }
 
     #[test]
+    fn command_names_are_case_insensitive() {
+        for (text, cmd) in [
+            ("vsim", Cmd::VSim),
+            ("VSIM", Cmd::VSim),
+            ("VSim", Cmd::VSim),
+            ("vcreate", Cmd::VCreate),
+            ("VADD", Cmd::VAdd),
+        ] {
+            assert_eq!(Cmd::parse(text), Some(cmd), "{text}");
+        }
+        assert_eq!(Cmd::parse("vsimilar"), None);
+        assert_eq!(Cmd::parse(""), None);
+    }
+
+    #[test]
+    fn sim_sources_are_case_insensitive() {
+        assert_eq!(SimSource::parse("VECTOR"), Some(SimSource::Vector));
+        assert_eq!(SimSource::parse("vector"), Some(SimSource::Vector));
+        assert_eq!(SimSource::parse("KEY"), Some(SimSource::Key));
+        assert_eq!(SimSource::parse("key"), Some(SimSource::Key));
+        assert_eq!(SimSource::parse("ID"), None);
+    }
+
+    #[test]
+    fn an_absent_filter_clause_is_none() {
+        let (_buf, raw) = tokenize("VSIM KEY docs 5 v1");
+        assert!(view(&raw).filter_clause(5).unwrap().is_none());
+    }
+
+    #[test]
+    fn filter_terms_are_anded_together() {
+        let (_buf, raw) = tokenize("VSIM KEY docs 5 v1 FILTER 2 cat=tech ts>1700000000");
+        let f = view(&raw).filter_clause(5).unwrap().unwrap();
+        assert!(f.matches(br#"{"cat":"tech","ts":1723248000}"#));
+        // Both terms must hold, so failing either one rejects the document.
+        assert!(!f.matches(br#"{"cat":"tech","ts":1}"#));
+        assert!(!f.matches(br#"{"cat":"news","ts":1723248000}"#));
+    }
+
+    #[test]
+    fn a_single_filter_term_needs_no_conjunction() {
+        let (_buf, raw) = tokenize("VSIM KEY docs 5 v1 FILTER 1 lang=ko");
+        let f = view(&raw).filter_clause(5).unwrap().unwrap();
+        assert!(f.matches(br#"{"lang":"ko"}"#));
+        assert!(!f.matches(br#"{"lang":"en"}"#));
+    }
+
+    #[test]
+    fn a_zero_term_filter_is_treated_as_absent() {
+        let (_buf, raw) = tokenize("VSIM KEY docs 5 v1 FILTER 0");
+        assert!(view(&raw).filter_clause(5).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_filter_count_that_disagrees_with_the_terms_is_rejected() {
+        // Guards against a term being silently dropped or picked up.
+        let (_buf, raw) = tokenize("VSIM KEY docs 5 v1 FILTER 3 cat=tech");
+        let msg = view(&raw).filter_clause(5).unwrap_err().to_string();
+        assert!(msg.contains("declares 3 terms but 1"), "{msg}");
+
+        let (_buf, raw) = tokenize("VSIM KEY docs 5 v1 FILTER 1 cat=tech lang=ko");
+        let msg = view(&raw).filter_clause(5).unwrap_err().to_string();
+        assert!(msg.contains("declares 1 terms but 2"), "{msg}");
+    }
+
+    #[test]
+    fn a_misspelled_filter_keyword_is_reported() {
+        let (_buf, raw) = tokenize("VSIM KEY docs 5 v1 FILTERS 1 cat=tech");
+        let msg = view(&raw).filter_clause(5).unwrap_err().to_string();
+        assert!(msg.contains("expected FILTER"), "{msg}");
+    }
+
+    #[test]
+    fn an_unparseable_filter_term_is_reported() {
+        let (_buf, raw) = tokenize("VSIM KEY docs 5 v1 FILTER 1 nonsense");
+        assert!(view(&raw).filter_clause(5).is_err());
+    }
+
+    #[test]
     fn options_are_upper_cased_and_paired() {
         let raw = tokens_from(&["vcreate", "docs", "8", "quant", "i8", "METRIC", "cos"]);
         let opts = view(&raw).options(3).unwrap();
@@ -457,10 +630,11 @@ mod tests {
     #[test]
     fn body_buffer_reserves_room_for_the_trailing_crlf() {
         let p = Pending::new(
-            PendingCmd::Search {
+            PendingCmd::Sim {
                 index: "docs".into(),
                 k: 5,
-                vec_bytes: 16,
+                dim: 4,
+                filter: Ok(None),
             },
             16,
         );

@@ -46,7 +46,7 @@ use engine_api::{
     extension_type_t_EXTENSION_ASCII_PROTOCOL, token_t,
 };
 use error::{Error, Reply, Result};
-use protocol::{MAX_BLOB_BYTES, PendingCmd, Responder, ResponseHandler, Tokens};
+use protocol::{Cmd, MAX_BLOB_BYTES, PendingCmd, Responder, ResponseHandler, SimSource, Tokens};
 use store::{Store, StoreError};
 
 /// Engine access for the callback currently running.
@@ -79,25 +79,59 @@ unsafe fn dispatch(cookie: *const c_void, tokens: &Tokens) -> Result<Reply> {
             PendingCmd::Add { index, id, attr } => {
                 command::vadd(&store, &index, &id, &attr?, &body)
             }
-            PendingCmd::Search {
+            PendingCmd::Sim {
                 index,
                 k,
-                vec_bytes,
-            } => command::vsearch(&store, &index, k, vec_bytes, &body),
+                dim,
+                filter,
+            } => command::vsim_vector(&store, &index, k, dim, filter?.as_ref(), &body),
         };
     }
 
     match tokens.command() {
-        "vcreate" => command::vcreate(&store?, tokens),
-        "vget" => command::vget(&store?, tokens),
-        "vdel" => command::vdel(&store?, tokens),
-        "vdrop" => command::vdrop(&store?, tokens),
-        "vlist" => command::vlist(tokens),
-        // A well-formed vadd/vsearch completes through the body phase above, so
-        // reaching here means the command line itself was malformed.
-        "vadd" | "vsearch" => Err(Error::bad_request("bad command line format")),
-        other => Err(Error::bad_request(format!("unknown command {other}"))),
+        Some(Cmd::VCreate) => command::vcreate(&store?, tokens),
+        Some(Cmd::VGet) => command::vget(&store?, tokens),
+        Some(Cmd::VDel) => command::vdel(&store?, tokens),
+        Some(Cmd::VDrop) => command::vdrop(&store?, tokens),
+        Some(Cmd::VList) => command::vlist(tokens),
+        // VSIM KEY needs no body and lands here; VSIM VECTOR completes through
+        // the body phase above, so seeing it here means the line was malformed.
+        Some(Cmd::VSim) => vsim(&store?, tokens),
+        // A well-formed vadd completes through the body phase above.
+        Some(Cmd::VAdd) => Err(Error::bad_request("bad command line format")),
+        None => Err(Error::bad_request(format!(
+            "unknown command {}",
+            tokens.text(0).unwrap_or("")
+        ))),
     }
+}
+
+/// `VSIM KEY <index> <num> <key> [FILTER <n> <term>...]`
+///
+/// The vector form is not answered here: it needs a body, so `accept` registers
+/// it and `dispatch` resumes it once the coordinates arrive.
+fn vsim(store: &Store, tokens: &Tokens) -> Result<Reply> {
+    if tokens.len() < 5 {
+        return Err(Error::bad_request("bad command line format"));
+    }
+    let source = SimSource::parse(tokens.text(1)?).ok_or_else(|| {
+        Error::bad_request(format!(
+            "expected VECTOR or KEY, got '{}'",
+            tokens.text(1).unwrap_or("")
+        ))
+    })?;
+    if source != SimSource::Key {
+        return Err(Error::bad_request("bad command line format"));
+    }
+
+    let index = tokens.text(2)?;
+    let k: usize = tokens.parse(3, "result count")?;
+    if k == 0 {
+        return Err(Error::bad_request("result count must be at least 1"));
+    }
+    let key = tokens.text(4)?;
+    let filter = tokens.filter_clause(5)?;
+    command::vsim_key(store, index, k, key, filter.as_ref())
 }
 
 /// Length of a body segment, rejecting values that cannot be transferred.
@@ -163,67 +197,70 @@ unsafe extern "C" fn accept_vector_cmd(
     // SAFETY: guaranteed by the caller.
     let tokens = unsafe { Tokens::new(argv, argc) };
 
-    // vadd    <index> <id> <veclen> [ATTR <attrlen> <attr JSON>]  then <vector>\r\n
-    // vsearch <index> <k>  <veclen> [filterlen]                   then <vector><filter>\r\n
+    // vadd <index> <id> <veclen> [ATTR <attrlen> <attr JSON>]        then <vector>\r\n
+    // VSIM VECTOR <index> <num> <bytes> <dim> [FILTER <n> <term>...] then <vec><vec>…\r\n
     //
-    // ATTR rides on the command line because it is short and bounded. The search
-    // filter does not: an expression with spaces would be at the mercy of the
-    // tokenizer's field limit, so it travels in the body instead.
-    let cmd = tokens.command();
-    match cmd {
-        "vcreate" | "vget" | "vdel" | "vdrop" | "vlist" => return true,
-        "vadd" | "vsearch" => {}
-        _ => return false,
-    }
-    if tokens.len() < 4 {
-        return true;
-    }
-    let Some(vec_bytes) = blob_len(&tokens, 3, "vector length", true) else {
-        return true;
-    };
-    let Ok(index) = tokens.text(1).map(str::to_owned) else {
-        return true;
-    };
-
-    let (pending, body_len) = if cmd == "vadd" {
-        let Ok(id) = tokens.text(2).map(str::to_owned) else {
-            return true;
-        };
-        // The body is exactly the vector; ATTR was already on the line.
-        (
-            PendingCmd::Add {
-                index,
-                id,
-                attr: read_attr(&tokens),
-            },
-            vec_bytes,
-        )
-    } else {
-        if tokens.len() > 5 {
-            return true;
-        }
-        let Ok(k) = tokens.parse::<usize>(2, "k") else {
-            return true;
-        };
-        if k == 0 {
-            return true;
-        }
-        let filter_bytes = if tokens.len() == 5 {
-            match blob_len(&tokens, 4, "filter length", false) {
-                Some(n) => n,
-                None => return true,
+    // Only these two carry a body. Everything else — including VSIM KEY, whose
+    // query is already in the index — is answered straight from the command line.
+    let (pending, body_len) = match tokens.command() {
+        Some(Cmd::VAdd) => {
+            if tokens.len() < 4 {
+                return true;
             }
-        } else {
-            0
-        };
-        (
-            PendingCmd::Search {
-                index,
-                k,
+            let Some(vec_bytes) = blob_len(&tokens, 3, "vector length", true) else {
+                return true;
+            };
+            let (Ok(index), Ok(id)) = (
+                tokens.text(1).map(str::to_owned),
+                tokens.text(2).map(str::to_owned),
+            ) else {
+                return true;
+            };
+            // The body is exactly the vector; ATTR was already on the line.
+            (
+                PendingCmd::Add {
+                    index,
+                    id,
+                    attr: read_attr(&tokens),
+                },
                 vec_bytes,
-            },
-            vec_bytes + filter_bytes,
-        )
+            )
+        }
+
+        Some(Cmd::VSim) => {
+            // VSIM KEY takes no body, so let execute() handle it.
+            let source = tokens.text(1).ok().and_then(SimSource::parse);
+            if tokens.len() < 6 || source != Some(SimSource::Vector) {
+                return true;
+            }
+            let Ok(index) = tokens.text(2).map(str::to_owned) else {
+                return true;
+            };
+            let (Ok(k), Ok(dim)) = (
+                tokens.parse::<usize>(3, "result count"),
+                tokens.parse::<usize>(5, "dimension"),
+            ) else {
+                return true;
+            };
+            let Some(bytes) = blob_len(&tokens, 4, "vector bytes", true) else {
+                return true;
+            };
+            if k == 0 || dim == 0 {
+                return true;
+            }
+            (
+                PendingCmd::Sim {
+                    index,
+                    k,
+                    dim,
+                    filter: tokens.filter_clause(6),
+                },
+                bytes,
+            )
+        }
+
+        Some(_) => return true,
+        None => return false,
     };
 
     // SAFETY: guaranteed by the caller.
