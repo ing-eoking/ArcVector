@@ -95,10 +95,11 @@ unsafe fn dispatch(cookie: *const c_void, tokens: &Tokens) -> Result<Reply> {
         Some(Cmd::VDrop) => command::vdrop(&store?, tokens),
         Some(Cmd::VList) => command::vlist(tokens),
         // VSIM KEY needs no body and lands here; VSIM VECTOR completes through
-        // the body phase above, so seeing it here means the line was malformed.
+        // the body phase above.
         Some(Cmd::VSim) => vsim(&store?, tokens),
-        // A well-formed vadd completes through the body phase above.
-        Some(Cmd::VAdd) => Err(Error::bad_request("bad command line format")),
+        // A well-formed vadd completes through the body phase above, so arriving
+        // here means the line was refused there — say why.
+        Some(Cmd::VAdd) => Err(body_command_error(tokens)),
         None => Err(Error::bad_request(format!(
             "unknown command {}",
             tokens.text(0).unwrap_or("")
@@ -121,7 +122,8 @@ fn vsim(store: &Store, tokens: &Tokens) -> Result<Reply> {
         ))
     })?;
     if source != SimSource::Key {
-        return Err(Error::bad_request("bad command line format"));
+        // VECTOR needs a body, so reaching here means accept refused the line.
+        return Err(body_command_error(tokens));
     }
 
     let index = tokens.text(2)?;
@@ -134,23 +136,31 @@ fn vsim(store: &Store, tokens: &Tokens) -> Result<Reply> {
     command::vsim_key(store, index, k, key, filter.as_ref())
 }
 
-/// Length of a body segment, rejecting values that cannot be transferred.
-fn blob_len(tokens: &Tokens, at: usize, what: &str, float_aligned: bool) -> Option<usize> {
-    let n: usize = tokens.parse(at, what).ok()?;
+/// Byte count of an f32 vector payload.
+///
+/// A length that is not a positive multiple of four cannot describe `f32`
+/// coordinates, so it is rejected here with the reason spelled out rather than
+/// reported later as a generic format error.
+fn vector_bytes(tokens: &Tokens, at: usize, what: &str) -> Result<usize> {
+    let n: usize = tokens.parse(at, what)?;
+    if n == 0 || !n.is_multiple_of(4) {
+        return Err(Error::bad_request(format!(
+            "{what} must be a positive multiple of 4 (dimensions x 4 bytes per f32), got {n}"
+        )));
+    }
     if n > MAX_BLOB_BYTES {
-        return None;
+        return Err(Error::bad_request(format!(
+            "{what} {n} exceeds the {MAX_BLOB_BYTES}-byte transfer limit"
+        )));
     }
-    if float_aligned && (n == 0 || !n.is_multiple_of(4)) {
-        return None;
-    }
-    Some(n)
+    Ok(n)
 }
 
 /// Read `ATTR <attrlen> <attr JSON>` off a `vadd` line.
 ///
 /// The clause is optional; without it a vector is stored with no attributes.
-/// `accept` cannot answer the client, so a malformed clause is returned as an
-/// error for `command::vadd` to report.
+/// `accept` cannot answer the client, so a malformed clause is carried as an
+/// error for [`command::vadd`] to report.
 fn read_attr(tokens: &Tokens) -> std::result::Result<Vec<u8>, Error> {
     if tokens.len() == 4 {
         return Ok(Vec::new());
@@ -177,10 +187,72 @@ fn read_attr(tokens: &Tokens) -> std::result::Result<Vec<u8>, Error> {
     tokens.tail(6, declared)
 }
 
+/// Parse a command line that carries a body, returning what to register and how
+/// many bytes to expect.
+///
+/// `accept` uses this to size the body and `execute` re-runs it to report why a
+/// line was refused — `accept` has no channel to answer the client, so the two
+/// share one implementation instead of one validating and the other guessing.
+fn parse_body_command(tokens: &Tokens) -> Result<(PendingCmd, usize)> {
+    let malformed = || Error::bad_request("bad command line format");
+    match tokens.command() {
+        // vadd <index> <id> <veclen> [ATTR <attrlen> <attr JSON>]
+        Some(Cmd::VAdd) => {
+            if tokens.len() < 4 {
+                return Err(malformed());
+            }
+            let index = tokens.text(1)?.to_owned();
+            let id = tokens.text(2)?.to_owned();
+            let vec_bytes = vector_bytes(tokens, 3, "vector length")?;
+            // The body is exactly the vector; ATTR was already on the line.
+            let attr = read_attr(tokens);
+            Ok((PendingCmd::Add { index, id, attr }, vec_bytes))
+        }
+
+        // VSIM VECTOR <index> <num> <bytes> <dim> [FILTER <n> <term>...]
+        Some(Cmd::VSim) => {
+            if tokens.len() < 6 {
+                return Err(malformed());
+            }
+            let index = tokens.text(2)?.to_owned();
+            let k: usize = tokens.parse(3, "result count")?;
+            if k == 0 {
+                return Err(Error::bad_request("result count must be at least 1"));
+            }
+            let bytes = vector_bytes(tokens, 4, "vector bytes")?;
+            let dim: usize = tokens.parse(5, "dimension")?;
+            if dim == 0 {
+                return Err(Error::bad_request("dimension must be at least 1"));
+            }
+            let filter = tokens.filter_clause(6);
+            Ok((
+                PendingCmd::Sim {
+                    index,
+                    k,
+                    dim,
+                    filter,
+                },
+                bytes,
+            ))
+        }
+
+        _ => Err(malformed()),
+    }
+}
+
+/// Why a body-carrying line never reached its body phase.
+fn body_command_error(tokens: &Tokens) -> Error {
+    match parse_body_command(tokens) {
+        Err(e) => e,
+        // The line parses, so the body should have been registered and resumed.
+        Ok(_) => Error::bad_request("lost command state"),
+    }
+}
+
 /// Decide how much body a command needs before it can run.
 ///
-/// Returning `true` without setting `ndata` makes memcached call `execute` on
-/// the command line, where the malformed input is reported.
+/// Returning `true` without setting `ndata` makes memcached call `execute` on the
+/// command line, where the refusal is reported.
 ///
 /// # Safety
 ///
@@ -197,70 +269,21 @@ unsafe extern "C" fn accept_vector_cmd(
     // SAFETY: guaranteed by the caller.
     let tokens = unsafe { Tokens::new(argv, argc) };
 
-    // vadd <index> <id> <veclen> [ATTR <attrlen> <attr JSON>]        then <vector>\r\n
-    // VSIM VECTOR <index> <num> <bytes> <dim> [FILTER <n> <term>...] then <vec><vec>…\r\n
-    //
-    // Only these two carry a body. Everything else — including VSIM KEY, whose
-    // query is already in the index — is answered straight from the command line.
-    let (pending, body_len) = match tokens.command() {
-        Some(Cmd::VAdd) => {
-            if tokens.len() < 4 {
-                return true;
-            }
-            let Some(vec_bytes) = blob_len(&tokens, 3, "vector length", true) else {
-                return true;
-            };
-            let (Ok(index), Ok(id)) = (
-                tokens.text(1).map(str::to_owned),
-                tokens.text(2).map(str::to_owned),
-            ) else {
-                return true;
-            };
-            // The body is exactly the vector; ATTR was already on the line.
-            (
-                PendingCmd::Add {
-                    index,
-                    id,
-                    attr: read_attr(&tokens),
-                },
-                vec_bytes,
-            )
-        }
-
-        Some(Cmd::VSim) => {
-            // VSIM KEY takes no body, so let execute() handle it.
-            let source = tokens.text(1).ok().and_then(SimSource::parse);
-            if tokens.len() < 6 || source != Some(SimSource::Vector) {
-                return true;
-            }
-            let Ok(index) = tokens.text(2).map(str::to_owned) else {
-                return true;
-            };
-            let (Ok(k), Ok(dim)) = (
-                tokens.parse::<usize>(3, "result count"),
-                tokens.parse::<usize>(5, "dimension"),
-            ) else {
-                return true;
-            };
-            let Some(bytes) = blob_len(&tokens, 4, "vector bytes", true) else {
-                return true;
-            };
-            if k == 0 || dim == 0 {
-                return true;
-            }
-            (
-                PendingCmd::Sim {
-                    index,
-                    k,
-                    dim,
-                    filter: tokens.filter_clause(6),
-                },
-                bytes,
-            )
-        }
-
+    // Only vadd and VSIM VECTOR carry a body. Everything else — including
+    // VSIM KEY, whose query is already in the index — is answered straight from
+    // the command line.
+    let vector_form = tokens.text(1).ok().and_then(SimSource::parse) == Some(SimSource::Vector);
+    match tokens.command() {
+        Some(Cmd::VAdd) => {}
+        Some(Cmd::VSim) if vector_form => {}
         Some(_) => return true,
         None => return false,
+    }
+
+    // A refusal here cannot be reported, so it is left to execute(), which runs
+    // the same parse and produces the same message.
+    let Ok((pending, body_len)) = parse_body_command(&tokens) else {
+        return true;
     };
 
     // SAFETY: guaranteed by the caller.
@@ -352,6 +375,61 @@ mod tests {
         // SAFETY: `raw` and its buffer outlive the borrow.
         let tokens = unsafe { Tokens::new(raw.as_ptr(), raw.len() as c_int) };
         read_attr(&tokens)
+    }
+
+    fn refusal(line: &str) -> String {
+        let (_buf, raw) = tokenize(line);
+        // SAFETY: `raw` and its buffer outlive the borrow.
+        let tokens = unsafe { Tokens::new(raw.as_ptr(), raw.len() as c_int) };
+        body_command_error(&tokens).to_string()
+    }
+
+    #[test]
+    fn a_vector_length_that_is_not_a_multiple_of_four_says_so() {
+        // Regression: this used to surface as a bare "bad command line format",
+        // which gave no hint that veclen counts bytes, not dimensions.
+        let msg = refusal(r#"vadd index doc1 7 ATTR 23 {"abc":123,"def":"abc"}"#);
+        assert!(msg.contains("multiple of 4"), "{msg}");
+        assert!(msg.contains("got 7"), "{msg}");
+
+        // 7 dimensions of f32 is 28 bytes, which is accepted, and the body is
+        // sized to the vector alone since ATTR came off the line.
+        let (_buf, raw) = tokenize(r#"vadd index doc1 28 ATTR 23 {"abc":123,"def":"abc"}"#);
+        // SAFETY: `raw` and its buffer outlive the borrow.
+        let tokens = unsafe { Tokens::new(raw.as_ptr(), raw.len() as c_int) };
+        let (cmd, body_len) = parse_body_command(&tokens).unwrap();
+        assert_eq!(body_len, 28);
+        let PendingCmd::Add { attr, .. } = cmd else {
+            panic!("expected an Add")
+        };
+        assert_eq!(attr.unwrap(), br#"{"abc":123,"def":"abc"}"#);
+    }
+
+    #[test]
+    fn a_zero_vector_length_is_refused() {
+        let msg = refusal("vadd index doc1 0");
+        assert!(msg.contains("multiple of 4"), "{msg}");
+    }
+
+    #[test]
+    fn a_non_numeric_vector_length_names_the_argument() {
+        let msg = refusal("vadd index doc1 abc");
+        assert!(msg.contains("vector length"), "{msg}");
+    }
+
+    #[test]
+    fn a_truncated_vadd_line_is_refused() {
+        assert!(refusal("vadd index doc1").contains("bad command line format"));
+    }
+
+    #[test]
+    fn vsim_vector_length_errors_are_specific_too() {
+        let msg = refusal("VSIM VECTOR docs 10 7 1024");
+        assert!(msg.contains("vector bytes"), "{msg}");
+        assert!(msg.contains("multiple of 4"), "{msg}");
+
+        assert!(refusal("VSIM VECTOR docs 0 4096 1024").contains("result count"));
+        assert!(refusal("VSIM VECTOR docs 10 4096 0").contains("dimension"));
     }
 
     #[test]
