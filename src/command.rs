@@ -47,7 +47,6 @@ fn coords(bytes: &[u8], expected_dim: usize, what: &str) -> Result<Vec<f32>> {
 struct Options {
     metric: Metric,
     quant: Quant,
-    filter_bytes: usize,
     threads: usize,
     connectivity: usize,
     expansion_add: usize,
@@ -61,7 +60,6 @@ impl Default for Options {
         Options {
             metric: Metric::Cos,
             quant: Quant::F32,
-            filter_bytes: codec::DEFAULT_FILTER_BYTES,
             threads: index::DEFAULT_THREADS,
             connectivity: 0,
             expansion_add: 0,
@@ -89,10 +87,6 @@ impl Options {
                     opts.quant = Quant::parse(raw).ok_or_else(|| {
                         Error::bad_request(format!("unknown quantization '{raw}'"))
                     })?;
-                }
-                "FBYTES" => {
-                    opts.filter_bytes = Layout::validate_filter_bytes(number("FBYTES")?)
-                        .map_err(Error::bad_request)?;
                 }
                 "THREADS" => opts.threads = number("THREADS")?.clamp(1, 1024),
                 "M" => opts.connectivity = number("M")?,
@@ -140,15 +134,14 @@ pub fn vcreate(store: &Store, tokens: &Tokens) -> Result<Reply> {
     // engine does not enforce it on the API path and an oversized element has
     // been observed to abort the daemon, so it is checked here.
     let limit = store.max_element_bytes() as usize;
-    let layout = Layout::new(dim, opts.quant, opts.filter_bytes);
+    let layout = Layout::new(dim, opts.quant);
     if layout.element_len() > limit {
-        let max_dim = Layout::max_dim_for(opts.quant, opts.filter_bytes, limit);
+        let max_dim = Layout::max_dim_for(opts.quant, limit);
         return Err(Error::bad_request(format!(
             "element would be {} bytes, over max_element_bytes {limit} \
-             (max dimension is {max_dim} for quant {} with FBYTES {})",
+             (max dimension is {max_dim} for quant {})",
             layout.element_len(),
             opts.quant,
-            opts.filter_bytes,
         )));
     }
 
@@ -186,16 +179,32 @@ pub fn vcreate(store: &Store, tokens: &Tokens) -> Result<Reply> {
 // vadd
 // ---------------------------------------------------------------------------
 
-pub fn vadd(store: &Store, name: &str, id: &str, vec_bytes: usize, body: &[u8]) -> Result<Reply> {
+pub fn vadd(store: &Store, name: &str, id: &str, attr: &[u8], body: &[u8]) -> Result<Reply> {
     let index = registry::require(name)?;
     index.ensure_built(store)?;
 
     let layout = index.ann.layout;
-    let vector = coords(&body[..vec_bytes], layout.dim, "vector")?;
-    let json = &body[vec_bytes..];
+    let vector = coords(body, layout.dim, "vector")?;
 
-    if !json.is_empty() && serde_json::from_slice::<serde_json::Value>(json).is_err() {
-        return Err(Error::bad_request("filter payload is not valid JSON"));
+    // ATTR must be a JSON object: it is stored as one and queried by field.
+    if !attr.is_empty() {
+        match serde_json::from_slice::<serde_json::Value>(attr) {
+            Ok(serde_json::Value::Object(_)) => {}
+            Ok(_) => return Err(Error::bad_request("ATTR must be a JSON object")),
+            Err(e) => return Err(Error::bad_request(format!("ATTR is not valid JSON: {e}"))),
+        }
+    }
+
+    // max_element_bytes can be lowered at runtime, so an index that fit when it
+    // was created may not fit now.
+    let limit = store.max_element_bytes() as usize;
+    if layout.element_len() > limit {
+        return Err(Error::bad_request(format!(
+            "element is {} bytes ({} header+ATTR + {} vector), over max_element_bytes {limit}",
+            layout.element_len(),
+            Layout::VECTOR_OFFSET,
+            layout.vector_bytes(),
+        )));
     }
 
     if index.ann.key_of(id).is_none() && index.ann.len() >= index.maxcount as usize {
@@ -203,7 +212,7 @@ pub fn vadd(store: &Store, name: &str, id: &str, vec_bytes: usize, body: &[u8]) 
     }
 
     let quantized = quant::encode(&vector, layout.quant);
-    let value = layout.encode(&quantized, json)?;
+    let value = layout.encode(&quantized, attr)?;
 
     // Map first: it is the source of truth. If the usearch insert below fails,
     // the vector is merely invisible to search until the next rebuild.
@@ -251,7 +260,7 @@ pub fn vsearch(
 
     // Reused across predicate calls so the hot path allocates nothing after the
     // first visited node.
-    let scratch = RefCell::new(Vec::with_capacity(layout.filter_bytes));
+    let scratch = RefCell::new(Vec::with_capacity(codec::ATTR_BYTES));
     let accept = |key: u64| -> bool {
         let Some(filter) = filter.as_ref() else {
             return true;
@@ -260,7 +269,7 @@ pub fn vsearch(
             return false;
         };
         let mut slot = scratch.borrow_mut();
-        match store.read_filter_slot(name, id, &layout, &mut slot) {
+        match store.read_attr_slot(name, id, &layout, &mut slot) {
             Ok(()) => filter.matches(&slot),
             // Evicted or vanished mid-search: no longer a candidate.
             Err(_) => false,
@@ -279,7 +288,7 @@ pub fn vsearch(
         };
         let json = layout
             .decode(&stored)
-            .map(|e| String::from_utf8_lossy(e.filter).into_owned())
+            .map(|e| String::from_utf8_lossy(e.attr).into_owned())
             .unwrap_or_default();
         let _ = write!(out, "VALUE {id} {distance} {}\r\n{json}\r\n", json.len());
     }
@@ -302,7 +311,7 @@ pub fn vget(store: &Store, tokens: &Tokens) -> Result<Reply> {
     match store.get_elem(name, id) {
         Ok(stored) => {
             let element = index.ann.layout.decode(&stored)?;
-            let json = String::from_utf8_lossy(element.filter);
+            let json = String::from_utf8_lossy(element.attr);
             Ok(Reply::Body(format!(
                 "VALUE {id} {}\r\n{json}\r\nEND\r\n",
                 json.len()
@@ -364,12 +373,12 @@ pub fn vlist(tokens: &Tokens) -> Result<Reply> {
         let layout = &index.ann.layout;
         let _ = writeln!(
             out,
-            "INDEX {} dim={} quant={} metric={} fbytes={} count={} maxcount={}\r",
+            "INDEX {} dim={} quant={} metric={} attrbytes={} count={} maxcount={}\r",
             index.name,
             layout.dim,
             layout.quant,
             index.ann.metric,
-            layout.filter_bytes,
+            codec::ATTR_BYTES,
             index.ann.len(),
             index.maxcount,
         );
@@ -422,13 +431,9 @@ mod tests {
 
     #[test]
     fn options_are_parsed_case_insensitively() {
-        let o = parse_options(&[
-            "vcreate", "docs", "8", "quant", "i8", "metric", "l2", "FBYTES", "128",
-        ])
-        .unwrap();
+        let o = parse_options(&["vcreate", "docs", "8", "quant", "i8", "metric", "l2"]).unwrap();
         assert_eq!(o.quant, Quant::I8);
         assert_eq!(o.metric, Metric::L2);
-        assert_eq!(o.filter_bytes, 128);
     }
 
     #[test]
@@ -436,9 +441,8 @@ mod tests {
         assert!(parse_options(&["vcreate", "docs", "8", "NOPE", "1"]).is_err());
         assert!(parse_options(&["vcreate", "docs", "8", "QUANT", "f64"]).is_err());
         assert!(parse_options(&["vcreate", "docs", "8", "METRIC", "manhattan"]).is_err());
-        // FBYTES must stay a multiple of 16 within range.
-        assert!(parse_options(&["vcreate", "docs", "8", "FBYTES", "24"]).is_err());
-        assert!(parse_options(&["vcreate", "docs", "8", "FBYTES", "512"]).is_err());
+        // FBYTES is gone: ATTR is a fixed 128 bytes.
+        assert!(parse_options(&["vcreate", "docs", "8", "FBYTES", "128"]).is_err());
     }
 
     #[test]
@@ -471,7 +475,6 @@ mod tests {
         let o = Options::default();
         assert_eq!(o.metric, Metric::Cos);
         assert_eq!(o.quant, Quant::F32);
-        assert_eq!(o.filter_bytes, codec::DEFAULT_FILTER_BYTES);
         assert!(o.maxcount.is_none());
     }
 }

@@ -112,7 +112,7 @@ mod tests {
     use crate::quant::Quant;
 
     fn index(name: &str) -> VectorIndex {
-        let ann = AnnIndex::new(Layout::new(4, Quant::F32, 64), Metric::L2, 0, 0, 0, 2).unwrap();
+        let ann = AnnIndex::new(Layout::new(4, Quant::F32), Metric::L2, 0, 0, 0, 2).unwrap();
         VectorIndex::new(name.to_owned(), ann, 100, true)
     }
 

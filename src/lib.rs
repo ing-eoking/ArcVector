@@ -74,17 +74,16 @@ unsafe fn dispatch(cookie: *const c_void, tokens: &Tokens) -> Result<Reply> {
         let pending =
             protocol::take_body(cookie).ok_or_else(|| Error::bad_request("lost command state"))?;
         let store = store?;
-        return match &pending.cmd {
-            PendingCmd::Add {
-                index,
-                id,
-                vec_bytes,
-            } => command::vadd(&store, index, id, *vec_bytes, pending.body()),
+        let (cmd, body) = pending.into_parts();
+        return match cmd {
+            PendingCmd::Add { index, id, attr } => {
+                command::vadd(&store, &index, &id, &attr?, &body)
+            }
             PendingCmd::Search {
                 index,
                 k,
                 vec_bytes,
-            } => command::vsearch(&store, index, *k, *vec_bytes, pending.body()),
+            } => command::vsearch(&store, &index, k, vec_bytes, &body),
         };
     }
 
@@ -113,6 +112,42 @@ fn blob_len(tokens: &Tokens, at: usize, what: &str, float_aligned: bool) -> Opti
     Some(n)
 }
 
+/// Read `ATTR <attrlen> <attr JSON>` off a `vadd` line.
+///
+/// The clause is optional; without it a vector is stored with no attributes.
+/// `accept` cannot answer the client, so a malformed clause is returned as an
+/// error for `command::vadd` to report.
+fn read_attr(tokens: &Tokens) -> std::result::Result<Vec<u8>, Error> {
+    if tokens.len() == 4 {
+        return Ok(Vec::new());
+    }
+    let keyword = tokens.text(4)?;
+    if !keyword.eq_ignore_ascii_case("ATTR") {
+        return Err(Error::bad_request(format!(
+            "expected ATTR after the vector length, got '{keyword}'"
+        )));
+    }
+    let declared: usize = tokens.parse(5, "ATTR length")?;
+    if declared > codec::ATTR_BYTES {
+        return Err(Error::bad_request(format!(
+            "ATTR is {declared} bytes, over the {}-byte limit",
+            codec::ATTR_BYTES
+        )));
+    }
+    if declared == 0 {
+        return Ok(Vec::new());
+    }
+
+    let attr = tokens.tail(6, codec::ATTR_BYTES)?;
+    if attr.len() != declared {
+        return Err(Error::bad_request(format!(
+            "ATTR length {declared} does not match the {} bytes supplied",
+            attr.len()
+        )));
+    }
+    Ok(attr)
+}
+
 /// Decide how much body a command needs before it can run.
 ///
 /// Returning `true` without setting `ndata` makes memcached call `execute` on
@@ -133,62 +168,71 @@ unsafe extern "C" fn accept_vector_cmd(
     // SAFETY: guaranteed by the caller.
     let tokens = unsafe { Tokens::new(argv, argc) };
 
-    // vadd    <index> <id> <veclen> [jsonlen]    then <vector><json>\r\n
-    // vsearch <index> <k>  <veclen> [filterlen]  then <vector><filter>\r\n
+    // vadd    <index> <id> <veclen> [ATTR <attrlen> <attr JSON>]  then <vector>\r\n
+    // vsearch <index> <k>  <veclen> [filterlen]                   then <vector><filter>\r\n
     //
-    // The tail travels in the body rather than as command-line tokens so that a
-    // filter expression containing spaces is not subject to the tokenizer's
-    // field limit.
-    let (cmd, vec_bytes, tail) = match tokens.command() {
+    // ATTR rides on the command line because it is short and bounded. The search
+    // filter does not: an expression with spaces would be at the mercy of the
+    // tokenizer's field limit, so it travels in the body instead.
+    let cmd = tokens.command();
+    match cmd {
         "vcreate" | "vget" | "vdel" | "vdrop" | "vlist" => return true,
-        cmd @ ("vadd" | "vsearch") => {
-            if !matches!(tokens.len(), 4 | 5) {
-                return true;
-            }
-            let Some(vec_bytes) = blob_len(&tokens, 3, "vector length", true) else {
-                return true;
-            };
-            let tail = if tokens.len() == 5 {
-                match blob_len(&tokens, 4, "payload length", false) {
-                    Some(n) => n,
-                    None => return true,
-                }
-            } else {
-                0
-            };
-            (cmd, vec_bytes, tail)
-        }
+        "vadd" | "vsearch" => {}
         _ => return false,
+    }
+    if tokens.len() < 4 {
+        return true;
+    }
+    let Some(vec_bytes) = blob_len(&tokens, 3, "vector length", true) else {
+        return true;
     };
-
     let Ok(index) = tokens.text(1).map(str::to_owned) else {
         return true;
     };
-    let pending = if cmd == "vadd" {
+
+    let (pending, body_len) = if cmd == "vadd" {
         let Ok(id) = tokens.text(2).map(str::to_owned) else {
             return true;
         };
-        PendingCmd::Add {
-            index,
-            id,
+        // The body is exactly the vector; ATTR was already on the line.
+        (
+            PendingCmd::Add {
+                index,
+                id,
+                attr: read_attr(&tokens),
+            },
             vec_bytes,
-        }
+        )
     } else {
+        if tokens.len() > 5 {
+            return true;
+        }
         let Ok(k) = tokens.parse::<usize>(2, "k") else {
             return true;
         };
         if k == 0 {
             return true;
         }
-        PendingCmd::Search {
-            index,
-            k,
-            vec_bytes,
-        }
+        let filter_bytes = if tokens.len() == 5 {
+            match blob_len(&tokens, 4, "filter length", false) {
+                Some(n) => n,
+                None => return true,
+            }
+        } else {
+            0
+        };
+        (
+            PendingCmd::Search {
+                index,
+                k,
+                vec_bytes,
+            },
+            vec_bytes + filter_bytes,
+        )
     };
 
     // SAFETY: guaranteed by the caller.
-    unsafe { protocol::expect_body(cookie, pending, vec_bytes + tail, ndata, ptr_out) };
+    unsafe { protocol::expect_body(cookie, pending, body_len, ndata, ptr_out) };
     true
 }
 
@@ -263,4 +307,91 @@ pub extern "C" fn memcached_extensions_initialize(
         }
     }
     EXTENSION_ERROR_CODE_EXTENSION_SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use protocol::tokenize_for_test as tokenize;
+
+    fn attr_of(line: &str) -> Result<Vec<u8>> {
+        let (_buf, raw) = tokenize(line);
+        // SAFETY: `raw` and its buffer outlive the borrow.
+        let tokens = unsafe { Tokens::new(raw.as_ptr(), raw.len() as c_int) };
+        read_attr(&tokens)
+    }
+
+    #[test]
+    fn attr_is_optional() {
+        assert_eq!(attr_of("vadd docs v1 16").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn attr_is_read_off_the_command_line() {
+        let json = r#"{"cat":"tech"}"#;
+        assert_eq!(
+            attr_of(&format!("vadd docs v1 16 ATTR {} {json}", json.len())).unwrap(),
+            json.as_bytes()
+        );
+    }
+
+    #[test]
+    fn attr_with_spaces_is_reassembled() {
+        let json = r#"{"cat": "tech", "ts": 1723248000}"#;
+        assert_eq!(
+            attr_of(&format!("vadd docs v1 16 ATTR {} {json}", json.len())).unwrap(),
+            json.as_bytes()
+        );
+    }
+
+    #[test]
+    fn the_attr_keyword_is_case_insensitive() {
+        assert!(attr_of("vadd docs v1 16 attr 2 {}").is_ok());
+        assert!(attr_of("vadd docs v1 16 Attr 2 {}").is_ok());
+    }
+
+    #[test]
+    fn a_missing_or_misspelled_keyword_is_reported() {
+        let msg = attr_of("vadd docs v1 16 ATTRS 2 {}")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("expected ATTR"), "{msg}");
+    }
+
+    #[test]
+    fn a_declared_length_over_the_limit_is_rejected_before_reading() {
+        // "미리 넘거나 하면 에러": the declared size alone is enough to refuse.
+        let msg = attr_of("vadd docs v1 16 ATTR 129 {}")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("over the 128-byte limit"), "{msg}");
+
+        // Exactly at the limit is accepted. Built from real content, since
+        // leading spaces are separators to the tokenizer, not part of the value.
+        let json = format!(r#"{{"k":"{}"}}"#, "x".repeat(120));
+        assert_eq!(json.len(), codec::ATTR_BYTES);
+        assert!(attr_of(&format!("vadd docs v1 16 ATTR 128 {json}")).is_ok());
+    }
+
+    #[test]
+    fn a_declared_length_that_disagrees_with_the_payload_is_rejected() {
+        let msg = attr_of("vadd docs v1 16 ATTR 99 {}")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("does not match"), "{msg}");
+    }
+
+    #[test]
+    fn a_zero_length_attr_is_treated_as_absent() {
+        assert_eq!(attr_of("vadd docs v1 16 ATTR 0").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn a_non_numeric_length_is_reported() {
+        let msg = attr_of("vadd docs v1 16 ATTR abc {}")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("ATTR length"), "{msg}");
+    }
 }

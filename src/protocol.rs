@@ -13,6 +13,11 @@ use crate::error::{Error, Reply, Result};
 /// enormous allocation.
 pub const MAX_BLOB_BYTES: usize = 8 * 1024 * 1024;
 
+/// Mirrors memcached's own `MAX_TOKENS` (memcached.c:8066). At this many tokens
+/// the tokenizer stops splitting and leaves the remainder of the line in one
+/// undelimited piece.
+pub const MAX_TOKENS: usize = 30;
+
 pub type ResponseHandler =
     Option<unsafe extern "C" fn(*const c_void, c_int, *const c_char) -> bool>;
 
@@ -76,6 +81,63 @@ impl<'a> Tokens<'a> {
             .map_err(|_| Error::bad_request(format!("invalid {what} '{raw}'")))
     }
 
+    /// Reassemble the tail of the command line from token `from` onward,
+    /// recovering the bytes exactly as the client sent them.
+    ///
+    /// [`tokenize_command`] splits on single spaces and overwrites each one with
+    /// `'\0'` in place, leaving runs of two or more spaces untouched. Since the
+    /// tokens are consecutive slices of that one buffer, reading from the first
+    /// token to the end of the last and mapping `'\0'` back to `' '` reproduces
+    /// the original text. JSON cannot contain a bare NUL, so the mapping is
+    /// unambiguous. memcached itself reassembles command lines the same way.
+    ///
+    /// Errors if the tail is empty or longer than `limit`.
+    ///
+    /// [`tokenize_command`]: https://github.com/naver/arcus-memcached/blob/master/mc_util.c
+    pub fn tail(&self, from: usize, limit: usize) -> Result<Vec<u8>> {
+        // Past the token limit memcached stops splitting and leaves the rest of
+        // the line in one piece; we cannot tell how long that piece is from the
+        // slice we were given, so refuse instead of guessing.
+        if self.len() >= MAX_TOKENS {
+            return Err(Error::bad_request(
+                "too many arguments; send ATTR JSON without spaces",
+            ));
+        }
+
+        let tail = self
+            .tokens
+            .get(from..)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| Error::bad_request("bad command line format"))?;
+        let first = tail
+            .iter()
+            .find(|t| !t.value.is_null() && t.length > 0)
+            .ok_or_else(|| Error::bad_request("bad command line format"))?;
+        let last = tail
+            .iter()
+            .rev()
+            .find(|t| !t.value.is_null() && t.length > 0)
+            .ok_or_else(|| Error::bad_request("bad command line format"))?;
+
+        // SAFETY: both pointers address the same command-line buffer, and `last`
+        // never precedes `first`, so the difference is the byte span between them.
+        let span = unsafe { last.value.offset_from(first.value) };
+        let len = span.unsigned_abs() + last.length;
+        if len > limit {
+            return Err(Error::bad_request(format!(
+                "ATTR is {len} bytes, over the {limit}-byte limit"
+            )));
+        }
+
+        // SAFETY: `len` spans from the first token to the end of the last, all
+        // within the single buffer the tokens point into.
+        let raw = unsafe { std::slice::from_raw_parts(first.value.cast::<u8>(), len) };
+        Ok(raw
+            .iter()
+            .map(|b| if *b == 0 { b' ' } else { *b })
+            .collect())
+    }
+
     /// Read the trailing `KEY value` options, upper-casing each key.
     pub fn options(&self, from: usize) -> Result<Vec<(String, &'a str)>> {
         let rest = self.len().saturating_sub(from);
@@ -127,13 +189,50 @@ impl Responder {
     }
 }
 
+/// Tokenizes a command line the way memcached's `tokenize_command` does: one
+/// buffer, each token-terminating space overwritten with NUL, runs of two or more
+/// spaces left intact. Returns the buffer, which must outlive the tokens.
+#[cfg(test)]
+pub fn tokenize_for_test(line: &str) -> (Vec<u8>, Vec<token_t>) {
+    let mut buf = line.as_bytes().to_vec();
+    let base = buf.as_mut_ptr();
+    let mut spans = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < buf.len() {
+        if buf[i] == b' ' {
+            if start != i {
+                spans.push((start, i - start));
+                buf[i] = 0;
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if start != buf.len() {
+        spans.push((start, buf.len() - start));
+    }
+    let tokens = spans
+        .into_iter()
+        .map(|(off, len)| token_t {
+            // SAFETY: `off` lies within `buf`, which the caller keeps alive.
+            value: unsafe { base.add(off) }.cast::<c_char>(),
+            length: len,
+        })
+        .collect();
+    (buf, tokens)
+}
+
 /// A command whose body still has to arrive.
 #[derive(Debug)]
 pub enum PendingCmd {
     Add {
         index: String,
         id: String,
-        vec_bytes: usize,
+        /// Attribute JSON taken off the command line, or the reason it could not
+        /// be read. `accept` has no way to answer the client, so the failure
+        /// travels here and the handler reports it.
+        attr: std::result::Result<Vec<u8>, Error>,
     },
     Search {
         index: String,
@@ -165,6 +264,15 @@ impl Pending {
 
     pub fn body(&self) -> &[u8] {
         &self.buffer[..self.body_len]
+    }
+
+    /// Split into the command and its body, dropping the trailing CRLF.
+    ///
+    /// Consuming lets the caller move values out of the command — notably the
+    /// deferred `attr` result — instead of cloning them.
+    pub fn into_parts(mut self) -> (PendingCmd, Vec<u8>) {
+        self.buffer.truncate(self.body_len);
+        (self.cmd, self.buffer)
     }
 }
 
@@ -264,6 +372,64 @@ mod tests {
         assert!(msg.contains("abc"), "{msg}");
     }
 
+    use super::tokenize_for_test as tokenize;
+
+    #[test]
+    fn tail_recovers_json_containing_single_spaces() {
+        // The tokenizer split this into five pieces and put NULs where the
+        // spaces were; tail must hand back the original bytes.
+        let json = r#"{"cat": "tech", "ts": 1}"#;
+        let (buf, raw) = tokenize(&format!("vadd docs v1 16 ATTR 24 {json}"));
+        let t = view(&raw);
+        assert!(t.len() > 7, "expected the JSON to be split up");
+        assert_eq!(t.tail(6, 128).unwrap(), json.as_bytes());
+        drop(buf);
+    }
+
+    #[test]
+    fn tail_recovers_json_with_no_spaces() {
+        let json = r#"{"cat":"tech"}"#;
+        let (_buf, raw) = tokenize(&format!("vadd docs v1 16 ATTR 14 {json}"));
+        assert_eq!(view(&raw).tail(6, 128).unwrap(), json.as_bytes());
+    }
+
+    #[test]
+    fn tail_preserves_runs_of_consecutive_spaces() {
+        // tokenize_command only NULs a space that terminates a token, so double
+        // spaces survive in the buffer and must survive the round trip too.
+        let json = r#"{"a":  1}"#;
+        let (_buf, raw) = tokenize(&format!("vadd docs v1 16 ATTR 9 {json}"));
+        assert_eq!(view(&raw).tail(6, 128).unwrap(), json.as_bytes());
+    }
+
+    #[test]
+    fn tail_rejects_a_span_over_the_limit() {
+        let json = "x".repeat(200);
+        let (_buf, raw) = tokenize(&format!("vadd docs v1 16 ATTR 200 {json}"));
+        let msg = view(&raw).tail(6, 128).unwrap_err().to_string();
+        assert!(msg.contains("over the 128-byte limit"), "{msg}");
+    }
+
+    #[test]
+    fn tail_rejects_an_absent_tail() {
+        let (_buf, raw) = tokenize("vadd docs v1 16 ATTR 5");
+        assert!(view(&raw).tail(6, 128).is_err());
+    }
+
+    #[test]
+    fn tail_refuses_when_the_tokenizer_ran_out_of_slots() {
+        // At MAX_TOKENS the remainder of the line is left undelimited and its
+        // length is not recoverable from the slice we get, so tail must refuse
+        // rather than read past the end.
+        let line = (0..MAX_TOKENS)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (_buf, raw) = tokenize(&line);
+        let msg = view(&raw).tail(6, 128).unwrap_err().to_string();
+        assert!(msg.contains("too many arguments"), "{msg}");
+    }
+
     #[test]
     fn options_are_upper_cased_and_paired() {
         let raw = tokens_from(&["vcreate", "docs", "8", "quant", "i8", "METRIC", "cos"]);
@@ -310,7 +476,7 @@ mod tests {
                 PendingCmd::Add {
                     index: "docs".into(),
                     id: "v1".into(),
-                    vec_bytes: 8,
+                    attr: Ok(br#"{"a":1}"#.to_vec()),
                 },
                 8,
                 &mut ndata,

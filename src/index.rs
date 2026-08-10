@@ -474,7 +474,7 @@ mod tests {
     }
 
     fn build(dim: usize, quant: Quant, metric: Metric, threads: usize) -> AnnIndex {
-        AnnIndex::new(Layout::new(dim, quant, 64), metric, 0, 0, 0, threads).unwrap()
+        AnnIndex::new(Layout::new(dim, quant), metric, 0, 0, 0, threads).unwrap()
     }
 
     fn add(idx: &AnnIndex, id: &str, coords: &[f32]) {

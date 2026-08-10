@@ -425,13 +425,13 @@ impl Store {
         Ok(f(&views))
     }
 
-    /// Copy the fixed filter slot of one element — the search predicate's hot path.
+    /// Copy the fixed ATTR region of one element — the search predicate's hot path.
     ///
-    /// The slot sits at a constant offset ([`crate::codec::FILTER_OFFSET`]), so
-    /// nothing has to be decoded and only one cache line is touched. The
-    /// surrounding `map_elem_get` still costs a global `cache_lock` and a
-    /// malloc; narrowing that is a change to this method's body alone.
-    pub fn read_filter_slot(
+    /// The region sits at a constant offset ([`crate::codec::ATTR_OFFSET`]), so
+    /// nothing has to be decoded and one or two cache lines are touched. The
+    /// surrounding `map_elem_get` still costs a global `cache_lock` and a malloc;
+    /// narrowing that is a change to this method's body alone.
+    pub fn read_attr_slot(
         &self,
         key: &str,
         field: &str,
@@ -440,7 +440,7 @@ impl Store {
     ) -> Result<()> {
         self.with_elems(key, Some(field), |elems| {
             let (_, value) = elems[0];
-            let slot = layout.filter_of(value).ok()?;
+            let slot = layout.attr_of(value).ok()?;
             out.clear();
             out.extend_from_slice(slot);
             Some(())

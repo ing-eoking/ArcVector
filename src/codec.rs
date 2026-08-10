@@ -1,30 +1,41 @@
 //! Map element byte layout.
 //!
 //! ```text
-//!  off  0    2   3     4       6        8       16          16+F
-//!      +----+---+-----+-------+--------+-------+-----------+---------------+
-//!      |"AV"|ver|quant|dim u16|flen u16|rsvd 8B| filter F   | quantized vec |
-//!      +----+---+-----+-------+--------+-------+-----------+---------------+
+//!  off  0    2   3     4       6        8       16              144
+//!      +----+---+-----+-------+--------+-------+---------------+---------------+
+//!      |"AV"|ver|quant|dim u16|alen u16|rsvd 8B| ATTR 128B     | quantized vec |
+//!      +----+---+-----+-------+--------+-------+---------------+---------------+
 //! ```
 //!
-//! The filter slot precedes the vector so its offset is the constant
-//! [`FILTER_OFFSET`], independent of `dim` and `quant`. The search predicate can
-//! therefore read it without decoding anything, touching a single cache line.
-//! Header (16B) plus a 16-byte-aligned `F` also keeps the vector 16-byte aligned.
+//! The ATTR region is a **fixed 128 bytes** regardless of how much JSON a vector
+//! actually carries, so the vector always starts at [`Layout::VECTOR_OFFSET`] and
+//! the search predicate can read attributes from the constant [`ATTR_OFFSET`]
+//! without decoding anything — one or two cache lines, no arithmetic.
+//!
+//! Why 128 bytes: a realistic attribute object
+//! (`{"category":"tech","lang":"ko","ts":1723248000,"score":0.87}`) is 62 bytes,
+//! so 128 leaves room for roughly twice that. It also lands better in arcus's
+//! slab classes than a smaller slot would — at 1024 dimensions with `i8`,
+//! `16 + 128 + 1024 = 1168` fits the 1184-byte class with 1.4% waste, where a
+//! 64-byte region would give 1104 bytes and waste 6.8% in that same class. The
+//! per-vector cost is 128 MB per million vectors, against 1 GB for the `i8`
+//! vectors themselves.
 
 use crate::quant::Quant;
 
 const MAGIC: [u8; 2] = *b"AV";
-const VERSION: u8 = 1;
+
+/// Layout version. Bumped whenever the on-element byte layout changes.
+const VERSION: u8 = 2;
+
 const HEADER_LEN: usize = 16;
 
-/// Constant offset of the filter slot within an element value.
-pub const FILTER_OFFSET: usize = HEADER_LEN;
+/// Constant offset of the ATTR region within an element value.
+pub const ATTR_OFFSET: usize = HEADER_LEN;
 
-pub const DEFAULT_FILTER_BYTES: usize = 64;
-const MIN_FILTER_BYTES: usize = 16;
-const MAX_FILTER_BYTES: usize = 256;
-const FILTER_BYTES_ALIGN: usize = 16;
+/// Fixed size of the ATTR region. Attribute JSON larger than this is rejected at
+/// `vadd` rather than being allowed to spill into the vector.
+pub const ATTR_BYTES: usize = 128;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CodecError {
@@ -38,8 +49,8 @@ pub enum CodecError {
     },
     /// Header disagrees with the index's declared layout.
     LayoutMismatch,
-    /// JSON longer than the fixed filter slot.
-    FilterTooLarge {
+    /// Attribute JSON longer than the fixed ATTR region.
+    AttrTooLarge {
         limit: usize,
         got: usize,
     },
@@ -55,15 +66,15 @@ impl std::error::Error for CodecError {}
 impl std::fmt::Display for CodecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CodecError::BadMagic => write!(f, "bad element magic"),
+            CodecError::BadMagic => f.write_str("bad element magic"),
             CodecError::UnsupportedVersion(v) => write!(f, "unsupported layout version {v}"),
             CodecError::UnknownQuant(q) => write!(f, "unknown quantization {q}"),
             CodecError::Truncated { need, got } => {
                 write!(f, "element truncated (need {need} bytes, got {got})")
             }
-            CodecError::LayoutMismatch => write!(f, "element layout does not match index"),
-            CodecError::FilterTooLarge { limit, got } => {
-                write!(f, "filter too large ({got} bytes, limit {limit})")
+            CodecError::LayoutMismatch => f.write_str("element layout does not match index"),
+            CodecError::AttrTooLarge { limit, got } => {
+                write!(f, "ATTR is {got} bytes, over the {limit}-byte limit")
             }
             CodecError::VectorLenMismatch { need, got } => {
                 write!(f, "vector length mismatch (need {need} bytes, got {got})")
@@ -77,67 +88,49 @@ impl std::fmt::Display for CodecError {
 pub struct Layout {
     pub dim: usize,
     pub quant: Quant,
-    pub filter_bytes: usize,
 }
 
 impl Layout {
-    pub const fn new(dim: usize, quant: Quant, filter_bytes: usize) -> Self {
-        Layout {
-            dim,
-            quant,
-            filter_bytes,
-        }
+    /// Where the vector begins. Constant, because ATTR has a fixed size.
+    pub const VECTOR_OFFSET: usize = HEADER_LEN + ATTR_BYTES;
+
+    pub const fn new(dim: usize, quant: Quant) -> Self {
+        Layout { dim, quant }
     }
 
     pub const fn vector_bytes(&self) -> usize {
         self.quant.vector_bytes(self.dim)
     }
 
-    pub const fn vector_offset(&self) -> usize {
-        HEADER_LEN + self.filter_bytes
-    }
-
-    /// Total element value size. This is what must fit in `max_element_bytes`.
+    /// Total element value size. This is what must fit `max_element_bytes`.
     pub const fn element_len(&self) -> usize {
-        self.vector_offset() + self.vector_bytes()
+        Self::VECTOR_OFFSET + self.vector_bytes()
     }
 
-    /// Largest dimension that fits a `max_element_bytes` budget for this
-    /// quantization and filter slot size. Returns 0 when even one coordinate
-    /// cannot fit.
-    pub const fn max_dim_for(quant: Quant, filter_bytes: usize, max_element_bytes: usize) -> usize {
-        let overhead = HEADER_LEN + filter_bytes;
-        if max_element_bytes <= overhead {
+    /// Largest dimension whose element fits `max_element_bytes`. Zero when not
+    /// even one coordinate fits.
+    pub const fn max_dim_for(quant: Quant, max_element_bytes: usize) -> usize {
+        if max_element_bytes <= Self::VECTOR_OFFSET {
             return 0;
         }
-        quant.max_dim(max_element_bytes - overhead)
+        quant.max_dim(max_element_bytes - Self::VECTOR_OFFSET)
     }
 
-    /// Validate a client-supplied filter slot size.
-    pub fn validate_filter_bytes(n: usize) -> Result<usize, &'static str> {
-        if !(MIN_FILTER_BYTES..=MAX_FILTER_BYTES).contains(&n) {
-            return Err("FBYTES must be between 16 and 256");
-        }
-        if !n.is_multiple_of(FILTER_BYTES_ALIGN) {
-            return Err("FBYTES must be a multiple of 16");
-        }
-        Ok(n)
-    }
-
-    /// Build an element value from an already-quantized vector and filter JSON.
+    /// Build an element value from an already-quantized vector and attribute JSON.
     ///
-    /// The filter slot is zero-padded; `flen` in the header records the real length.
-    pub fn encode(&self, vector: &[u8], filter_json: &[u8]) -> Result<Vec<u8>, CodecError> {
+    /// The ATTR region is zero-padded; `alen` in the header records the real
+    /// length so trailing zeros are never mistaken for content.
+    pub fn encode(&self, vector: &[u8], attr: &[u8]) -> Result<Vec<u8>, CodecError> {
         if vector.len() != self.vector_bytes() {
             return Err(CodecError::VectorLenMismatch {
                 need: self.vector_bytes(),
                 got: vector.len(),
             });
         }
-        if filter_json.len() > self.filter_bytes {
-            return Err(CodecError::FilterTooLarge {
-                limit: self.filter_bytes,
-                got: filter_json.len(),
+        if attr.len() > ATTR_BYTES {
+            return Err(CodecError::AttrTooLarge {
+                limit: ATTR_BYTES,
+                got: attr.len(),
             });
         }
 
@@ -146,16 +139,15 @@ impl Layout {
         buf[2] = VERSION;
         buf[3] = self.quant as u8;
         buf[4..6].copy_from_slice(&(self.dim as u16).to_le_bytes());
-        buf[6..8].copy_from_slice(&(filter_json.len() as u16).to_le_bytes());
+        buf[6..8].copy_from_slice(&(attr.len() as u16).to_le_bytes());
         // buf[8..16] stays zero: reserved.
 
-        buf[FILTER_OFFSET..FILTER_OFFSET + filter_json.len()].copy_from_slice(filter_json);
-        let vo = self.vector_offset();
-        buf[vo..vo + vector.len()].copy_from_slice(vector);
+        buf[ATTR_OFFSET..ATTR_OFFSET + attr.len()].copy_from_slice(attr);
+        buf[Self::VECTOR_OFFSET..].copy_from_slice(vector);
         Ok(buf)
     }
 
-    /// Borrow the filter and vector regions out of a stored element value.
+    /// Borrow the attribute and vector regions out of a stored element value.
     pub fn decode<'a>(&self, buf: &'a [u8]) -> Result<Element<'a>, CodecError> {
         let head = parse_header(buf)?;
         if head.dim != self.dim || head.quant != self.quant {
@@ -168,34 +160,26 @@ impl Layout {
                 got: buf.len(),
             });
         }
-        if head.filter_len as usize > self.filter_bytes {
-            return Err(CodecError::LayoutMismatch);
-        }
-        let vo = self.vector_offset();
         Ok(Element {
-            filter: &buf[FILTER_OFFSET..FILTER_OFFSET + head.filter_len as usize],
-            vector: &buf[vo..vo + self.vector_bytes()],
+            attr: &buf[ATTR_OFFSET..ATTR_OFFSET + head.attr_len],
+            vector: &buf[Self::VECTOR_OFFSET..need],
         })
     }
 
-    /// Read only the filter slot — the hot path used by the search predicate.
+    /// Read only the ATTR region — the hot path used by the search predicate.
     ///
     /// Deliberately avoids [`decode`](Self::decode): no vector bounds are needed,
-    /// so a truncated tail still yields a usable filter.
-    pub fn filter_of<'a>(&self, buf: &'a [u8]) -> Result<&'a [u8], CodecError> {
+    /// so a truncated tail still yields usable attributes.
+    pub fn attr_of<'a>(&self, buf: &'a [u8]) -> Result<&'a [u8], CodecError> {
         let head = parse_header(buf)?;
-        let flen = head.filter_len as usize;
-        if flen > self.filter_bytes {
-            return Err(CodecError::LayoutMismatch);
-        }
-        let end = FILTER_OFFSET + flen;
+        let end = ATTR_OFFSET + head.attr_len;
         if buf.len() < end {
             return Err(CodecError::Truncated {
                 need: end,
                 got: buf.len(),
             });
         }
-        Ok(&buf[FILTER_OFFSET..end])
+        Ok(&buf[ATTR_OFFSET..end])
     }
 }
 
@@ -203,7 +187,7 @@ impl Layout {
 struct Header {
     quant: Quant,
     dim: usize,
-    filter_len: u16,
+    attr_len: usize,
 }
 
 fn parse_header(buf: &[u8]) -> Result<Header, CodecError> {
@@ -220,17 +204,21 @@ fn parse_header(buf: &[u8]) -> Result<Header, CodecError> {
         return Err(CodecError::UnsupportedVersion(buf[2]));
     }
     let quant = Quant::from_u8(buf[3]).ok_or(CodecError::UnknownQuant(buf[3]))?;
+    let attr_len = u16::from_le_bytes([buf[6], buf[7]]) as usize;
+    if attr_len > ATTR_BYTES {
+        return Err(CodecError::LayoutMismatch);
+    }
     Ok(Header {
         quant,
         dim: u16::from_le_bytes([buf[4], buf[5]]) as usize,
-        filter_len: u16::from_le_bytes([buf[6], buf[7]]),
+        attr_len,
     })
 }
 
 /// Borrowed view of a decoded element.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Element<'a> {
-    pub filter: &'a [u8],
+    pub attr: &'a [u8],
     pub vector: &'a [u8],
 }
 
@@ -239,82 +227,93 @@ mod tests {
     use super::*;
 
     fn layout() -> Layout {
-        Layout::new(4, Quant::I8, DEFAULT_FILTER_BYTES)
+        Layout::new(4, Quant::I8)
     }
 
     #[test]
-    fn element_len_is_header_plus_filter_plus_vector() {
-        let l = Layout::new(1024, Quant::I8, 64);
-        assert_eq!(l.vector_offset(), 80);
-        assert_eq!(l.element_len(), 16 + 64 + 1024);
-        // The vector must start 16-byte aligned for SIMD-friendly access.
-        assert_eq!(l.vector_offset() % 16, 0);
-    }
+    fn the_vector_offset_is_a_constant() {
+        assert_eq!(ATTR_OFFSET, 16);
+        assert_eq!(Layout::VECTOR_OFFSET, 144);
+        // Being 16-byte aligned keeps the vector SIMD-friendly.
+        assert_eq!(Layout::VECTOR_OFFSET % 16, 0);
 
-    #[test]
-    fn filter_offset_is_independent_of_dim_and_quant() {
-        // The whole point of putting the filter first: one constant offset.
+        // It must not move with dim or quant — that is the whole point.
         for dim in [1usize, 128, 4096] {
             for q in [Quant::F32, Quant::F16, Quant::I8, Quant::B1] {
-                let l = Layout::new(dim, q, 64);
-                let e = l.encode(&vec![0u8; l.vector_bytes()], b"{}").unwrap();
-                assert_eq!(l.filter_of(&e).unwrap(), b"{}");
+                let l = Layout::new(dim, q);
+                assert_eq!(l.element_len(), 144 + l.vector_bytes());
             }
         }
-        assert_eq!(FILTER_OFFSET, 16);
+    }
+
+    #[test]
+    fn attr_is_readable_at_a_constant_offset_for_every_layout() {
+        for dim in [1usize, 128, 4096] {
+            for q in [Quant::F32, Quant::F16, Quant::I8, Quant::B1] {
+                let l = Layout::new(dim, q);
+                let e = l.encode(&vec![0u8; l.vector_bytes()], b"{}").unwrap();
+                assert_eq!(l.attr_of(&e).unwrap(), b"{}");
+            }
+        }
     }
 
     #[test]
     fn encode_decode_roundtrip() {
         let l = layout();
         let vector = vec![1u8, 2, 3, 4];
-        let json = br#"{"cat":"tech"}"#;
+        let attr = br#"{"cat":"tech"}"#;
 
-        let buf = l.encode(&vector, json).unwrap();
+        let buf = l.encode(&vector, attr).unwrap();
         assert_eq!(buf.len(), l.element_len());
+        assert_eq!(buf.len(), 144 + 4);
 
         let e = l.decode(&buf).unwrap();
-        assert_eq!(e.filter, json);
+        assert_eq!(e.attr, attr);
         assert_eq!(e.vector, &vector[..]);
     }
 
     #[test]
-    fn empty_filter_roundtrips() {
+    fn an_absent_attr_roundtrips_as_empty() {
         let l = layout();
         let buf = l.encode(&[0, 0, 0, 0], b"").unwrap();
-        assert_eq!(l.decode(&buf).unwrap().filter, b"");
-        assert_eq!(l.filter_of(&buf).unwrap(), b"");
+        assert_eq!(l.decode(&buf).unwrap().attr, b"");
+        assert_eq!(l.attr_of(&buf).unwrap(), b"");
     }
 
     #[test]
-    fn filter_slot_is_zero_padded() {
+    fn the_attr_region_is_zero_padded() {
         let l = layout();
         let buf = l.encode(&[9, 9, 9, 9], b"{}").unwrap();
-        // Only `flen` bytes are meaningful; the rest of the slot must be zeroed
-        // so stale bytes can never leak between writes.
+        // Only `alen` bytes are meaningful; the rest of the region must be zeroed
+        // so bytes from an earlier, longer value can never leak.
         assert!(
-            buf[FILTER_OFFSET + 2..l.vector_offset()]
+            buf[ATTR_OFFSET + 2..Layout::VECTOR_OFFSET]
                 .iter()
                 .all(|b| *b == 0)
         );
     }
 
     #[test]
-    fn oversized_filter_is_rejected() {
+    fn an_attr_exactly_at_the_limit_fits_and_one_over_does_not() {
         let l = layout();
-        let json = vec![b'x'; DEFAULT_FILTER_BYTES + 1];
+        let attr = vec![b'x'; ATTR_BYTES + 1];
+        assert!(l.encode(&[0, 0, 0, 0], &attr[..ATTR_BYTES]).is_ok());
         assert_eq!(
-            l.encode(&[0, 0, 0, 0], &json),
-            Err(CodecError::FilterTooLarge {
-                limit: DEFAULT_FILTER_BYTES,
-                got: DEFAULT_FILTER_BYTES + 1
+            l.encode(&[0, 0, 0, 0], &attr),
+            Err(CodecError::AttrTooLarge {
+                limit: ATTR_BYTES,
+                got: ATTR_BYTES + 1
             })
         );
-        // Exactly at the limit must still fit.
-        assert!(
-            l.encode(&[0, 0, 0, 0], &json[..DEFAULT_FILTER_BYTES])
-                .is_ok()
-        );
+    }
+
+    #[test]
+    fn a_full_attr_region_still_decodes() {
+        let l = layout();
+        let attr = vec![b'x'; ATTR_BYTES];
+        let buf = l.encode(&[1, 2, 3, 4], &attr).unwrap();
+        assert_eq!(l.decode(&buf).unwrap().attr, &attr[..]);
+        assert_eq!(l.decode(&buf).unwrap().vector, &[1, 2, 3, 4]);
     }
 
     #[test]
@@ -347,6 +346,12 @@ mod tests {
         let mut bad = good.clone();
         bad[4..6].copy_from_slice(&99u16.to_le_bytes());
         assert_eq!(l.decode(&bad), Err(CodecError::LayoutMismatch));
+
+        // An attr length that cannot fit the fixed region.
+        let mut bad = good.clone();
+        bad[6..8].copy_from_slice(&(ATTR_BYTES as u16 + 1).to_le_bytes());
+        assert_eq!(l.decode(&bad), Err(CodecError::LayoutMismatch));
+        assert_eq!(l.attr_of(&bad), Err(CodecError::LayoutMismatch));
     }
 
     #[test]
@@ -360,52 +365,42 @@ mod tests {
                 got: l.element_len() - 1
             })
         );
-        assert!(matches!(
+        assert_eq!(
             parse_header(&good[..4]),
             Err(CodecError::Truncated { need: 16, got: 4 })
-        ));
+        );
     }
 
     #[test]
-    fn filter_of_survives_a_truncated_vector_tail() {
-        // The predicate only needs the filter, so a damaged tail must not
-        // prevent it from making a decision.
+    fn attr_of_survives_a_truncated_vector_tail() {
+        // The predicate only needs attributes, so a damaged tail must not stop it
+        // from making a decision.
         let l = layout();
         let good = l.encode(&[0, 0, 0, 0], b"{}").unwrap();
-        let short = &good[..l.vector_offset()];
-        assert_eq!(l.filter_of(short).unwrap(), b"{}");
+        let short = &good[..Layout::VECTOR_OFFSET];
+        assert_eq!(l.attr_of(short).unwrap(), b"{}");
         assert!(l.decode(short).is_err());
     }
 
     #[test]
-    fn max_dim_for_matches_the_documented_table() {
+    fn max_dim_for_is_the_exact_ceiling() {
         let limit = 16 * 1024;
-        assert_eq!(Layout::max_dim_for(Quant::F32, 64, limit), 4076);
-        assert_eq!(Layout::max_dim_for(Quant::F16, 64, limit), 8152);
-        assert_eq!(Layout::max_dim_for(Quant::I8, 64, limit), 16304);
-        assert_eq!(Layout::max_dim_for(Quant::B1, 64, limit), 130432);
+        assert_eq!(Layout::max_dim_for(Quant::F32, limit), 4060);
+        assert_eq!(Layout::max_dim_for(Quant::F16, limit), 8120);
+        assert_eq!(Layout::max_dim_for(Quant::I8, limit), 16240);
+        assert_eq!(Layout::max_dim_for(Quant::B1, limit), 129_920);
 
-        // A layout built at exactly max_dim must fit the limit.
         for q in [Quant::F32, Quant::F16, Quant::I8, Quant::B1] {
-            let d = Layout::max_dim_for(q, 64, limit);
-            assert!(Layout::new(d, q, 64).element_len() <= limit, "{q:?}");
-            assert!(Layout::new(d + 1, q, 64).element_len() > limit, "{q:?}");
+            let d = Layout::max_dim_for(q, limit);
+            assert!(Layout::new(d, q).element_len() <= limit, "{q:?}");
+            assert!(Layout::new(d + 1, q).element_len() > limit, "{q:?}");
         }
     }
 
     #[test]
-    fn max_dim_for_handles_a_budget_smaller_than_the_overhead() {
-        assert_eq!(Layout::max_dim_for(Quant::I8, 64, 16), 0);
-        assert_eq!(Layout::max_dim_for(Quant::I8, 64, 80), 0);
-    }
-
-    #[test]
-    fn filter_bytes_validation() {
-        assert_eq!(Layout::validate_filter_bytes(64), Ok(64));
-        assert_eq!(Layout::validate_filter_bytes(16), Ok(16));
-        assert_eq!(Layout::validate_filter_bytes(256), Ok(256));
-        assert!(Layout::validate_filter_bytes(8).is_err());
-        assert!(Layout::validate_filter_bytes(272).is_err());
-        assert!(Layout::validate_filter_bytes(24).is_err());
+    fn max_dim_for_handles_a_budget_below_the_fixed_overhead() {
+        assert_eq!(Layout::max_dim_for(Quant::I8, 16), 0);
+        assert_eq!(Layout::max_dim_for(Quant::I8, Layout::VECTOR_OFFSET), 0);
+        assert_eq!(Layout::max_dim_for(Quant::I8, Layout::VECTOR_OFFSET + 1), 1);
     }
 }

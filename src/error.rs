@@ -55,7 +55,7 @@ impl Error {
             // Encoding failures reflect what the client sent; decoding failures
             // mean the stored bytes are wrong, which is ours to answer for.
             Error::Codec(e) => match e {
-                CodecError::FilterTooLarge { .. } | CodecError::VectorLenMismatch { .. } => {
+                CodecError::AttrTooLarge { .. } | CodecError::VectorLenMismatch { .. } => {
                     Blame::Client
                 }
                 _ => Blame::Server,
@@ -153,9 +153,13 @@ mod tests {
         assert_eq!(Error::bad_request("nope").blame(), Blame::Client);
         assert_eq!(Error::NoSuchIndex.blame(), Blame::Client);
         assert_eq!(Error::Filter(ParseError::Empty).blame(), Blame::Client);
-        // Oversized filter: the client sent it.
+        // Oversized ATTR: the client sent it.
         assert_eq!(
-            Error::Codec(CodecError::FilterTooLarge { limit: 64, got: 90 }).blame(),
+            Error::Codec(CodecError::AttrTooLarge {
+                limit: 128,
+                got: 200
+            })
+            .blame(),
             Blame::Client
         );
     }
