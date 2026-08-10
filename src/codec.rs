@@ -32,14 +32,25 @@ pub enum CodecError {
     UnsupportedVersion(u8),
     UnknownQuant(u8),
     /// Buffer shorter than the layout requires.
-    Truncated { need: usize, got: usize },
+    Truncated {
+        need: usize,
+        got: usize,
+    },
     /// Header disagrees with the index's declared layout.
     LayoutMismatch,
     /// JSON longer than the fixed filter slot.
-    FilterTooLarge { limit: usize, got: usize },
+    FilterTooLarge {
+        limit: usize,
+        got: usize,
+    },
     /// Vector byte count disagrees with `dim` and `quant`.
-    VectorLenMismatch { need: usize, got: usize },
+    VectorLenMismatch {
+        need: usize,
+        got: usize,
+    },
 }
+
+impl std::error::Error for CodecError {}
 
 impl std::fmt::Display for CodecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -70,27 +81,31 @@ pub struct Layout {
 }
 
 impl Layout {
-    pub fn new(dim: usize, quant: Quant, filter_bytes: usize) -> Self {
-        Layout { dim, quant, filter_bytes }
+    pub const fn new(dim: usize, quant: Quant, filter_bytes: usize) -> Self {
+        Layout {
+            dim,
+            quant,
+            filter_bytes,
+        }
     }
 
-    pub fn vector_bytes(&self) -> usize {
+    pub const fn vector_bytes(&self) -> usize {
         self.quant.vector_bytes(self.dim)
     }
 
-    pub fn vector_offset(&self) -> usize {
+    pub const fn vector_offset(&self) -> usize {
         HEADER_LEN + self.filter_bytes
     }
 
     /// Total element value size. This is what must fit in `max_element_bytes`.
-    pub fn element_len(&self) -> usize {
+    pub const fn element_len(&self) -> usize {
         self.vector_offset() + self.vector_bytes()
     }
 
     /// Largest dimension that fits a `max_element_bytes` budget for this
     /// quantization and filter slot size. Returns 0 when even one coordinate
     /// cannot fit.
-    pub fn max_dim_for(quant: Quant, filter_bytes: usize, max_element_bytes: usize) -> usize {
+    pub const fn max_dim_for(quant: Quant, filter_bytes: usize, max_element_bytes: usize) -> usize {
         let overhead = HEADER_LEN + filter_bytes;
         if max_element_bytes <= overhead {
             return 0;
@@ -100,10 +115,10 @@ impl Layout {
 
     /// Validate a client-supplied filter slot size.
     pub fn validate_filter_bytes(n: usize) -> Result<usize, &'static str> {
-        if n < MIN_FILTER_BYTES || n > MAX_FILTER_BYTES {
+        if !(MIN_FILTER_BYTES..=MAX_FILTER_BYTES).contains(&n) {
             return Err("FBYTES must be between 16 and 256");
         }
-        if n % FILTER_BYTES_ALIGN != 0 {
+        if !n.is_multiple_of(FILTER_BYTES_ALIGN) {
             return Err("FBYTES must be a multiple of 16");
         }
         Ok(n)
@@ -148,7 +163,10 @@ impl Layout {
         }
         let need = self.element_len();
         if buf.len() < need {
-            return Err(CodecError::Truncated { need, got: buf.len() });
+            return Err(CodecError::Truncated {
+                need,
+                got: buf.len(),
+            });
         }
         if head.filter_len as usize > self.filter_bytes {
             return Err(CodecError::LayoutMismatch);
@@ -172,7 +190,10 @@ impl Layout {
         }
         let end = FILTER_OFFSET + flen;
         if buf.len() < end {
-            return Err(CodecError::Truncated { need: end, got: buf.len() });
+            return Err(CodecError::Truncated {
+                need: end,
+                got: buf.len(),
+            });
         }
         Ok(&buf[FILTER_OFFSET..end])
     }
@@ -187,7 +208,10 @@ struct Header {
 
 fn parse_header(buf: &[u8]) -> Result<Header, CodecError> {
     if buf.len() < HEADER_LEN {
-        return Err(CodecError::Truncated { need: HEADER_LEN, got: buf.len() });
+        return Err(CodecError::Truncated {
+            need: HEADER_LEN,
+            got: buf.len(),
+        });
     }
     if buf[0..2] != MAGIC {
         return Err(CodecError::BadMagic);
@@ -268,7 +292,11 @@ mod tests {
         let buf = l.encode(&[9, 9, 9, 9], b"{}").unwrap();
         // Only `flen` bytes are meaningful; the rest of the slot must be zeroed
         // so stale bytes can never leak between writes.
-        assert!(buf[FILTER_OFFSET + 2..l.vector_offset()].iter().all(|b| *b == 0));
+        assert!(
+            buf[FILTER_OFFSET + 2..l.vector_offset()]
+                .iter()
+                .all(|b| *b == 0)
+        );
     }
 
     #[test]
@@ -283,7 +311,10 @@ mod tests {
             })
         );
         // Exactly at the limit must still fit.
-        assert!(l.encode(&[0, 0, 0, 0], &json[..DEFAULT_FILTER_BYTES]).is_ok());
+        assert!(
+            l.encode(&[0, 0, 0, 0], &json[..DEFAULT_FILTER_BYTES])
+                .is_ok()
+        );
     }
 
     #[test]
@@ -324,7 +355,10 @@ mod tests {
         let good = l.encode(&[0, 0, 0, 0], b"{}").unwrap();
         assert_eq!(
             l.decode(&good[..good.len() - 1]),
-            Err(CodecError::Truncated { need: l.element_len(), got: l.element_len() - 1 })
+            Err(CodecError::Truncated {
+                need: l.element_len(),
+                got: l.element_len() - 1
+            })
         );
         assert!(matches!(
             parse_header(&good[..4]),

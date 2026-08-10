@@ -16,7 +16,7 @@ pub enum Quant {
 }
 
 impl Quant {
-    pub fn from_u8(v: u8) -> Option<Self> {
+    pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Quant::F32),
             1 => Some(Quant::F16),
@@ -36,7 +36,7 @@ impl Quant {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Quant::F32 => "f32",
             Quant::F16 => "f16",
@@ -46,7 +46,7 @@ impl Quant {
     }
 
     /// Bytes occupied by `dim` coordinates under this quantization.
-    pub fn vector_bytes(self, dim: usize) -> usize {
+    pub const fn vector_bytes(self, dim: usize) -> usize {
         match self {
             Quant::F32 => dim * 4,
             Quant::F16 => dim * 2,
@@ -56,13 +56,19 @@ impl Quant {
     }
 
     /// Largest `dim` whose vector fits in `budget` bytes.
-    pub fn max_dim(self, budget: usize) -> usize {
+    pub const fn max_dim(self, budget: usize) -> usize {
         match self {
             Quant::F32 => budget / 4,
             Quant::F16 => budget / 2,
             Quant::I8 => budget,
             Quant::B1 => budget * 8,
         }
+    }
+}
+
+impl std::fmt::Display for Quant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -92,7 +98,7 @@ pub fn encode(v: &[f32], quant: Quant) -> Vec<u8> {
             v.iter()
                 .map(|x| {
                     let n = (x * inv * 127.0).round();
-                    n.clamp(-127.0, 127.0) as i8 as u8
+                    (n.clamp(-127.0, 127.0) as i8).cast_unsigned()
                 })
                 .collect()
         }
@@ -124,20 +130,20 @@ pub fn f32_to_f16_bits(x: f32) -> i16 {
     if exp == 0xff {
         // Inf or NaN. Preserve NaN-ness by forcing a non-zero mantissa.
         let m = if mant != 0 { 0x0200 } else { 0 };
-        return (sign | 0x7c00 | m) as i16;
+        return (sign | 0x7c00 | m).cast_signed();
     }
 
     // Rebase exponent: f32 bias 127 -> f16 bias 15.
     let new_exp = exp - 127 + 15;
 
     if new_exp >= 0x1f {
-        return (sign | 0x7c00) as i16; // overflow -> infinity
+        return (sign | 0x7c00).cast_signed(); // overflow -> infinity
     }
 
     if new_exp <= 0 {
         // Subnormal, or too small to represent at all.
         if new_exp < -10 {
-            return sign as i16;
+            return sign.cast_signed();
         }
         let mant_with_implicit = mant | 0x0080_0000;
         let shift = (14 - new_exp) as u32;
@@ -146,21 +152,21 @@ pub fn f32_to_f16_bits(x: f32) -> i16 {
         if (mant_with_implicit >> (shift - 1)) & 1 == 1 {
             half += 1;
         }
-        return (sign | half) as i16;
+        return (sign | half).cast_signed();
     }
 
     let mut half = (sign as u32) | ((new_exp as u32) << 10) | (mant >> 13);
     if (mant >> 12) & 1 == 1 {
         half += 1; // carries into the exponent naturally
     }
-    half as u16 as i16
+    (half as u16).cast_signed()
 }
 
 /// Inverse of [`f32_to_f16_bits`]. Only the tests need it today — nothing in the
 /// command path decodes f16 back to f32 — so it is not part of the shipped library.
 #[cfg(test)]
 pub fn f16_bits_to_f32(bits: i16) -> f32 {
-    let h = bits as u16;
+    let h = bits.cast_unsigned();
     let sign = ((h & 0x8000) as u32) << 16;
     let exp = ((h >> 10) & 0x1f) as u32;
     let mant = (h & 0x03ff) as u32;
@@ -240,7 +246,10 @@ mod tests {
     #[test]
     fn f16_handles_specials_and_overflow() {
         assert!(f16_bits_to_f32(f32_to_f16_bits(f32::NAN)).is_nan());
-        assert_eq!(f16_bits_to_f32(f32_to_f16_bits(f32::INFINITY)), f32::INFINITY);
+        assert_eq!(
+            f16_bits_to_f32(f32_to_f16_bits(f32::INFINITY)),
+            f32::INFINITY
+        );
         // Beyond f16's max finite value, so it must saturate to infinity.
         assert_eq!(f16_bits_to_f32(f32_to_f16_bits(1.0e30)), f32::INFINITY);
         // Far below f16's smallest subnormal, so it must flush to zero.

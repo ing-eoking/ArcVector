@@ -1,17 +1,27 @@
-//! arcus Map engine wrapper — the source of truth for every vector.
+//! arcus Map engine access — the source of truth for every vector.
 //!
 //! One index is one Map item (key = index name); one vector is one Map element
 //! (field = vector id, value = the [`crate::codec`] layout). Map is used rather
-//! than plain KV items because key-based lookup, replication and TTL already ride
-//! on the Map path.
+//! than plain KV items because key-based lookup, replication and TTL already
+//! ride on the Map path.
+//!
+//! All unsafety is concentrated in [`Store::for_cookie`]. Everything downstream
+//! takes `&self` and hands out owned or borrowed Rust values, so no other module
+//! deals in raw pointers.
 
+use std::ffi::CStr;
+use std::fmt;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::codec::Layout;
-use crate::engine_api::*;
+use crate::engine_api::{
+    ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT, ENGINE_ERROR_CODE_ENGINE_EOVERFLOW,
+    ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT, ENGINE_ERROR_CODE_ENGINE_SUCCESS, ENGINE_HANDLE,
+    SERVER_HANDLE_V1, eitem, eitem_info, elems_result, engine_interface_v1, field_t, item_attr,
+};
 
 unsafe extern "C" {
     fn free(ptr: *mut c_void);
@@ -21,40 +31,43 @@ unsafe extern "C" {
 const ITEM_TYPE_MAP: c_int = 3;
 
 pub const DEFAULT_MAX_ELEMENT_BYTES: u32 = 16 * 1024;
+const DEFAULT_MAX_MAP_SIZE: u32 = 50_000;
 
 static ENGINE: AtomicPtr<engine_interface_v1> = AtomicPtr::new(ptr::null_mut());
-static GET_SERVER_API_FN: OnceLock<unsafe extern "C" fn() -> *mut SERVER_HANDLE_V1> =
-    OnceLock::new();
+static GET_SERVER_API: OnceLock<unsafe extern "C" fn() -> *mut SERVER_HANDLE_V1> = OnceLock::new();
 
+/// Record the server-API accessor handed to the extension at load time.
 pub fn set_server_api(f: unsafe extern "C" fn() -> *mut SERVER_HANDLE_V1) {
-    let _ = GET_SERVER_API_FN.set(f);
+    let _ = GET_SERVER_API.set(f);
 }
 
-/// Resolve (and cache) the engine handle. The engine is not available at
-/// extension-initialize time, so this is resolved lazily on first use.
-pub fn ensure_engine() -> *mut engine_interface_v1 {
+/// Resolve and cache the engine handle.
+///
+/// The engine is not wired up when the extension initializes, so this resolves
+/// lazily on first use.
+fn engine() -> *mut engine_interface_v1 {
     let cached = ENGINE.load(Ordering::Acquire);
     if !cached.is_null() {
         return cached;
     }
-    let Some(get_api) = GET_SERVER_API_FN.get() else {
+    let Some(get_api) = GET_SERVER_API.get() else {
         return ptr::null_mut();
     };
-    unsafe {
-        let server = get_api();
-        if server.is_null() {
-            return ptr::null_mut();
-        }
-        let engine_ptr = (*server).engine;
-        if engine_ptr.is_null() {
-            return ptr::null_mut();
-        }
-        let eng = engine_ptr as *mut engine_interface_v1;
-        // Racing resolvers must agree on one pointer.
-        match ENGINE.compare_exchange(ptr::null_mut(), eng, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => eng,
-            Err(existing) => existing,
-        }
+    // SAFETY: memcached handed us this function pointer during extension
+    // initialization and it stays valid for the process lifetime.
+    let server = unsafe { get_api() };
+    if server.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: a non-null SERVER_HANDLE_V1 from memcached is fully initialized.
+    let handle = unsafe { (*server).engine }.cast::<engine_interface_v1>();
+    if handle.is_null() {
+        return ptr::null_mut();
+    }
+    // Racing resolvers must agree on a single pointer.
+    match ENGINE.compare_exchange(ptr::null_mut(), handle, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => handle,
+        Err(existing) => existing,
     }
 }
 
@@ -68,21 +81,25 @@ pub enum StoreError {
     ElemGone,
     /// Map is full (`maxcount` / `max_map_size`).
     Overflow,
-    /// Engine returned a code we do not translate individually.
+    /// An engine code we do not translate individually.
     Engine(u32),
 }
 
-impl std::fmt::Display for StoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StoreError::Unavailable => write!(f, "engine unavailable"),
-            StoreError::KeyGone => write!(f, "index not found in engine"),
-            StoreError::ElemGone => write!(f, "element not found"),
-            StoreError::Overflow => write!(f, "index is full"),
-            StoreError::Engine(c) => write!(f, "engine error {c}"),
+            StoreError::Unavailable => f.write_str("engine unavailable"),
+            StoreError::KeyGone => f.write_str("index not found in engine"),
+            StoreError::ElemGone => f.write_str("element not found"),
+            StoreError::Overflow => f.write_str("index is full"),
+            StoreError::Engine(code) => write!(f, "engine error {code}"),
         }
     }
 }
+
+impl std::error::Error for StoreError {}
+
+type Result<T> = std::result::Result<T, StoreError>;
 
 fn translate(code: u32) -> StoreError {
     match code {
@@ -93,341 +110,469 @@ fn translate(code: u32) -> StoreError {
     }
 }
 
-macro_rules! vtable {
-    ($eng:expr, $field:ident) => {
-        match (*$eng).$field {
-            Some(f) => f,
-            None => return Err(StoreError::Unavailable),
-        }
-    };
+fn check(code: u32) -> Result<()> {
+    if code == ENGINE_ERROR_CODE_ENGINE_SUCCESS {
+        Ok(())
+    } else {
+        Err(translate(code))
+    }
 }
 
-/// Read a `uint32` engine configuration value, falling back to `default`.
-fn config_u32(cookie: *const c_void, key: &std::ffi::CStr, default: u32) -> u32 {
-    let eng = ensure_engine();
-    if eng.is_null() {
-        return default;
+/// Engine access bound to one connection.
+///
+/// Cheap to copy and never stored: it lives only for the extension callback that
+/// created it, which is what makes the raw pointers inside it safe to use
+/// without synchronization.
+#[derive(Clone, Copy)]
+pub struct Store {
+    engine: *mut engine_interface_v1,
+    cookie: *const c_void,
+}
+
+impl Store {
+    /// # Safety
+    ///
+    /// `cookie` must be the connection cookie memcached passed to the extension
+    /// callback that is currently running, and the returned `Store` must not
+    /// outlive that callback.
+    pub unsafe fn for_cookie(cookie: *const c_void) -> Option<Store> {
+        let engine = engine();
+        (!engine.is_null()).then_some(Store { engine, cookie })
     }
-    unsafe {
-        let Some(get_config) = (*eng).get_config else {
+
+    fn handle(&self) -> *mut ENGINE_HANDLE {
+        self.engine.cast::<ENGINE_HANDLE>()
+    }
+
+    fn vtable(&self) -> &engine_interface_v1 {
+        // SAFETY: `for_cookie` rejects a null engine, and the engine outlives
+        // every connection.
+        unsafe { &*self.engine }
+    }
+
+    /// Read a `uint32` engine configuration value, falling back to `default`.
+    fn config_u32(&self, key: &CStr, default: u32) -> u32 {
+        let Some(get_config) = self.vtable().get_config else {
             return default;
         };
         let mut out: u32 = 0;
-        let ret = get_config(
-            eng as *mut ENGINE_HANDLE,
-            cookie,
-            key.as_ptr(),
-            &mut out as *mut u32 as *mut c_void,
-        );
-        if ret == ENGINE_ERROR_CODE_ENGINE_SUCCESS && out > 0 { out } else { default }
+        // SAFETY: `out` is a live u32, which is what the engine writes for a
+        // uint32-typed configuration key.
+        let code = unsafe {
+            get_config(
+                self.handle(),
+                self.cookie,
+                key.as_ptr(),
+                ptr::from_mut(&mut out).cast::<c_void>(),
+            )
+        };
+        if code == ENGINE_ERROR_CODE_ENGINE_SUCCESS && out > 0 {
+            out
+        } else {
+            default
+        }
     }
-}
 
-pub fn max_element_bytes(cookie: *const c_void) -> u32 {
-    config_u32(cookie, c"max_element_bytes", DEFAULT_MAX_ELEMENT_BYTES)
-}
-
-pub fn max_map_size(cookie: *const c_void) -> u32 {
-    config_u32(cookie, c"max_map_size", 50_000)
-}
-
-/// Create the Map item backing an index.
-///
-/// `maxcount` and `exptime` are the index's element-count limit and TTL — the
-/// Map constraints the index inherits.
-pub fn create_map(
-    cookie: *const c_void,
-    key: &str,
-    maxcount: Option<u32>,
-    exptime: Option<u32>,
-) -> Result<(), StoreError> {
-    let eng = ensure_engine();
-    if eng.is_null() {
-        return Err(StoreError::Unavailable);
+    /// Per-element size limit. This is what caps an index's dimension.
+    pub fn max_element_bytes(&self) -> u32 {
+        self.config_u32(c"max_element_bytes", DEFAULT_MAX_ELEMENT_BYTES)
     }
-    unsafe {
-        let create = vtable!(eng, map_struct_create);
-        let mut attr = std::mem::zeroed::<item_attr>();
+
+    /// Default element-count limit for a new Map.
+    pub fn max_map_size(&self) -> u32 {
+        self.config_u32(c"max_map_size", DEFAULT_MAX_MAP_SIZE)
+    }
+
+    /// Create the Map item backing an index.
+    ///
+    /// `maxcount` and `exptime` are the element-count limit and TTL the index
+    /// inherits from Map.
+    pub fn create_map(&self, key: &str, maxcount: Option<u32>, exptime: Option<u32>) -> Result<()> {
+        let Some(create) = self.vtable().map_struct_create else {
+            return Err(StoreError::Unavailable);
+        };
+        // SAFETY: all-zero is a valid item_attr; the engine reads the fields we
+        // set plus the zeroed defaults.
+        let mut attr: item_attr = unsafe { std::mem::zeroed() };
         attr.readable = 1;
         if let Some(m) = maxcount {
-            attr.maxcount = m as i32;
+            // Callers validate the range; saturate rather than wrap if one slips.
+            attr.maxcount = i32::try_from(m).unwrap_or(i32::MAX);
         }
         if let Some(e) = exptime {
             attr.exptime = e;
         }
-        let ret = create(
-            eng as *mut ENGINE_HANDLE,
-            cookie,
-            key.as_ptr() as *const c_void,
-            key.len() as c_int,
-            &mut attr,
-            0,
-        );
-        if ret == ENGINE_ERROR_CODE_ENGINE_SUCCESS {
-            Ok(())
-        } else {
-            Err(translate(ret))
-        }
+        // SAFETY: `key` and `attr` outlive the call.
+        check(unsafe {
+            create(
+                self.handle(),
+                self.cookie,
+                key.as_ptr().cast::<c_void>(),
+                key.len() as c_int,
+                ptr::from_mut(&mut attr),
+                0,
+            )
+        })
     }
-}
 
-/// Delete the whole Map item — this is how an index is dropped.
-pub fn drop_map(cookie: *const c_void, key: &str) -> Result<(), StoreError> {
-    let eng = ensure_engine();
-    if eng.is_null() {
-        return Err(StoreError::Unavailable);
+    /// Delete the whole Map item — this is how an index is dropped.
+    pub fn drop_map(&self, key: &str) -> Result<()> {
+        let Some(remove) = self.vtable().remove else {
+            return Err(StoreError::Unavailable);
+        };
+        // SAFETY: `key` outlives the call.
+        check(unsafe {
+            remove(
+                self.handle(),
+                self.cookie,
+                key.as_ptr().cast::<c_void>(),
+                key.len(),
+                0,
+                0,
+            )
+        })
     }
-    unsafe {
-        let remove = vtable!(eng, remove);
-        let ret = remove(
-            eng as *mut ENGINE_HANDLE,
-            cookie,
-            key.as_ptr() as *const c_void,
-            key.len(),
-            0,
-            0,
-        );
-        if ret == ENGINE_ERROR_CODE_ENGINE_SUCCESS {
-            Ok(())
-        } else {
-            Err(translate(ret))
-        }
-    }
-}
 
-/// Insert or replace one element.
-pub fn put_elem(
-    cookie: *const c_void,
-    key: &str,
-    field: &str,
-    value: &[u8],
-) -> Result<(), StoreError> {
-    let eng = ensure_engine();
-    if eng.is_null() {
-        return Err(StoreError::Unavailable);
-    }
-    unsafe {
-        let alloc = vtable!(eng, map_elem_alloc);
-        let insert = vtable!(eng, map_elem_insert);
-        let elem_free = vtable!(eng, map_elem_free);
-        let elem_info = vtable!(eng, get_elem_info);
+    /// Insert or replace one element.
+    pub fn put_elem(&self, key: &str, field: &str, value: &[u8]) -> Result<()> {
+        let vt = self.vtable();
+        let (Some(alloc), Some(insert), Some(elem_free), Some(elem_info)) = (
+            vt.map_elem_alloc,
+            vt.map_elem_insert,
+            vt.map_elem_free,
+            vt.get_elem_info,
+        ) else {
+            return Err(StoreError::Unavailable);
+        };
 
-        let mut eitem_ptr: *mut eitem = ptr::null_mut();
-        let ret = alloc(
-            eng as *mut ENGINE_HANDLE,
-            cookie,
-            key.as_ptr() as *const c_void,
-            key.len() as c_int,
-            field.len(),
-            value.len(),
-            &mut eitem_ptr,
-        );
-        if ret != ENGINE_ERROR_CODE_ENGINE_SUCCESS {
-            return Err(translate(ret));
-        }
+        let mut item: *mut eitem = ptr::null_mut();
+        // SAFETY: `item` is a live out-parameter the engine fills on success.
+        check(unsafe {
+            alloc(
+                self.handle(),
+                self.cookie,
+                key.as_ptr().cast::<c_void>(),
+                key.len() as c_int,
+                field.len(),
+                value.len(),
+                ptr::from_mut(&mut item),
+            )
+        })?;
 
-        let mut info = std::mem::zeroed::<eitem_info>();
-        elem_info(eng as *mut ENGINE_HANDLE, cookie, ITEM_TYPE_MAP, eitem_ptr, &mut info);
-        if info.score.is_null() || info.value.is_null() {
-            elem_free(eng as *mut ENGINE_HANDLE, cookie, eitem_ptr);
+        // SAFETY: `item` came from a successful alloc, so its field and value
+        // regions exist with exactly the sizes requested above.
+        let filled = unsafe {
+            let mut info: eitem_info = std::mem::zeroed();
+            elem_info(
+                self.handle(),
+                self.cookie,
+                ITEM_TYPE_MAP,
+                item,
+                ptr::from_mut(&mut info),
+            );
+            let ok = !info.score.is_null() && !info.value.is_null();
+            if ok {
+                ptr::copy_nonoverlapping(
+                    field.as_ptr(),
+                    info.score.cast::<u8>().cast_mut(),
+                    field.len(),
+                );
+                ptr::copy_nonoverlapping(
+                    value.as_ptr(),
+                    info.value.cast::<u8>().cast_mut(),
+                    value.len(),
+                );
+            }
+            ok
+        };
+        if !filled {
+            // SAFETY: `item` was never inserted, so it is still ours to free.
+            unsafe { elem_free(self.handle(), self.cookie, item) };
             return Err(StoreError::Unavailable);
         }
-        ptr::copy_nonoverlapping(field.as_ptr(), info.score as *mut u8, field.len());
-        ptr::copy_nonoverlapping(value.as_ptr(), info.value as *mut u8, value.len());
 
         let mut replaced = false;
         let mut created = false;
-        let ret = insert(
-            eng as *mut ENGINE_HANDLE,
-            cookie,
-            key.as_ptr() as *const c_void,
-            key.len() as c_int,
-            eitem_ptr,
-            true, // replace_if_exist
-            ptr::null_mut(),
-            &mut replaced,
-            &mut created,
-            0,
-        );
-        if ret != ENGINE_ERROR_CODE_ENGINE_SUCCESS {
-            elem_free(eng as *mut ENGINE_HANDLE, cookie, eitem_ptr);
-            return Err(translate(ret));
-        }
-        Ok(())
+        // SAFETY: ownership of `item` passes to the engine only on success.
+        let code = unsafe {
+            insert(
+                self.handle(),
+                self.cookie,
+                key.as_ptr().cast::<c_void>(),
+                key.len() as c_int,
+                item,
+                true, // replace_if_exist
+                ptr::null_mut(),
+                ptr::from_mut(&mut replaced),
+                ptr::from_mut(&mut created),
+                0,
+            )
+        };
+        check(code).inspect_err(|_| {
+            // SAFETY: insert failed, so `item` is still ours to free.
+            unsafe { elem_free(self.handle(), self.cookie, item) };
+        })
     }
-}
 
-pub fn delete_elem(cookie: *const c_void, key: &str, field: &str) -> Result<(), StoreError> {
-    let eng = ensure_engine();
-    if eng.is_null() {
-        return Err(StoreError::Unavailable);
-    }
-    unsafe {
-        let delete = vtable!(eng, map_elem_delete);
-        let f = field_t { value: field.as_ptr() as *mut c_char, length: field.len() };
-        let mut del_count: u32 = 0;
+    pub fn delete_elem(&self, key: &str, field: &str) -> Result<()> {
+        let Some(delete) = self.vtable().map_elem_delete else {
+            return Err(StoreError::Unavailable);
+        };
+        let selector = field_t {
+            value: field.as_ptr().cast::<c_char>().cast_mut(),
+            length: field.len(),
+        };
+        let mut deleted: u32 = 0;
         let mut dropped = false;
-        let ret = delete(
-            eng as *mut ENGINE_HANDLE,
-            cookie,
-            key.as_ptr() as *const c_void,
-            key.len() as c_int,
-            1,
-            &f,
-            false, // drop_if_empty: an emptied index must keep existing
-            &mut del_count,
-            &mut dropped,
-            0,
-        );
-        if ret == ENGINE_ERROR_CODE_ENGINE_SUCCESS && del_count > 0 {
+        // SAFETY: `key`, `selector` and the out-parameters outlive the call.
+        let code = unsafe {
+            delete(
+                self.handle(),
+                self.cookie,
+                key.as_ptr().cast::<c_void>(),
+                key.len() as c_int,
+                1,
+                ptr::from_ref(&selector),
+                false, // drop_if_empty: an emptied index must keep existing
+                ptr::from_mut(&mut deleted),
+                ptr::from_mut(&mut dropped),
+                0,
+            )
+        };
+        check(code)?;
+        if deleted > 0 {
             Ok(())
-        } else if ret == ENGINE_ERROR_CODE_ENGINE_SUCCESS {
-            Err(StoreError::ElemGone)
         } else {
-            Err(translate(ret))
+            Err(StoreError::ElemGone)
         }
     }
-}
 
-/// Run `f` over the raw values of the requested elements, then release them.
-///
-/// `map_elem_get` mallocs its result array even for a single field
-/// (coll_map.c:934) and hands back refcounted element pointers, so every early
-/// return has to go through the same release path. Callers get borrowed slices
-/// and must copy anything they need to keep.
-fn with_elems<T>(
-    cookie: *const c_void,
-    key: &str,
-    field: Option<&str>,
-    f: impl FnOnce(&[(&[u8], &[u8])]) -> T,
-) -> Result<T, StoreError> {
-    let eng = ensure_engine();
-    if eng.is_null() {
-        return Err(StoreError::Unavailable);
-    }
-    unsafe {
-        let get = vtable!(eng, map_elem_get);
-        let release = vtable!(eng, map_elem_release);
-        let elem_info = vtable!(eng, get_elem_info);
+    /// Run `f` over the raw (field, value) pairs of the requested elements.
+    ///
+    /// `map_elem_get` mallocs its result array even for a single field
+    /// (coll_map.c:934) and returns refcounted element pointers, so [`Elems`]
+    /// owns the cleanup and every exit path releases exactly once. Callers get
+    /// borrowed slices and must copy whatever they keep.
+    fn with_elems<T>(
+        &self,
+        key: &str,
+        field: Option<&str>,
+        f: impl FnOnce(&[(&[u8], &[u8])]) -> T,
+    ) -> Result<T> {
+        let vt = self.vtable();
+        let (Some(get), Some(elem_info)) = (vt.map_elem_get, vt.get_elem_info) else {
+            return Err(StoreError::Unavailable);
+        };
 
-        let fld = field.map(|s| field_t {
-            value: s.as_ptr() as *mut c_char,
+        let selector = field.map(|s| field_t {
+            value: s.as_ptr().cast::<c_char>().cast_mut(),
             length: s.len(),
         });
-        let (numfields, flist) = match &fld {
-            Some(f) => (1, f as *const field_t),
+        let (numfields, flist) = match &selector {
+            Some(f) => (1, ptr::from_ref(f)),
             None => (0, ptr::null()),
         };
 
-        let mut eresult = std::mem::zeroed::<elems_result>();
-        let ret = get(
-            eng as *mut ENGINE_HANDLE,
-            cookie,
-            key.as_ptr() as *const c_void,
-            key.len() as c_int,
-            numfields,
-            flist,
-            false, // delete
-            false, // drop_if_empty
-            &mut eresult,
-            0,
-        );
+        // SAFETY: all-zero is a valid elems_result; the engine fills it in.
+        let mut result: elems_result = unsafe { std::mem::zeroed() };
+        // SAFETY: `key` and `selector` outlive the call.
+        let code = unsafe {
+            get(
+                self.handle(),
+                self.cookie,
+                key.as_ptr().cast::<c_void>(),
+                key.len() as c_int,
+                numfields,
+                flist,
+                false, // delete
+                false, // drop_if_empty
+                ptr::from_mut(&mut result),
+                0,
+            )
+        };
 
-        if ret != ENGINE_ERROR_CODE_ENGINE_SUCCESS
-            || eresult.elem_count == 0
-            || eresult.elem_array.is_null()
-        {
-            if !eresult.elem_array.is_null() {
-                release(
-                    eng as *mut ENGINE_HANDLE,
-                    cookie,
-                    eresult.elem_array,
-                    eresult.elem_count as c_int,
-                );
-                free(eresult.elem_array as *mut c_void);
-            }
-            return Err(if ret == ENGINE_ERROR_CODE_ENGINE_SUCCESS {
-                StoreError::ElemGone
-            } else {
-                translate(ret)
-            });
+        // Take ownership before the error check so a partial result is still
+        // released.
+        // SAFETY: `result` is exactly what the call above wrote.
+        let elems = unsafe { Elems::new(self, &result) };
+        check(code)?;
+        let Some(items) = elems.as_slice() else {
+            return Err(StoreError::ElemGone);
+        };
+
+        let views: Vec<(&[u8], &[u8])> = items
+            .iter()
+            .map(|item| {
+                // SAFETY: each entry is a live Map element held by our refcount,
+                // and get_elem_info reports the extents of its own storage.
+                unsafe {
+                    let mut info: eitem_info = std::mem::zeroed();
+                    elem_info(
+                        self.handle(),
+                        self.cookie,
+                        ITEM_TYPE_MAP,
+                        *item,
+                        ptr::from_mut(&mut info),
+                    );
+                    (
+                        slice_or_empty(info.score.cast::<u8>(), info.nscore as usize),
+                        slice_or_empty(info.value.cast::<u8>(), info.nbytes as usize),
+                    )
+                }
+            })
+            .collect();
+
+        Ok(f(&views))
+    }
+
+    /// Copy the fixed filter slot of one element — the search predicate's hot path.
+    ///
+    /// The slot sits at a constant offset ([`crate::codec::FILTER_OFFSET`]), so
+    /// nothing has to be decoded and only one cache line is touched. The
+    /// surrounding `map_elem_get` still costs a global `cache_lock` and a
+    /// malloc; narrowing that is a change to this method's body alone.
+    pub fn read_filter_slot(
+        &self,
+        key: &str,
+        field: &str,
+        layout: &Layout,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.with_elems(key, Some(field), |elems| {
+            let (_, value) = elems[0];
+            let slot = layout.filter_of(value).ok()?;
+            out.clear();
+            out.extend_from_slice(slot);
+            Some(())
+        })?
+        .ok_or(StoreError::ElemGone)
+    }
+
+    /// Read one element's full value.
+    pub fn get_elem(&self, key: &str, field: &str) -> Result<Vec<u8>> {
+        self.with_elems(key, Some(field), |elems| elems[0].1.to_vec())
+    }
+
+    /// Read every element — used to rebuild the usearch index from Map.
+    pub fn get_all(&self, key: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let all = self.with_elems(key, None, |elems| {
+            elems
+                .iter()
+                .map(|(field, value)| (String::from_utf8_lossy(field).into_owned(), value.to_vec()))
+                .collect::<Vec<_>>()
+        });
+        match all {
+            // An index with no elements yet is empty, not missing.
+            Err(StoreError::ElemGone) => Ok(Vec::new()),
+            other => other,
         }
-
-        let n = eresult.elem_count as usize;
-        let mut views: Vec<(&[u8], &[u8])> = Vec::with_capacity(n);
-        for i in 0..n {
-            let elem = *eresult.elem_array.add(i);
-            let mut info = std::mem::zeroed::<eitem_info>();
-            elem_info(eng as *mut ENGINE_HANDLE, cookie, ITEM_TYPE_MAP, elem, &mut info);
-            let field_bytes = if info.score.is_null() {
-                &[][..]
-            } else {
-                std::slice::from_raw_parts(info.score as *const u8, info.nscore as usize)
-            };
-            let value_bytes = if info.value.is_null() {
-                &[][..]
-            } else {
-                std::slice::from_raw_parts(info.value as *const u8, info.nbytes as usize)
-            };
-            views.push((field_bytes, value_bytes));
-        }
-
-        let out = f(&views);
-
-        release(
-            eng as *mut ENGINE_HANDLE,
-            cookie,
-            eresult.elem_array,
-            eresult.elem_count as c_int,
-        );
-        free(eresult.elem_array as *mut c_void);
-        Ok(out)
     }
 }
 
-/// Copy the fixed filter slot of one element — the search predicate's hot path.
+/// # Safety
 ///
-/// The slot lives at a constant offset ([`crate::codec::FILTER_OFFSET`]), so no
-/// decoding is needed and only one cache line is touched. The surrounding
-/// `map_elem_get` still costs a global `cache_lock` plus a malloc; replacing it
-/// with a narrower engine call changes this function's body and nothing else.
-pub fn get_filter_slot(
-    cookie: *const c_void,
-    key: &str,
-    field: &str,
-    layout: &Layout,
-    out: &mut Vec<u8>,
-) -> Result<(), StoreError> {
-    with_elems(cookie, key, Some(field), |elems| {
-        let (_, value) = elems[0];
-        out.clear();
-        match layout.filter_of(value) {
-            Ok(slot) => {
-                out.extend_from_slice(slot);
-                true
-            }
-            Err(_) => false,
+/// `ptr` must be null, or point to `len` initialized bytes that outlive `'a`.
+unsafe fn slice_or_empty<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
+    if ptr.is_null() || len == 0 {
+        &[]
+    } else {
+        // SAFETY: guaranteed by the caller.
+        unsafe { std::slice::from_raw_parts(ptr, len) }
+    }
+}
+
+/// Owns the element array `map_elem_get` allocated and releases it on drop.
+struct Elems<'a> {
+    store: &'a Store,
+    array: *mut *mut eitem,
+    count: usize,
+}
+
+impl<'a> Elems<'a> {
+    /// # Safety
+    ///
+    /// `result` must be exactly what a `map_elem_get` call wrote, so `elem_array`
+    /// is null or an engine-allocated array of `elem_count` refcounted elements
+    /// that has not yet been released.
+    unsafe fn new(store: &'a Store, result: &elems_result) -> Elems<'a> {
+        Elems {
+            store,
+            array: result.elem_array,
+            count: result.elem_count as usize,
         }
-    })
-    .and_then(|ok| if ok { Ok(()) } else { Err(StoreError::ElemGone) })
+    }
+
+    fn as_slice(&self) -> Option<&[*mut eitem]> {
+        if self.array.is_null() || self.count == 0 {
+            return None;
+        }
+        // SAFETY: the engine allocated `count` entries at `array`.
+        Some(unsafe { std::slice::from_raw_parts(self.array, self.count) })
+    }
 }
 
-/// Read one element's full value.
-pub fn get_elem(cookie: *const c_void, key: &str, field: &str) -> Result<Vec<u8>, StoreError> {
-    with_elems(cookie, key, Some(field), |elems| elems[0].1.to_vec())
+impl Drop for Elems<'_> {
+    fn drop(&mut self) {
+        if self.array.is_null() {
+            return;
+        }
+        if let Some(release) = self.store.vtable().map_elem_release {
+            // SAFETY: we hold the only reference to this array and each entry
+            // still carries the refcount `map_elem_get` took.
+            unsafe {
+                release(
+                    self.store.handle(),
+                    self.store.cookie,
+                    self.array,
+                    self.count as c_int,
+                );
+            }
+        }
+        // SAFETY: the array itself is plain malloc memory owned by the caller
+        // and is not freed anywhere else.
+        unsafe { free(self.array.cast::<c_void>()) };
+    }
 }
 
-/// Read every element — used to rebuild the usearch index from Map.
-pub fn get_all(cookie: *const c_void, key: &str) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
-    match with_elems(cookie, key, None, |elems| {
-        elems
-            .iter()
-            .map(|(f, v)| (String::from_utf8_lossy(f).into_owned(), v.to_vec()))
-            .collect::<Vec<_>>()
-    }) {
-        Ok(v) => Ok(v),
-        // An index with no elements yet is empty, not missing.
-        Err(StoreError::ElemGone) => Ok(Vec::new()),
-        Err(e) => Err(e),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_codes_map_to_distinguishable_errors() {
+        assert_eq!(
+            translate(ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT),
+            StoreError::KeyGone
+        );
+        assert_eq!(
+            translate(ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT),
+            StoreError::ElemGone
+        );
+        assert_eq!(
+            translate(ENGINE_ERROR_CODE_ENGINE_EOVERFLOW),
+            StoreError::Overflow
+        );
+        assert_eq!(translate(9999), StoreError::Engine(9999));
+    }
+
+    #[test]
+    fn check_only_accepts_success() {
+        assert!(check(ENGINE_ERROR_CODE_ENGINE_SUCCESS).is_ok());
+        assert_eq!(
+            check(ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT),
+            Err(StoreError::KeyGone)
+        );
+    }
+
+    #[test]
+    fn empty_slices_are_returned_for_null_or_zero_length() {
+        let data = [1u8, 2, 3];
+        // SAFETY: a null pointer, and a valid pointer with zero length, are both
+        // handled without dereferencing; the third case reads 3 live bytes.
+        unsafe {
+            assert!(slice_or_empty(ptr::null(), 8).is_empty());
+            assert!(slice_or_empty(data.as_ptr(), 0).is_empty());
+            assert_eq!(slice_or_empty(data.as_ptr(), 3), &data[..]);
+        }
     }
 }

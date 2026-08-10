@@ -19,12 +19,21 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, RwLock};
+use std::sync::{Condvar, Mutex, PoisonError, RwLock};
 
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind, b1x8, f16};
 
 use crate::codec::Layout;
+use crate::error::Error;
 use crate::quant::Quant;
+
+type Result<T> = std::result::Result<T, Error>;
+
+/// usearch reports failures as a `cxx::Exception`; carry its message through
+/// without depending on the cxx crate directly.
+fn usearch_err(e: impl std::fmt::Display) -> Error {
+    Error::Index(e.to_string())
+}
 
 /// Distance metric. Restricted per quantization by [`Metric::check_quant`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -48,7 +57,7 @@ impl Metric {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Metric::Cos => "cos",
             Metric::L2 => "l2",
@@ -58,7 +67,7 @@ impl Metric {
         }
     }
 
-    fn kind(self) -> MetricKind {
+    const fn kind(self) -> MetricKind {
         match self {
             Metric::Cos => MetricKind::Cos,
             Metric::L2 => MetricKind::L2sq,
@@ -69,24 +78,27 @@ impl Metric {
     }
 
     /// Reject metric/quantization pairs whose distances would be meaningless.
-    pub fn check_quant(self, quant: Quant) -> Result<(), String> {
+    pub fn check_quant(self, quant: Quant) -> Result<()> {
         let bitwise = matches!(self, Metric::Hamming | Metric::Tanimoto);
         match (quant, bitwise) {
-            (Quant::B1, false) => Err(format!(
-                "quantization b1 requires a bitwise metric (hamming or tanimoto), got {}",
-                self.as_str()
-            )),
-            (q, true) if q != Quant::B1 => Err(format!(
-                "metric {} requires quantization b1, got {}",
-                self.as_str(),
-                q.as_str()
-            )),
+            (Quant::B1, false) => Err(Error::bad_request(format!(
+                "quantization b1 requires a bitwise metric (hamming or tanimoto), got {self}"
+            ))),
+            (q, true) if q != Quant::B1 => Err(Error::bad_request(format!(
+                "metric {self} requires quantization b1, got {q}"
+            ))),
             _ => Ok(()),
         }
     }
 }
 
-fn scalar_kind(q: Quant) -> ScalarKind {
+impl std::fmt::Display for Metric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+const fn scalar_kind(q: Quant) -> ScalarKind {
     match q {
         Quant::F32 => ScalarKind::F32,
         Quant::F16 => ScalarKind::F16,
@@ -106,13 +118,16 @@ struct Semaphore {
 
 impl Semaphore {
     fn new(n: usize) -> Self {
-        Semaphore { avail: Mutex::new(n.max(1)), cv: Condvar::new() }
+        Semaphore {
+            avail: Mutex::new(n.max(1)),
+            cv: Condvar::new(),
+        }
     }
 
     fn acquire(&self) -> Permit<'_> {
-        let mut avail = self.avail.lock().unwrap_or_else(|e| e.into_inner());
+        let mut avail = self.avail.lock().unwrap_or_else(PoisonError::into_inner);
         while *avail == 0 {
-            avail = self.cv.wait(avail).unwrap_or_else(|e| e.into_inner());
+            avail = self.cv.wait(avail).unwrap_or_else(PoisonError::into_inner);
         }
         *avail -= 1;
         Permit { sem: self }
@@ -125,7 +140,11 @@ struct Permit<'a> {
 
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
-        let mut avail = self.sem.avail.lock().unwrap_or_else(|e| e.into_inner());
+        let mut avail = self
+            .sem
+            .avail
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         *avail += 1;
         drop(avail);
         self.sem.cv.notify_one();
@@ -172,7 +191,7 @@ impl AnnIndex {
         expansion_add: usize,
         expansion_search: usize,
         threads: usize,
-    ) -> Result<AnnIndex, String> {
+    ) -> Result<AnnIndex> {
         metric.check_quant(layout.quant)?;
 
         let options = IndexOptions {
@@ -184,11 +203,11 @@ impl AnnIndex {
             expansion_search,
             multi: false,
         };
-        let index = Index::new(&options).map_err(|e| e.to_string())?;
+        let index = Index::new(&options).map_err(usearch_err)?;
         let threads = threads.max(1);
         index
             .reserve_capacity_and_threads(MIN_CAPACITY, threads)
-            .map_err(|e| e.to_string())?;
+            .map_err(usearch_err)?;
 
         Ok(AnnIndex {
             layout,
@@ -203,7 +222,14 @@ impl AnnIndex {
     }
 
     pub fn len(&self) -> usize {
-        self.by_id.read().unwrap_or_else(|e| e.into_inner()).len()
+        self.by_id
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Lock-free key -> id lookup. Returns `None` for tombstoned slots.
@@ -219,7 +245,7 @@ impl AnnIndex {
     pub fn key_of(&self, id: &str) -> Option<u64> {
         self.by_id
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .get(id)
             .copied()
     }
@@ -229,11 +255,11 @@ impl AnnIndex {
     /// Taking the write lock is what makes this safe: it drains all readers, so
     /// no thread is inside usearch while the node arrays are reallocated. Permits
     /// need not be reclaimed separately.
-    fn ensure_capacity(&self, needed: usize) -> Result<(), String> {
+    fn ensure_capacity(&self, needed: usize) -> Result<()> {
         if needed <= self.reserved.load(Ordering::Acquire) {
             return Ok(());
         }
-        let index = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let index = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         let current = self.reserved.load(Ordering::Acquire);
         if needed <= current {
             return Ok(()); // another writer grew it while we waited
@@ -241,25 +267,25 @@ impl AnnIndex {
         let target = (current * 2).max(needed).max(MIN_CAPACITY);
         index
             .reserve_capacity_and_threads(target, self.threads)
-            .map_err(|e| e.to_string())?;
+            .map_err(usearch_err)?;
         self.reserved.store(target, Ordering::Release);
         Ok(())
     }
 
     /// Insert or replace `id`. `vector` is the already-quantized byte form.
-    pub fn add(&self, id: &str, vector: &[u8]) -> Result<u64, String> {
+    pub fn add(&self, id: &str, vector: &[u8]) -> Result<u64> {
         if vector.len() != self.layout.vector_bytes() {
-            return Err(format!(
+            return Err(Error::bad_request(format!(
                 "vector is {} bytes, expected {}",
                 vector.len(),
                 self.layout.vector_bytes()
-            ));
+            )));
         }
 
         // Allocate (or reuse) the key while holding by_id, so two concurrent
         // vadds of the same id cannot end up with two different keys.
         let (key, existed) = {
-            let mut by_id = self.by_id.write().unwrap_or_else(|e| e.into_inner());
+            let mut by_id = self.by_id.write().unwrap_or_else(PoisonError::into_inner);
             match by_id.get(id) {
                 Some(k) => {
                     let k = *k;
@@ -282,32 +308,32 @@ impl AnnIndex {
         self.ensure_capacity(key as usize + 1)?;
 
         let _permit = self.permits.acquire();
-        let index = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         if existed {
             // The index is built with `multi: false`, so usearch rejects a second
             // add under the same key. An update is therefore remove-then-add.
             // A concurrent search can miss this vector inside that window; Map
             // remains the source of truth, so nothing is lost.
-            index.remove(key).map_err(|e| e.to_string())?;
+            index.remove(key).map_err(usearch_err)?;
         }
         self.typed_add(&index, key, vector)?;
         Ok(key)
     }
 
-    fn typed_add(&self, index: &Index, key: u64, vector: &[u8]) -> Result<(), String> {
+    fn typed_add(&self, index: &Index, key: u64, vector: &[u8]) -> Result<()> {
         match self.layout.quant {
             Quant::F32 => index.add(key, &to_f32(vector)),
             Quant::F16 => index.add(key, f16::from_i16s(&to_i16(vector))),
             Quant::I8 => index.add(key, &to_i8(vector)),
             Quant::B1 => index.add(key, b1x8::from_u8s(vector)),
         }
-        .map_err(|e| e.to_string())
+        .map_err(usearch_err)
     }
 
     /// Remove `id`. Returns false when it was not present.
-    pub fn remove(&self, id: &str) -> Result<bool, String> {
+    pub fn remove(&self, id: &str) -> Result<bool> {
         let key = {
-            let mut by_id = self.by_id.write().unwrap_or_else(|e| e.into_inner());
+            let mut by_id = self.by_id.write().unwrap_or_else(PoisonError::into_inner);
             match by_id.remove(id) {
                 Some(k) => k,
                 None => return Ok(false),
@@ -318,23 +344,23 @@ impl AnnIndex {
         }
 
         let _permit = self.permits.acquire();
-        let index = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        index.remove(key).map_err(|e| e.to_string())?;
+        let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        index.remove(key).map_err(usearch_err)?;
         Ok(true)
     }
 
     /// k-NN search. `accept` is called once per visited graph node and must be
     /// cheap — it runs inside usearch's traversal.
-    pub fn search<F>(&self, query: &[u8], k: usize, accept: F) -> Result<Vec<(u64, f32)>, String>
+    pub fn search<F>(&self, query: &[u8], k: usize, accept: F) -> Result<Vec<(u64, f32)>>
     where
         F: Fn(u64) -> bool,
     {
         if query.len() != self.layout.vector_bytes() {
-            return Err(format!(
+            return Err(Error::bad_request(format!(
                 "query is {} bytes, expected {}",
                 query.len(),
                 self.layout.vector_bytes()
-            ));
+            )));
         }
 
         // Tombstoned keys must never reach the caller, even if usearch still
@@ -342,20 +368,18 @@ impl AnnIndex {
         let alive_and_accepted = |key: u64| self.id_of(key).is_some() && accept(key);
 
         let _permit = self.permits.acquire();
-        let index = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let matches = match self.layout.quant {
             Quant::F32 => index.filtered_search(&to_f32(query), k, alive_and_accepted),
-            Quant::F16 => index.filtered_search(f16::from_i16s(&to_i16(query)), k, alive_and_accepted),
+            Quant::F16 => {
+                index.filtered_search(f16::from_i16s(&to_i16(query)), k, alive_and_accepted)
+            }
             Quant::I8 => index.filtered_search(&to_i8(query), k, alive_and_accepted),
             Quant::B1 => index.filtered_search(b1x8::from_u8s(query), k, alive_and_accepted),
         }
-        .map_err(|e| e.to_string())?;
+        .map_err(usearch_err)?;
 
-        Ok(matches
-            .keys
-            .into_iter()
-            .zip(matches.distances)
-            .collect())
+        Ok(matches.keys.into_iter().zip(matches.distances).collect())
     }
 }
 
@@ -402,7 +426,13 @@ mod tests {
 
     #[test]
     fn metric_names_roundtrip() {
-        for m in [Metric::Cos, Metric::L2, Metric::IP, Metric::Hamming, Metric::Tanimoto] {
+        for m in [
+            Metric::Cos,
+            Metric::L2,
+            Metric::IP,
+            Metric::Hamming,
+            Metric::Tanimoto,
+        ] {
             assert_eq!(Metric::parse(m.as_str()), Some(m));
         }
         assert_eq!(Metric::parse("cosine"), Some(Metric::Cos));
@@ -435,7 +465,11 @@ mod tests {
         }
 
         // This is the invariant that keeps usearch's context pool from draining.
-        assert!(peak.load(Ordering::SeqCst) <= 3, "peak {}", peak.load(Ordering::SeqCst));
+        assert!(
+            peak.load(Ordering::SeqCst) <= 3,
+            "peak {}",
+            peak.load(Ordering::SeqCst)
+        );
         assert_eq!(live.load(Ordering::SeqCst), 0);
     }
 
@@ -444,7 +478,8 @@ mod tests {
     }
 
     fn add(idx: &AnnIndex, id: &str, coords: &[f32]) {
-        idx.add(id, &crate::quant::encode(coords, idx.layout.quant)).unwrap();
+        idx.add(id, &crate::quant::encode(coords, idx.layout.quant))
+            .unwrap();
     }
 
     fn search(idx: &AnnIndex, coords: &[f32], k: usize) -> Vec<String> {
@@ -546,7 +581,11 @@ mod tests {
         // returns "Reserve capacity ahead of insertions!" instead of results.
         let idx = Arc::new(build(8, Quant::F32, Metric::Cos, 2));
         for i in 0..200 {
-            add(&idx, &format!("v{i}"), &[i as f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+            add(
+                &idx,
+                &format!("v{i}"),
+                &[i as f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+            );
         }
 
         let failures = Arc::new(AtomicUsize::new(0));
@@ -581,8 +620,11 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 for i in 0..100 {
                     let id = format!("t{t}-{i}");
-                    idx.add(&id, &crate::quant::encode(&[t as f32, i as f32, 0.0, 0.0], Quant::F32))
-                        .unwrap();
+                    idx.add(
+                        &id,
+                        &crate::quant::encode(&[t as f32, i as f32, 0.0, 0.0], Quant::F32),
+                    )
+                    .unwrap();
                     let q = crate::quant::encode(&[t as f32, i as f32, 0.0, 0.0], Quant::F32);
                     let _ = idx.search(&q, 3, |_| true).unwrap();
                 }

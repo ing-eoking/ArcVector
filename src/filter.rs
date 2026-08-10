@@ -58,6 +58,8 @@ pub enum ParseError {
     TrailingInput(String),
 }
 
+impl std::error::Error for ParseError {}
+
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -73,7 +75,10 @@ impl std::fmt::Display for ParseError {
 
 impl Filter {
     pub fn parse(src: &str) -> Result<Filter, ParseError> {
-        let mut p = Parser { s: src.as_bytes(), i: 0 };
+        let mut p = Parser {
+            s: src.as_bytes(),
+            i: 0,
+        };
         p.skip_ws();
         if p.eof() {
             return Err(ParseError::Empty);
@@ -134,7 +139,7 @@ fn bool_str_eq(a: bool, b: &str) -> bool {
 }
 
 fn cmp_ord(ord: Option<std::cmp::Ordering>, op: Op) -> bool {
-    use std::cmp::Ordering::*;
+    use std::cmp::Ordering::{Equal, Greater, Less};
     // NaN comparisons yield None and must be false for every operator except Ne.
     let Some(o) = ord else {
         return matches!(op, Op::Ne);
@@ -224,7 +229,11 @@ impl<'a> Parser<'a> {
 
     fn parse_op(&mut self) -> Result<Op, ParseError> {
         let two = |p: &Parser<'a>| -> Option<[u8; 2]> {
-            if p.i + 1 < p.s.len() { Some([p.s[p.i], p.s[p.i + 1]]) } else { None }
+            if p.i + 1 < p.s.len() {
+                Some([p.s[p.i], p.s[p.i + 1]])
+            } else {
+                None
+            }
         };
         if let Some(pair) = two(self) {
             let op = match &pair {
@@ -345,11 +354,12 @@ fn lookup<'a>(json: &'a [u8], field: &[u8]) -> Option<JsonVal<'a>> {
         if i >= json.len() {
             return None;
         }
-        match json[i] {
-            b',' => i += 1,
-            b'}' => return None,
-            _ => return None,
+        // A closing brace means the field is absent; anything else is malformed.
+        // Either way the lookup is over.
+        if json[i] != b',' {
+            return None;
         }
+        i += 1;
     }
 }
 
@@ -401,7 +411,9 @@ fn scan_value<'a>(s: &'a [u8], i: &mut usize) -> Option<JsonVal<'a>> {
         b'{' | b'[' => None, // nested values are not addressable in the base grammar
         _ => {
             let start = *i;
-            while *i < s.len() && !matches!(s[*i], b',' | b'}' | b']') && !s[*i].is_ascii_whitespace()
+            while *i < s.len()
+                && !matches!(s[*i], b',' | b'}' | b']')
+                && !s[*i].is_ascii_whitespace()
             {
                 *i += 1;
             }
@@ -458,7 +470,8 @@ fn skip_value(s: &[u8], i: &mut usize) -> Option<()> {
 mod tests {
     use super::*;
 
-    const DOC: &[u8] = br#"{"cat":"tech","lang":"ko","ts":1723248000,"score":-1.5,"ok":true,"nil":null}"#;
+    const DOC: &[u8] =
+        br#"{"cat":"tech","lang":"ko","ts":1723248000,"score":-1.5,"ok":true,"nil":null}"#;
 
     fn m(expr: &str) -> bool {
         Filter::parse(expr).unwrap().matches(DOC)
@@ -569,13 +582,27 @@ mod tests {
     fn parse_rejects_malformed_input() {
         assert!(matches!(Filter::parse(""), Err(ParseError::Empty)));
         assert!(matches!(Filter::parse("   "), Err(ParseError::Empty)));
-        assert!(matches!(Filter::parse("cat"), Err(ParseError::ExpectedOperator(_))));
-        assert!(matches!(Filter::parse("= tech"), Err(ParseError::ExpectedField)));
-        assert!(matches!(Filter::parse("cat = "), Err(ParseError::ExpectedValue(_))));
-        assert!(matches!(Filter::parse(r#"cat = "x"#), Err(ParseError::UnterminatedString)));
-        assert!(matches!(Filter::parse("cat = a b"), Err(ParseError::TrailingInput(_))));
+        assert!(matches!(
+            Filter::parse("cat"),
+            Err(ParseError::ExpectedOperator(_))
+        ));
+        assert!(matches!(
+            Filter::parse("= tech"),
+            Err(ParseError::ExpectedField)
+        ));
+        assert!(matches!(
+            Filter::parse("cat = "),
+            Err(ParseError::ExpectedValue(_))
+        ));
+        assert!(matches!(
+            Filter::parse(r#"cat = "x"#),
+            Err(ParseError::UnterminatedString)
+        ));
+        assert!(matches!(
+            Filter::parse("cat = a b"),
+            Err(ParseError::TrailingInput(_))
+        ));
     }
-
 
     #[test]
     fn empty_json_matches_nothing() {
