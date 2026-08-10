@@ -81,57 +81,61 @@ impl<'a> Tokens<'a> {
             .map_err(|_| Error::bad_request(format!("invalid {what} '{raw}'")))
     }
 
-    /// Reassemble the tail of the command line from token `from` onward,
-    /// recovering the bytes exactly as the client sent them.
+    /// Byte extent of the command line from token `from` to the end of the line.
     ///
-    /// [`tokenize_command`] splits on single spaces and overwrites each one with
-    /// `'\0'` in place, leaving runs of two or more spaces untouched. Since the
-    /// tokens are consecutive slices of that one buffer, reading from the first
-    /// token to the end of the last and mapping `'\0'` back to `' '` reproduces
-    /// the original text. JSON cannot contain a bare NUL, so the mapping is
-    /// unambiguous. memcached itself reassembles command lines the same way.
+    /// The tokens are consecutive slices of one buffer, so the span from the
+    /// first of them to the end of the last is exactly the remaining line.
+    fn tail_span(&self, from: usize) -> Result<(*const u8, usize)> {
+        let malformed = || Error::bad_request("bad command line format");
+        let tail = self.tokens.get(from..).ok_or_else(malformed)?;
+        let mut real = tail.iter().filter(|t| !t.value.is_null() && t.length > 0);
+        let first = real.next().ok_or_else(malformed)?;
+        let last = real.next_back().unwrap_or(first);
+
+        // SAFETY: both pointers address the same command-line buffer and `last`
+        // never precedes `first`, so the difference is the span between them.
+        let offset = unsafe { last.value.offset_from(first.value) };
+        Ok((
+            first.value.cast::<u8>(),
+            offset.unsigned_abs() + last.length,
+        ))
+    }
+
+    /// Read exactly `len` bytes of command line starting at token `from`,
+    /// recovering the text as the client sent it.
     ///
-    /// Errors if the tail is empty or longer than `limit`.
+    /// [`tokenize_command`] overwrites each token-terminating space with `'\0'`
+    /// in place and leaves runs of two or more spaces alone, so mapping `'\0'`
+    /// back to `' '` reproduces the original bytes. JSON cannot contain a raw
+    /// NUL, which is what makes the mapping unambiguous. memcached reassembles
+    /// command lines the same way when it logs them (memcached.c:8078).
+    ///
+    /// `len` comes from the client, so it is checked against the span the tokens
+    /// actually cover — that is what keeps the read in bounds. A mismatch means
+    /// the declared length disagreed with what was sent.
     ///
     /// [`tokenize_command`]: https://github.com/naver/arcus-memcached/blob/master/mc_util.c
-    pub fn tail(&self, from: usize, limit: usize) -> Result<Vec<u8>> {
+    pub fn tail(&self, from: usize, len: usize) -> Result<Vec<u8>> {
         // Past the token limit memcached stops splitting and leaves the rest of
-        // the line in one piece; we cannot tell how long that piece is from the
-        // slice we were given, so refuse instead of guessing.
+        // the line undelimited; its length lives in a slot beyond the array we
+        // were handed, so the span cannot be verified and we refuse rather than
+        // read unbounded.
         if self.len() >= MAX_TOKENS {
             return Err(Error::bad_request(
-                "too many arguments; send ATTR JSON without spaces",
+                "too many arguments; send ATTR JSON with less whitespace",
             ));
         }
 
-        let tail = self
-            .tokens
-            .get(from..)
-            .filter(|t| !t.is_empty())
-            .ok_or_else(|| Error::bad_request("bad command line format"))?;
-        let first = tail
-            .iter()
-            .find(|t| !t.value.is_null() && t.length > 0)
-            .ok_or_else(|| Error::bad_request("bad command line format"))?;
-        let last = tail
-            .iter()
-            .rev()
-            .find(|t| !t.value.is_null() && t.length > 0)
-            .ok_or_else(|| Error::bad_request("bad command line format"))?;
-
-        // SAFETY: both pointers address the same command-line buffer, and `last`
-        // never precedes `first`, so the difference is the byte span between them.
-        let span = unsafe { last.value.offset_from(first.value) };
-        let len = span.unsigned_abs() + last.length;
-        if len > limit {
+        let (start, available) = self.tail_span(from)?;
+        if len != available {
             return Err(Error::bad_request(format!(
-                "ATTR is {len} bytes, over the {limit}-byte limit"
+                "declared length {len} does not match the {available} bytes supplied"
             )));
         }
 
-        // SAFETY: `len` spans from the first token to the end of the last, all
-        // within the single buffer the tokens point into.
-        let raw = unsafe { std::slice::from_raw_parts(first.value.cast::<u8>(), len) };
+        // SAFETY: `len` equals a span the tokens proved to be within the single
+        // command-line buffer they point into.
+        let raw = unsafe { std::slice::from_raw_parts(start, len) };
         Ok(raw
             .iter()
             .map(|b| if *b == 0 { b' ' } else { *b })
@@ -382,7 +386,7 @@ mod tests {
         let (buf, raw) = tokenize(&format!("vadd docs v1 16 ATTR 24 {json}"));
         let t = view(&raw);
         assert!(t.len() > 7, "expected the JSON to be split up");
-        assert_eq!(t.tail(6, 128).unwrap(), json.as_bytes());
+        assert_eq!(t.tail(6, json.len()).unwrap(), json.as_bytes());
         drop(buf);
     }
 
@@ -390,7 +394,7 @@ mod tests {
     fn tail_recovers_json_with_no_spaces() {
         let json = r#"{"cat":"tech"}"#;
         let (_buf, raw) = tokenize(&format!("vadd docs v1 16 ATTR 14 {json}"));
-        assert_eq!(view(&raw).tail(6, 128).unwrap(), json.as_bytes());
+        assert_eq!(view(&raw).tail(6, json.len()).unwrap(), json.as_bytes());
     }
 
     #[test]
@@ -399,21 +403,21 @@ mod tests {
         // spaces survive in the buffer and must survive the round trip too.
         let json = r#"{"a":  1}"#;
         let (_buf, raw) = tokenize(&format!("vadd docs v1 16 ATTR 9 {json}"));
-        assert_eq!(view(&raw).tail(6, 128).unwrap(), json.as_bytes());
+        assert_eq!(view(&raw).tail(6, json.len()).unwrap(), json.as_bytes());
     }
 
     #[test]
-    fn tail_rejects_a_span_over_the_limit() {
-        let json = "x".repeat(200);
-        let (_buf, raw) = tokenize(&format!("vadd docs v1 16 ATTR 200 {json}"));
-        let msg = view(&raw).tail(6, 128).unwrap_err().to_string();
-        assert!(msg.contains("over the 128-byte limit"), "{msg}");
+    fn tail_rejects_a_length_that_disagrees_with_the_line() {
+        let json = r#"{"a":1}"#;
+        let (_buf, raw) = tokenize(&format!("vadd docs v1 16 ATTR 99 {json}"));
+        let msg = view(&raw).tail(6, 99).unwrap_err().to_string();
+        assert!(msg.contains("does not match the 7 bytes"), "{msg}");
     }
 
     #[test]
     fn tail_rejects_an_absent_tail() {
         let (_buf, raw) = tokenize("vadd docs v1 16 ATTR 5");
-        assert!(view(&raw).tail(6, 128).is_err());
+        assert!(view(&raw).tail(6, 5).is_err());
     }
 
     #[test]
@@ -426,7 +430,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let (_buf, raw) = tokenize(&line);
-        let msg = view(&raw).tail(6, 128).unwrap_err().to_string();
+        let msg = view(&raw).tail(6, 8).unwrap_err().to_string();
         assert!(msg.contains("too many arguments"), "{msg}");
     }
 

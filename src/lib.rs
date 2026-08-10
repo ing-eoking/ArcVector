@@ -138,14 +138,9 @@ fn read_attr(tokens: &Tokens) -> std::result::Result<Vec<u8>, Error> {
         return Ok(Vec::new());
     }
 
-    let attr = tokens.tail(6, codec::ATTR_BYTES)?;
-    if attr.len() != declared {
-        return Err(Error::bad_request(format!(
-            "ATTR length {declared} does not match the {} bytes supplied",
-            attr.len()
-        )));
-    }
-    Ok(attr)
+    // The declared length drives the read; `tail` verifies it against the span
+    // the tokens cover, so a wrong length is reported rather than trusted.
+    tokens.tail(6, declared)
 }
 
 /// Decide how much body a command needs before it can run.
@@ -343,6 +338,44 @@ mod tests {
             attr_of(&format!("vadd docs v1 16 ATTR {} {json}", json.len())).unwrap(),
             json.as_bytes()
         );
+    }
+
+    #[test]
+    fn conventionally_spaced_json_is_accepted_up_to_the_byte_limit() {
+        // json.dumps / jq style: one space after each comma. Fourteen fields is
+        // 120 bytes with 13 spaces, well inside the token budget.
+        let json = format!(
+            "{{{}}}",
+            (0..14)
+                .map(|i| format!("\"k{i}\":{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(json.len() <= codec::ATTR_BYTES);
+        assert_eq!(
+            attr_of(&format!("vadd docs v1 16 ATTR {} {json}", json.len())).unwrap(),
+            json.as_bytes()
+        );
+    }
+
+    #[test]
+    fn json_padded_with_whitespace_everywhere_hits_the_token_budget() {
+        // memcached tokenizes on spaces and stops splitting at MAX_TOKENS, after
+        // which the remaining length is not recoverable from the array we get.
+        // Six fields spaced as `{ "k" : 0 , ... }` is only 67 bytes but already
+        // 31 tokens, so it is refused with an actionable message instead of
+        // being read past a bound we cannot verify.
+        let body = (0..6)
+            .map(|i| format!("\"k{i}\" : {i}"))
+            .collect::<Vec<_>>()
+            .join(" , ");
+        let json = format!("{{ {body} }}");
+        assert!(json.len() < codec::ATTR_BYTES, "{} bytes", json.len());
+
+        let msg = attr_of(&format!("vadd docs v1 16 ATTR {} {json}", json.len()))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("less whitespace"), "{msg}");
     }
 
     #[test]
