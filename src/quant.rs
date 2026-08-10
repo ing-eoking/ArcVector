@@ -156,7 +156,9 @@ pub fn f32_to_f16_bits(x: f32) -> i16 {
     half as u16 as i16
 }
 
-/// Inverse of [`f32_to_f16_bits`]. Used by `vget` to report stored coordinates.
+/// Inverse of [`f32_to_f16_bits`]. Only the tests need it today — nothing in the
+/// command path decodes f16 back to f32 — so it is not part of the shipped library.
+#[cfg(test)]
 pub fn f16_bits_to_f32(bits: i16) -> f32 {
     let h = bits as u16;
     let sign = ((h & 0x8000) as u32) << 16;

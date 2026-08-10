@@ -14,17 +14,17 @@
 
 use crate::quant::Quant;
 
-pub const MAGIC: [u8; 2] = *b"AV";
-pub const VERSION: u8 = 1;
-pub const HEADER_LEN: usize = 16;
+const MAGIC: [u8; 2] = *b"AV";
+const VERSION: u8 = 1;
+const HEADER_LEN: usize = 16;
 
 /// Constant offset of the filter slot within an element value.
 pub const FILTER_OFFSET: usize = HEADER_LEN;
 
 pub const DEFAULT_FILTER_BYTES: usize = 64;
-pub const MIN_FILTER_BYTES: usize = 16;
-pub const MAX_FILTER_BYTES: usize = 256;
-pub const FILTER_BYTES_ALIGN: usize = 16;
+const MIN_FILTER_BYTES: usize = 16;
+const MAX_FILTER_BYTES: usize = 256;
+const FILTER_BYTES_ALIGN: usize = 16;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CodecError {
@@ -155,8 +155,6 @@ impl Layout {
         }
         let vo = self.vector_offset();
         Ok(Element {
-            dim: head.dim,
-            quant: head.quant,
             filter: &buf[FILTER_OFFSET..FILTER_OFFSET + head.filter_len as usize],
             vector: &buf[vo..vo + self.vector_bytes()],
         })
@@ -181,14 +179,13 @@ impl Layout {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct Header {
-    pub version: u8,
-    pub quant: Quant,
-    pub dim: usize,
-    pub filter_len: u16,
+struct Header {
+    quant: Quant,
+    dim: usize,
+    filter_len: u16,
 }
 
-pub fn parse_header(buf: &[u8]) -> Result<Header, CodecError> {
+fn parse_header(buf: &[u8]) -> Result<Header, CodecError> {
     if buf.len() < HEADER_LEN {
         return Err(CodecError::Truncated { need: HEADER_LEN, got: buf.len() });
     }
@@ -200,7 +197,6 @@ pub fn parse_header(buf: &[u8]) -> Result<Header, CodecError> {
     }
     let quant = Quant::from_u8(buf[3]).ok_or(CodecError::UnknownQuant(buf[3]))?;
     Ok(Header {
-        version: buf[2],
         quant,
         dim: u16::from_le_bytes([buf[4], buf[5]]) as usize,
         filter_len: u16::from_le_bytes([buf[6], buf[7]]),
@@ -210,8 +206,6 @@ pub fn parse_header(buf: &[u8]) -> Result<Header, CodecError> {
 /// Borrowed view of a decoded element.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Element<'a> {
-    pub dim: usize,
-    pub quant: Quant,
     pub filter: &'a [u8],
     pub vector: &'a [u8],
 }
@@ -256,8 +250,6 @@ mod tests {
         assert_eq!(buf.len(), l.element_len());
 
         let e = l.decode(&buf).unwrap();
-        assert_eq!(e.dim, 4);
-        assert_eq!(e.quant, Quant::I8);
         assert_eq!(e.filter, json);
         assert_eq!(e.vector, &vector[..]);
     }

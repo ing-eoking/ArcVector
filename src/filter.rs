@@ -19,7 +19,7 @@
 //! `a != x OR b = y` cannot be satisfied merely by `a` being absent.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Op {
+enum Op {
     Eq,
     Ne,
     Lt,
@@ -101,19 +101,6 @@ impl Filter {
         self.terms
             .iter()
             .any(|term| term.iter().all(|c| eval_cond(c, json)))
-    }
-
-    /// Field names referenced by this filter, for diagnostics.
-    pub fn fields(&self) -> Vec<&str> {
-        let mut out: Vec<&str> = self
-            .terms
-            .iter()
-            .flatten()
-            .map(|c| c.field.as_str())
-            .collect();
-        out.sort_unstable();
-        out.dedup();
-        out
     }
 }
 
@@ -309,7 +296,7 @@ fn is_ident_byte(b: u8) -> bool {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, PartialEq)]
-pub enum JsonVal<'a> {
+enum JsonVal<'a> {
     Str(&'a [u8]),
     Num(f64),
     Bool(bool),
@@ -321,7 +308,7 @@ pub enum JsonVal<'a> {
 /// Nested objects and arrays are skipped wholesale; string contents are returned
 /// raw (escape sequences are not decoded), which is sufficient for the small,
 /// flat documents the fixed filter slot is sized for.
-pub fn lookup<'a>(json: &'a [u8], field: &[u8]) -> Option<JsonVal<'a>> {
+fn lookup<'a>(json: &'a [u8], field: &[u8]) -> Option<JsonVal<'a>> {
     let mut i = 0;
     skip_ws(json, &mut i);
     if i >= json.len() || json[i] != b'{' {
@@ -548,7 +535,7 @@ mod tests {
         assert!(m("cat = sports or lang = ko"));
         // A field named ANDROID must not be read as the AND keyword.
         let f = Filter::parse("ANDROID = 1").unwrap();
-        assert_eq!(f.fields(), vec!["ANDROID"]);
+        assert!(f.matches(br#"{"ANDROID":1}"#));
     }
 
     #[test]
@@ -589,11 +576,6 @@ mod tests {
         assert!(matches!(Filter::parse("cat = a b"), Err(ParseError::TrailingInput(_))));
     }
 
-    #[test]
-    fn fields_are_deduped_and_sorted() {
-        let f = Filter::parse("b = 1 AND a = 2 OR b = 3").unwrap();
-        assert_eq!(f.fields(), vec!["a", "b"]);
-    }
 
     #[test]
     fn empty_json_matches_nothing() {

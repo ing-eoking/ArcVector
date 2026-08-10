@@ -103,7 +103,7 @@ macro_rules! vtable {
 }
 
 /// Read a `uint32` engine configuration value, falling back to `default`.
-pub fn config_u32(cookie: *const c_void, key: &std::ffi::CStr, default: u32) -> u32 {
+fn config_u32(cookie: *const c_void, key: &std::ffi::CStr, default: u32) -> u32 {
     let eng = ensure_engine();
     if eng.is_null() {
         return default;
@@ -430,12 +430,4 @@ pub fn get_all(cookie: *const c_void, key: &str) -> Result<Vec<(String, Vec<u8>)
         Err(StoreError::ElemGone) => Ok(Vec::new()),
         Err(e) => Err(e),
     }
-}
-
-/// Does the Map item exist? Distinguishes "empty index" from "evicted index".
-pub fn map_exists(cookie: *const c_void, key: &str) -> bool {
-    !matches!(
-        with_elems(cookie, key, None, |_| ()),
-        Err(StoreError::KeyGone) | Err(StoreError::Unavailable)
-    )
 }

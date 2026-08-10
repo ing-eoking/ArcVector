@@ -99,17 +99,17 @@ fn scalar_kind(q: Quant) -> ScalarKind {
 // Semaphore
 // ---------------------------------------------------------------------------
 
-pub struct Semaphore {
+struct Semaphore {
     avail: Mutex<usize>,
     cv: Condvar,
 }
 
 impl Semaphore {
-    pub fn new(n: usize) -> Self {
+    fn new(n: usize) -> Self {
         Semaphore { avail: Mutex::new(n.max(1)), cv: Condvar::new() }
     }
 
-    pub fn acquire(&self) -> Permit<'_> {
+    fn acquire(&self) -> Permit<'_> {
         let mut avail = self.avail.lock().unwrap_or_else(|e| e.into_inner());
         while *avail == 0 {
             avail = self.cv.wait(avail).unwrap_or_else(|e| e.into_inner());
@@ -119,7 +119,7 @@ impl Semaphore {
     }
 }
 
-pub struct Permit<'a> {
+struct Permit<'a> {
     sem: &'a Semaphore,
 }
 
@@ -151,7 +151,7 @@ const MIN_CAPACITY: usize = 1024;
 pub struct AnnIndex {
     pub layout: Layout,
     pub metric: Metric,
-    pub threads: usize,
+    threads: usize,
     /// Write-locked only for `reserve`; every other operation takes a read lock,
     /// because usearch guards concurrent add/search/remove internally.
     inner: RwLock<Index>,
@@ -204,10 +204,6 @@ impl AnnIndex {
 
     pub fn len(&self) -> usize {
         self.by_id.read().unwrap_or_else(|e| e.into_inner()).len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     /// Lock-free key -> id lookup. Returns `None` for tombstoned slots.
