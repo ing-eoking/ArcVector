@@ -1,9 +1,9 @@
 # ArcVector v2 — usearch 기반 재설계
 
 - 작성일: 2026-08-10
-- 상태: 설계 확정 (구현 전)
+- 상태: 구현 완료
 - 브랜치: `usearch-base`
-- 대체 대상: `hnsw_rs` 기반 현행 `src/lib.rs` (1213줄 단일 파일)
+- 대체 대상: `hnsw_rs` 기반의 이전 `src/lib.rs` (1213줄 단일 파일)
 
 ---
 
