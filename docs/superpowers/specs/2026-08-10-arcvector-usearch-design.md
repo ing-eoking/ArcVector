@@ -10,8 +10,7 @@
 ## 1. 배경과 목표
 
 현행 ArcVector는 `hnsw_rs`로 메모리 ANN 인덱스를 만들고, 벡터 원본(f32)과 payload를
-arcus Map 컬렉션의 element에 저장한다. [DESIGN.md](../../../DESIGN.md)가 지적한 두 가지가
-실질적 병목이다.
+arcus Map 컬렉션의 element에 저장했다. 두 가지가 실질적 병목이었다.
 
 1. **element 크기 한도** — `max_element_bytes`(기본 16KB / 최대 32KB) 안에 `f32 벡터 + payload`가
    들어가야 하므로 차원 상한이 사실상 4,096 수준이다.
@@ -85,9 +84,19 @@ Map을 유지하는 이유는 **키 기반 조회 · 복제 · TTL**이 이미 M
 
 ## 3. 인덱스에 강제되는 Map 제약
 
-인덱스는 Map 위에 얹히므로 Map의 제약을 그대로 물려받아야 한다. 엔진은 이 한도를
-`map_elem_alloc` 수준에서 강제하지 않고, 초과 시 데몬이 죽는 사례가 관측되었다
-([DESIGN.md](../../../DESIGN.md) "실측으로 확인한 사실"). 따라서 **모듈이 선검증한다.**
+인덱스는 Map 위에 얹히므로 Map의 제약을 그대로 물려받아야 한다. 그런데
+**엔진은 이 한도를 강제하지 않는다.** `max_element_bytes` 검증은 프로토콜 레벨
+(`mop/bop/lop/sop insert`)에만 있고 엔진 API `map_elem_alloc`에는 없어서, 모듈이 엔진 API를
+직접 호출하면 한도를 우회할 수 있다. 실측에서 16KB 한도를 한참 넘는 element가 약 1019KB까지
+저장되었고, 정확히 1MB(`item_size_max`) element를 저장하자 슬랩 할당자 회계가 깨지며
+데몬이 죽었다.
+
+```
+Assertion failed: (cur_length == slen), do_smmgr_free, slabs.c:1006  -> SIGABRT
+```
+
+small memory manager의 슬롯 길이가 `uint16_t`(8B 단위)이고 정상 슬롯 한계가
+`SM_MAX_SLOT_SIZE`(48KB)이기 때문이다. 따라서 **모듈이 선검증한다.**
 
 | Map 제약 | 인덱스에서의 의미 | 강제 지점 |
 |---|---|---|
