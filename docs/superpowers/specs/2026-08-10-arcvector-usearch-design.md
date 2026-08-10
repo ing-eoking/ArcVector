@@ -309,7 +309,7 @@ src/
 ```
 vcreate <index> <dim> [METRIC cos|l2|ip|hamming|tanimoto] [QUANT f32|f16|i8|b1]
                       [M n] [EFC n] [EFS n] [MAXCOUNT n] [EXPTIME n]
-vadd    <index> <id> <veclen> [ATTR <attrlen> <attr JSON>]\r\n<f32 LE 벡터>\r\n
+vadd    <index> <id> <veclen> <dim> [ATTR <attrlen> <attr JSON>]\r\n<f32 LE 벡터>\r\n
 
 VSIM VECTOR <index> <num> <bytes> <dim> [FILTER <n> <term>...]\r\n<vec><vec>...\r\n
 VSIM KEY    <index> <num> <key>         [FILTER <n> <term>...]\r\n
@@ -376,10 +376,24 @@ END\r\n
 
 | 검사 | 시점 |
 |---|---|
-| `attrlen > 128` | 선언값만으로 즉시 거부 (본문을 읽기 전) |
+| `veclen` ≠ `dim × 4` | `vadd` — 두 값이 이미 어긋나므로 인덱스를 보지 않는다 |
+| `dim` ≠ 인덱스 차원 | `vadd` |
+| `attrlen > 128` | 선언값만으로 즉시 거부 (바이트를 읽기 전) |
 | `attrlen` ≠ 실제 전달 바이트 수 | 복원 후 비교 |
 | ATTR이 JSON **객체**인지 | `vadd` — 필드로 질의하므로 배열·스칼라는 거부 |
 | `144 + 벡터 바이트 > max_element_bytes` | `vadd`마다 |
+
+`vadd`가 바이트 수와 차원을 **둘 다** 받는 이유는, 어긋났을 때 어느 쪽이 문제인지 지목할 수
+있기 때문이다. 바이트 수만 받으면 `7`이 7차원인지 7바이트인지 구분할 수 없다.
+
+### accept 단계에서 거부하지 않는다
+
+`accept` 콜백은 클라이언트에 응답할 수단이 없다. 여기서 명령을 거부하면 **본문을 읽지 않은 채
+넘어가고, memcached가 그 벡터 바이트를 다음 명령줄로 파싱한다** — 스트림이 어긋난다.
+
+그래서 `accept`는 **본문 길이만** 본다. 나머지는 파싱하되 실패를 pending 상태에 실어 보내고,
+본문이 소비된 뒤 핸들러가 보고한다. 길이 토큰 자체를 읽을 수 없을 때만 거부하는데, 그때는
+얼마를 버려야 할지 알 방법이 없어 선택지가 없다.
 
 필터 문법(베이스): `field op value`를 `AND` / `OR`로 결합. `op` = `=` `!=` `<` `<=` `>` `>=`.
 `AND`가 `OR`보다 강하게 결합하며 괄호는 없다. JSON 최상위 필드만 지원하고 중첩 경로는 후속

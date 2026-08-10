@@ -318,25 +318,36 @@ pub fn tokenize_for_test(line: &str) -> (Vec<u8>, Vec<token_t>) {
     (buf, tokens)
 }
 
+/// Everything a `vadd` needs beyond its body.
+#[derive(Debug)]
+pub struct AddSpec {
+    pub index: String,
+    pub id: String,
+    /// Dimension the client declared, checked against both the byte count and
+    /// the index.
+    pub dim: usize,
+    pub attr: Vec<u8>,
+}
+
+/// Everything a `VSIM VECTOR` needs beyond its body.
+#[derive(Debug)]
+pub struct SimSpec {
+    pub index: String,
+    pub k: usize,
+    pub dim: usize,
+    pub filter: Option<crate::filter::Filter>,
+}
+
 /// A command whose body still has to arrive.
+///
+/// Each variant carries either the parsed line or the first thing wrong with it.
+/// `accept` cannot answer the client, so it registers the body regardless and
+/// lets the handler report the error *after* the bytes have been drained —
+/// otherwise the body would be left in the stream and read as the next command.
 #[derive(Debug)]
 pub enum PendingCmd {
-    Add {
-        index: String,
-        id: String,
-        /// Attribute JSON taken off the command line, or the reason it could not
-        /// be read. `accept` has no way to answer the client, so the failure
-        /// travels here and the handler reports it.
-        attr: std::result::Result<Vec<u8>, Error>,
-    },
-    /// `VSIM VECTOR`: the query coordinates follow in the body.
-    Sim {
-        index: String,
-        k: usize,
-        dim: usize,
-        /// Filter taken off the command line, or the reason it could not be read.
-        filter: std::result::Result<Option<crate::filter::Filter>, Error>,
-    },
+    Add(std::result::Result<AddSpec, Error>),
+    Sim(std::result::Result<SimSpec, Error>),
 }
 
 /// Buffer memcached fills with the command body.
@@ -630,12 +641,12 @@ mod tests {
     #[test]
     fn body_buffer_reserves_room_for_the_trailing_crlf() {
         let p = Pending::new(
-            PendingCmd::Sim {
+            PendingCmd::Sim(Ok(SimSpec {
                 index: "docs".into(),
                 k: 5,
                 dim: 4,
-                filter: Ok(None),
-            },
+                filter: None,
+            })),
             16,
         );
         assert_eq!(p.buffer.len(), 18);
@@ -651,11 +662,12 @@ mod tests {
         unsafe {
             expect_body(
                 cookie,
-                PendingCmd::Add {
+                PendingCmd::Add(Ok(AddSpec {
                     index: "docs".into(),
                     id: "v1".into(),
-                    attr: Ok(br#"{"a":1}"#.to_vec()),
-                },
+                    dim: 2,
+                    attr: br#"{"a":1}"#.to_vec(),
+                })),
                 8,
                 &mut ndata,
                 &mut ptr,

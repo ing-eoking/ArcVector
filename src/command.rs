@@ -10,7 +10,7 @@ use crate::codec::{self, Layout};
 use crate::error::{Error, Reply, Result};
 use crate::filter::Filter;
 use crate::index::{self, AnnIndex, Metric};
-use crate::protocol::Tokens;
+use crate::protocol::{AddSpec, SimSpec, Tokens};
 use crate::quant::{self, Quant};
 use crate::registry::{self, VectorIndex};
 use crate::store::{Store, StoreError};
@@ -20,6 +20,20 @@ fn to_f32(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+/// Check a body's byte count against the dimension the client declared.
+///
+/// Both are supplied so that a miscount is named rather than having the bytes
+/// silently reinterpreted as a different number of coordinates.
+fn check_length(len: usize, dim: usize) -> Result<()> {
+    let expected = dim * size_of::<f32>();
+    if len == expected {
+        return Ok(());
+    }
+    Err(Error::bad_request(format!(
+        "vector length {len} does not match dimension {dim} ({expected} bytes expected)"
+    )))
 }
 
 /// Decode and validate a client-supplied query or vector.
@@ -176,8 +190,31 @@ pub fn vcreate(store: &Store, tokens: &Tokens) -> Result<Reply> {
 // vadd
 // ---------------------------------------------------------------------------
 
-pub fn vadd(store: &Store, name: &str, id: &str, attr: &[u8], body: &[u8]) -> Result<Reply> {
+/// `vadd <index> <id> <veclen> <dim> [ATTR <attrlen> <attr JSON>]`
+///
+/// Both the byte count and the dimension are supplied, so a client that
+/// miscounts is told which of the two disagrees instead of having its bytes
+/// silently reinterpreted.
+pub fn vadd(store: &Store, spec: &AddSpec, body: &[u8]) -> Result<Reply> {
+    let AddSpec {
+        index: name,
+        id,
+        dim,
+        attr,
+    } = spec;
+    let attr = attr.as_slice();
+
+    // The body length was fixed by veclen, so this compares veclen against the
+    // declared dimension.
+    check_length(body.len(), *dim)?;
+
     let index = registry::require(name)?;
+    if *dim != index.ann.layout.dim {
+        return Err(Error::bad_request(format!(
+            "index {name} has dimension {}, got {dim}",
+            index.ann.layout.dim
+        )));
+    }
     index.ensure_built(store)?;
 
     let layout = index.ann.layout;
@@ -295,17 +332,17 @@ fn similar(
 /// The body holds `bytes` of little-endian `f32`, which is `bytes / (dim * 4)`
 /// query vectors searched in one round trip. Each contributes one `QUERY` group
 /// of up to `num` neighbours.
-pub fn vsim_vector(
-    store: &Store,
-    name: &str,
-    k: usize,
-    dim: usize,
-    filter: Option<&Filter>,
-    body: &[u8],
-) -> Result<Reply> {
-    let index = registry::require(name)?;
-    index.ensure_built(store)?;
+pub fn vsim_vector(store: &Store, spec: &SimSpec, body: &[u8]) -> Result<Reply> {
+    let SimSpec {
+        index: name,
+        k,
+        dim,
+        filter,
+    } = spec;
+    let (k, dim) = (*k, *dim);
+    let filter = filter.as_ref();
 
+    let index = registry::require(name)?;
     let layout = index.ann.layout;
     if dim != layout.dim {
         return Err(Error::bad_request(format!(
@@ -313,6 +350,7 @@ pub fn vsim_vector(
             layout.dim
         )));
     }
+    index.ensure_built(store)?;
 
     let stride = dim * size_of::<f32>();
     if !body.len().is_multiple_of(stride) {
@@ -523,6 +561,21 @@ mod tests {
         );
         assert!(parse_options(&["vcreate", "docs", "8", "MAXCOUNT", "2147483648"]).is_err());
         assert!(parse_options(&["vcreate", "docs", "8", "MAXCOUNT", "0"]).is_err());
+    }
+
+    #[test]
+    fn a_byte_count_must_match_the_declared_dimension() {
+        assert!(check_length(28, 7).is_ok());
+        assert!(check_length(4096, 1024).is_ok());
+
+        // The case that started this: 7 read as a byte count, not a dimension.
+        let msg = check_length(7, 7).unwrap_err().to_string();
+        assert!(msg.contains("does not match dimension 7"), "{msg}");
+        assert!(msg.contains("28 bytes expected"), "{msg}");
+
+        // A count that is a multiple of four but the wrong multiple.
+        let msg = check_length(24, 7).unwrap_err().to_string();
+        assert!(msg.contains("28 bytes expected"), "{msg}");
     }
 
     #[test]
