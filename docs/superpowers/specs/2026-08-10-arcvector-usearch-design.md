@@ -176,8 +176,15 @@ thread_lock_t thread_lock_(std::size_t thread_id) const {
 동시 usearch 진입 수 <= T == 예약된 컨텍스트 수   ==>   any_thread() pop은 실패할 수 없다
 ```
 
-`T` 기본값 64, `vcreate ... THREADS n`으로 조정. 워커가 `T`보다 많으면 초과분은 세마포어에서
-대기한다 — 느려질 뿐 실패하지 않는다.
+`T`는 **클라이언트가 정하지 않는다.** 워커 스레드 수에서 나오는 값이고 클라이언트에는 그 정보가
+없으므로 `vcreate` 옵션이 아니라 상수(64)다. 세마포어가 어떤 값에서도 불변식을 지켜 주므로
+`T`는 정확성이 아니라 처리량/메모리 절충일 뿐이다 — 워커 수보다 작으면 초과분이 잠깐 대기하고
+(느려질 뿐 실패하지 않는다), 크면 스레드별 버퍼가 낭비된다(usearch가 캐스팅용으로
+`bytes_per_vector × T`를 잡으므로 4096차원 f32 인덱스에서 약 1MB). 64를 고른 것은 `-t`가 그
+이상에서 경고만 하므로 도달 가능한 워커 수를 모두 덮으면서 대기가 없기 때문이다.
+
+`settings.num_threads`에서 유도하는 방안은 검토 후 버렸다. 심볼은 노출되어 있지만 읽으려면
+`struct settings` 레이아웃이 필요하고, 그 필드 오프셋은 빌드 타임 `#ifdef`에 따라 달라진다.
 
 ### 5.2 락 구조
 
@@ -301,7 +308,7 @@ src/
 
 ```
 vcreate <index> <dim> [METRIC cos|l2|ip|hamming|tanimoto] [QUANT f32|f16|i8|b1]
-                      [THREADS n] [M n] [EFC n] [EFS n] [MAXCOUNT n] [EXPTIME n]
+                      [M n] [EFC n] [EFS n] [MAXCOUNT n] [EXPTIME n]
 vadd    <index> <id> <veclen> [ATTR <attrlen> <attr JSON>]\r\n<f32 LE 벡터>\r\n
 
 VSIM VECTOR <index> <num> <bytes> <dim> [FILTER <n> <term>...]\r\n<vec><vec>...\r\n

@@ -47,7 +47,6 @@ fn coords(bytes: &[u8], expected_dim: usize, what: &str) -> Result<Vec<f32>> {
 struct Options {
     metric: Metric,
     quant: Quant,
-    threads: usize,
     connectivity: usize,
     expansion_add: usize,
     expansion_search: usize,
@@ -60,7 +59,6 @@ impl Default for Options {
         Options {
             metric: Metric::Cos,
             quant: Quant::F32,
-            threads: index::DEFAULT_THREADS,
             connectivity: 0,
             expansion_add: 0,
             expansion_search: 0,
@@ -88,7 +86,6 @@ impl Options {
                         Error::bad_request(format!("unknown quantization '{raw}'"))
                     })?;
                 }
-                "THREADS" => opts.threads = number("THREADS")?.clamp(1, 1024),
                 "M" => opts.connectivity = number("M")?,
                 "EFC" => opts.expansion_add = number("EFC")?,
                 "EFS" => opts.expansion_search = number("EFS")?,
@@ -155,7 +152,7 @@ pub fn vcreate(store: &Store, tokens: &Tokens) -> Result<Reply> {
         opts.connectivity,
         opts.expansion_add,
         opts.expansion_search,
-        opts.threads,
+        index::THREAD_SLOTS,
     )?;
 
     if store.create_map(name, opts.maxcount, opts.exptime).is_err() {
@@ -508,8 +505,10 @@ mod tests {
         assert!(parse_options(&["vcreate", "docs", "8", "NOPE", "1"]).is_err());
         assert!(parse_options(&["vcreate", "docs", "8", "QUANT", "f64"]).is_err());
         assert!(parse_options(&["vcreate", "docs", "8", "METRIC", "manhattan"]).is_err());
-        // FBYTES is gone: ATTR is a fixed 128 bytes.
+        // FBYTES is gone: ATTR is a fixed 128 bytes. THREADS is gone too: it
+        // describes the server, not the index.
         assert!(parse_options(&["vcreate", "docs", "8", "FBYTES", "128"]).is_err());
+        assert!(parse_options(&["vcreate", "docs", "8", "THREADS", "8"]).is_err());
     }
 
     #[test]
@@ -524,17 +523,6 @@ mod tests {
         );
         assert!(parse_options(&["vcreate", "docs", "8", "MAXCOUNT", "2147483648"]).is_err());
         assert!(parse_options(&["vcreate", "docs", "8", "MAXCOUNT", "0"]).is_err());
-    }
-
-    #[test]
-    fn threads_are_clamped_rather_than_rejected() {
-        // Zero would leave usearch with no reserved contexts at all.
-        assert_eq!(
-            parse_options(&["vcreate", "docs", "8", "THREADS", "0"])
-                .unwrap()
-                .threads,
-            1
-        );
     }
 
     #[test]

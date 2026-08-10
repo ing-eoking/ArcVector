@@ -164,7 +164,22 @@ struct IdSlot {
 // Index
 // ---------------------------------------------------------------------------
 
-pub const DEFAULT_THREADS: usize = 64;
+/// Thread contexts reserved per index, and therefore the semaphore's permit
+/// count. Not a client-facing setting: it follows from how many worker threads
+/// the server runs, which the client has no view of.
+///
+/// The value is not correctness-critical — the semaphore holds the invariant for
+/// any value — so it is purely a throughput/memory tradeoff. Below the worker
+/// count, excess workers queue briefly; above it, the surplus per-thread buffers
+/// are wasted (usearch allocates `bytes_per_vector * threads` for casting, so a
+/// 4096-dimension f32 index costs about 1 MB here). 64 is chosen because `-t`
+/// only warns past that (memcached.c:16107), so it covers every reachable worker
+/// count without queueing.
+///
+/// Deriving it from `settings.num_threads` was considered and rejected: the
+/// symbol is exported, but reading it needs the `struct settings` layout, whose
+/// field offsets shift with build-time `#ifdef`s.
+pub const THREAD_SLOTS: usize = 64;
 const MIN_CAPACITY: usize = 1024;
 
 pub struct AnnIndex {
