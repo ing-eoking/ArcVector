@@ -18,7 +18,7 @@ For how it works inside, see [docs/INTERNALS.md](docs/INTERNALS.md).
 cargo build --release        # -> target/release/libarcusv.{so,dylib}
 ```
 
-`build.rs` runs bindgen over the vendored arcus headers in `src/c`, so libclang
+`build.rs` runs bindgen over the vendored arcus headers in `include/`, so libclang
 must be available. usearch compiles a C++ core, so a C++17 toolchain is needed too.
 
 Load it into arcus with `-X`:

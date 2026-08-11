@@ -315,10 +315,15 @@ allocate, so `filter` scans the raw bytes instead.
 
 ### bindgen 0.72 — engine ABI
 
-`build.rs` generates `src/engine_api.rs` from `src/c/engine.h` on every build, so
-it is not committed. `src/c` holds only the headers `engine.h` transitively
-includes; `src/c/memcached/*.h` are symlinks providing the `memcached/` include
-prefix.
+`build.rs` generates the bindings from `include/engine.h` into `OUT_DIR`, and
+`lib.rs` pulls them in with `include!`. Writing to `OUT_DIR` rather than into
+`src/` keeps the build from touching the source tree, so a read-only checkout
+works and two profiles can build the same sources without contending for one
+generated file.
+
+`include/` holds only the headers `engine.h` transitively includes;
+`include/memcached/*.h` are symlinks to their siblings one level up, which is what
+supplies the `memcached/` prefix those headers include by.
 
 ### arcus `engine_interface_v1`
 

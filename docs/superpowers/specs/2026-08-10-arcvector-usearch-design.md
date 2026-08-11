@@ -297,7 +297,8 @@ src/
   cmd/        vcreate vadd vget vsearch vdel vdrop vlist
 ```
 
-`src/c/*.h`와 bindgen 빌드 설정은 arcus ABI 정의이므로 재사용한다. 로직은 전부 새로 쓴다.
+벤더링된 arcus 헤더와 bindgen 빌드 설정은 ABI 정의이므로 재사용한다(작성 당시 `src/c/`,
+이후 `include/`로 이동). 로직은 전부 새로 쓴다.
 
 의존성: `usearch 2.26`, `serde_json`(vadd 시 JSON 검증), `boxcar`(락 없는 append-only 벡터).
 `hnsw_rs` 제거.
