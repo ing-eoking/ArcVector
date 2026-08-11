@@ -28,47 +28,54 @@ They are joined by a key. The graph finds candidates; Map holds the bytes.
 
 ## 2. Module map
 
-The store holds vectors, the index finds them, and the registry pairs the two:
+Three tiers, and the top level is the architecture:
 
 ```
-lib.rs        registration and the four memcached callbacks   <- the FFI boundary
-  protocol/   the wire — memcached's ASCII protocol
-    tokens      read the token array, write the reply
-    request     command line -> typed request                  (pure)
-    pending     a command waiting for its body
-  vector      what a stored vector is: scalar kind + byte layout   (pure)
-  filter      attribute filter expressions                         (pure)
-  store       arcus Map — holds vectors, the source of truth   (raw pointers)
-  index       usearch — finds them, a cache of the store
-  registry    the live store/index pairs, and the rebuild
-  command     one handler per command
-  error       one error type, and who gets blamed for it
+lib.rs       the C ABI — registration and memcached's four callbacks
+  command/   receive a command, interpret it, run it
+    tokens     read the token array, write the reply
+    request    command line -> typed request               (pure)
+    pending    a command waiting for its body
+    filter     the FILTER clause's little language         (pure)
+    handler    do the work, calling the two backends
+  arcus/     store vectors in the arcus engine — the source of truth
+    element    what one Map element contains               (pure)
+    engine     the vtable                           (all raw pointers)
+  usearch/   search them — a cache of the arcus side
+    index      the wrapper: capacity and key mapping
+    metric     distance measures
+    threads    the reserved-context invariant
+  registry   the live pairs, and rebuilding one side from the other
+  error      one error type, and who gets blamed for it
 ```
 
-One file per idea, and one directory — `protocol/`, because the wire really is
-three stages: read the tokens, type them, hold the request while its body arrives.
+`lib.rs` is the C ABI and nothing else: four callbacks and a descriptor.
+Everything a command means lives under `command/`, which calls exactly two
+things — `arcus` to store, `usearch` to search. Those two never call each other.
 
-`vector` is the pair `Quant` and `Layout`: how a coordinate is represented and
-where those bytes sit in an element. They are one decision, not two, and they
-belong to neither external system. `store` writes exactly those bytes into a Map
-element and `index` hands exactly those bytes to usearch — which is why rebuilding
-an index from the store is lossless, and why splitting them across the two sides
-would have been wrong.
+The split of `arcus/` is worth spelling out, because it is not "everything that
+uses the engine". `element` makes no engine calls at all; it is there because its
+shape is arcus's to dictate — the size ceiling is `max_element_bytes`, the fixed
+144-byte overhead is chosen to land in arcus's slab classes, and the scalar kind
+it records is what gets written into a Map element. So the directory is *how a
+vector is stored in arcus*, of which the vtable calls are only the last step.
 
-Dependencies run one way. `store` and `index` both use `vector`; `index` knows it
-is a cache of `store`; `store` never knows `index` exists. `registry` is the only
-thing that holds both.
+`usearch/index` depends on `arcus/element` for that same reason: the index is
+configured from the stored layout, and it is handed the very bytes the store
+holds. That is what makes a rebuild lossless, and it fixes the direction —
+the cache knows the store, never the reverse.
 
-Two boundaries carry most of the weight:Two boundaries carry most of the weight:
+Two boundaries carry most of the weight:Two boundaries carry most of the weight:Two boundaries carry most of the weight:
 
-**Parsing never touches state.** `protocol::request` turns tokens into `Line` /
-`Body` values and stops. `command` handlers take those values and never see a
+**Parsing never touches state.** `command::request` turns tokens into `Line` /
+`Body` values and stops. `command::handler` takes those values and never sees a
 token. So syntax has exactly one home, and handlers are reachable from unit tests
 without a server.
 
-**Raw pointers live only in `store`.** `Store::for_cookie` is the single `unsafe`
-constructor; every method below it takes `&self` and returns owned or borrowed Rust
-values. `vector` and `filter` are pure and have no idea a daemon exists.
+**Raw pointers live only in `arcus::engine`.** `Store::for_cookie` is the single
+`unsafe` constructor; every method below it takes `&self` and returns owned or
+borrowed Rust values. `arcus::element` and `command::filter` are pure and have no
+idea a daemon exists.
 
 ---
 

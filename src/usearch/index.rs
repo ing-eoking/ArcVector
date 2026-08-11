@@ -1,31 +1,27 @@
-//! usearch index wrapper: concurrency gating, capacity growth and id mapping.
+//! The usearch index itself: capacity, the key mapping, and add/search/remove.
 //!
-//! # Why the semaphore exists
+//! usearch keys are `u64` while ours are strings, so this owns both directions of
+//! that mapping. The `key -> id` side is lock-free on purpose: the search
+//! predicate reads it once per visited graph node.
 //!
-//! usearch's Rust bindings always call into C++ with `any_thread()`, which pops a
-//! context from a **fixed-size pool**. When the pool is empty it does not block —
-//! it fails with "Reserve capacity ahead of insertions!". Since arcus allows more
-//! worker threads than any constant we could assume (`-t` above 64 only warns),
-//! correctness cannot rest on the worker count.
-//!
-//! Instead we hold the invariant
-//!
-//! ```text
-//! concurrent entries into usearch <= permits == reserved thread contexts
-//! ```
-//!
-//! by gating every `add`/`search`/`remove` on a semaphore whose permit count equals
-//! the reserved context count. Excess workers wait instead of failing.
+//! Concurrency has two halves. usearch guards concurrent construction, search and
+//! updates internally, so those take a **read** lock; the `RwLock` exists only to
+//! make `reserve` exclusive, since that reallocates the node arrays. The other
+//! half — not exhausting usearch's thread-context pool — lives in
+//! [`super::threads`].
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, PoisonError, RwLock};
+use std::sync::{PoisonError, RwLock};
 
-use usearch::{Index, IndexOptions, MetricKind, ScalarKind, b1x8, f16};
+// `::` because this module shares a name with the crate it wraps.
+use ::usearch::{Index, IndexOptions, ScalarKind, b1x8, f16};
 
+use super::metric::Metric;
+use super::threads::Semaphore;
+use crate::arcus::element::Layout;
+use crate::arcus::element::Quant;
 use crate::error::Error;
-use crate::vector::Layout;
-use crate::vector::Quant;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -35,119 +31,12 @@ fn usearch_err(e: impl std::fmt::Display) -> Error {
     Error::Index(e.to_string())
 }
 
-/// Distance metric. Restricted per quantization by [`Metric::check_quant`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Metric {
-    Cos,
-    L2,
-    IP,
-    Hamming,
-    Tanimoto,
-}
-
-impl Metric {
-    pub fn parse(s: &str) -> Option<Metric> {
-        match s.to_ascii_lowercase().as_str() {
-            "cos" | "cosine" => Some(Metric::Cos),
-            "l2" | "l2sq" | "euclidean" => Some(Metric::L2),
-            "ip" | "dot" => Some(Metric::IP),
-            "hamming" => Some(Metric::Hamming),
-            "tanimoto" | "jaccard" => Some(Metric::Tanimoto),
-            _ => None,
-        }
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Metric::Cos => "cos",
-            Metric::L2 => "l2",
-            Metric::IP => "ip",
-            Metric::Hamming => "hamming",
-            Metric::Tanimoto => "tanimoto",
-        }
-    }
-
-    const fn kind(self) -> MetricKind {
-        match self {
-            Metric::Cos => MetricKind::Cos,
-            Metric::L2 => MetricKind::L2sq,
-            Metric::IP => MetricKind::IP,
-            Metric::Hamming => MetricKind::Hamming,
-            Metric::Tanimoto => MetricKind::Tanimoto,
-        }
-    }
-
-    /// Reject metric/quantization pairs whose distances would be meaningless.
-    pub fn check_quant(self, quant: Quant) -> Result<()> {
-        let bitwise = matches!(self, Metric::Hamming | Metric::Tanimoto);
-        match (quant, bitwise) {
-            (Quant::B1, false) => Err(Error::bad_request(format!(
-                "quantization b1 requires a bitwise metric (hamming or tanimoto), got {self}"
-            ))),
-            (q, true) if q != Quant::B1 => Err(Error::bad_request(format!(
-                "metric {self} requires quantization b1, got {q}"
-            ))),
-            _ => Ok(()),
-        }
-    }
-}
-
-impl std::fmt::Display for Metric {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 const fn scalar_kind(q: Quant) -> ScalarKind {
     match q {
         Quant::F32 => ScalarKind::F32,
         Quant::F16 => ScalarKind::F16,
         Quant::I8 => ScalarKind::I8,
         Quant::B1 => ScalarKind::B1,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Semaphore
-// ---------------------------------------------------------------------------
-
-struct Semaphore {
-    avail: Mutex<usize>,
-    cv: Condvar,
-}
-
-impl Semaphore {
-    fn new(n: usize) -> Self {
-        Semaphore {
-            avail: Mutex::new(n.max(1)),
-            cv: Condvar::new(),
-        }
-    }
-
-    fn acquire(&self) -> Permit<'_> {
-        let mut avail = self.avail.lock().unwrap_or_else(PoisonError::into_inner);
-        while *avail == 0 {
-            avail = self.cv.wait(avail).unwrap_or_else(PoisonError::into_inner);
-        }
-        *avail -= 1;
-        Permit { sem: self }
-    }
-}
-
-struct Permit<'a> {
-    sem: &'a Semaphore,
-}
-
-impl Drop for Permit<'_> {
-    fn drop(&mut self) {
-        let mut avail = self
-            .sem
-            .avail
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        *avail += 1;
-        drop(avail);
-        self.sem.cv.notify_one();
     }
 }
 
@@ -164,22 +53,6 @@ struct IdSlot {
 // Index
 // ---------------------------------------------------------------------------
 
-/// Thread contexts reserved per index, and therefore the semaphore's permit
-/// count. Not a client-facing setting: it follows from how many worker threads
-/// the server runs, which the client has no view of.
-///
-/// The value is not correctness-critical — the semaphore holds the invariant for
-/// any value — so it is purely a throughput/memory tradeoff. Below the worker
-/// count, excess workers queue briefly; above it, the surplus per-thread buffers
-/// are wasted (usearch allocates `bytes_per_vector * threads` for casting, so a
-/// 4096-dimension f32 index costs about 1 MB here). 64 is chosen because `-t`
-/// only warns past that (memcached.c:16107), so it covers every reachable worker
-/// count without queueing.
-///
-/// Deriving it from `settings.num_threads` was considered and rejected: the
-/// symbol is exported, but reading it needs the `struct settings` layout, whose
-/// field offsets shift with build-time `#ifdef`s.
-pub const THREAD_SLOTS: usize = 64;
 const MIN_CAPACITY: usize = 1024;
 
 pub struct AnnIndex {
@@ -423,82 +296,22 @@ fn to_i8(bytes: &[u8]) -> Vec<i8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arcus::element::Quant;
+    use crate::usearch::metric::Metric;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
-
-    #[test]
-    fn metric_quant_compatibility() {
-        assert!(Metric::Cos.check_quant(Quant::I8).is_ok());
-        assert!(Metric::L2.check_quant(Quant::F32).is_ok());
-        assert!(Metric::Hamming.check_quant(Quant::B1).is_ok());
-        assert!(Metric::Tanimoto.check_quant(Quant::B1).is_ok());
-
-        // b1 vectors carry no magnitude, so cosine/L2/IP are meaningless.
-        assert!(Metric::Cos.check_quant(Quant::B1).is_err());
-        // ...and bitwise metrics are meaningless on non-bit vectors.
-        assert!(Metric::Hamming.check_quant(Quant::F32).is_err());
-    }
-
-    #[test]
-    fn metric_names_roundtrip() {
-        for m in [
-            Metric::Cos,
-            Metric::L2,
-            Metric::IP,
-            Metric::Hamming,
-            Metric::Tanimoto,
-        ] {
-            assert_eq!(Metric::parse(m.as_str()), Some(m));
-        }
-        assert_eq!(Metric::parse("cosine"), Some(Metric::Cos));
-        assert_eq!(Metric::parse("nonsense"), None);
-    }
-
-    #[test]
-    fn semaphore_bounds_concurrent_holders() {
-        let sem = Arc::new(Semaphore::new(3));
-        let live = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-
-        let mut handles = Vec::new();
-        for _ in 0..16 {
-            let sem = Arc::clone(&sem);
-            let live = Arc::clone(&live);
-            let peak = Arc::clone(&peak);
-            handles.push(std::thread::spawn(move || {
-                for _ in 0..200 {
-                    let _p = sem.acquire();
-                    let n = live.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(n, Ordering::SeqCst);
-                    std::thread::yield_now();
-                    live.fetch_sub(1, Ordering::SeqCst);
-                }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        // This is the invariant that keeps usearch's context pool from draining.
-        assert!(
-            peak.load(Ordering::SeqCst) <= 3,
-            "peak {}",
-            peak.load(Ordering::SeqCst)
-        );
-        assert_eq!(live.load(Ordering::SeqCst), 0);
-    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn build(dim: usize, quant: Quant, metric: Metric, threads: usize) -> AnnIndex {
         AnnIndex::new(Layout::new(dim, quant), metric, 0, 0, 0, threads).unwrap()
     }
 
     fn add(idx: &AnnIndex, id: &str, coords: &[f32]) {
-        idx.add(id, &crate::vector::encode(coords, idx.layout.quant))
+        idx.add(id, &crate::arcus::element::encode(coords, idx.layout.quant))
             .unwrap();
     }
 
     fn search(idx: &AnnIndex, coords: &[f32], k: usize) -> Vec<String> {
-        let q = crate::vector::encode(coords, idx.layout.quant);
+        let q = crate::arcus::element::encode(coords, idx.layout.quant);
         idx.search(&q, k, |_| true)
             .unwrap()
             .into_iter()
@@ -543,7 +356,7 @@ mod tests {
         add(&idx, "keep", &[1.0, 0.0, 0.0, 0.0]);
         add(&idx, "skip", &[1.0, 0.0, 0.0, 0.0]);
 
-        let q = crate::vector::encode(&[1.0, 0.0, 0.0, 0.0], Quant::F32);
+        let q = crate::arcus::element::encode(&[1.0, 0.0, 0.0, 0.0], Quant::F32);
         let hits = idx
             .search(&q, 10, |key| idx.id_of(key) == Some("keep"))
             .unwrap();
@@ -609,7 +422,7 @@ mod tests {
             let idx = Arc::clone(&idx);
             let failures = Arc::clone(&failures);
             handles.push(std::thread::spawn(move || {
-                let q = crate::vector::encode(
+                let q = crate::arcus::element::encode(
                     &[t as f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
                     Quant::F32,
                 );
@@ -637,10 +450,11 @@ mod tests {
                     let id = format!("t{t}-{i}");
                     idx.add(
                         &id,
-                        &crate::vector::encode(&[t as f32, i as f32, 0.0, 0.0], Quant::F32),
+                        &crate::arcus::element::encode(&[t as f32, i as f32, 0.0, 0.0], Quant::F32),
                     )
                     .unwrap();
-                    let q = crate::vector::encode(&[t as f32, i as f32, 0.0, 0.0], Quant::F32);
+                    let q =
+                        crate::arcus::element::encode(&[t as f32, i as f32, 0.0, 0.0], Quant::F32);
                     let _ = idx.search(&q, 3, |_| true).unwrap();
                 }
             }));
@@ -665,18 +479,5 @@ mod tests {
         let idx = build(4, Quant::F32, Metric::L2, 2);
         assert!(idx.add("a", &[0u8; 8]).is_err());
         assert!(idx.search(&[0u8; 8], 1, |_| true).is_err());
-    }
-
-    #[test]
-    fn semaphore_permits_are_returned_on_panic_unwind() {
-        let sem = Arc::new(Semaphore::new(1));
-        let s2 = Arc::clone(&sem);
-        let _ = std::thread::spawn(move || {
-            let _p = s2.acquire();
-            panic!("boom");
-        })
-        .join();
-        // If Drop had not run, this would deadlock.
-        let _p = sem.acquire();
     }
 }

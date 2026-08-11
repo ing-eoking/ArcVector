@@ -1,20 +1,24 @@
 //! ArcVector — vector similarity search as an arcus ASCII protocol extension.
 //!
-//! The store holds vectors, the index finds them, and the registry pairs the two:
+//! Three tiers, and the top level is the architecture:
 //!
 //! ```text
-//! lib.rs        registration and the four memcached callbacks  <- FFI boundary
-//!   protocol/   the wire — memcached's ASCII protocol
-//!     tokens      read the token array, write the reply
-//!     request     command line -> typed request                (pure)
-//!     pending     a command waiting for its body
-//!   vector      what a stored vector is: scalar kind + byte layout  (pure)
-//!   filter      attribute filter expressions                        (pure)
-//!   store       arcus Map — holds vectors, the source of truth  (raw pointers)
-//!   index       usearch — finds them, a cache of the store
-//!   registry    the live store/index pairs, and the rebuild
-//!   command     one handler per command
-//!   error       one error type, and who gets blamed for it
+//! lib.rs       the C ABI — registration and memcached's four callbacks
+//!   command/   receive a command, interpret it, run it
+//!     tokens     read the token array, write the reply
+//!     request    command line -> typed request              (pure)
+//!     pending    a command waiting for its body
+//!     filter     the FILTER clause's little language        (pure)
+//!     handler    do the work, calling the two backends
+//!   arcus/     store vectors in the arcus engine — the source of truth
+//!     element    what one Map element contains              (pure)
+//!     engine     the vtable                          (all raw pointers)
+//!   usearch/   search them — a cache of the arcus side
+//!     index      the wrapper: capacity and key mapping
+//!     metric     distance measures
+//!     threads    the reserved-context invariant
+//!   registry   the live pairs, and rebuilding one side from the other
+//!   error      one error type, and who gets blamed for it
 //! ```
 //!
 //! The single consistency rule: **the usearch index is a cache rebuildable from
@@ -40,90 +44,23 @@ pub mod engine_api {
     include!(concat!(env!("OUT_DIR"), "/engine_api.rs"));
 }
 
+pub mod arcus;
 pub mod command;
 pub mod error;
-pub mod filter;
-pub mod index;
-pub mod protocol;
 pub mod registry;
-pub mod store;
-pub mod vector;
+pub mod usearch;
 
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
+use command::pending;
+use command::request::{self, MAX_BODY_BYTES};
+use command::tokens::{Responder, ResponseHandler, Tokens};
 use engine_api::{
     EXTENSION_ASCII_PROTOCOL_DESCRIPTOR, EXTENSION_ERROR_CODE,
     EXTENSION_ERROR_CODE_EXTENSION_FATAL, EXTENSION_ERROR_CODE_EXTENSION_SUCCESS, GET_SERVER_API,
     extension_type_t_EXTENSION_ASCII_PROTOCOL, token_t,
 };
-use error::{Error, Reply, Result};
-use protocol::pending;
-use protocol::request::{self, Body, Line, MAX_BODY_BYTES};
-use protocol::tokens::{Responder, ResponseHandler, Tokens};
-use store::{Store, StoreError};
-
-/// Engine access for the callback currently running.
-///
-/// # Safety
-///
-/// `cookie` must be the cookie memcached passed to that callback.
-unsafe fn store_for(cookie: *const c_void) -> Result<Store> {
-    // SAFETY: guaranteed by the caller.
-    unsafe { Store::for_cookie(cookie) }.ok_or(Error::Store(StoreError::Unavailable))
-}
-
-/// Run a request whose command line said everything.
-fn run_line(store: &Store, line: Line) -> Result<Reply> {
-    match line {
-        Line::Create(spec) => command::vcreate(store, &spec),
-        Line::SimKey(spec) => command::vsim_key(store, &spec),
-        Line::Get { index, id } => command::vget(store, index, id),
-        Line::Del { index, id } => command::vdel(store, index, id),
-        Line::Drop { index } => command::vdrop(store, index),
-        Line::List => command::vlist(),
-    }
-}
-
-/// Run a request once its body has arrived.
-fn run_body(store: &Store, body: Body, bytes: &[u8]) -> Result<Reply> {
-    match body {
-        Body::Add(spec) => command::vadd(store, &spec, bytes),
-        Body::Sim(spec) => command::vsim_vector(store, &spec, bytes),
-    }
-}
-
-/// Route one command line, or resume one whose body has arrived.
-///
-/// # Safety
-///
-/// `tokens` must borrow the argument vector memcached passed to `execute`, and
-/// `cookie` must be that call's connection cookie.
-unsafe fn dispatch(cookie: *const c_void, tokens: &Tokens) -> Result<Reply> {
-    // SAFETY: guaranteed by the caller.
-    let store = unsafe { store_for(cookie) };
-
-    // An empty argument vector means a body arrived for a two-phase command.
-    if tokens.is_empty() {
-        let pending =
-            pending::take_body(cookie).ok_or_else(|| Error::bad_request("lost command state"))?;
-        let (request, bytes) = pending.into_parts();
-        return run_body(&store?, request?, &bytes);
-    }
-
-    // A body-carrying line reaching `execute` means `accept` could not size its
-    // body; otherwise the body phase above would have handled it.
-    if let Some(at) = request::body_length_at(tokens) {
-        let what = if at == 3 {
-            "vector length"
-        } else {
-            "vector bytes"
-        };
-        return Err(request::body_length_error(tokens, at, what));
-    }
-
-    run_line(&store?, request::parse_line(tokens)?)
-}
 
 /// Decide how much body a command needs before it can run.
 ///
@@ -188,7 +125,7 @@ unsafe extern "C" fn execute_vector_cmd(
     // SAFETY: guaranteed by the caller.
     let tokens = unsafe { Tokens::new(argv, argc) };
     // SAFETY: `cookie` belongs to the call in progress.
-    let outcome = unsafe { dispatch(cookie, &tokens) };
+    let outcome = unsafe { command::dispatch(cookie, &tokens) };
     Responder::new(handler, cookie).reply(outcome);
     true
 }
@@ -222,7 +159,7 @@ pub extern "C" fn memcached_extensions_initialize(
     let Some(get_api) = get_server_api else {
         return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
     };
-    store::set_server_api(get_api);
+    arcus::engine::set_server_api(get_api);
 
     // SAFETY: memcached hands us a live SERVER_HANDLE_V1 accessor, and the
     // descriptor is a process-lifetime static that the server only reads.

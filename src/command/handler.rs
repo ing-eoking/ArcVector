@@ -1,18 +1,18 @@
 //! Command handlers.
 //!
 //! Every handler returns `Result<Reply>`; turning that into an ASCII response is
-//! [`crate::protocol::tokens::Responder::reply`]'s job, so nothing here formats errors.
+//! [`crate::command::tokens::Responder::reply`]'s job, so nothing here formats errors.
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
 
+use super::filter::Filter;
+use super::request::{Add, Create, Sim, SimKey};
+use crate::arcus::element::{self, Layout};
+use crate::arcus::engine::{Store, StoreError};
 use crate::error::{Error, Reply, Result};
-use crate::filter::Filter;
-use crate::index::{AnnIndex, THREAD_SLOTS};
-use crate::protocol::request::{Add, Create, Sim, SimKey};
 use crate::registry::{self, VectorIndex};
-use crate::store::{Store, StoreError};
-use crate::vector::{self, Layout};
+use crate::usearch::{AnnIndex, THREAD_SLOTS};
 
 /// Parse whitespace-separated decimal coordinates.
 ///
@@ -177,7 +177,7 @@ pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
         return Ok(Reply::Overflowed);
     }
 
-    let quantized = vector::encode(&vector, layout.quant);
+    let quantized = element::encode(&vector, layout.quant);
     let value = layout.encode(&quantized, attr)?;
 
     // Map first: it is the source of truth. If the usearch insert below fails,
@@ -217,7 +217,7 @@ fn similar(
 
     // Reused across predicate calls so the hot path allocates nothing after the
     // first visited node.
-    let scratch = RefCell::new(Vec::with_capacity(vector::ATTR_BYTES));
+    let scratch = RefCell::new(Vec::with_capacity(element::ATTR_BYTES));
     let accept = |key: u64| -> bool {
         let Some(filter) = filter else {
             return true;
@@ -286,7 +286,7 @@ pub fn vsim_vector(store: &Store, spec: &Sim, body: &[u8]) -> Result<Reply> {
 
     let mut out = String::new();
     for (query_no, query) in coord_vectors(body, dim, "query")?.iter().enumerate() {
-        let quantized = vector::encode(query, layout.quant);
+        let quantized = element::encode(query, layout.quant);
         similar(store, &index, &quantized, k, filter, query_no, &mut out)?;
     }
     out.push_str("END\r\n");
@@ -387,7 +387,7 @@ pub fn vlist() -> Result<Reply> {
             layout.dim,
             layout.quant,
             index.ann.metric,
-            vector::ATTR_BYTES,
+            element::ATTR_BYTES,
             index.ann.len(),
             index.maxcount,
         );

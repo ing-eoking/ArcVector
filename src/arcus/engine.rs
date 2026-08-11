@@ -16,12 +16,12 @@ use std::ptr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
+use crate::arcus::element::Layout;
 use crate::engine_api::{
     ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT, ENGINE_ERROR_CODE_ENGINE_EOVERFLOW,
     ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT, ENGINE_ERROR_CODE_ENGINE_SUCCESS, ENGINE_HANDLE,
     SERVER_HANDLE_V1, eitem, eitem_info, elems_result, engine_interface_v1, field_t, item_attr,
 };
-use crate::vector::Layout;
 
 unsafe extern "C" {
     fn free(ptr: *mut c_void);
