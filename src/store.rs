@@ -110,6 +110,14 @@ fn translate(code: u32) -> StoreError {
     }
 }
 
+/// Length of a key or field as the engine's `int` parameters want it.
+///
+/// The protocol bounds keys at 250 bytes and fields at `MAX_FIELD_LENG`, so this
+/// cannot truncate in practice; saturate rather than wrap if that ever changes.
+fn as_int(len: usize) -> c_int {
+    c_int::try_from(len).unwrap_or(c_int::MAX)
+}
+
 fn check(code: u32) -> Result<()> {
     if code == ENGINE_ERROR_CODE_ENGINE_SUCCESS {
         Ok(())
@@ -208,7 +216,7 @@ impl Store {
                 self.handle(),
                 self.cookie,
                 key.as_ptr().cast::<c_void>(),
-                key.len() as c_int,
+                as_int(key.len()),
                 ptr::from_mut(&mut attr),
                 0,
             )
@@ -252,7 +260,7 @@ impl Store {
                 self.handle(),
                 self.cookie,
                 key.as_ptr().cast::<c_void>(),
-                key.len() as c_int,
+                as_int(key.len()),
                 field.len(),
                 value.len(),
                 ptr::from_mut(&mut item),
@@ -299,7 +307,7 @@ impl Store {
                 self.handle(),
                 self.cookie,
                 key.as_ptr().cast::<c_void>(),
-                key.len() as c_int,
+                as_int(key.len()),
                 item,
                 true, // replace_if_exist
                 ptr::null_mut(),
@@ -330,7 +338,7 @@ impl Store {
                 self.handle(),
                 self.cookie,
                 key.as_ptr().cast::<c_void>(),
-                key.len() as c_int,
+                as_int(key.len()),
                 1,
                 ptr::from_ref(&selector),
                 false, // drop_if_empty: an emptied index must keep existing
@@ -381,7 +389,7 @@ impl Store {
                 self.handle(),
                 self.cookie,
                 key.as_ptr().cast::<c_void>(),
-                key.len() as c_int,
+                as_int(key.len()),
                 numfields,
                 flist,
                 false, // delete

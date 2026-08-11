@@ -9,10 +9,10 @@ use std::fmt::Write as _;
 use crate::codec::{self, Layout};
 use crate::error::{Error, Reply, Result};
 use crate::filter::Filter;
-use crate::index::{self, AnnIndex, Metric};
-use crate::protocol::{AddSpec, SimSpec, Tokens};
-use crate::quant::{self, Quant};
+use crate::index::AnnIndex;
+use crate::quant;
 use crate::registry::{self, VectorIndex};
+use crate::request::{self, Add, Create, Sim, SimKey};
 use crate::store::{Store, StoreError};
 
 /// Parse whitespace-separated decimal coordinates.
@@ -68,102 +68,26 @@ fn coords(text: &[u8], dim: usize, what: &str) -> Result<Vec<f32>> {
 // vcreate
 // ---------------------------------------------------------------------------
 
-/// Everything `vcreate` can be told, with the defaults it falls back to.
-struct Options {
-    metric: Metric,
-    quant: Quant,
-    connectivity: usize,
-    expansion_add: usize,
-    expansion_search: usize,
-    maxcount: Option<u32>,
-    exptime: Option<u32>,
-}
+pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
+    let Create {
+        index: name,
+        dim,
+        metric,
+        quant,
+        ..
+    } = *spec;
 
-impl Default for Options {
-    fn default() -> Options {
-        Options {
-            metric: Metric::Cos,
-            quant: Quant::F32,
-            connectivity: 0,
-            expansion_add: 0,
-            expansion_search: 0,
-            maxcount: None,
-            exptime: None,
-        }
-    }
-}
-
-impl Options {
-    fn parse(tokens: &Tokens, from: usize) -> Result<Options> {
-        let mut opts = Options::default();
-        for (key, raw) in tokens.options(from)? {
-            let number = |kind: &str| -> Result<usize> {
-                raw.parse::<usize>()
-                    .map_err(|_| Error::bad_request(format!("invalid {kind} '{raw}'")))
-            };
-            match key.as_str() {
-                "METRIC" => {
-                    opts.metric = Metric::parse(raw)
-                        .ok_or_else(|| Error::bad_request(format!("unknown metric '{raw}'")))?;
-                }
-                "QUANT" => {
-                    opts.quant = Quant::parse(raw).ok_or_else(|| {
-                        Error::bad_request(format!("unknown quantization '{raw}'"))
-                    })?;
-                }
-                "M" => opts.connectivity = number("M")?,
-                "EFC" => opts.expansion_add = number("EFC")?,
-                "EFS" => opts.expansion_search = number("EFS")?,
-                // item_attr.maxcount is an i32, so anything past its range
-                // would wrap to a negative limit.
-                "MAXCOUNT" => {
-                    let n = number("MAXCOUNT")?;
-                    if n == 0 || n > i32::MAX as usize {
-                        return Err(Error::bad_request(
-                            "MAXCOUNT must be between 1 and 2147483647",
-                        ));
-                    }
-                    opts.maxcount = Some(n as u32);
-                }
-                "EXPTIME" => {
-                    let n = number("EXPTIME")?;
-                    if n > u32::MAX as usize {
-                        return Err(Error::bad_request("EXPTIME is out of range"));
-                    }
-                    opts.exptime = Some(n as u32);
-                }
-                other => return Err(Error::bad_request(format!("unknown option {other}"))),
-            }
-        }
-        Ok(opts)
-    }
-}
-
-pub fn vcreate(store: &Store, tokens: &Tokens) -> Result<Reply> {
-    if tokens.len() < 3 {
-        return Err(Error::bad_request("bad command line format"));
-    }
-    let name = tokens.text(1)?;
-    let dim: usize = tokens.parse(2, "dimension")?;
-    if dim == 0 || dim > u16::MAX as usize {
-        return Err(Error::bad_request("dimension out of range (1..65535)"));
-    }
-
-    let opts = Options::parse(tokens, 3)?;
-    opts.metric.check_quant(opts.quant)?;
-
-    // The Map element size limit is the index's real dimension ceiling. The
-    // engine does not enforce it on the API path and an oversized element has
-    // been observed to abort the daemon, so it is checked here.
+    // The Map element size limit is the index's real dimension ceiling. The engine
+    // does not enforce it on the API path and an oversized element has been
+    // observed to abort the daemon, so it is checked here.
     let limit = store.max_element_bytes() as usize;
-    let layout = Layout::new(dim, opts.quant);
+    let layout = Layout::new(dim, quant);
     if layout.element_len() > limit {
-        let max_dim = Layout::max_dim_for(opts.quant, limit);
         return Err(Error::bad_request(format!(
             "element would be {} bytes, over max_element_bytes {limit} \
-             (max dimension is {max_dim} for quant {})",
+             (max dimension is {} for quant {quant})",
             layout.element_len(),
-            opts.quant,
+            Layout::max_dim_for(quant, limit),
         )));
     }
 
@@ -173,21 +97,21 @@ pub fn vcreate(store: &Store, tokens: &Tokens) -> Result<Reply> {
 
     let ann = AnnIndex::new(
         layout,
-        opts.metric,
-        opts.connectivity,
-        opts.expansion_add,
-        opts.expansion_search,
-        index::THREAD_SLOTS,
+        metric,
+        spec.connectivity,
+        spec.expansion_add,
+        spec.expansion_search,
+        request::THREAD_SLOTS,
     )?;
 
-    if store.create_map(name, opts.maxcount, opts.exptime).is_err() {
-        // The engine may still hold an orphan Map from before a restart. Clear
-        // it and retry once so module and engine resynchronize.
+    if store.create_map(name, spec.maxcount, spec.exptime).is_err() {
+        // The engine may still hold an orphan Map from before a restart. Clear it
+        // and retry once so module and engine resynchronize.
         store.drop_map(name)?;
-        store.create_map(name, opts.maxcount, opts.exptime)?;
+        store.create_map(name, spec.maxcount, spec.exptime)?;
     }
 
-    let maxcount = opts.maxcount.unwrap_or_else(|| store.max_map_size());
+    let maxcount = spec.maxcount.unwrap_or_else(|| store.max_map_size());
     // Freshly created, so there is nothing in Map to rebuild from.
     let created = registry::insert(VectorIndex::new(name.to_owned(), ann, maxcount, true));
     Ok(if created {
@@ -206,8 +130,8 @@ pub fn vcreate(store: &Store, tokens: &Tokens) -> Result<Reply> {
 /// Both the byte count and the dimension are supplied, so a client that
 /// miscounts is told which of the two disagrees instead of having its bytes
 /// silently reinterpreted.
-pub fn vadd(store: &Store, spec: &AddSpec, body: &[u8]) -> Result<Reply> {
-    let AddSpec {
+pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
+    let Add {
         index: name,
         id,
         dim,
@@ -341,8 +265,8 @@ fn similar(
 /// The body holds `bytes` of little-endian `f32`, which is `bytes / (dim * 4)`
 /// query vectors searched in one round trip. Each contributes one `QUERY` group
 /// of up to `num` neighbours.
-pub fn vsim_vector(store: &Store, spec: &SimSpec, body: &[u8]) -> Result<Reply> {
-    let SimSpec {
+pub fn vsim_vector(store: &Store, spec: &Sim, body: &[u8]) -> Result<Reply> {
+    let Sim {
         index: name,
         k,
         dim,
@@ -375,13 +299,15 @@ pub fn vsim_vector(store: &Store, spec: &SimSpec, body: &[u8]) -> Result<Reply> 
 /// Searches using a vector already in the index, so no body is transferred. The
 /// stored bytes are handed to usearch as they are — already quantized, so there
 /// is no re-encoding step.
-pub fn vsim_key(
-    store: &Store,
-    name: &str,
-    k: usize,
-    key: &str,
-    filter: Option<&Filter>,
-) -> Result<Reply> {
+pub fn vsim_key(store: &Store, spec: &SimKey) -> Result<Reply> {
+    let SimKey {
+        index: name,
+        key,
+        k,
+        filter,
+    } = spec;
+    let (k, filter) = (*k, filter.as_ref());
+
     let index = registry::require(name)?;
     index.ensure_built(store)?;
 
@@ -402,12 +328,7 @@ pub fn vsim_key(
 // vget / vdel / vdrop / vlist
 // ---------------------------------------------------------------------------
 
-pub fn vget(store: &Store, tokens: &Tokens) -> Result<Reply> {
-    if tokens.len() != 3 {
-        return Err(Error::bad_request("bad command line format"));
-    }
-    let name = tokens.text(1)?;
-    let id = tokens.text(2)?;
+pub fn vget(store: &Store, name: &str, id: &str) -> Result<Reply> {
     let index = registry::require(name)?;
 
     match store.get_elem(name, id) {
@@ -424,12 +345,7 @@ pub fn vget(store: &Store, tokens: &Tokens) -> Result<Reply> {
     }
 }
 
-pub fn vdel(store: &Store, tokens: &Tokens) -> Result<Reply> {
-    if tokens.len() != 3 {
-        return Err(Error::bad_request("bad command line format"));
-    }
-    let name = tokens.text(1)?;
-    let id = tokens.text(2)?;
+pub fn vdel(store: &Store, name: &str, id: &str) -> Result<Reply> {
     let index = registry::require(name)?;
 
     // Map first, then the cache. A failure to drop the graph node only leaves a
@@ -448,12 +364,7 @@ pub fn vdel(store: &Store, tokens: &Tokens) -> Result<Reply> {
     })
 }
 
-pub fn vdrop(store: &Store, tokens: &Tokens) -> Result<Reply> {
-    if tokens.len() != 2 {
-        return Err(Error::bad_request("bad command line format"));
-    }
-    let name = tokens.text(1)?;
-
+pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {
     let known = registry::remove(name);
     // Try the engine delete regardless, so an orphan Map left by a restart can
     // still be cleaned up through vdrop.
@@ -466,10 +377,7 @@ pub fn vdrop(store: &Store, tokens: &Tokens) -> Result<Reply> {
     })
 }
 
-pub fn vlist(tokens: &Tokens) -> Result<Reply> {
-    if tokens.len() != 1 {
-        return Err(Error::bad_request("bad command line format"));
-    }
+pub fn vlist() -> Result<Reply> {
     let mut out = String::new();
     for index in registry::snapshot() {
         let layout = &index.ann.layout;
@@ -492,51 +400,6 @@ pub fn vlist(tokens: &Tokens) -> Result<Reply> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn parse_options(args: &[&str]) -> Result<Options> {
-        let raw: Vec<crate::engine_api::token_t> = args
-            .iter()
-            .map(|s| crate::engine_api::token_t {
-                value: s.as_ptr().cast::<std::os::raw::c_char>().cast_mut(),
-                length: s.len(),
-            })
-            .collect();
-        // SAFETY: `raw` outlives the view and the parse that borrows from it.
-        let tokens = unsafe { Tokens::new(raw.as_ptr(), raw.len() as std::os::raw::c_int) };
-        Options::parse(&tokens, 3)
-    }
-
-    #[test]
-    fn options_are_parsed_case_insensitively() {
-        let o = parse_options(&["vcreate", "docs", "8", "quant", "i8", "metric", "l2"]).unwrap();
-        assert_eq!(o.quant, Quant::I8);
-        assert_eq!(o.metric, Metric::L2);
-    }
-
-    #[test]
-    fn unknown_options_and_values_are_rejected() {
-        assert!(parse_options(&["vcreate", "docs", "8", "NOPE", "1"]).is_err());
-        assert!(parse_options(&["vcreate", "docs", "8", "QUANT", "f64"]).is_err());
-        assert!(parse_options(&["vcreate", "docs", "8", "METRIC", "manhattan"]).is_err());
-        // FBYTES is gone: ATTR is a fixed 128 bytes. THREADS is gone too: it
-        // describes the server, not the index.
-        assert!(parse_options(&["vcreate", "docs", "8", "FBYTES", "128"]).is_err());
-        assert!(parse_options(&["vcreate", "docs", "8", "THREADS", "8"]).is_err());
-    }
-
-    #[test]
-    fn maxcount_is_bounded_by_the_engines_i32_field() {
-        // item_attr.maxcount is an i32; without this guard 2^31 would wrap to a
-        // negative limit and the index would reject every insert.
-        assert_eq!(
-            parse_options(&["vcreate", "docs", "8", "MAXCOUNT", "2147483647"])
-                .unwrap()
-                .maxcount,
-            Some(2_147_483_647)
-        );
-        assert!(parse_options(&["vcreate", "docs", "8", "MAXCOUNT", "2147483648"]).is_err());
-        assert!(parse_options(&["vcreate", "docs", "8", "MAXCOUNT", "0"]).is_err());
-    }
 
     #[test]
     fn coordinates_are_parsed_from_text() {
@@ -592,13 +455,5 @@ mod tests {
     #[test]
     fn a_zero_dimension_does_not_divide_by_zero() {
         assert!(coord_vectors(b"1 2", 0, "query").is_err());
-    }
-
-    #[test]
-    fn options_default_to_a_usable_index() {
-        let o = Options::default();
-        assert_eq!(o.metric, Metric::Cos);
-        assert_eq!(o.quant, Quant::F32);
-        assert!(o.maxcount.is_none());
     }
 }
