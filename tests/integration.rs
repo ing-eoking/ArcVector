@@ -329,6 +329,55 @@ fn maxcount_stops_inserts_at_the_limit() {
 }
 
 #[test]
+fn vstats_reports_module_memory_and_follows_the_vector_count() {
+    session!(_daemon, client);
+    let ix = index_name("stats");
+    client.send(&format!("vcreate {ix} 4"));
+
+    let stat = |body: &str, key: &str| -> usize {
+        let needle = format!("STAT {key} ");
+        body.lines()
+            .find_map(|l| l.trim_end().strip_prefix(&needle)?.parse().ok())
+            .unwrap_or_else(|| panic!("no {key} in:\n{body}"))
+    };
+
+    for i in 0..40 {
+        assert_reply(
+            &client.vadd(&ix, &format!("v{i}"), 4, &format!("{i}.0 1.0 2.0 3.0")),
+            "STORED\r\n",
+        );
+    }
+
+    let full = client.send("vstats");
+    assert!(full.ends_with("END\r\n"), "{full}");
+    assert_contains(&full, &format!("STAT {ix}:vectors 40"));
+    assert_eq!(stat(&full, "attr_bytes_per_vector"), 128);
+    let idmap = stat(&full, &format!("{ix}:idmap_bytes"));
+    let used = stat(&full, &format!("{ix}:index_used_bytes"));
+    let held = stat(&full, &format!("{ix}:index_held_bytes"));
+    assert!(idmap > 0 && used > 0, "idmap {idmap} used {used}");
+    // Held memory is chunked, so it is a floor on used, never below it.
+    assert!(held >= used, "held {held} < used {used}");
+
+    // Deleting must give the id-map memory back rather than leaving tombstones.
+    for i in 0..40 {
+        client.send(&format!("vdel {ix} v{i}"));
+    }
+    let empty = client.send("vstats");
+    assert_contains(&empty, &format!("STAT {ix}:vectors 0"));
+    assert_eq!(stat(&empty, &format!("{ix}:idmap_bytes")), 0);
+    // The chunks stay held after the vectors are gone; that is the cost being
+    // reported, and the reason held is worth a line of its own. usearch's tape
+    // allocator has no per-object free, so used does not fall either — it is a
+    // high-water mark, which is why the docs tell readers to compare it to
+    // `vectors` rather than trust it as a live figure.
+    assert_eq!(stat(&empty, &format!("{ix}:index_held_bytes")), held);
+    assert_eq!(stat(&empty, &format!("{ix}:index_used_bytes")), used);
+
+    client.send(&format!("vdrop {ix}"));
+}
+
+#[test]
 fn many_connections_search_the_same_index_at_once() {
     // The concurrency invariants are unit-tested, but only here do they run on
     // the daemon's own worker threads.

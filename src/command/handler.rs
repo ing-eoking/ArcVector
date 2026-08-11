@@ -376,6 +376,68 @@ pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {
     })
 }
 
+/// `vstats` — module memory, which arcus's own accounting cannot see.
+///
+/// The engine's `-m` limit governs slab memory, so the Map items holding vectors
+/// are counted. The key mapping and usearch's graph are plain heap allocations in
+/// this module and are not, which is the gap this reports.
+///
+/// `idmap_bytes` is an estimate — entries and id text, without a hash map's slack.
+/// The two usearch figures are both measured, and both are needed:
+/// `index_held_bytes` is what the allocator has taken from the OS, which grows in
+/// 8 MiB chunks and so reads the same for an index of one vector as for one of a
+/// thousand; `index_used_bytes` is the part of it carrying actual data. Held is the
+/// cost, used is the content. Per-index lines follow the totals so it is clear
+/// which index is growing — and which are merely holding a chunk each.
+pub fn vstats() -> Result<Reply> {
+    let indexes = registry::snapshot();
+
+    let mut vectors = 0usize;
+    let mut idmap_bytes = 0usize;
+    let mut held_bytes = 0usize;
+    let mut used_bytes = 0usize;
+    let mut per_index = String::new();
+    for index in &indexes {
+        let (count, idmap, held, used) = (
+            index.ann.len(),
+            index.ann.id_map_bytes(),
+            index.ann.held_bytes(),
+            index.ann.used_bytes(),
+        );
+        vectors += count;
+        idmap_bytes += idmap;
+        held_bytes += held;
+        used_bytes += used;
+
+        let name = &index.name;
+        let _ = write!(
+            per_index,
+            "STAT {name}:vectors {count}\r\n\
+             STAT {name}:idmap_bytes {idmap}\r\n\
+             STAT {name}:index_held_bytes {held}\r\n\
+             STAT {name}:index_used_bytes {used}\r\n\
+             STAT {name}:reserved {}\r\n",
+            index.ann.reserved()
+        );
+    }
+
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "STAT indexes {}\r\n\
+         STAT vectors {vectors}\r\n\
+         STAT idmap_bytes {idmap_bytes}\r\n\
+         STAT index_held_bytes {held_bytes}\r\n\
+         STAT index_used_bytes {used_bytes}\r\n\
+         STAT attr_bytes_per_vector {}\r\n",
+        indexes.len(),
+        element::ATTR_BYTES,
+    );
+    out.push_str(&per_index);
+    out.push_str("END\r\n");
+    Ok(Reply::Body(out))
+}
+
 pub fn vlist() -> Result<Reply> {
     let mut out = String::new();
     for index in registry::snapshot() {

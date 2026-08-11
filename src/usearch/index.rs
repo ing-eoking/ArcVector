@@ -58,6 +58,12 @@ struct IdMap {
     by_key: HashMap<u64, Arc<str>>,
     by_id: HashMap<Arc<str>, u64>,
     next: u64,
+    /// Total length of the live id strings, kept as a running sum.
+    ///
+    /// Tracked rather than computed so that reporting memory is O(1) instead of
+    /// walking every entry with the lock held — which for a million vectors would
+    /// stall writers for as long as the walk takes.
+    id_bytes: usize,
 }
 
 impl IdMap {
@@ -68,6 +74,7 @@ impl IdMap {
         }
         let key = self.next;
         self.next += 1;
+        self.id_bytes += id.len();
         let id: Arc<str> = Arc::from(id);
         self.by_key.insert(key, Arc::clone(&id));
         self.by_id.insert(id, key);
@@ -76,8 +83,22 @@ impl IdMap {
 
     fn forget(&mut self, id: &str) -> Option<u64> {
         let key = self.by_id.remove(id)?;
-        self.by_key.remove(&key);
+        if let Some(gone) = self.by_key.remove(&key) {
+            self.id_bytes -= gone.len();
+        }
         Some(key)
+    }
+
+    /// Module memory held by this mapping.
+    ///
+    /// An estimate: it counts the entries and the id text, but not the slack a
+    /// hash map keeps for its load factor, so the true figure is somewhat higher.
+    /// The point is to show which index is growing, not to balance a ledger.
+    fn bytes(&self) -> usize {
+        const ARC_HEADER: usize = 16; // strong + weak counts
+        let per_entry = size_of::<u64>() + size_of::<Arc<str>>();
+        // Both directions hold a key and an Arc, and the text is shared once.
+        self.by_key.len() * per_entry * 2 + self.by_key.len() * ARC_HEADER + self.id_bytes
     }
 }
 
@@ -167,6 +188,53 @@ impl AnnIndex {
 
     fn ids(&self) -> std::sync::RwLockReadGuard<'_, IdMap> {
         self.ids.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Module memory held by the key mapping. Invisible to arcus's own accounting,
+    /// which is why it is worth reporting.
+    pub fn id_map_bytes(&self) -> usize {
+        self.ids().bytes()
+    }
+
+    /// Bytes usearch holds from the allocator for this index — measured, not
+    /// estimated, and the figure that shows up in the process's RSS.
+    ///
+    /// usearch allocates its graph and its vectors from two tape allocators that
+    /// grow in **8 MiB chunks**, so this jumps to ~16.8 MiB on the first insert and
+    /// then does not move again for a long time. It is a floor, not a measure of
+    /// how much data an index holds; pair it with [`Self::used_bytes`].
+    pub fn held_bytes(&self) -> usize {
+        self.inner
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .memory_usage()
+    }
+
+    /// Bytes of the held memory that actually carry graph nodes and vectors.
+    ///
+    /// usearch's own `reserved` counters are the *unused* slack inside the chunks
+    /// and `wasted` is alignment padding, so the live figure is what remains after
+    /// subtracting both. This is the number that tracks the vector count.
+    ///
+    /// A high-water mark, not a live figure: the tapes are append-only with no
+    /// per-object free, so a `remove` does not give bytes back. Compare it with
+    /// [`Self::len`] to see how much of it is churn.
+    pub fn used_bytes(&self) -> usize {
+        let s = self
+            .inner
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .memory_stats();
+        let tape = |allocated: usize, wasted: usize, reserved: usize| {
+            allocated.saturating_sub(wasted).saturating_sub(reserved)
+        };
+        tape(s.graph_allocated, s.graph_wasted, s.graph_reserved)
+            + tape(s.vectors_allocated, s.vectors_wasted, s.vectors_reserved)
+    }
+
+    /// Members usearch has room for, which grows ahead of the live count.
+    pub fn reserved(&self) -> usize {
+        self.reserved.load(Ordering::Acquire)
     }
 
     /// Grow usearch's capacity so `needed` keys fit.
@@ -539,6 +607,38 @@ mod tests {
                 assert_eq!(idx.id_of(key).as_deref(), Some(id.as_str()));
             }
         }
+    }
+
+    #[test]
+    fn held_memory_is_chunked_while_used_memory_tracks_the_data() {
+        // Why vstats reports both. usearch's tape allocators grow in 8 MiB chunks,
+        // so `held_bytes` leaps on the first insert and then sits still: measured at
+        // 23 KB empty and 16.8 MiB from one vector through a thousand, at dim 4 and
+        // at dim 1024 alike. Reporting only that number would say every index is the
+        // same size. `used_bytes` is the one that moves with the data.
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let empty = idx.held_bytes();
+        add(&idx, "v0", &[0.0, 0.0, 0.0, 0.0]);
+        let one = idx.held_bytes();
+        let one_used = idx.used_bytes();
+        assert!(one > empty * 2, "the first insert takes a chunk");
+
+        for i in 1..500 {
+            add(&idx, &format!("v{i}"), &[i as f32, 0.0, 0.0, 0.0]);
+        }
+        assert_eq!(
+            idx.held_bytes(),
+            one,
+            "held memory is chunked, not per-vector"
+        );
+        assert!(
+            idx.used_bytes() > one_used * 100,
+            "used memory tracks the vector count"
+        );
+        assert!(
+            idx.used_bytes() < idx.held_bytes(),
+            "used memory cannot exceed what is held"
+        );
     }
 
     #[test]

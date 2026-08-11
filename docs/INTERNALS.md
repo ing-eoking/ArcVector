@@ -65,7 +65,7 @@ configured from the stored layout, and it is handed the very bytes the store
 holds. That is what makes a rebuild lossless, and it fixes the direction —
 the cache knows the store, never the reverse.
 
-Two boundaries carry most of the weight:Two boundaries carry most of the weight:Two boundaries carry most of the weight:
+Two boundaries carry most of the weight:
 
 **Parsing never touches state.** `command::request` turns tokens into `Line` /
 `Body` values and stops. `command::handler` takes those values and never sees a
@@ -95,6 +95,14 @@ Most commands finish in `execute` straight off the line. `vadd` and
 calls this an `nread`. For those, `accept` registers a buffer and `execute` is
 called a second time with an **empty token array**, which is how the code knows a
 body arrived.
+
+### Why the module's metrics need their own command
+
+memcached consults an extension only when it has already failed to recognise a
+command (`memcached.c`, the `unknown_command` path). A built-in like `stats` never
+reaches us, so there is no way to add a `stats vector` section from here without
+patching arcus. Hence `vstats`, which needs no engine change. Section 8 covers
+what it reports and why two memory figures rather than one.
 
 ### Why `accept` never refuses a malformed line
 
@@ -325,6 +333,8 @@ A C++ single-header engine with cxx-based Rust bindings.
 | `filtered_search::<T, F>(query, k, F: Fn(u64) -> bool)` | the predicate hook the attribute filter rides on |
 | `remove(key)` | delete; also used before re-adding, since `multi: false` **rejects a duplicate key** |
 | `MetricKind` / `ScalarKind` | `Cos`, `L2sq`, `IP`, `Hamming`, `Tanimoto` / `F32`, `F16`, `I8`, `B1` |
+| `memory_usage()` | bytes held from the allocator; `vstats index_held_bytes` |
+| `memory_stats()` | the per-tape breakdown `vstats index_used_bytes` is derived from |
 
 Keys are `u64`, so the module keeps its own `String ↔ u64` mapping. Updating an
 existing id is therefore `remove` then `add`; a concurrent search can miss that
@@ -332,6 +342,52 @@ vector inside the window, which is acceptable because Map is the source of truth
 
 Not used: `save`/`load` (the graph is rebuilt from Map instead), `exact_search`,
 custom metrics.
+
+#### Reading usearch's memory counters
+
+`memory_stats()` returns three counters per allocator tape, and the names do not
+mean what a reader might assume:
+
+| Field | What it actually is |
+|---|---|
+| `*_allocated` | total taken from the OS, in 8 MiB chunks |
+| `*_reserved` | the **unused slack inside** those chunks — not a capacity |
+| `*_wasted` | alignment padding |
+
+So live bytes are `allocated - reserved - wasted`, per tape, summed over the graph
+tape and the vectors tape. `memory_usage()` is roughly the two `allocated` figures
+plus a fixed ~23 KB base.
+
+Measured, dim 4, `f32`, capacity 1024:
+
+| | `memory_usage()` |
+|---|---|
+| empty | 23 208 |
+| 1 vector | 16 800 360 |
+| 1 000 vectors | 16 800 360 |
+| 1 000 vectors, dim 1024 | 16 800 360 |
+
+One insert takes a chunk from each tape and nothing moves after that, at any
+dimension. `memory_usage()` alone therefore reports every non-empty index as
+identical, which is why `vstats` emits both numbers:
+[`held_bytes`](../src/usearch/index.rs) is the cost and `used_bytes` is the
+content. `held_memory_is_chunked_while_used_memory_tracks_the_data` in
+`src/usearch/index.rs` pins this down, so a later "simplification" back to a single
+counter fails a test rather than quietly losing the distinction.
+
+The operational consequence is a floor of ~16.8 MB per non-empty index, invisible
+to the engine's `-m` accounting, released only by `vdrop`. It argues for fewer,
+larger indexes.
+
+Neither counter falls on `remove`. A tape allocator is append-only with no
+per-object free, so `used_bytes` is a high-water mark: measured at 54 080 for 200
+vectors and still 54 080 after deleting 100 of them, while `idmap_bytes` halved
+from 13 490 to 6 800 as it should. Read `used_bytes` as *ever inserted* and `len()`
+as *live*; the gap between them is tape that only `vdrop` reclaims.
+
+The empty-index figure also scales with the thread-context pool, though far less
+steeply — 11 KB at one thread against 23 KB at 64 — so `THREADS` is not where the
+memory goes.
 
 ### serde_json 1 — ATTR validation
 

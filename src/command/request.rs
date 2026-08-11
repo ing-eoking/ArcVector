@@ -30,11 +30,12 @@ pub enum Cmd {
     VDel,
     VDrop,
     VList,
+    VStats,
 }
 
 impl Cmd {
     pub fn parse(name: &str) -> Option<Cmd> {
-        const NAMES: [(&str, Cmd); 7] = [
+        const NAMES: [(&str, Cmd); 8] = [
             ("vcreate", Cmd::VCreate),
             ("vadd", Cmd::VAdd),
             ("vsim", Cmd::VSim),
@@ -42,6 +43,7 @@ impl Cmd {
             ("vdel", Cmd::VDel),
             ("vdrop", Cmd::VDrop),
             ("vlist", Cmd::VList),
+            ("vstats", Cmd::VStats),
         ];
         NAMES
             .iter()
@@ -124,6 +126,7 @@ pub enum Line<'a> {
     Del { index: &'a str, id: &'a str },
     Drop { index: &'a str },
     List,
+    Stats,
 }
 
 /// A `vadd` line, awaiting its coordinates.
@@ -182,18 +185,22 @@ pub fn parse_line<'a>(tokens: &Tokens<'a>) -> Result<Line<'a>> {
                 index: tokens.text(1)?,
             })
         }
-        Some(Cmd::VList) => {
-            if tokens.len() != 1 {
-                return Err(malformed());
-            }
-            Ok(Line::List)
-        }
+        Some(Cmd::VList) => no_arguments(tokens).map(|()| Line::List),
+        Some(Cmd::VStats) => no_arguments(tokens).map(|()| Line::Stats),
         // These carry a body and are parsed by `parse_body`.
         Some(Cmd::VAdd) => Err(malformed()),
         None => Err(Error::bad_request(format!(
             "unknown command {}",
             tokens.text(0).unwrap_or("")
         ))),
+    }
+}
+
+fn no_arguments(tokens: &Tokens) -> Result<()> {
+    if tokens.len() == 1 {
+        Ok(())
+    } else {
+        Err(malformed())
     }
 }
 
@@ -473,6 +480,7 @@ mod tests {
             ("VSim", Cmd::VSim),
             ("vcreate", Cmd::VCreate),
             ("VADD", Cmd::VAdd),
+            ("VSTATS", Cmd::VStats),
         ] {
             assert_eq!(Cmd::parse(text), Some(cmd), "{text}");
         }
@@ -781,11 +789,14 @@ mod tests {
         assert!(matches!(parse_line(&drop_), Ok(Line::Drop { .. })));
         tokens!(list = "vlist");
         assert!(matches!(parse_line(&list), Ok(Line::List)));
+        tokens!(stats = "vstats");
+        assert!(matches!(parse_line(&stats), Ok(Line::Stats)));
 
         assert!(err("vget docs").contains("bad command line format"));
         assert!(err("vdel docs v1 extra").contains("bad command line format"));
         assert!(err("vdrop").contains("bad command line format"));
         assert!(err("vlist extra").contains("bad command line format"));
+        assert!(err("vstats extra").contains("bad command line format"));
         assert!(err("nonsense").contains("unknown command"));
     }
 

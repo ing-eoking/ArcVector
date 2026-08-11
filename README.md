@@ -161,8 +161,80 @@ VSIM KEY docs 5 v1
 | `vdel <index> <id>` | `DELETED` · `NOT_FOUND` |
 | `vdrop <index>` | `DROPPED` · `NOT_FOUND` |
 | `vlist` | one `INDEX <name> dim=… quant=… metric=… attrbytes=128 count=… maxcount=…` per index, then `END` |
+| `vstats` | module memory, then `END` |
 
 `vget` returns attributes only, not coordinates.
+
+## vstats
+
+```
+vstats\r\n
+```
+
+Reports the memory this module holds **outside** the engine. arcus's `-m` limit
+covers slab memory, so the Map items holding vectors are already accounted for;
+the usearch graph and the id map are plain heap allocations in the module and are
+not. That gap is what this reports. There is no `stats vector` equivalent —
+memcached only consults an extension for an *unknown* command, so `stats` cannot
+be hooked.
+
+```
+vstats
+→ STAT indexes 2
+  STAT vectors 201
+  STAT idmap_bytes 13556
+  STAT index_held_bytes 33600720
+  STAT index_used_bytes 51384
+  STAT attr_bytes_per_vector 128
+  STAT docs:vectors 200
+  STAT docs:idmap_bytes 13490
+  STAT docs:index_held_bytes 16800360
+  STAT docs:index_used_bytes 51200
+  STAT docs:reserved 1024
+  ... one block per index ...
+  END
+```
+
+Totals first, then a block per index so it is clear which one is growing.
+
+| Field | Meaning |
+|---|---|
+| `indexes` | live index count |
+| `vectors` | live vectors — not the number ever added |
+| `idmap_bytes` | the `id ↔ u64` map: entries plus id text. An estimate; excludes hash-map slack |
+| `index_held_bytes` | bytes usearch has taken from the allocator. **Chunked** — see below |
+| `index_used_bytes` | the part of that carrying real graph nodes and vectors |
+| `reserved` | members usearch has room for; grows ahead of `vectors` |
+| `attr_bytes_per_vector` | the fixed ATTR region, 128 |
+
+### Why held and used are both reported
+
+usearch allocates its graph and its vectors from two tape allocators that grow in
+**8 MiB chunks**. Measured on an otherwise idle index:
+
+| | `index_held_bytes` |
+|---|---|
+| empty | 23 KB |
+| 1 vector | 16.8 MB |
+| 1 000 vectors | 16.8 MB |
+| 1 000 vectors, dim 1024 | 16.8 MB |
+
+The first insert takes one chunk from each allocator and nothing moves after
+that, at any dimension. So held memory alone would report every index as the same
+size — which is why `index_used_bytes` exists, and it is the figure that tracks
+the vector count.
+
+**The practical consequence: an index holds ~16.8 MB from its first vector
+onward, whether it has one vector or a thousand.** A hundred small indexes cost
+~1.7 GB of resident memory regardless of the data in them, and none of it is
+visible to `-m` or to `vlist`'s `count`. Prefer fewer, larger indexes.
+
+Neither figure falls when vectors are deleted. A tape allocator hands out bytes
+in order and has no per-object free, so `vdel` returns the Map element and the
+`idmap_bytes` — both of which do drop — but the usearch tape keeps its high-water
+mark. Only `vdrop` releases it, by dropping the whole index. So on a workload that
+churns ids, `index_used_bytes` reads as total ever inserted rather than currently
+live; compare it against `vectors` to tell the two apart.
 
 ---
 
@@ -173,3 +245,6 @@ VSIM KEY docs 5 v1
   paths, and no spaces inside a term value.
 - The usearch graph is not serialized. After a restart it is rebuilt from Map on
   first use.
+- Every non-empty index holds ~16.8 MB of usearch allocator chunks regardless of
+  its size, and it is invisible to `-m`. Many small indexes are expensive; see
+  [vstats](#why-held-and-used-are-both-reported).

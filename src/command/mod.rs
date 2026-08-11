@@ -80,5 +80,6 @@ pub unsafe fn dispatch(cookie: *const c_void, tokens: &Tokens) -> Result<Reply> 
         Line::Del { index, id } => handler::vdel(store, index, id),
         Line::Drop { index } => handler::vdrop(store, index),
         Line::List => handler::vlist(),
+        Line::Stats => handler::vstats(),
     }
 }
