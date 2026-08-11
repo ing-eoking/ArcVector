@@ -16,7 +16,11 @@ For how it works inside, see [docs/INTERNALS.md](docs/INTERNALS.md).
 
 ```sh
 cargo build --release        # -> target/release/libarcusv.{so,dylib}
+cargo test                   # unit tests, plus integration if a daemon is available
 ```
+
+Integration tests drive a real arcus daemon; see [docker/README.md](docker/README.md)
+for how to point them at one or run them in a container.
 
 `build.rs` runs bindgen over the vendored arcus headers in `include/`, so libclang
 must be available. usearch compiles a C++ core, so a C++17 toolchain is needed too.
@@ -161,8 +165,6 @@ VSIM KEY docs 5 v1
 
 ## Limitations
 
-- **Never run against a live daemon.** The engine call path in `src/store.rs` is
-  covered by unit tests and code review only; there is no integration test.
 - `vget` cannot read coordinates back.
 - Filters support `AND` over top-level fields. No `OR`, no parentheses, no nested
   paths, and no spaces inside a term value.

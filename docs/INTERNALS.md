@@ -362,7 +362,7 @@ wrong (`SERVER_ERROR`).
 
 ## 10. Testing
 
-110 unit tests, no daemon required.
+111 unit tests need no daemon; 18 integration tests need one.
 
 - `codec`, `quant`, `filter`, `request`, `error` are pure and fully covered:
   layout round-trips, quantization accuracy, filter parsing and evaluation, every
@@ -374,5 +374,20 @@ wrong (`SERVER_ERROR`).
 - `store` covers error translation and the slice helpers; the engine calls
   themselves cannot be reached without a daemon.
 
-**The engine path has never run against a live daemon.** That is the standing gap:
-`store.rs` is verified by review and by its pure helpers only.
+`tests/` drives a real daemon with the extension loaded — the only way to reach
+`store.rs`, since the engine calls are unreachable from unit tests. Each test
+starts its own daemon on its own unix socket and kills it on drop. They **skip**
+when no daemon is available; see `docker/README.md`.
+
+Two hazards the harness guards against, both found by hitting them:
+
+- **A stale library.** `cargo test` builds the rlib the harness links against but
+  not the `cdylib` the daemon loads, so it would happily verify old code. The
+  harness compares timestamps and fails rather than skipping — a stale result is a
+  wrong result, not a missing one.
+- **Port collisions.** Allocating a free TCP port and then spawning leaves a
+  window for a parallel test to take it, and the daemon that loses exits. Unix
+  sockets remove the window entirely.
+
+Lengths the protocol requires are derived from what is actually sent, because a
+test that miscounts tests the wrong thing.

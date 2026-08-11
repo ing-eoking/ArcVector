@@ -39,12 +39,33 @@ impl Pending {
         }
     }
 
+    /// Fill in the CRLF memcached would have written, for tests that never go
+    /// through a real transfer.
+    #[cfg(test)]
+    fn terminate(mut self) -> Pending {
+        let n = self.body_len;
+        self.buffer[n..].copy_from_slice(b"\r\n");
+        self
+    }
+
     /// Split into the parsed line and its body, dropping the trailing CRLF.
+    ///
+    /// memcached fills the two extra bytes with whatever followed the body. If
+    /// they are not CRLF, the declared length was wrong: the body we were handed
+    /// is truncated and the rest of it is still in the stream, waiting to be
+    /// misread as the next command line. That is refused here the same way
+    /// memcached refuses a `set` whose data chunk does not line up.
     ///
     /// Consuming lets the caller move the `Result` out instead of cloning it.
     pub fn into_parts(mut self) -> (std::result::Result<Body, Error>, Vec<u8>) {
+        let terminated = self.buffer[self.body_len..] == *b"\r\n";
         self.buffer.truncate(self.body_len);
-        (self.request, self.buffer)
+        let request = if terminated {
+            self.request
+        } else {
+            Err(Error::bad_request("bad data chunk"))
+        };
+        (request, self.buffer)
     }
 }
 
@@ -104,7 +125,8 @@ mod tests {
     fn the_buffer_reserves_room_for_the_trailing_crlf() {
         let p = Pending::new(Ok(add()), 7);
         assert_eq!(p.buffer.len(), 9);
-        let (_request, body) = p.into_parts();
+        let (request, body) = p.terminate().into_parts();
+        assert!(request.is_ok());
         assert_eq!(body.len(), 7);
     }
 
@@ -112,9 +134,24 @@ mod tests {
     fn a_refused_line_still_gets_a_body_to_drain() {
         // The stream stays in sync only because the bytes are consumed.
         let p = Pending::new(Err(Error::bad_request("nope")), 7);
-        let (request, body) = p.into_parts();
+        let (request, body) = p.terminate().into_parts();
         assert!(request.is_err());
         assert_eq!(body.len(), 7);
+    }
+
+    #[test]
+    fn a_body_not_followed_by_crlf_is_a_bad_data_chunk() {
+        // The client declared fewer bytes than it sent, so what we were handed is
+        // truncated and the remainder is still in the stream. Storing it would
+        // silently keep a short vector and desync the connection.
+        let mut p = Pending::new(Ok(add()), 7);
+        p.buffer.copy_from_slice(b"0.11 0.21");
+        let (request, _body) = p.into_parts();
+        assert_eq!(
+            request.unwrap_err().to_string(),
+            "bad data chunk",
+            "a mis-declared length must be refused"
+        );
     }
 
     #[test]
@@ -140,9 +177,13 @@ mod tests {
         let b = ptr::without_provenance::<c_void>(2);
         let mut ndata = 0usize;
         let mut ptr: *mut c_char = ptr::null_mut();
-        // SAFETY: both out-parameters are live locals.
+        // SAFETY: both out-parameters are live locals, and each copy writes
+        // exactly the `body_len + 2` bytes the buffer was sized for — which is
+        // what memcached itself does, body followed by CRLF.
         unsafe {
-            expect_body(a, Ok(add()), 4, &mut ndata, &mut ptr);
+            expect_body(a, Ok(add()), 3, &mut ndata, &mut ptr);
+            ptr::copy_nonoverlapping(b"1 2\r\n".as_ptr(), ptr.cast::<u8>(), 5);
+
             expect_body(
                 b,
                 Ok(Body::Sim(Sim {
@@ -151,15 +192,17 @@ mod tests {
                     dim: 2,
                     filter: None,
                 })),
-                8,
+                7,
                 &mut ndata,
                 &mut ptr,
             );
+            ptr::copy_nonoverlapping(b"1 2 3 4\r\n".as_ptr(), ptr.cast::<u8>(), 9);
         }
-        let (_, body_a) = take_body(a).unwrap().into_parts();
+        let (request_a, body_a) = take_body(a).unwrap().into_parts();
         let (request_b, body_b) = take_body(b).unwrap().into_parts();
-        assert_eq!(body_a.len(), 4);
-        assert_eq!(body_b.len(), 8);
+        assert_eq!(body_a, b"1 2");
+        assert_eq!(body_b, b"1 2 3 4");
+        assert!(matches!(request_a, Ok(Body::Add(_))));
         assert!(matches!(request_b, Ok(Body::Sim(_))));
     }
 }
