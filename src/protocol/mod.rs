@@ -12,6 +12,9 @@
 //! Nothing here decides what a command *does*; that is [`crate::command`]. So
 //! handlers receive plain data and can be exercised without a server, and every
 //! syntax rule has exactly one home.
+//!
+//! This is the only directory in the crate. It earns one because the wire is three
+//! distinct stages; everything else is one file per idea.
 
 pub mod pending;
 pub mod request;

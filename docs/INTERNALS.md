@@ -28,47 +28,47 @@ They are joined by a key. The graph finds candidates; Map holds the bytes.
 
 ## 2. Module map
 
-One directory per system this talks to:
+The store holds vectors, the index finds them, and the registry pairs the two:
 
 ```
 lib.rs        registration and the four memcached callbacks   <- the FFI boundary
-  protocol/   memcached ASCII protocol
-    tokens      reading a token array, writing one response
+  protocol/   the wire — memcached's ASCII protocol
+    tokens      read the token array, write the reply
     request     command line -> typed request                  (pure)
-    pending     state for the two commands that carry a body
-  storage/    arcus engine — how a vector is stored, and where
-    quantize    f32 -> the bytes that get stored
-    element     those bytes laid out, with a header and ATTR
-    map         the engine vtable                              (all raw pointers)
-  search      usearch — the ANN index, a cache of storage
+    pending     a command waiting for its body
+  vector      what a stored vector is: scalar kind + byte layout   (pure)
+  filter      attribute filter expressions                         (pure)
+  store       arcus Map — holds vectors, the source of truth   (raw pointers)
+  index       usearch — finds them, a cache of the store
+  registry    the live store/index pairs, and the rebuild
   command     one handler per command
-  registry    ties a Map to an index, and rebuilds one from the other
-  filter      attribute filter expressions — ours, not either system's
   error       one error type, and who gets blamed for it
 ```
 
-The axis is *which system the code talks to*, which is more useful than grouping
-by "is it pure": it tells you where to look when a given dependency misbehaves,
-and it keeps the dependency direction visible. `search` knows about `storage`,
-because it caches it; `storage` never knows about `search`. `quantize` sits in
-`storage` for exactly that reason — `element` needs it to size a vector, and
-putting it on the search side would have inverted the relationship.
+One file per idea, and one directory — `protocol/`, because the wire really is
+three stages: read the tokens, type them, hold the request while its body arrives.
 
-`filter` stays at the top level because it belongs to neither system. It is our
-own query language: `storage` holds the bytes it reads, `search` evaluates it
-inside the graph traversal, but neither owns it.
+`vector` is the pair `Quant` and `Layout`: how a coordinate is represented and
+where those bytes sit in an element. They are one decision, not two, and they
+belong to neither external system. `store` writes exactly those bytes into a Map
+element and `index` hands exactly those bytes to usearch — which is why rebuilding
+an index from the store is lossless, and why splitting them across the two sides
+would have been wrong.
 
-Two boundaries carry most of the weight:
+Dependencies run one way. `store` and `index` both use `vector`; `index` knows it
+is a cache of `store`; `store` never knows `index` exists. `registry` is the only
+thing that holds both.
+
+Two boundaries carry most of the weight:Two boundaries carry most of the weight:
 
 **Parsing never touches state.** `protocol::request` turns tokens into `Line` /
 `Body` values and stops. `command` handlers take those values and never see a
 token. So syntax has exactly one home, and handlers are reachable from unit tests
 without a server.
 
-**Raw pointers live only in `storage::map`.** `Store::for_cookie` is the single
-`unsafe` constructor; every method below it takes `&self` and returns owned or
-borrowed Rust values. `element`, `quantize` and `filter` are pure and have no idea
-a daemon exists.
+**Raw pointers live only in `store`.** `Store::for_cookie` is the single `unsafe`
+constructor; every method below it takes `&self` and returns owned or borrowed Rust
+values. `vector` and `filter` are pure and have no idea a daemon exists.
 
 ---
 

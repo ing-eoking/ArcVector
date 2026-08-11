@@ -8,8 +8,8 @@
 use std::fmt;
 
 use crate::filter::ParseError;
-use crate::storage::element::CodecError;
-use crate::storage::map::StoreError;
+use crate::store::StoreError;
+use crate::vector::CodecError;
 
 /// Who is at fault, which picks the ASCII error prefix.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

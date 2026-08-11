@@ -1,22 +1,19 @@
 //! ArcVector — vector similarity search as an arcus ASCII protocol extension.
 //!
-//! One directory per system this talks to:
+//! The store holds vectors, the index finds them, and the registry pairs the two:
 //!
 //! ```text
 //! lib.rs        registration and the four memcached callbacks  <- FFI boundary
-//!   protocol/   memcached ASCII protocol
-//!     tokens      reading a token array, writing one response
+//!   protocol/   the wire — memcached's ASCII protocol
+//!     tokens      read the token array, write the reply
 //!     request     command line -> typed request                (pure)
-//!     pending     state for the two commands that carry a body
-//!   storage/    arcus engine — where vectors live
-//!     map         the engine vtable                    (all raw pointers)
-//!     element     one Map element's byte layout
-//!   search/     usearch — the ANN index, a cache of storage
-//!     index       capacity, concurrency, key mapping
-//!     quantize    f32 -> f16/i8/b1
+//!     pending     a command waiting for its body
+//!   vector      what a stored vector is: scalar kind + byte layout  (pure)
+//!   filter      attribute filter expressions                        (pure)
+//!   store       arcus Map — holds vectors, the source of truth  (raw pointers)
+//!   index       usearch — finds them, a cache of the store
+//!   registry    the live store/index pairs, and the rebuild
 //!   command     one handler per command
-//!   registry    ties a Map to an index, and rebuilds one from the other
-//!   filter      attribute filter expressions — ours, not either system's
 //!   error       one error type, and who gets blamed for it
 //! ```
 //!
@@ -46,10 +43,11 @@ pub mod engine_api {
 pub mod command;
 pub mod error;
 pub mod filter;
+pub mod index;
 pub mod protocol;
 pub mod registry;
-pub mod search;
-pub mod storage;
+pub mod store;
+pub mod vector;
 
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
@@ -63,7 +61,7 @@ use error::{Error, Reply, Result};
 use protocol::pending;
 use protocol::request::{self, Body, Line, MAX_BODY_BYTES};
 use protocol::tokens::{Responder, ResponseHandler, Tokens};
-use storage::{Store, StoreError};
+use store::{Store, StoreError};
 
 /// Engine access for the callback currently running.
 ///
@@ -224,7 +222,7 @@ pub extern "C" fn memcached_extensions_initialize(
     let Some(get_api) = get_server_api else {
         return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
     };
-    storage::map::set_server_api(get_api);
+    store::set_server_api(get_api);
 
     // SAFETY: memcached hands us a live SERVER_HANDLE_V1 accessor, and the
     // descriptor is a process-lifetime static that the server only reads.

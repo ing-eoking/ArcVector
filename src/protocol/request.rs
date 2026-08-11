@@ -12,9 +12,9 @@
 use super::tokens::Tokens;
 use crate::error::{Error, Result};
 use crate::filter::Filter;
-use crate::search::Metric;
-use crate::storage::element;
-use crate::storage::quantize::Quant;
+use crate::index::Metric;
+use crate::vector;
+use crate::vector::Quant;
 
 /// Upper bound on one transferred body, so a malformed length cannot ask for an
 /// enormous allocation.
@@ -374,10 +374,10 @@ fn attr_clause(tokens: &Tokens, at: usize) -> Result<Vec<u8>> {
         )));
     }
     let declared: usize = tokens.parse(at + 1, "ATTR length")?;
-    if declared > element::ATTR_BYTES {
+    if declared > vector::ATTR_BYTES {
         return Err(Error::bad_request(format!(
             "ATTR is {declared} bytes, over the {}-byte limit",
-            element::ATTR_BYTES
+            vector::ATTR_BYTES
         )));
     }
     if declared == 0 {
@@ -621,7 +621,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        assert!(json.len() <= element::ATTR_BYTES);
+        assert!(json.len() <= vector::ATTR_BYTES);
         assert_eq!(
             attr_of(&format!("vadd docs v1 16 4 ATTR {} {json}", json.len())).unwrap(),
             json.as_bytes()
@@ -637,7 +637,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" , ");
         let json = format!("{{ {body} }}");
-        assert!(json.len() < element::ATTR_BYTES, "{} bytes", json.len());
+        assert!(json.len() < vector::ATTR_BYTES, "{} bytes", json.len());
         let msg = attr_of(&format!("vadd docs v1 16 4 ATTR {} {json}", json.len()))
             .unwrap_err()
             .to_string();
@@ -679,7 +679,7 @@ mod tests {
         // Built from real content: leading spaces are separators to the
         // tokenizer, not part of the value.
         let json = format!(r#"{{"k":"{}"}}"#, "x".repeat(120));
-        assert_eq!(json.len(), element::ATTR_BYTES);
+        assert_eq!(json.len(), vector::ATTR_BYTES);
         assert!(attr_of(&format!("vadd docs v1 16 4 ATTR 128 {json}")).is_ok());
     }
 
