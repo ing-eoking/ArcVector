@@ -226,7 +226,7 @@ fn similar(
             return false;
         };
         let mut slot = scratch.borrow_mut();
-        match store.read_attr_slot(&index.name, id, &layout, &mut slot) {
+        match store.read_attr_slot(&index.name, &id, &layout, &mut slot) {
             Ok(()) => filter.matches(&slot),
             // Evicted or vanished mid-search: no longer a candidate.
             Err(_) => false,
@@ -240,7 +240,7 @@ fn similar(
         let Some(id) = index.ann.id_of(key) else {
             continue;
         };
-        let Ok(stored) = store.get_elem(&index.name, id) else {
+        let Ok(stored) = store.get_elem(&index.name, &id) else {
             continue;
         };
         let attr = layout

@@ -248,8 +248,7 @@ reserved contexts and asserts zero failures.
 | index registry | `RwLock<HashMap<_, Arc<VectorIndex>>>` | read lock released immediately after cloning the `Arc` |
 | `built` flag | `Mutex<bool>` | serializes the lazy rebuild |
 | usearch index | `RwLock<Index>` | **write only for `reserve`** |
-| key → id | `boxcar::Vec` | lock-free append and read |
-| id → key | `RwLock<HashMap>` | write path only |
+| key ↔ id | `RwLock<IdMap>` | both directions under one lock |
 
 `add`, `search` and `remove` take the **read** lock: usearch guards concurrent
 construction, search and updates internally with striped spin-locks. The `RwLock`
@@ -257,9 +256,19 @@ exists solely to make `reserve` exclusive, since that reallocates the node array
 Taking the write lock drains all readers, which is exactly the guarantee `reserve`
 needs — permits do not have to be reclaimed separately.
 
-`key → id` must be lock-free because the search predicate reads it once per
-visited graph node. A `RwLock` there would mean hundreds of atomic RMWs per query
-and would block `vadd` for the duration of a search.
+The predicate reads `key → id` once per visited graph node, and takes a read lock
+to do it. That was once an append-only lock-free vector on the grounds that a lock
+per node would be too expensive — but the proportions were wrong: the same
+predicate already makes an engine call on that path, taking a global mutex and a
+malloc, against which two atomic operations do not register. Buying a few
+nanoseconds there cost a leak, which was the wrong trade.
+
+Keys come from a counter and are never reused, so they may be sparse. usearch does
+not mind: `reserve` sizes for a member *count*, not a key range — verified by
+adding `u64::MAX - 1` to an index reserved for eight. That is what lets a delete
+free its entry outright rather than leave a tombstone, and it avoids the hazard a
+free list would bring, where a reused key could change meaning under a search
+already in flight.
 
 **Lock order** is `registry → built → ann → by_id → [engine cache_lock]`, never
 the reverse. The engine never calls back into the module, so its lock is always
@@ -323,11 +332,6 @@ vector inside the window, which is acceptable because Map is the source of truth
 
 Not used: `save`/`load` (the graph is rebuilt from Map instead), `exact_search`,
 custom metrics.
-
-### boxcar 0.2 — lock-free append-only vector
-
-Backs `key → id`. Chosen for exactly one property: indexed reads and appends
-without a lock, on the predicate's hot path.
 
 ### serde_json 1 — ATTR validation
 

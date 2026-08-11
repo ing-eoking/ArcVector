@@ -11,8 +11,8 @@
 //! [`super::threads`].
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{PoisonError, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
 
 // `::` because this module shares a name with the crate it wraps.
 use ::usearch::{Index, IndexOptions, ScalarKind, b1x8, f16};
@@ -44,9 +44,41 @@ const fn scalar_kind(q: Quant) -> ScalarKind {
 // Id mapping
 // ---------------------------------------------------------------------------
 
-struct IdSlot {
-    id: Box<str>,
-    alive: AtomicBool,
+/// The `String` ↔ `u64` mapping usearch needs, both directions under one lock so
+/// they cannot disagree with each other.
+///
+/// Keys are handed out by a counter and never reused. They may therefore be
+/// sparse, which usearch does not mind: `reserve` sizes for a member *count*, not
+/// a key range — verified by adding `u64::MAX - 1` to an index reserved for eight.
+/// That is what lets a delete actually free its entry instead of leaving a
+/// tombstone behind, and it removes the reuse hazard a free list would introduce,
+/// where a key could change meaning under a search already in flight.
+#[derive(Default)]
+struct IdMap {
+    by_key: HashMap<u64, Arc<str>>,
+    by_id: HashMap<Arc<str>, u64>,
+    next: u64,
+}
+
+impl IdMap {
+    /// The key for `id`, minting one if it is new. Returns whether it existed.
+    fn intern(&mut self, id: &str) -> (u64, bool) {
+        if let Some(key) = self.by_id.get(id) {
+            return (*key, true);
+        }
+        let key = self.next;
+        self.next += 1;
+        let id: Arc<str> = Arc::from(id);
+        self.by_key.insert(key, Arc::clone(&id));
+        self.by_id.insert(id, key);
+        (key, false)
+    }
+
+    fn forget(&mut self, id: &str) -> Option<u64> {
+        let key = self.by_id.remove(id)?;
+        self.by_key.remove(&key);
+        Some(key)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -64,11 +96,13 @@ pub struct AnnIndex {
     inner: RwLock<Index>,
     permits: Semaphore,
     reserved: AtomicUsize,
-    /// key -> id. Append-only and lock-free: the search predicate reads it once
-    /// per visited graph node, so a lock here would serialize the whole search.
-    ids: boxcar::Vec<IdSlot>,
-    /// id -> key. Write path only; never touched by the predicate.
-    by_id: RwLock<HashMap<Box<str>, u64>>,
+    /// Both directions of the key mapping.
+    ///
+    /// The search predicate takes a read lock here once per visited graph node.
+    /// That is affordable because the predicate already pays for an engine call on
+    /// the same path — a global mutex and a malloc — against which two atomic
+    /// operations do not register.
+    ids: RwLock<IdMap>,
 }
 
 impl AnnIndex {
@@ -104,16 +138,13 @@ impl AnnIndex {
             inner: RwLock::new(index),
             permits: Semaphore::new(threads),
             reserved: AtomicUsize::new(MIN_CAPACITY),
-            ids: boxcar::Vec::new(),
-            by_id: RwLock::new(HashMap::new()),
+            ids: RwLock::new(IdMap::default()),
         })
     }
 
+    /// How many vectors are live. Not the number ever added.
     pub fn len(&self) -> usize {
-        self.by_id
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .len()
+        self.ids().by_key.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -121,21 +152,21 @@ impl AnnIndex {
     }
 
     /// Lock-free key -> id lookup. Returns `None` for tombstoned slots.
-    pub fn id_of(&self, key: u64) -> Option<&str> {
-        let slot = self.ids.get(key as usize)?;
-        if slot.alive.load(Ordering::Acquire) {
-            Some(&slot.id)
-        } else {
-            None
-        }
+    /// The id a usearch key stands for, or `None` if it has been removed.
+    ///
+    /// Returns an `Arc` rather than a borrow so the lock is released before the
+    /// caller uses it — the predicate goes on to make an engine call, and holding
+    /// this lock across that would serialize every search behind every insert.
+    pub fn id_of(&self, key: u64) -> Option<Arc<str>> {
+        self.ids().by_key.get(&key).map(Arc::clone)
     }
 
     pub fn key_of(&self, id: &str) -> Option<u64> {
-        self.by_id
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(id)
-            .copied()
+        self.ids().by_id.get(id).copied()
+    }
+
+    fn ids(&self) -> std::sync::RwLockReadGuard<'_, IdMap> {
+        self.ids.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Grow usearch's capacity so `needed` keys fit.
@@ -171,29 +202,17 @@ impl AnnIndex {
         }
 
         // Allocate (or reuse) the key while holding by_id, so two concurrent
-        // vadds of the same id cannot end up with two different keys.
-        let (key, existed) = {
-            let mut by_id = self.by_id.write().unwrap_or_else(PoisonError::into_inner);
-            match by_id.get(id) {
-                Some(k) => {
-                    let k = *k;
-                    if let Some(slot) = self.ids.get(k as usize) {
-                        slot.alive.store(true, Ordering::Release);
-                    }
-                    (k, true)
-                }
-                None => {
-                    let k = self.ids.push(IdSlot {
-                        id: id.into(),
-                        alive: AtomicBool::new(true),
-                    }) as u64;
-                    by_id.insert(id.into(), k);
-                    (k, false)
-                }
-            }
+        // vadds of the same id cannot end up with two different keys: one lock
+        // covers both directions of the mapping.
+        let (key, existed, live) = {
+            let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
+            let (key, existed) = ids.intern(id);
+            (key, existed, ids.by_key.len())
         };
 
-        self.ensure_capacity(key as usize + 1)?;
+        // Capacity tracks live members, not keys ever handed out, so churn does not
+        // grow the reservation.
+        self.ensure_capacity(live)?;
 
         let _permit = self.permits.acquire();
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
@@ -221,15 +240,12 @@ impl AnnIndex {
     /// Remove `id`. Returns false when it was not present.
     pub fn remove(&self, id: &str) -> Result<bool> {
         let key = {
-            let mut by_id = self.by_id.write().unwrap_or_else(PoisonError::into_inner);
-            match by_id.remove(id) {
-                Some(k) => k,
+            let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
+            match ids.forget(id) {
+                Some(key) => key,
                 None => return Ok(false),
             }
         };
-        if let Some(slot) = self.ids.get(key as usize) {
-            slot.alive.store(false, Ordering::Release);
-        }
 
         let _permit = self.permits.acquire();
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
@@ -315,7 +331,7 @@ mod tests {
         idx.search(&q, k, |_| true)
             .unwrap()
             .into_iter()
-            .filter_map(|(key, _)| idx.id_of(key).map(str::to_owned))
+            .filter_map(|(key, _)| idx.id_of(key).map(|id| id.to_string()))
             .collect()
     }
 
@@ -358,9 +374,14 @@ mod tests {
 
         let q = crate::arcus::element::encode(&[1.0, 0.0, 0.0, 0.0], Quant::F32);
         let hits = idx
-            .search(&q, 10, |key| idx.id_of(key) == Some("keep"))
+            .search(&q, 10, |key| {
+                idx.id_of(key).is_some_and(|id| &*id == "keep")
+            })
             .unwrap();
-        let ids: Vec<&str> = hits.iter().filter_map(|(k, _)| idx.id_of(*k)).collect();
+        let ids: Vec<String> = hits
+            .iter()
+            .filter_map(|(k, _)| idx.id_of(*k).map(|id| id.to_string()))
+            .collect();
         assert_eq!(ids, vec!["keep"]);
     }
 
@@ -372,6 +393,52 @@ mod tests {
         add(&idx, "a", &[0.0, 1.0, 0.0, 0.0]);
         assert_eq!(idx.key_of("a"), Some(first));
         assert_eq!(idx.len(), 1, "an update must not grow the index");
+    }
+
+    #[test]
+    fn churn_does_not_grow_the_index() {
+        // The regression this guards: keys used to index an append-only table, so a
+        // removed entry left a tombstone and the reservation tracked every key ever
+        // handed out. A thousand replacements of the same few vectors grew both
+        // without bound while the live count never moved.
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        for round in 0..200 {
+            for i in 0..5 {
+                add(&idx, &format!("r{round}-{i}"), &[i as f32, 1.0, 2.0, 3.0]);
+            }
+            for i in 0..5 {
+                assert!(idx.remove(&format!("r{round}-{i}")).unwrap());
+            }
+            assert_eq!(idx.len(), 0, "round {round} leaked live entries");
+        }
+
+        // Keys are never reused, so they climb; what must not climb is the amount
+        // of state kept for them.
+        assert_eq!(idx.len(), 0);
+        assert_eq!(idx.ids().by_key.len(), 0, "key -> id entries leaked");
+        assert_eq!(idx.ids().by_id.len(), 0, "id -> key entries leaked");
+        assert_eq!(idx.ids().next, 1000, "keys are handed out monotonically");
+        // 1000 keys were issued, but the reservation only ever needed the live
+        // count, which peaked at five.
+        assert_eq!(
+            idx.reserved.load(Ordering::Acquire),
+            MIN_CAPACITY,
+            "the reservation grew with keys rather than with members"
+        );
+    }
+
+    #[test]
+    fn a_sparse_key_is_fine_for_usearch() {
+        // What makes never reusing a key affordable: usearch reserves for a member
+        // count, not a key range.
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        for i in 0..50 {
+            add(&idx, &format!("v{i}"), &[i as f32, 1.0, 2.0, 3.0]);
+            idx.remove(&format!("v{i}")).unwrap();
+        }
+        add(&idx, "last", &[1.0, 1.0, 2.0, 3.0]);
+        assert_eq!(idx.len(), 1);
+        assert_eq!(search(&idx, &[1.0, 1.0, 2.0, 3.0], 1), vec!["last"]);
     }
 
     #[test]
@@ -469,7 +536,7 @@ mod tests {
             for i in 0..100 {
                 let id = format!("t{t}-{i}");
                 let key = idx.key_of(&id).expect("id missing");
-                assert_eq!(idx.id_of(key), Some(id.as_str()));
+                assert_eq!(idx.id_of(key).as_deref(), Some(id.as_str()));
             }
         }
     }
