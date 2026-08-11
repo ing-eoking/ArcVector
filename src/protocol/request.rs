@@ -9,12 +9,12 @@
 //! [`crate::pending`] holds until the bytes arrive. The rest resolve to a
 //! [`Line`] and run immediately.
 
-use super::protocol::Tokens;
+use super::tokens::Tokens;
 use crate::error::{Error, Result};
-use crate::index::Metric;
-use crate::vector::codec;
-use crate::vector::filter::Filter;
-use crate::vector::quant::Quant;
+use crate::filter::Filter;
+use crate::search::Metric;
+use crate::storage::element;
+use crate::storage::quantize::Quant;
 
 /// Upper bound on one transferred body, so a malformed length cannot ask for an
 /// enormous allocation.
@@ -374,10 +374,10 @@ fn attr_clause(tokens: &Tokens, at: usize) -> Result<Vec<u8>> {
         )));
     }
     let declared: usize = tokens.parse(at + 1, "ATTR length")?;
-    if declared > codec::ATTR_BYTES {
+    if declared > element::ATTR_BYTES {
         return Err(Error::bad_request(format!(
             "ATTR is {declared} bytes, over the {}-byte limit",
-            codec::ATTR_BYTES
+            element::ATTR_BYTES
         )));
     }
     if declared == 0 {
@@ -430,7 +430,7 @@ fn filter_clause(tokens: &Tokens, at: usize) -> Result<Option<Filter>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::protocol::tokenize_for_test as tokenize;
+    use crate::protocol::tokens::tokenize_for_test as tokenize;
     use std::os::raw::c_int;
 
     /// Binds `$name` to a `Tokens` view of `$src`, keeping the backing buffer
@@ -621,7 +621,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        assert!(json.len() <= codec::ATTR_BYTES);
+        assert!(json.len() <= element::ATTR_BYTES);
         assert_eq!(
             attr_of(&format!("vadd docs v1 16 4 ATTR {} {json}", json.len())).unwrap(),
             json.as_bytes()
@@ -637,7 +637,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" , ");
         let json = format!("{{ {body} }}");
-        assert!(json.len() < codec::ATTR_BYTES, "{} bytes", json.len());
+        assert!(json.len() < element::ATTR_BYTES, "{} bytes", json.len());
         let msg = attr_of(&format!("vadd docs v1 16 4 ATTR {} {json}", json.len()))
             .unwrap_err()
             .to_string();
@@ -679,7 +679,7 @@ mod tests {
         // Built from real content: leading spaces are separators to the
         // tokenizer, not part of the value.
         let json = format!(r#"{{"k":"{}"}}"#, "x".repeat(120));
-        assert_eq!(json.len(), codec::ATTR_BYTES);
+        assert_eq!(json.len(), element::ATTR_BYTES);
         assert!(attr_of(&format!("vadd docs v1 16 4 ATTR 128 {json}")).is_ok());
     }
 

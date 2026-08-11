@@ -1,19 +1,19 @@
 //! Command handlers.
 //!
 //! Every handler returns `Result<Reply>`; turning that into an ASCII response is
-//! [`crate::wire::protocol::Responder::reply`]'s job, so nothing here formats errors.
+//! [`crate::protocol::tokens::Responder::reply`]'s job, so nothing here formats errors.
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
 
 use crate::error::{Error, Reply, Result};
-use crate::index::{self, AnnIndex};
+use crate::filter::Filter;
+use crate::protocol::request::{Add, Create, Sim, SimKey};
 use crate::registry::{self, VectorIndex};
-use crate::store::{Store, StoreError};
-use crate::vector::codec::{self, Layout};
-use crate::vector::filter::Filter;
-use crate::vector::quant;
-use crate::wire::request::{Add, Create, Sim, SimKey};
+use crate::search::{AnnIndex, THREAD_SLOTS};
+use crate::storage::element::{self, Layout};
+use crate::storage::quantize;
+use crate::storage::{Store, StoreError};
 
 /// Parse whitespace-separated decimal coordinates.
 ///
@@ -101,7 +101,7 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         spec.connectivity,
         spec.expansion_add,
         spec.expansion_search,
-        index::THREAD_SLOTS,
+        THREAD_SLOTS,
     )?;
 
     if store.create_map(name, spec.maxcount, spec.exptime).is_err() {
@@ -178,7 +178,7 @@ pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
         return Ok(Reply::Overflowed);
     }
 
-    let quantized = quant::encode(&vector, layout.quant);
+    let quantized = quantize::encode(&vector, layout.quant);
     let value = layout.encode(&quantized, attr)?;
 
     // Map first: it is the source of truth. If the usearch insert below fails,
@@ -218,7 +218,7 @@ fn similar(
 
     // Reused across predicate calls so the hot path allocates nothing after the
     // first visited node.
-    let scratch = RefCell::new(Vec::with_capacity(codec::ATTR_BYTES));
+    let scratch = RefCell::new(Vec::with_capacity(element::ATTR_BYTES));
     let accept = |key: u64| -> bool {
         let Some(filter) = filter else {
             return true;
@@ -287,7 +287,7 @@ pub fn vsim_vector(store: &Store, spec: &Sim, body: &[u8]) -> Result<Reply> {
 
     let mut out = String::new();
     for (query_no, query) in coord_vectors(body, dim, "query")?.iter().enumerate() {
-        let quantized = quant::encode(query, layout.quant);
+        let quantized = quantize::encode(query, layout.quant);
         similar(store, &index, &quantized, k, filter, query_no, &mut out)?;
     }
     out.push_str("END\r\n");
@@ -388,7 +388,7 @@ pub fn vlist() -> Result<Reply> {
             layout.dim,
             layout.quant,
             index.ann.metric,
-            codec::ATTR_BYTES,
+            element::ATTR_BYTES,
             index.ann.len(),
             index.maxcount,
         );

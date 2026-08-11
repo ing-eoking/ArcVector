@@ -16,12 +16,12 @@ use std::ptr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
+use super::element::Layout;
 use crate::engine_api::{
     ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT, ENGINE_ERROR_CODE_ENGINE_EOVERFLOW,
     ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT, ENGINE_ERROR_CODE_ENGINE_SUCCESS, ENGINE_HANDLE,
     SERVER_HANDLE_V1, eitem, eitem_info, elems_result, engine_interface_v1, field_t, item_attr,
 };
-use crate::vector::codec::Layout;
 
 unsafe extern "C" {
     fn free(ptr: *mut c_void);
@@ -435,7 +435,7 @@ impl Store {
 
     /// Copy the fixed ATTR region of one element — the search predicate's hot path.
     ///
-    /// The region sits at a constant offset ([`crate::vector::codec::ATTR_OFFSET`]), so
+    /// The region sits at a constant offset ([`super::element::ATTR_OFFSET`]), so
     /// nothing has to be decoded and one or two cache lines are touched. The
     /// surrounding `map_elem_get` still costs a global `cache_lock` and a malloc;
     /// narrowing that is a change to this method's body alone.

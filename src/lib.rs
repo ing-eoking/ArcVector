@@ -1,19 +1,22 @@
 //! ArcVector — vector similarity search as an arcus ASCII protocol extension.
 //!
+//! One directory per system this talks to:
+//!
 //! ```text
 //! lib.rs        registration and the four memcached callbacks  <- FFI boundary
-//!   wire/       socket bytes -> typed request
-//!     protocol    reading a token array, writing one response
+//!   protocol/   memcached ASCII protocol
+//!     tokens      reading a token array, writing one response
 //!     request     command line -> typed request                (pure)
 //!     pending     state for the two commands that carry a body
+//!   storage/    arcus engine — where vectors live
+//!     map         the engine vtable                    (all raw pointers)
+//!     element     one Map element's byte layout
+//!   search/     usearch — the ANN index, a cache of storage
+//!     index       capacity, concurrency, key mapping
+//!     quantize    f32 -> f16/i8/b1
 //!   command     one handler per command
-//!   registry    live indexes and the lazy rebuild
-//!   store       arcus Map engine access                        (all raw pointers)
-//!   index       usearch wrapper and concurrency
-//!   vector/     how a vector and its attributes are represented (pure)
-//!     codec       element byte layout
-//!     quant       f32 -> f16/i8/b1
-//!     filter      attribute filter expressions
+//!   registry    ties a Map to an index, and rebuilds one from the other
+//!   filter      attribute filter expressions — ours, not either system's
 //!   error       one error type, and who gets blamed for it
 //! ```
 //!
@@ -42,11 +45,11 @@ pub mod engine_api {
 
 pub mod command;
 pub mod error;
-pub mod index;
+pub mod filter;
+pub mod protocol;
 pub mod registry;
-pub mod store;
-pub mod vector;
-pub mod wire;
+pub mod search;
+pub mod storage;
 
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
@@ -57,10 +60,10 @@ use engine_api::{
     extension_type_t_EXTENSION_ASCII_PROTOCOL, token_t,
 };
 use error::{Error, Reply, Result};
-use store::{Store, StoreError};
-use wire::pending;
-use wire::protocol::{Responder, ResponseHandler, Tokens};
-use wire::request::{self, Body, Line, MAX_BODY_BYTES};
+use protocol::pending;
+use protocol::request::{self, Body, Line, MAX_BODY_BYTES};
+use protocol::tokens::{Responder, ResponseHandler, Tokens};
+use storage::{Store, StoreError};
 
 /// Engine access for the callback currently running.
 ///
@@ -221,7 +224,7 @@ pub extern "C" fn memcached_extensions_initialize(
     let Some(get_api) = get_server_api else {
         return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
     };
-    store::set_server_api(get_api);
+    storage::map::set_server_api(get_api);
 
     // SAFETY: memcached hands us a live SERVER_HANDLE_V1 accessor, and the
     // descriptor is a process-lifetime static that the server only reads.

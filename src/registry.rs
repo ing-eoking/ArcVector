@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
 
 use crate::error::{Error, Result};
-use crate::index::AnnIndex;
-use crate::store::Store;
+use crate::search::AnnIndex;
+use crate::storage::map::Store;
 
 pub struct VectorIndex {
     pub name: String,
@@ -107,9 +107,9 @@ pub fn snapshot() -> Vec<Arc<VectorIndex>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::Metric;
-    use crate::vector::codec::Layout;
-    use crate::vector::quant::Quant;
+    use crate::search::Metric;
+    use crate::storage::element::Layout;
+    use crate::storage::quantize::Quant;
 
     fn index(name: &str) -> VectorIndex {
         let ann = AnnIndex::new(Layout::new(4, Quant::F32), Metric::L2, 0, 0, 0, 2).unwrap();

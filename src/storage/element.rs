@@ -21,7 +21,7 @@
 //! per-vector cost is 128 MB per million vectors, against 1 GB for the `i8`
 //! vectors themselves.
 
-use super::quant::Quant;
+use super::quantize::Quant;
 
 const MAGIC: [u8; 2] = *b"AV";
 

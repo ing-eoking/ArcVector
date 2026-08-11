@@ -109,7 +109,7 @@ pub fn take_body(cookie: *const c_void) -> Option<Pending> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::request::{Add, Sim};
+    use crate::protocol::request::{Add, Sim};
     use std::ptr;
 
     fn add() -> Body {
