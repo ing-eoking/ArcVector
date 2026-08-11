@@ -1,19 +1,19 @@
 //! Command handlers.
 //!
 //! Every handler returns `Result<Reply>`; turning that into an ASCII response is
-//! [`crate::protocol::Responder::reply`]'s job, so nothing here formats errors.
+//! [`crate::wire::protocol::Responder::reply`]'s job, so nothing here formats errors.
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
 
-use crate::codec::{self, Layout};
 use crate::error::{Error, Reply, Result};
-use crate::filter::Filter;
-use crate::index::AnnIndex;
-use crate::quant;
+use crate::index::{self, AnnIndex};
 use crate::registry::{self, VectorIndex};
-use crate::request::{self, Add, Create, Sim, SimKey};
 use crate::store::{Store, StoreError};
+use crate::vector::codec::{self, Layout};
+use crate::vector::filter::Filter;
+use crate::vector::quant;
+use crate::wire::request::{Add, Create, Sim, SimKey};
 
 /// Parse whitespace-separated decimal coordinates.
 ///
@@ -101,7 +101,7 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         spec.connectivity,
         spec.expansion_add,
         spec.expansion_search,
-        request::THREAD_SLOTS,
+        index::THREAD_SLOTS,
     )?;
 
     if store.create_map(name, spec.maxcount, spec.exptime).is_err() {

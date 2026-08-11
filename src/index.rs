@@ -23,9 +23,9 @@ use std::sync::{Condvar, Mutex, PoisonError, RwLock};
 
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind, b1x8, f16};
 
-use crate::codec::Layout;
 use crate::error::Error;
-use crate::quant::Quant;
+use crate::vector::codec::Layout;
+use crate::vector::quant::Quant;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -493,12 +493,12 @@ mod tests {
     }
 
     fn add(idx: &AnnIndex, id: &str, coords: &[f32]) {
-        idx.add(id, &crate::quant::encode(coords, idx.layout.quant))
+        idx.add(id, &crate::vector::quant::encode(coords, idx.layout.quant))
             .unwrap();
     }
 
     fn search(idx: &AnnIndex, coords: &[f32], k: usize) -> Vec<String> {
-        let q = crate::quant::encode(coords, idx.layout.quant);
+        let q = crate::vector::quant::encode(coords, idx.layout.quant);
         idx.search(&q, k, |_| true)
             .unwrap()
             .into_iter()
@@ -543,7 +543,7 @@ mod tests {
         add(&idx, "keep", &[1.0, 0.0, 0.0, 0.0]);
         add(&idx, "skip", &[1.0, 0.0, 0.0, 0.0]);
 
-        let q = crate::quant::encode(&[1.0, 0.0, 0.0, 0.0], Quant::F32);
+        let q = crate::vector::quant::encode(&[1.0, 0.0, 0.0, 0.0], Quant::F32);
         let hits = idx
             .search(&q, 10, |key| idx.id_of(key) == Some("keep"))
             .unwrap();
@@ -609,7 +609,7 @@ mod tests {
             let idx = Arc::clone(&idx);
             let failures = Arc::clone(&failures);
             handles.push(std::thread::spawn(move || {
-                let q = crate::quant::encode(
+                let q = crate::vector::quant::encode(
                     &[t as f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
                     Quant::F32,
                 );
@@ -637,10 +637,11 @@ mod tests {
                     let id = format!("t{t}-{i}");
                     idx.add(
                         &id,
-                        &crate::quant::encode(&[t as f32, i as f32, 0.0, 0.0], Quant::F32),
+                        &crate::vector::quant::encode(&[t as f32, i as f32, 0.0, 0.0], Quant::F32),
                     )
                     .unwrap();
-                    let q = crate::quant::encode(&[t as f32, i as f32, 0.0, 0.0], Quant::F32);
+                    let q =
+                        crate::vector::quant::encode(&[t as f32, i as f32, 0.0, 0.0], Quant::F32);
                     let _ = idx.search(&q, 3, |_| true).unwrap();
                 }
             }));

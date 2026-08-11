@@ -9,12 +9,12 @@
 //! [`crate::pending`] holds until the bytes arrive. The rest resolve to a
 //! [`Line`] and run immediately.
 
-use crate::codec;
+use super::protocol::Tokens;
 use crate::error::{Error, Result};
-use crate::filter::Filter;
-use crate::index::{self, Metric};
-use crate::protocol::Tokens;
-use crate::quant::Quant;
+use crate::index::Metric;
+use crate::vector::codec;
+use crate::vector::filter::Filter;
+use crate::vector::quant::Quant;
 
 /// Upper bound on one transferred body, so a malformed length cannot ask for an
 /// enormous allocation.
@@ -427,14 +427,10 @@ fn filter_clause(tokens: &Tokens, at: usize) -> Result<Option<Filter>> {
     Filter::parse(&expression).map(Some).map_err(Error::from)
 }
 
-/// Thread contexts an index reserves. Re-exported so [`crate::command`] does not
-/// have to reach into [`crate::index`] for a value the protocol never carries.
-pub const THREAD_SLOTS: usize = index::THREAD_SLOTS;
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::tokenize_for_test as tokenize;
+    use crate::wire::protocol::tokenize_for_test as tokenize;
     use std::os::raw::c_int;
 
     /// Binds `$name` to a `Tokens` view of `$src`, keeping the backing buffer

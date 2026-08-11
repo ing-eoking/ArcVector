@@ -29,19 +29,27 @@ They are joined by a key. The graph finds candidates; Map holds the bytes.
 ## 2. Module map
 
 ```
-lib.rs      registration and the four memcached callbacks     <- the FFI boundary
-  protocol  reading a token array, writing one response
-  request   command line -> typed request                     (pure)
-  pending   per-connection state for two-phase transfers
-  command   one handler per command
-  registry  live indexes and the lazy rebuild
-  store     arcus Map engine access                           (all raw pointers)
-  index     usearch wrapper and concurrency
-  codec     element byte layout                               (pure)
-  quant     f32 -> f16/i8/b1                                  (pure)
-  filter    attribute filter expressions                      (pure)
-  error     one error type, and who gets blamed for it
+lib.rs        registration and the four memcached callbacks   <- the FFI boundary
+  wire/       socket bytes -> typed request
+    protocol    reading a token array, writing one response
+    request     command line -> typed request                  (pure)
+    pending     state for the two commands that carry a body
+  command     one handler per command
+  registry    live indexes and the lazy rebuild
+  store       arcus Map engine access                          (all raw pointers)
+  index       usearch wrapper and concurrency
+  vector/     how a vector and its attributes are represented  (pure)
+    codec       element byte layout
+    quant       f32 -> f16/i8/b1
+    filter      attribute filter expressions
+  error       one error type, and who gets blamed for it
 ```
+
+The two directories are each one concern that needed several files. `wire/` is
+split by stage — read the tokens, type them, hold them while a body arrives — and
+`vector/` by aspect: how an element is laid out, how coordinates are quantized,
+how attributes are queried. Everything in `vector/` is pure, which is why it
+carries most of the test coverage.
 
 Two boundaries carry most of the weight:
 

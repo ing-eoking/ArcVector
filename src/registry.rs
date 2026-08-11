@@ -107,9 +107,9 @@ pub fn snapshot() -> Vec<Arc<VectorIndex>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::Layout;
     use crate::index::Metric;
-    use crate::quant::Quant;
+    use crate::vector::codec::Layout;
+    use crate::vector::quant::Quant;
 
     fn index(name: &str) -> VectorIndex {
         let ann = AnnIndex::new(Layout::new(4, Quant::F32), Metric::L2, 0, 0, 0, 2).unwrap();

@@ -1,18 +1,20 @@
 //! ArcVector — vector similarity search as an arcus ASCII protocol extension.
 //!
 //! ```text
-//! lib.rs      registration and the four memcached callbacks   <- FFI boundary
-//!   protocol  reading a token array, writing one response
-//!   request   command line -> typed request                    (pure)
-//!   pending   per-connection state for two-phase transfers
-//!   command   one handler per command
-//!   registry  live indexes and the lazy rebuild
-//!   store     arcus Map engine access                          (all raw pointers)
-//!   index     usearch wrapper and concurrency
-//!   codec     element byte layout                              (pure)
-//!   quant     f32 -> f16/i8/b1                                 (pure)
-//!   filter    attribute filter expressions                     (pure)
-//!   error     one error type, and who gets blamed for it
+//! lib.rs        registration and the four memcached callbacks  <- FFI boundary
+//!   wire/       socket bytes -> typed request
+//!     protocol    reading a token array, writing one response
+//!     request     command line -> typed request                (pure)
+//!     pending     state for the two commands that carry a body
+//!   command     one handler per command
+//!   registry    live indexes and the lazy rebuild
+//!   store       arcus Map engine access                        (all raw pointers)
+//!   index       usearch wrapper and concurrency
+//!   vector/     how a vector and its attributes are represented (pure)
+//!     codec       element byte layout
+//!     quant       f32 -> f16/i8/b1
+//!     filter      attribute filter expressions
+//!   error       one error type, and who gets blamed for it
 //! ```
 //!
 //! The single consistency rule: **the usearch index is a cache rebuildable from
@@ -38,17 +40,13 @@ pub mod engine_api {
     include!(concat!(env!("OUT_DIR"), "/engine_api.rs"));
 }
 
-pub mod codec;
 pub mod command;
 pub mod error;
-pub mod filter;
 pub mod index;
-pub mod pending;
-pub mod protocol;
-pub mod quant;
 pub mod registry;
-pub mod request;
 pub mod store;
+pub mod vector;
+pub mod wire;
 
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
@@ -59,9 +57,10 @@ use engine_api::{
     extension_type_t_EXTENSION_ASCII_PROTOCOL, token_t,
 };
 use error::{Error, Reply, Result};
-use protocol::{Responder, ResponseHandler, Tokens};
-use request::{Body, Line, MAX_BODY_BYTES};
 use store::{Store, StoreError};
+use wire::pending;
+use wire::protocol::{Responder, ResponseHandler, Tokens};
+use wire::request::{self, Body, Line, MAX_BODY_BYTES};
 
 /// Engine access for the callback currently running.
 ///

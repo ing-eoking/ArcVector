@@ -6,9 +6,9 @@
 use std::os::raw::{c_char, c_int, c_void};
 use std::str::FromStr;
 
+use super::request::Cmd;
 use crate::engine_api::token_t;
 use crate::error::{Error, Reply, Result};
-use crate::request::Cmd;
 
 /// Mirrors memcached's own `MAX_TOKENS` (memcached.c:8066). At this many tokens
 /// the tokenizer stops splitting and leaves the rest of the line in one

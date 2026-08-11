@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::os::raw::{c_char, c_void};
 use std::sync::{LazyLock, Mutex, PoisonError};
 
+use super::request::Body;
 use crate::error::Error;
-use crate::request::Body;
 
 /// A command line whose body has still to arrive, with the buffer for it.
 ///
@@ -109,7 +109,7 @@ pub fn take_body(cookie: *const c_void) -> Option<Pending> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::request::{Add, Sim};
+    use crate::wire::request::{Add, Sim};
     use std::ptr;
 
     fn add() -> Body {
