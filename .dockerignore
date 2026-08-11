@@ -1,0 +1,9 @@
+# Build output and local artifacts; the image builds its own.
+/target
+/data
+/docs
+memcached
+default_engine.so
+arcus.conf
+.git
+.gitignore

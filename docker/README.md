@@ -13,6 +13,8 @@ Point the harness at an arcus build:
 ```sh
 export ARCVECTOR_MEMCACHED=/path/to/arcus/bin/memcached
 export ARCVECTOR_ENGINE=/path/to/arcus/lib/default_engine.so
+# Only if you run as root: memcached refuses to without -u.
+export ARCVECTOR_MEMCACHED_ARGS="-u root"
 
 cargo build && cargo test
 ```
@@ -60,8 +62,23 @@ from what is actually sent by `Client::vadd` and friends, because a test that
 miscounts tests the wrong thing. The tests that *want* a wrong length call
 `send_body` directly and say so.
 
+## Skip versus fail
+
+A **missing** daemon or engine skips: this crate cannot build them. Anything that
+is present but does not work **fails**, with the daemon's own output attached.
+`Daemon::start` checks two things beyond "the socket accepted a connection":
+
+- the process did not exit, and
+- `vlist` answers `END`, which only happens if our extension registered.
+
+That second check exists because it was needed. The first version of this image
+shipped a library with no `memcached_extensions_initialize` at all — the
+dependency-caching layer left a placeholder artifact in place — and the daemon
+refused to start. Every test skipped and the suite reported 18 passed. A setup
+that cannot answer is a broken run, not an absent one.
+
 ## Status
 
-Unverified: the `docker/Dockerfile` has not been built — no Docker daemon was
-available here. The local path is verified; 18 integration tests pass against a
-real daemon.
+Verified. `docker build -f docker/Dockerfile -t arcvector-test . && docker run
+--rm arcvector-test` runs 111 unit and 18 integration tests, all passing, against
+a Linux `.so` — the artifact that ships.

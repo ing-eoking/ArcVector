@@ -25,20 +25,33 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=arcus /arcus /arcus
+
+# ARCVECTOR_MEMCACHED_ARGS carries "-u root" because memcached refuses to run as
+# root without it, and this image is root. The harness does not guess at a uid.
 ENV ARCVECTOR_MEMCACHED=/arcus/bin/memcached \
-    ARCVECTOR_ENGINE=/arcus/lib/default_engine.so
+    ARCVECTOR_ENGINE=/arcus/lib/default_engine.so \
+    ARCVECTOR_MEMCACHED_ARGS="-u root"
 
 WORKDIR /src
 
-# Dependencies first, so editing sources does not rebuild usearch's C++ core.
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "" > src/lib.rs && cargo fetch
-
-COPY build.rs ./
+# Compile the dependencies against a placeholder crate first, so editing sources
+# does not recompile usearch's C++ core. build.rs and the headers come along
+# because bindgen runs during this build too.
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY include ./include
+RUN mkdir src && echo "" > src/lib.rs && cargo build --lib
+
 COPY src ./src
 COPY tests ./tests
 
-# cargo test does not build the cdylib the daemon loads, and the harness refuses
-# to run against a stale one — so build it explicitly first.
-CMD ["sh", "-c", "cargo build && cargo test"]
+# `cargo clean -p` is not optional. COPY stamps files with their mtime from the
+# build context, which is *older* than the placeholder build above, so cargo sees
+# the real sources as unchanged and skips them — shipping a library with no
+# extension entry point at all. Dropping just this crate's artifacts forces the
+# rebuild while leaving the dependency cache, and usearch's C++ core, intact.
+#
+# cargo test would not rebuild the cdylib either: it builds the rlib the harness
+# links against, not the library the daemon loads.
+RUN cargo clean -p arcusv && cargo build
+
+CMD ["cargo", "test"]

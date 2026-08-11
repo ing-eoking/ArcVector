@@ -4,18 +4,28 @@
 //! against a local build and inside a container:
 //!
 //! ```text
-//! ARCVECTOR_MEMCACHED   path to the memcached binary  (default <crate>/memcached)
-//! ARCVECTOR_ENGINE      path to default_engine.so     (default <crate>/default_engine.so)
+//! ARCVECTOR_MEMCACHED        path to the memcached binary (default <crate>/memcached)
+//! ARCVECTOR_ENGINE           path to default_engine.so    (default <crate>/default_engine.so)
+//! ARCVECTOR_MEMCACHED_ARGS   extra daemon arguments, space separated
 //! ```
 //!
-//! When either is missing the tests **skip** rather than fail — those artifacts
-//! come from building arcus-memcached, which is not part of this crate's build.
+//! `ARCVECTOR_MEMCACHED_ARGS` exists because memcached refuses to run as root
+//! without `-u`, which containers hit and workstations do not. The environment
+//! that needs it declares it, rather than the harness guessing at a uid.
+//!
+//! When either is **missing** the tests skip: those artifacts come from building
+//! arcus-memcached, which is not part of this crate's build. When they are present
+//! but the daemon will not come up, or comes up without our extension registered,
+//! the tests **fail** — a setup that cannot answer is a broken run, not an absent
+//! one. Conflating the two once turned a container that shipped a placeholder
+//! library into a green suite.
 //!
 //! Each test gets its own daemon on its own **unix socket**. Sockets rather than
 //! TCP ports because tests run in parallel: allocating a free port and then
 //! spawning leaves a window in which another test can take it, and the daemon that
 //! loses exits, which showed up as connections being refused mid-suite.
 
+use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -112,6 +122,7 @@ fn assert_fresh(module: &Path) {
 pub struct Daemon {
     child: Child,
     socket: PathBuf,
+    log: PathBuf,
 }
 
 impl Daemon {
@@ -140,41 +151,73 @@ impl Daemon {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
+        let log = socket.with_extension("log");
         let _ = std::fs::remove_file(&socket);
 
+        // Diagnostics go to a file rather than a pipe: nothing has to drain it, so
+        // a chatty daemon cannot block on a full pipe buffer, and the text is
+        // available whenever a failure needs to explain itself.
         let child = Command::new(&memcached)
             .args(["-E".as_ref(), engine.as_os_str()])
             .args(["-X".as_ref(), module.as_os_str()])
             .args(["-s".as_ref(), socket.as_os_str()])
             // Several workers, so the concurrency paths are actually live.
             .args(["-t", "4"])
+            .args(extra_args())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(File::create(&log).map_or(Stdio::null(), Stdio::from))
             .spawn()
-            .ok()?;
+            .unwrap_or_else(|e| panic!("could not run {}: {e}", memcached.display()));
 
-        let mut daemon = Daemon { child, socket };
-        if daemon.wait_until_listening() {
-            Some(daemon)
-        } else {
-            skip("the daemon never accepted a connection");
-            None
-        }
+        let mut daemon = Daemon { child, socket, log };
+        daemon.wait_until_listening();
+        daemon.assert_extension_registered(&module);
+        Some(daemon)
     }
 
-    fn wait_until_listening(&mut self) -> bool {
+    /// Wait for the socket, failing with the daemon's own diagnostics if it dies.
+    fn wait_until_listening(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if let Ok(Some(status)) = self.child.try_wait() {
-                eprintln!("daemon exited early with {status}");
-                return false;
+                panic!(
+                    "the daemon exited with {status} instead of listening.\n{}",
+                    self.diagnostics()
+                );
             }
             if UnixStream::connect(&self.socket).is_ok() {
-                return true;
+                return;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        false
+        panic!(
+            "the daemon never accepted a connection on {}.\n{}",
+            self.socket.display(),
+            self.diagnostics()
+        );
+    }
+
+    /// A listening daemon is not enough — it has to have loaded *our* extension.
+    ///
+    /// Without this a library missing `memcached_extensions_initialize` produced a
+    /// daemon that answered everything with `ERROR`, and every test skipped and
+    /// reported success.
+    fn assert_extension_registered(&self, module: &Path) {
+        let reply = self.connect().send("vlist");
+        assert!(
+            reply == "END\r\n",
+            "the daemon is up but did not answer `vlist`, so {} was not registered \
+             as an extension.\nGot {reply:?}.\n{}",
+            module.display(),
+            self.diagnostics()
+        );
+    }
+
+    fn diagnostics(&self) -> String {
+        match std::fs::read_to_string(&self.log) {
+            Ok(text) if !text.trim().is_empty() => format!("daemon output:\n{text}"),
+            _ => "the daemon wrote no diagnostics.".to_owned(),
+        }
     }
 
     pub fn connect(&self) -> Client {
@@ -191,9 +234,21 @@ impl Drop for Daemon {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_file(&self.log);
     }
 }
 
+/// Daemon arguments the environment adds, such as the `-u` a root container needs.
+fn extra_args() -> Vec<String> {
+    std::env::var("ARCVECTOR_MEMCACHED_ARGS")
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Report a genuinely absent prerequisite. Only for things this crate cannot
+/// build; anything that is present but broken must fail instead.
 fn skip(reason: &str) {
     eprintln!(
         "SKIP: {reason}.\n      \

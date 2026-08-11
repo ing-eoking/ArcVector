@@ -388,6 +388,11 @@ Two hazards the harness guards against, both found by hitting them:
 - **Port collisions.** Allocating a free TCP port and then spawning leaves a
   window for a parallel test to take it, and the daemon that loses exits. Unix
   sockets remove the window entirely.
+- **Skipping a broken setup.** Skipping when anything went wrong turned a
+  container that shipped a library with no extension entry point into a green
+  suite of 18 "passing" tests. Only an *absent* daemon skips now; a daemon that
+  will not start, or starts without our extension registered, fails with its own
+  output attached.
 
 Lengths the protocol requires are derived from what is actually sent, because a
 test that miscounts tests the wrong thing.
