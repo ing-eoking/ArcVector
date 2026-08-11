@@ -13,6 +13,11 @@
 //! per machine and is not something this crate builds. `make test` supplies both
 //! in a container; see `docker/README.md`.
 //!
+//! Building this target at all means the `integration` feature was requested,
+//! which asserts a daemon is reachable. So an unset variable **fails** here. There
+//! is no skip path left: a test that reports success without running is the one
+//! failure mode this suite has already had twice.
+//!
 //! `ARCVECTOR_MEMCACHED_ARGS` exists because memcached refuses to run as root
 //! without `-u`, which containers hit and workstations do not. The environment
 //! that needs it declares it, rather than the harness guessing at a uid.
@@ -132,24 +137,29 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Start a daemon, or return `None` after printing why it could not.
-    pub fn start() -> Option<Daemon> {
+    /// Start a daemon, failing with the reason if that is not possible.
+    pub fn start() -> Daemon {
         let (Some(memcached), Some(engine)) = (
             from_env("ARCVECTOR_MEMCACHED"),
             from_env("ARCVECTOR_ENGINE"),
         ) else {
-            skip("ARCVECTOR_MEMCACHED and ARCVECTOR_ENGINE are not set");
-            return None;
+            panic!(
+                "{}",
+                missing("ARCVECTOR_MEMCACHED and ARCVECTOR_ENGINE are not set")
+            )
         };
         for (what, path) in [("memcached", &memcached), ("engine", &engine)] {
-            if !path.exists() {
-                skip(&format!("{what} not found at {}", path.display()));
-                return None;
-            }
+            assert!(
+                path.exists(),
+                "{}",
+                missing(&format!("{what} not found at {}", path.display()))
+            );
         }
         let Some(module) = extension() else {
-            skip("the extension library was not found next to the test binary");
-            return None;
+            panic!(
+                "{}",
+                missing("the extension library was not found next to the test binary")
+            )
         };
         assert_fresh(&module);
 
@@ -182,7 +192,7 @@ impl Daemon {
         let mut daemon = Daemon { child, socket, log };
         daemon.wait_until_listening();
         daemon.assert_extension_registered(&module);
-        Some(daemon)
+        daemon
     }
 
     /// Wait for the socket, failing with the daemon's own diagnostics if it dies.
@@ -257,14 +267,14 @@ fn extra_args() -> Vec<String> {
         .collect()
 }
 
-/// Report a genuinely absent prerequisite. Only for things this crate cannot
-/// build; anything that is present but broken must fail instead.
-fn skip(reason: &str) {
-    eprintln!(
-        "SKIP: {reason}.\n      \
-         Run `make test` to get a daemon from the container, or point\n      \
+/// Explain an absent prerequisite. Building this target asked for a daemon, so
+/// not having one is a failure, not something to pass over quietly.
+fn missing(reason: &str) -> String {
+    format!(
+        "{reason}.\n\
+         Run `make test` to get a daemon from the container, or point\n\
          ARCVECTOR_MEMCACHED / ARCVECTOR_ENGINE at an arcus build yourself."
-    );
+    )
 }
 
 /// One connection, speaking the ASCII protocol.

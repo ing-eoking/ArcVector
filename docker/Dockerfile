@@ -52,8 +52,10 @@ COPY tests ./tests
 #
 # cargo test would not rebuild the cdylib either: it builds the rlib the harness
 # links against, not the library the daemon loads.
-RUN cargo clean -p arcusv && cargo build
+RUN cargo clean -p arcusv \
+ && cargo build \
+ && cargo build --features integration --tests
 
-# --include-ignored: the integration tests are ignored by default because they
-# need a daemon, and this image is the environment that has one.
-CMD ["cargo", "test", "--", "--include-ignored"]
+# The integration target is behind a feature because it needs a daemon; this is
+# the environment that has one.
+CMD ["cargo", "test", "--features", "integration"]

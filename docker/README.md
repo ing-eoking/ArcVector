@@ -38,19 +38,22 @@ make unit     # unit tests only; no daemon involved
 make lint     # fmt --check and clippy -D warnings
 ```
 
-The integration tests are `#[ignore]`d, so a plain `cargo test` reports them as
-*ignored* rather than passed. That is deliberate: they would otherwise report
-success without having run, which is exactly the failure this suite already had
-once.
+The integration target sits behind the `integration` feature, so a plain
+`cargo test` does not build it and reports nothing about it. That is deliberate:
+the alternative was listing tests that never ran, which this suite has already
+mistaken for success twice.
 
-To run them on the host anyway, point the harness at an arcus build and ask for
-the ignored tests:
+To run them on the host, point the harness at an arcus build and ask for the
+feature:
 
 ```sh
 export ARCVECTOR_MEMCACHED=/path/to/arcus/bin/memcached
 export ARCVECTOR_ENGINE=/path/to/arcus/lib/default_engine.so
-cargo build && cargo test -- --include-ignored
+cargo build && cargo test --features integration
 ```
+
+Asking for the feature asserts that a daemon is reachable, so an unset variable
+fails rather than skipping. There is no skip path left.
 
 **`cargo build` first.** `cargo test` builds the rlib the harness links against
 but *not* the `cdylib` the daemon loads; the harness compares timestamps and fails

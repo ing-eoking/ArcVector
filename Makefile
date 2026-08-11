@@ -19,13 +19,15 @@ test: image
 image:
 	docker build -f $(DOCKERFILE) -t $(IMAGE) .
 
-## Unit tests only. The integration tests are #[ignore]d without a daemon.
+## Unit tests only. The integration target is not built without a daemon.
 unit:
 	cargo test --lib
 
+# --all-features so the integration target is type-checked here too, even though
+# it is not built by a plain `cargo test`.
 lint:
 	cargo fmt --check
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --all-targets --all-features -- -D warnings
 
 ## The image with a shell instead of the test run, daemon paths already set.
 shell: image

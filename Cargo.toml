@@ -8,6 +8,18 @@ edition = "2024"
 # rlib:   lets `cargo test` exercise the pure modules (codec/quant/filter).
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# The integration tests need an arcus daemon, which this crate does not build.
+# Gating the target means `cargo test` does not report on tests it never ran.
+integration = []
+
+# Only built when the feature is on, so a plain `cargo test` says nothing about it
+# rather than listing it as ignored.
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+required-features = ["integration"]
+
 [dependencies]
 usearch = "2.26"
 serde_json = "1"

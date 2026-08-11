@@ -388,9 +388,11 @@ starts its own daemon on its own unix socket and kills it on drop. `make test`
 runs the whole suite in a container that supplies the daemon; see
 `docker/README.md`.
 
-Those tests are `#[ignore]`d by default. A plain `cargo test` reports them as
-*ignored* rather than passed, because a test that reports success without running
-is the failure mode this suite already had once.
+That target is behind the `integration` feature, so a plain `cargo test` does not
+build it and says nothing about it — rather than listing tests that never ran.
+Requesting the feature asserts a daemon is reachable, so a missing one fails.
+There is no skip path: a test reporting success without running is the failure mode
+this suite mistook for green twice.
 
 Two hazards the harness guards against, both found by hitting them:
 
