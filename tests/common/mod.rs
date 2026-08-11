@@ -1,13 +1,17 @@
 //! Harness for driving a real arcus daemon with the extension loaded.
 //!
-//! The daemon and engine are found through the environment, so the same tests run
-//! against a local build and inside a container:
+//! The daemon and engine come from the environment, with no default path:
 //!
 //! ```text
-//! ARCVECTOR_MEMCACHED        path to the memcached binary (default <crate>/memcached)
-//! ARCVECTOR_ENGINE           path to default_engine.so    (default <crate>/default_engine.so)
+//! ARCVECTOR_MEMCACHED        path to the memcached binary       (required)
+//! ARCVECTOR_ENGINE           path to default_engine.so          (required)
 //! ARCVECTOR_MEMCACHED_ARGS   extra daemon arguments, space separated
 //! ```
+//!
+//! Required rather than defaulted, because guessing at a path in the working tree
+//! makes the suite depend on whatever happens to be lying there — which differs
+//! per machine and is not something this crate builds. `make test` supplies both
+//! in a container; see `docker/README.md`.
 //!
 //! `ARCVECTOR_MEMCACHED_ARGS` exists because memcached refuses to run as root
 //! without `-u`, which containers hit and workstations do not. The environment
@@ -51,8 +55,10 @@ fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn from_env_or(var: &str, default: &str) -> PathBuf {
-    std::env::var_os(var).map_or_else(|| crate_root().join(default), PathBuf::from)
+fn from_env(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 /// The `cdylib` this crate built.
@@ -128,9 +134,13 @@ pub struct Daemon {
 impl Daemon {
     /// Start a daemon, or return `None` after printing why it could not.
     pub fn start() -> Option<Daemon> {
-        let memcached = from_env_or("ARCVECTOR_MEMCACHED", "memcached");
-        let engine = from_env_or("ARCVECTOR_ENGINE", "default_engine.so");
-
+        let (Some(memcached), Some(engine)) = (
+            from_env("ARCVECTOR_MEMCACHED"),
+            from_env("ARCVECTOR_ENGINE"),
+        ) else {
+            skip("ARCVECTOR_MEMCACHED and ARCVECTOR_ENGINE are not set");
+            return None;
+        };
         for (what, path) in [("memcached", &memcached), ("engine", &engine)] {
             if !path.exists() {
                 skip(&format!("{what} not found at {}", path.display()));
@@ -252,8 +262,8 @@ fn extra_args() -> Vec<String> {
 fn skip(reason: &str) {
     eprintln!(
         "SKIP: {reason}.\n      \
-         Build arcus-memcached and point ARCVECTOR_MEMCACHED / ARCVECTOR_ENGINE at it,\n      \
-         or run the suite in the container (see docker/)."
+         Run `make test` to get a daemon from the container, or point\n      \
+         ARCVECTOR_MEMCACHED / ARCVECTOR_ENGINE at an arcus build yourself."
     );
 }
 

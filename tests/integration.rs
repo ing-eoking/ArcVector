@@ -1,8 +1,12 @@
 //! End-to-end tests against a real arcus daemon with the extension loaded.
 //!
 //! These are the only tests that exercise `store.rs` — the engine call path
-//! cannot be reached from unit tests. They **skip** when the daemon or engine is
-//! not available; see [`common`] for how to point them at a build.
+//! cannot be reached from unit tests.
+//!
+//! Every test here is `#[ignore]`d, because it needs a daemon this crate does not
+//! build. `make test` runs them in a container with `--include-ignored`. Ignored
+//! rather than silently skipped so that `cargo test` on a workstation reports
+//! "18 ignored" instead of "18 passed" for tests that never ran.
 
 mod common;
 
@@ -19,6 +23,7 @@ macro_rules! session {
 }
 
 #[test]
+#[ignore = "needs an arcus daemon; run `make test`"]
 fn the_extension_loads_and_claims_its_commands() {
     session!(daemon, client);
     // Reaching the extension at all proves registration worked.
@@ -29,6 +34,7 @@ fn the_extension_loads_and_claims_its_commands() {
 }
 
 #[test]
+#[ignore = "needs an arcus daemon; run `make test`"]
 fn an_index_is_created_once_and_listed() {
     session!(_daemon, client);
     let ix = index_name("create");
@@ -48,6 +54,7 @@ fn an_index_is_created_once_and_listed() {
 }
 
 #[test]
+#[ignore = "needs an arcus daemon; run `make test`"]
 fn a_vector_round_trips_through_the_engine() {
     session!(_daemon, client);
     let ix = index_name("roundtrip");
@@ -73,6 +80,7 @@ fn a_vector_round_trips_through_the_engine() {
 }
 
 #[test]
+#[ignore = "needs an arcus daemon; run `make test`"]
 fn attributes_are_optional_and_come_back_empty() {
     session!(_daemon, client);
     let ix = index_name("noattr");
@@ -87,6 +95,7 @@ fn attributes_are_optional_and_come_back_empty() {
 }
 
 #[test]
+#[ignore = "needs an arcus daemon; run `make test`"]
 fn search_ranks_by_distance() {
     session!(_daemon, client);
     let ix = index_name("rank");
@@ -107,6 +116,7 @@ fn search_ranks_by_distance() {
 }
 
 #[test]
+#[ignore = "needs an arcus daemon; run `make test`"]
 fn a_batch_of_queries_returns_one_group_each() {
     session!(_daemon, client);
     let ix = index_name("batch");
@@ -127,6 +137,7 @@ fn a_batch_of_queries_returns_one_group_each() {
 }
 
 #[test]
+#[ignore = "needs an arcus daemon; run `make test`"]
 fn a_filter_restricts_results_by_attribute() {
     session!(_daemon, client);
     let ix = index_name("filter");
@@ -152,6 +163,7 @@ fn a_filter_restricts_results_by_attribute() {
 }
 
 #[test]
+#[ignore = "needs an arcus daemon; run `make test`"]
 fn search_by_key_uses_the_stored_vector() {
     session!(_daemon, client);
     let ix = index_name("bykey");
@@ -175,6 +187,7 @@ fn search_by_key_uses_the_stored_vector() {
 }
 
 #[test]
+#[ignore = "needs an arcus daemon; run `make test`"]
 fn quantizations_all_survive_a_round_trip_through_the_engine() {
     session!(_daemon, client);
     for (quant, metric) in [
@@ -201,6 +214,7 @@ fn quantizations_all_survive_a_round_trip_through_the_engine() {
 // -- rejection paths, which is where the wire format is easiest to get wrong --
 
 #[test]
+#[ignore = "needs an arcus daemon; run `make test`"]
 fn a_mis_declared_body_length_is_refused_without_storing() {
     session!(_daemon, client);
     let ix = index_name("chunk");
@@ -222,6 +236,7 @@ fn a_mis_declared_body_length_is_refused_without_storing() {
 }
 
 #[test]
+#[ignore = "needs an arcus daemon; run `make test`"]
 fn a_coordinate_count_that_disagrees_with_the_dimension_is_named() {
     session!(_daemon, client);
     let ix = index_name("dim");
@@ -235,6 +250,7 @@ fn a_coordinate_count_that_disagrees_with_the_dimension_is_named() {
 }
 
 #[test]
+#[ignore = "needs an arcus daemon; run `make test`"]
 fn a_dimension_that_disagrees_with_the_index_is_named() {
     session!(_daemon, client);
     let ix = index_name("indexdim");
@@ -247,6 +263,7 @@ fn a_dimension_that_disagrees_with_the_index_is_named() {
 }
 
 #[test]
+#[ignore = "needs an arcus daemon; run `make test`"]
 fn a_malformed_attr_is_refused_and_the_connection_survives() {
     session!(_daemon, client);
     let ix = index_name("attr");
@@ -271,6 +288,7 @@ fn a_malformed_attr_is_refused_and_the_connection_survives() {
 }
 
 #[test]
+#[ignore = "needs an arcus daemon; run `make test`"]
 fn operating_on_a_missing_index_is_a_client_error() {
     session!(_daemon, client);
     let ix = index_name("absent");
@@ -281,6 +299,7 @@ fn operating_on_a_missing_index_is_a_client_error() {
 }
 
 #[test]
+#[ignore = "needs an arcus daemon; run `make test`"]
 fn an_incompatible_metric_and_quantization_are_refused() {
     session!(_daemon, client);
     let ix = index_name("badquant");
@@ -293,6 +312,7 @@ fn an_incompatible_metric_and_quantization_are_refused() {
 }
 
 #[test]
+#[ignore = "needs an arcus daemon; run `make test`"]
 fn a_dimension_over_the_element_limit_is_refused() {
     session!(_daemon, client);
     let ix = index_name("toobig");
@@ -309,6 +329,7 @@ fn a_dimension_over_the_element_limit_is_refused() {
 }
 
 #[test]
+#[ignore = "needs an arcus daemon; run `make test`"]
 fn maxcount_stops_inserts_at_the_limit() {
     session!(_daemon, client);
     let ix = index_name("maxcount");
@@ -324,6 +345,7 @@ fn maxcount_stops_inserts_at_the_limit() {
 }
 
 #[test]
+#[ignore = "needs an arcus daemon; run `make test`"]
 fn many_connections_search_the_same_index_at_once() {
     // The concurrency invariants are unit-tested, but only here do they run on
     // the daemon's own worker threads.

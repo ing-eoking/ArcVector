@@ -16,11 +16,14 @@ For how it works inside, see [docs/INTERNALS.md](docs/INTERNALS.md).
 
 ```sh
 cargo build --release        # -> target/release/libarcusv.{so,dylib}
-cargo test                   # unit tests, plus integration if a daemon is available
+make test                    # all tests, in a container with a real daemon
+make unit                    # unit tests only, on the host
 ```
 
-Integration tests drive a real arcus daemon; see [docker/README.md](docker/README.md)
-for how to point them at one or run them in a container.
+`make test` is the full suite: the integration tests need an arcus daemon that
+this crate does not build, and the container also exercises the Linux `.so` that
+ships rather than the macOS `.dylib` development produces. See
+[docker/README.md](docker/README.md).
 
 `build.rs` runs bindgen over the vendored arcus headers in `include/`, so libclang
 must be available. usearch compiles a C++ core, so a C++17 toolchain is needed too.

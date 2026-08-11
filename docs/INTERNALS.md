@@ -376,8 +376,13 @@ wrong (`SERVER_ERROR`).
 
 `tests/` drives a real daemon with the extension loaded — the only way to reach
 `store.rs`, since the engine calls are unreachable from unit tests. Each test
-starts its own daemon on its own unix socket and kills it on drop. They **skip**
-when no daemon is available; see `docker/README.md`.
+starts its own daemon on its own unix socket and kills it on drop. `make test`
+runs the whole suite in a container that supplies the daemon; see
+`docker/README.md`.
+
+Those tests are `#[ignore]`d by default. A plain `cargo test` reports them as
+*ignored* rather than passed, because a test that reports success without running
+is the failure mode this suite already had once.
 
 Two hazards the harness guards against, both found by hitting them:
 

@@ -54,4 +54,6 @@ COPY tests ./tests
 # links against, not the library the daemon loads.
 RUN cargo clean -p arcusv && cargo build
 
-CMD ["cargo", "test"]
+# --include-ignored: the integration tests are ignored by default because they
+# need a daemon, and this image is the environment that has one.
+CMD ["cargo", "test", "--", "--include-ignored"]

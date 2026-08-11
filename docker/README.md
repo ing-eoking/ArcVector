@@ -1,53 +1,60 @@
-# Running the tests against a real daemon
-
-The integration tests in `tests/` need a memcached binary and a
-`default_engine.so`, which this crate does not build. Without them they **skip**
-— the suite stays green but `store.rs`, the engine call path, goes unverified.
-
-There are two ways to supply them.
-
-## Locally (fast loop)
-
-Point the harness at an arcus build:
+# Running the tests
 
 ```sh
-export ARCVECTOR_MEMCACHED=/path/to/arcus/bin/memcached
-export ARCVECTOR_ENGINE=/path/to/arcus/lib/default_engine.so
-# Only if you run as root: memcached refuses to without -u.
-export ARCVECTOR_MEMCACHED_ARGS="-u root"
-
-cargo build && cargo test
+make test
 ```
 
-The defaults are `./memcached` and `./default_engine.so` at the crate root, so
-dropping a build there needs no environment at all.
+That is the whole thing: it builds the image and runs **all** the tests, unit and
+integration, in the container.
 
-**`cargo build` first, every time.** `cargo test` builds the rlib the harness
-links against but *not* the `cdylib` the daemon loads. The harness compares
-timestamps and fails loudly rather than silently verifying a stale library.
+## Why the container
 
-## In a container (reproducible, and the real target)
+The integration tests need a memcached binary and a `default_engine.so`, which
+this crate does not build. The container supplies them, so the suite does not
+depend on whatever happens to be lying in the working tree.
 
-```sh
-docker build -f docker/Dockerfile -t arcvector-test .
-docker run --rm arcvector-test
-```
-
-Worth doing even when the local path works, because development on macOS
-produces a `.dylib` while deployment is a Linux `.so`. This is the only place
-that artifact gets exercised.
+It also builds the artifact that ships. Development on macOS produces a `.dylib`;
+deployment is a Linux `.so`, and this is the only place that one runs. The
+generated bindings are not even the same size on the two platforms — bindgen reads
+the target's own system headers — so "it works locally" is not the same claim.
 
 The image takes the daemon from `jam2in/arcus-memcached:latest` and builds the
-module with the Rust toolchain in the same layer, so the tests spawn the daemon
-locally exactly as they do on a workstation.
+module with the Rust toolchain in the same layer, so the tests spawn the daemon as
+a local subprocess exactly as they would on a workstation. There is no separate
+daemon service; Docker only supplies the binaries and the platform.
 
 If that image is unavailable, build one from an arcus checkout — its `Dockerfile`
-installs into `/arcus`, which is the layout expected here:
+installs into `/arcus`, the layout expected here:
 
 ```sh
 docker build -t arcus-local /path/to/arcus-memcached
 # then change the first FROM in docker/Dockerfile to arcus-local
 ```
+
+## On the host
+
+```sh
+make unit     # unit tests only; no daemon involved
+make lint     # fmt --check and clippy -D warnings
+```
+
+The integration tests are `#[ignore]`d, so a plain `cargo test` reports them as
+*ignored* rather than passed. That is deliberate: they would otherwise report
+success without having run, which is exactly the failure this suite already had
+once.
+
+To run them on the host anyway, point the harness at an arcus build and ask for
+the ignored tests:
+
+```sh
+export ARCVECTOR_MEMCACHED=/path/to/arcus/bin/memcached
+export ARCVECTOR_ENGINE=/path/to/arcus/lib/default_engine.so
+cargo build && cargo test -- --include-ignored
+```
+
+**`cargo build` first.** `cargo test` builds the rlib the harness links against
+but *not* the `cdylib` the daemon loads; the harness compares timestamps and fails
+rather than verifying a stale library.
 
 ## How the harness works
 
