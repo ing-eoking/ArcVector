@@ -1,164 +1,6 @@
-//! Turning a command line into a typed request.
-//!
-//! Nothing here touches the engine or an index. Parsing lives entirely on this
-//! side of the boundary so that [`crate::command`] handlers receive plain data
-//! and can be exercised without a server, and so that every syntax rule has one
-//! place to live.
-//!
-//! Two commands carry a body, and their lines are parsed into a [`Body`] that
-//! [`crate::pending`] holds until the bytes arrive. The rest resolve to a
-//! [`Line`] and run immediately.
+//! Tokens in, typed requests out. Nothing here touches the engine or the index.
 
-use super::filter::Filter;
-use super::tokens::Tokens;
-use crate::arcus::element::{self, Quant};
-use crate::error::{Error, Result};
-use crate::usearch::Metric;
-
-/// Upper bound on one transferred body, so a malformed length cannot ask for an
-/// enormous allocation.
-pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
-
-/// The commands this extension answers. Names match case-insensitively, so
-/// `VSIM` and `vsim` are the same command.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Cmd {
-    VCreate,
-    VAdd,
-    VSim,
-    VGet,
-    VDel,
-    VDrop,
-    VList,
-    VStats,
-}
-
-impl Cmd {
-    pub fn parse(name: &str) -> Option<Cmd> {
-        const NAMES: [(&str, Cmd); 8] = [
-            ("vcreate", Cmd::VCreate),
-            ("vadd", Cmd::VAdd),
-            ("vsim", Cmd::VSim),
-            ("vget", Cmd::VGet),
-            ("vdel", Cmd::VDel),
-            ("vdrop", Cmd::VDrop),
-            ("vlist", Cmd::VList),
-            ("vstats", Cmd::VStats),
-        ];
-        NAMES
-            .iter()
-            .find(|(text, _)| name.eq_ignore_ascii_case(text))
-            .map(|(_, cmd)| *cmd)
-    }
-}
-
-/// Where a `VSIM` gets its query coordinates.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SimSource {
-    /// Coordinates arrive in the body.
-    Vector,
-    /// The query is a vector already stored under a key.
-    Key,
-}
-
-impl SimSource {
-    pub fn parse(name: &str) -> Option<SimSource> {
-        if name.eq_ignore_ascii_case("VECTOR") {
-            Some(SimSource::Vector)
-        } else if name.eq_ignore_ascii_case("KEY") {
-            Some(SimSource::Key)
-        } else {
-            None
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Requests
-// ---------------------------------------------------------------------------
-
-/// Index geometry and tuning from a `vcreate` line.
-#[derive(Clone, Copy, Debug)]
-pub struct Create<'a> {
-    pub index: &'a str,
-    pub dim: usize,
-    pub metric: Metric,
-    pub quant: Quant,
-    pub connectivity: usize,
-    pub expansion_add: usize,
-    pub expansion_search: usize,
-    pub maxcount: Option<u32>,
-    pub exptime: Option<u32>,
-}
-
-impl Create<'_> {
-    /// Defaults for everything a `vcreate` line may omit.
-    fn with_defaults(index: &str, dim: usize) -> Create<'_> {
-        Create {
-            index,
-            dim,
-            metric: Metric::Cos,
-            quant: Quant::F32,
-            connectivity: 0,
-            expansion_add: 0,
-            expansion_search: 0,
-            maxcount: None,
-            exptime: None,
-        }
-    }
-}
-
-/// A `VSIM KEY` query.
-#[derive(Debug)]
-pub struct SimKey<'a> {
-    pub index: &'a str,
-    pub key: &'a str,
-    pub k: usize,
-    pub filter: Option<Filter>,
-}
-
-/// A request fully determined by its command line.
-#[derive(Debug)]
-pub enum Line<'a> {
-    Create(Create<'a>),
-    SimKey(SimKey<'a>),
-    Get { index: &'a str, id: &'a str },
-    Del { index: &'a str, id: &'a str },
-    Drop { index: &'a str },
-    List,
-    Stats,
-}
-
-/// A `vadd` line, awaiting its coordinates.
-#[derive(Debug)]
-pub struct Add {
-    pub index: String,
-    pub id: String,
-    /// Dimension the client declared, checked against the parsed coordinate
-    /// count and against the index.
-    pub dim: usize,
-    pub attr: Vec<u8>,
-}
-
-/// A `VSIM VECTOR` line, awaiting its coordinates.
-#[derive(Debug)]
-pub struct Sim {
-    pub index: String,
-    pub k: usize,
-    pub dim: usize,
-    pub filter: Option<Filter>,
-}
-
-/// A request whose body has still to arrive.
-#[derive(Debug)]
-pub enum Body {
-    Add(Add),
-    Sim(Sim),
-}
-
-// ---------------------------------------------------------------------------
-// Parsing
-// ---------------------------------------------------------------------------
+use super::*;
 
 fn malformed() -> Error {
     Error::bad_request("bad command line format")
@@ -212,7 +54,6 @@ fn two_names<'a>(tokens: &Tokens<'a>) -> Result<(&'a str, &'a str)> {
 }
 
 /// `vcreate <index> <dim> [METRIC m] [QUANT q] [M n] [EFC n] [EFS n]
-///          [MAXCOUNT n] [EXPTIME n]`
 fn parse_create<'a>(tokens: &Tokens<'a>) -> Result<Create<'a>> {
     if tokens.len() < 3 {
         return Err(malformed());
@@ -240,8 +81,7 @@ fn parse_create<'a>(tokens: &Tokens<'a>) -> Result<Create<'a>> {
             "M" => create.connectivity = number("M")?,
             "EFC" => create.expansion_add = number("EFC")?,
             "EFS" => create.expansion_search = number("EFS")?,
-            // item_attr.maxcount is an i32, so a larger value would wrap to a
-            // negative limit that rejects every insert.
+            // item_attr.maxcount is an i32; larger wraps to a negative limit.
             "MAXCOUNT" => {
                 let n = number("MAXCOUNT")?;
                 if n == 0 || n > i32::MAX as usize {
@@ -299,8 +139,6 @@ fn result_count(tokens: &Tokens, at: usize) -> Result<usize> {
 }
 
 /// Which token holds the body length, for the two commands that have a body.
-///
-/// `VSIM KEY` is excluded: its query is already in the index.
 pub fn body_length_at(tokens: &Tokens) -> Option<usize> {
     match tokens.command()? {
         Cmd::VAdd => Some(3),
@@ -312,10 +150,6 @@ pub fn body_length_at(tokens: &Tokens) -> Option<usize> {
 }
 
 /// Parse a line that carries a body.
-///
-/// Only the length matters to the caller registering the body; a failure here is
-/// still worth carrying, because the body must be drained before the client can
-/// be told about it.
 pub fn parse_body(tokens: &Tokens) -> Result<Body> {
     match tokens.command() {
         Some(Cmd::VAdd) => parse_add(tokens).map(Body::Add),
@@ -351,9 +185,6 @@ fn parse_sim(tokens: &Tokens) -> Result<Sim> {
 }
 
 /// Why a body-carrying line never reached its body phase.
-///
-/// Registering the body is the only way to keep the stream in sync, and that
-/// needs a length. Without one there is nothing to do but report it.
 pub fn body_length_error(tokens: &Tokens, at: usize, what: &str) -> Error {
     match tokens.parse::<usize>(at, what) {
         Err(e) => e,
@@ -363,10 +194,6 @@ pub fn body_length_error(tokens: &Tokens, at: usize, what: &str) -> Error {
         Ok(_) => Error::bad_request("lost command state"),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Optional clauses
-// ---------------------------------------------------------------------------
 
 /// `ATTR <attrlen> <attr JSON>`, starting at token `at`. Optional.
 fn attr_clause(tokens: &Tokens, at: usize) -> Result<Vec<u8>> {
@@ -389,17 +216,26 @@ fn attr_clause(tokens: &Tokens, at: usize) -> Result<Vec<u8>> {
     if declared == 0 {
         return Ok(Vec::new());
     }
-    // The declared length drives the read; `tail` checks it against the span the
-    // tokens cover, so a wrong length is reported rather than trusted.
-    tokens.tail(at + 2, declared)
+
+    // One token. A space would make the tokenizer split the JSON, and the pieces
+    // cannot be put back together: the separator it leaves behind is a NUL, which
+    // is also a byte the client could have sent.
+    let json = tokens.text(at + 2)?;
+    if tokens.len() > at + 3 {
+        return Err(Error::bad_request(
+            "ATTR JSON must be a single argument with no spaces in it",
+        ));
+    }
+    if json.len() != declared {
+        return Err(Error::bad_request(format!(
+            "declared ATTR length {declared} does not match the {} bytes supplied",
+            json.len()
+        )));
+    }
+    Ok(json.as_bytes().to_vec())
 }
 
 /// `FILTER <n> <term>...`, starting at token `at`. Optional.
-///
-/// Each term is one token, which is what keeps the clause immune to the
-/// tokenizer — a free-form expression on the command line would not be. Terms
-/// are ANDed and handed to the same parser a full expression would use, so a
-/// term must not contain spaces.
 fn filter_clause(tokens: &Tokens, at: usize) -> Result<Option<Filter>> {
     if tokens.len() <= at {
         return Ok(None);
@@ -610,45 +446,32 @@ mod tests {
     }
 
     #[test]
-    fn attr_with_spaces_is_reassembled() {
-        let json = r#"{"cat": "tech", "ts": 1723248000}"#;
-        assert_eq!(
-            attr_of(&format!("vadd docs v1 16 4 ATTR {} {json}", json.len())).unwrap(),
-            json.as_bytes()
-        );
+    fn attr_json_must_be_one_token() {
+        // A space makes the tokenizer split the JSON, and the pieces cannot be
+        // put back: the separator it leaves behind is a NUL, which is also a
+        // byte a client could have sent.
+        let json = r#"{"cat": "tech"}"#;
+        let msg = attr_of(&format!("vadd docs v1 16 4 ATTR {} {json}", json.len()))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("no spaces in it"), "{msg}");
     }
 
     #[test]
-    fn conventionally_spaced_json_fits_the_token_budget() {
-        // json.dumps / jq style: one space after each comma.
+    fn attr_json_without_spaces_fills_the_whole_region() {
+        // With no whitespace budget to share, the byte limit is the only limit.
         let json = format!(
             "{{{}}}",
             (0..14)
                 .map(|i| format!("\"k{i}\":{i}"))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(",")
         );
         assert!(json.len() <= element::ATTR_BYTES);
         assert_eq!(
             attr_of(&format!("vadd docs v1 16 4 ATTR {} {json}", json.len())).unwrap(),
             json.as_bytes()
         );
-    }
-
-    #[test]
-    fn json_padded_with_whitespace_everywhere_exhausts_the_token_budget() {
-        // Only 67 bytes, but already past MAX_TOKENS, after which the remaining
-        // length is not recoverable from the array we are handed.
-        let body = (0..6)
-            .map(|i| format!("\"k{i}\" : {i}"))
-            .collect::<Vec<_>>()
-            .join(" , ");
-        let json = format!("{{ {body} }}");
-        assert!(json.len() < element::ATTR_BYTES, "{} bytes", json.len());
-        let msg = attr_of(&format!("vadd docs v1 16 4 ATTR {} {json}", json.len()))
-            .unwrap_err()
-            .to_string();
-        assert!(msg.contains("less whitespace"), "{msg}");
     }
 
     #[test]

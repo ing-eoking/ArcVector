@@ -9,9 +9,35 @@ edition = "2024"
 crate-type = ["cdylib", "rlib"]
 
 [features]
+# --- How the daemon was configured -------------------------------------------
+#
+# These describe the *daemon*, not this crate — hence the `daemon-` prefix. This
+# crate calls no replication, migration or cluster API at all; each flag merely
+# inserts members into `engine_interface_v1`, which is called by offset, so
+# `get_item_info` and `get_elem_info` move even though nothing about them changes.
+# The bindings must therefore be generated with the same set the daemon has.
+#
+# They gate no Rust code. `build.rs` reads CARGO_FEATURE_* and passes the matching
+# `-D` to bindgen, so the effect is entirely in the generated `engine_api.rs`.
+#
+# The daemon's own `config.h` lists which to pass. See docs/engine-abi.md.
+daemon-replication = []    # -DENABLE_REPLICATION
+daemon-migration = []      # -DENABLE_MIGRATION
+daemon-cluster-aware = []  # -DENABLE_CLUSTER_AWARE
+
+# --- Test targets ------------------------------------------------------------
+#
 # The integration tests need an arcus daemon, which this crate does not build.
 # Gating the target means `cargo test` does not report on tests it never ran.
 integration = []
+
+# The replication tests need an EE daemon built with ENABLE_REPLICATION, a running
+# ZooKeeper, and a provisioned master/slave pair. None of that is available in the
+# container `make test` uses, so these stay out of the required suite entirely —
+# a green run must not imply switchover was covered. See docs/replication-testing.md.
+#
+# Implies `daemon-replication`, since the daemon it talks to has it.
+replication-tests = ["daemon-replication"]
 
 # Only built when the feature is on, so a plain `cargo test` says nothing about it
 # rather than listing it as ignored.
@@ -20,10 +46,15 @@ name = "integration"
 path = "tests/integration.rs"
 required-features = ["integration"]
 
+[[test]]
+name = "replication"
+path = "tests/replication.rs"
+required-features = ["replication-tests"]
+
 [dependencies]
 usearch = "2.26"
 serde_json = "1"
 
 [build-dependencies]
 bindgen = "0.72.1"
-cc = "1.0"
+cc = "1.4.2"

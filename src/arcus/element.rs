@@ -1,214 +1,8 @@
-//! What a stored vector is: its scalar kind, and the bytes it becomes.
+//! Where a vector's bytes sit inside a stored element.
 //!
-//! Two halves of one decision. [`Quant`] fixes how a coordinate is represented —
-//! `f32`, `f16`, `i8` or a single bit — and [`Layout`] says where those bytes sit
-//! inside a Map element, after a header and a fixed-size attribute region.
-//!
-//! Neither half belongs to arcus or to usearch, which is why they live here rather
-//! than beside either. [`crate::store`] writes these bytes into a Map element and
-//! [`crate::index`] hands the very same bytes to usearch, and that is exactly why
-//! rebuilding an index from the store is lossless: nothing is re-quantized.
-//!
-//! Pure. No engine, no index, no daemon — which is why most of the crate's test
-//! coverage is here.
+//! Pure: no engine, no index, no daemon. `docs/내부구조.md` §4.
 
-// ---------------------------------------------------------------------------
-// Scalar kind
-// ---------------------------------------------------------------------------
-
-/// Scalar kind of a stored vector. The discriminant is persisted in the element
-/// header, so values must never be renumbered.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum Quant {
-    F32 = 0,
-    F16 = 1,
-    I8 = 2,
-    B1 = 3,
-}
-
-impl Quant {
-    pub const fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(Quant::F32),
-            1 => Some(Quant::F16),
-            2 => Some(Quant::I8),
-            3 => Some(Quant::B1),
-            _ => None,
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "f32" => Some(Quant::F32),
-            "f16" => Some(Quant::F16),
-            "i8" => Some(Quant::I8),
-            "b1" => Some(Quant::B1),
-            _ => None,
-        }
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Quant::F32 => "f32",
-            Quant::F16 => "f16",
-            Quant::I8 => "i8",
-            Quant::B1 => "b1",
-        }
-    }
-
-    /// Bytes occupied by `dim` coordinates under this quantization.
-    pub const fn vector_bytes(self, dim: usize) -> usize {
-        match self {
-            Quant::F32 => dim * 4,
-            Quant::F16 => dim * 2,
-            Quant::I8 => dim,
-            Quant::B1 => dim.div_ceil(8),
-        }
-    }
-
-    /// Largest `dim` whose vector fits in `budget` bytes.
-    pub const fn max_dim(self, budget: usize) -> usize {
-        match self {
-            Quant::F32 => budget / 4,
-            Quant::F16 => budget / 2,
-            Quant::I8 => budget,
-            Quant::B1 => budget * 8,
-        }
-    }
-}
-
-impl std::fmt::Display for Quant {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// Convert `f32` coordinates into the on-wire bytes for `quant`.
-///
-/// `I8` L2-normalizes first, so distances live in the normalized space — this is
-/// why `vcreate` restricts `i8` to cosine-like metrics.
-pub fn encode(v: &[f32], quant: Quant) -> Vec<u8> {
-    match quant {
-        Quant::F32 => {
-            let mut out = Vec::with_capacity(v.len() * 4);
-            for x in v {
-                out.extend_from_slice(&x.to_le_bytes());
-            }
-            out
-        }
-        Quant::F16 => {
-            let mut out = Vec::with_capacity(v.len() * 2);
-            for x in v {
-                out.extend_from_slice(&f32_to_f16_bits(*x).to_le_bytes());
-            }
-            out
-        }
-        Quant::I8 => {
-            let scale = l2_norm(v);
-            let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-            v.iter()
-                .map(|x| {
-                    let n = (x * inv * 127.0).round();
-                    (n.clamp(-127.0, 127.0) as i8).cast_unsigned()
-                })
-                .collect()
-        }
-        Quant::B1 => {
-            // LSB-first within each byte, matching usearch's `b1x8` bit addressing.
-            let mut out = vec![0u8; v.len().div_ceil(8)];
-            for (i, x) in v.iter().enumerate() {
-                if *x > 0.0 {
-                    out[i / 8] |= 1 << (i % 8);
-                }
-            }
-            out
-        }
-    }
-}
-
-fn l2_norm(v: &[f32]) -> f32 {
-    v.iter().map(|x| x * x).sum::<f32>().sqrt()
-}
-
-/// IEEE 754 binary16 encoding, returned as the raw bits usearch expects in its
-/// `i16` container. Handles subnormals, overflow-to-infinity and NaN.
-pub fn f32_to_f16_bits(x: f32) -> i16 {
-    let bits = x.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32;
-    let mant = bits & 0x007f_ffff;
-
-    if exp == 0xff {
-        // Inf or NaN. Preserve NaN-ness by forcing a non-zero mantissa.
-        let m = if mant != 0 { 0x0200 } else { 0 };
-        return (sign | 0x7c00 | m).cast_signed();
-    }
-
-    // Rebase exponent: f32 bias 127 -> f16 bias 15.
-    let new_exp = exp - 127 + 15;
-
-    if new_exp >= 0x1f {
-        return (sign | 0x7c00).cast_signed(); // overflow -> infinity
-    }
-
-    if new_exp <= 0 {
-        // Subnormal, or too small to represent at all.
-        if new_exp < -10 {
-            return sign.cast_signed();
-        }
-        let mant_with_implicit = mant | 0x0080_0000;
-        let shift = (14 - new_exp) as u32;
-        let mut half = (mant_with_implicit >> shift) as u16;
-        // Round to nearest, ties away from zero.
-        if (mant_with_implicit >> (shift - 1)) & 1 == 1 {
-            half += 1;
-        }
-        return (sign | half).cast_signed();
-    }
-
-    let mut half = (sign as u32) | ((new_exp as u32) << 10) | (mant >> 13);
-    if (mant >> 12) & 1 == 1 {
-        half += 1; // carries into the exponent naturally
-    }
-    (half as u16).cast_signed()
-}
-
-/// Inverse of [`f32_to_f16_bits`]. Only the tests need it today — nothing in the
-/// command path decodes f16 back to f32 — so it is not part of the shipped library.
-#[cfg(test)]
-pub fn f16_bits_to_f32(bits: i16) -> f32 {
-    let h = bits.cast_unsigned();
-    let sign = ((h & 0x8000) as u32) << 16;
-    let exp = ((h >> 10) & 0x1f) as u32;
-    let mant = (h & 0x03ff) as u32;
-
-    if exp == 0 {
-        if mant == 0 {
-            return f32::from_bits(sign);
-        }
-        // Subnormal: renormalize into f32's range.
-        let mut e = -1i32;
-        let mut m = mant;
-        while m & 0x0400 == 0 {
-            m <<= 1;
-            e -= 1;
-        }
-        m &= 0x03ff;
-        let new_exp = (e + 1 - 15 + 127) as u32;
-        return f32::from_bits(sign | (new_exp << 23) | (m << 13));
-    }
-    if exp == 0x1f {
-        return f32::from_bits(sign | 0x7f80_0000 | (mant << 13));
-    }
-    // Signed arithmetic: exp < 15 for every value below 1.0, and u32 would wrap.
-    let new_exp = (exp as i32 - 15 + 127) as u32;
-    f32::from_bits(sign | (new_exp << 23) | (mant << 13))
-}
-
-// ---------------------------------------------------------------------------
-// Element layout
-// ---------------------------------------------------------------------------
+pub use super::quant::{Quant, encode};
 
 const MAGIC: [u8; 2] = *b"AV";
 
@@ -217,17 +11,49 @@ const VERSION: u8 = 2;
 
 const HEADER_LEN: usize = 16;
 
+/// Offset of the record type, the first of the header's reserved bytes.
+const RECORD_TYPE_OFFSET: usize = 8;
+
+/// What a record in the Map is. One framing, one magic, two kinds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum RecordType {
+    Vector = 0,
+    IndexMeta = 1,
+}
+
+impl RecordType {
+    const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Vector),
+            1 => Some(Self::IndexMeta),
+            _ => None,
+        }
+    }
+}
+
+/// Field name of the reserved element holding an index's metadata.
+pub const META_FIELD: &str = "AV META";
+
 /// Constant offset of the ATTR region within an element value.
 pub const ATTR_OFFSET: usize = HEADER_LEN;
 
-/// Fixed size of the ATTR region. Attribute JSON larger than this is rejected at
-/// `vadd` rather than being allowed to spill into the vector.
+/// Fixed size of the ATTR region.
 pub const ATTR_BYTES: usize = 128;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CodecError {
     BadMagic,
     UnsupportedVersion(u8),
+    /// The record type byte is one this build does not define.
+    UnknownRecordType(u8),
+    /// A vector was read where metadata was expected, or the reverse.
+    WrongRecordType {
+        want: RecordType,
+        got: RecordType,
+    },
+    /// The metadata JSON is absent, unparsable, or missing a field.
+    BadMetadata(String),
     UnknownQuant(u8),
     /// Buffer shorter than the layout requires.
     Truncated {
@@ -253,17 +79,22 @@ impl std::error::Error for CodecError {}
 impl std::fmt::Display for CodecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CodecError::BadMagic => f.write_str("bad element magic"),
-            CodecError::UnsupportedVersion(v) => write!(f, "unsupported layout version {v}"),
-            CodecError::UnknownQuant(q) => write!(f, "unknown quantization {q}"),
-            CodecError::Truncated { need, got } => {
+            Self::BadMagic => f.write_str("bad element magic"),
+            Self::UnsupportedVersion(v) => write!(f, "unsupported layout version {v}"),
+            Self::UnknownRecordType(t) => write!(f, "unknown record type {t}"),
+            Self::WrongRecordType { want, got } => {
+                write!(f, "expected a {want:?} record, found {got:?}")
+            }
+            Self::BadMetadata(m) => write!(f, "index metadata is unusable: {m}"),
+            Self::UnknownQuant(q) => write!(f, "unknown quantization {q}"),
+            Self::Truncated { need, got } => {
                 write!(f, "element truncated (need {need} bytes, got {got})")
             }
-            CodecError::LayoutMismatch => f.write_str("element layout does not match index"),
-            CodecError::AttrTooLarge { limit, got } => {
+            Self::LayoutMismatch => f.write_str("element layout does not match index"),
+            Self::AttrTooLarge { limit, got } => {
                 write!(f, "ATTR is {got} bytes, over the {limit}-byte limit")
             }
-            CodecError::VectorLenMismatch { need, got } => {
+            Self::VectorLenMismatch { need, got } => {
                 write!(f, "vector length mismatch (need {need} bytes, got {got})")
             }
         }
@@ -282,31 +113,35 @@ impl Layout {
     pub const VECTOR_OFFSET: usize = HEADER_LEN + ATTR_BYTES;
 
     pub const fn new(dim: usize, quant: Quant) -> Self {
-        Layout { dim, quant }
+        Self { dim, quant }
     }
 
     pub const fn vector_bytes(&self) -> usize {
         self.quant.vector_bytes(self.dim)
     }
 
-    /// Total element value size. This is what must fit `max_element_bytes`.
+    /// Bytes the engine appends to every collection element for the terminator.
+    pub const STORED_TERMINATOR: usize = 2;
+
     pub const fn element_len(&self) -> usize {
         Self::VECTOR_OFFSET + self.vector_bytes()
     }
 
-    /// Largest dimension whose element fits `max_element_bytes`. Zero when not
-    /// even one coordinate fits.
+    /// What the engine allocates, and what must fit `max_element_bytes`.
+    pub const fn stored_len(&self) -> usize {
+        self.element_len() + Self::STORED_TERMINATOR
+    }
+
+    /// Largest dimension whose element fits `budget`. Zero if not even one does.
     pub const fn max_dim_for(quant: Quant, max_element_bytes: usize) -> usize {
-        if max_element_bytes <= Self::VECTOR_OFFSET {
+        let overhead = Self::VECTOR_OFFSET + Self::STORED_TERMINATOR;
+        if max_element_bytes <= overhead {
             return 0;
         }
-        quant.max_dim(max_element_bytes - Self::VECTOR_OFFSET)
+        quant.max_dim(max_element_bytes - overhead)
     }
 
     /// Build an element value from an already-quantized vector and attribute JSON.
-    ///
-    /// The ATTR region is zero-padded; `alen` in the header records the real
-    /// length so trailing zeros are never mistaken for content.
     pub fn encode(&self, vector: &[u8], attr: &[u8]) -> Result<Vec<u8>, CodecError> {
         if vector.len() != self.vector_bytes() {
             return Err(CodecError::VectorLenMismatch {
@@ -337,6 +172,12 @@ impl Layout {
     /// Borrow the attribute and vector regions out of a stored element value.
     pub fn decode<'a>(&self, buf: &'a [u8]) -> Result<Element<'a>, CodecError> {
         let head = parse_header(buf)?;
+        if head.record != RecordType::Vector {
+            return Err(CodecError::WrongRecordType {
+                want: RecordType::Vector,
+                got: head.record,
+            });
+        }
         if head.dim != self.dim || head.quant != self.quant {
             return Err(CodecError::LayoutMismatch);
         }
@@ -354,9 +195,6 @@ impl Layout {
     }
 
     /// Read only the ATTR region — the hot path used by the search predicate.
-    ///
-    /// Deliberately avoids [`decode`](Self::decode): no vector bounds are needed,
-    /// so a truncated tail still yields usable attributes.
     pub fn attr_of<'a>(&self, buf: &'a [u8]) -> Result<&'a [u8], CodecError> {
         let head = parse_header(buf)?;
         let end = ATTR_OFFSET + head.attr_len;
@@ -375,6 +213,7 @@ struct Header {
     quant: Quant,
     dim: usize,
     attr_len: usize,
+    record: RecordType,
 }
 
 fn parse_header(buf: &[u8]) -> Result<Header, CodecError> {
@@ -391,6 +230,8 @@ fn parse_header(buf: &[u8]) -> Result<Header, CodecError> {
         return Err(CodecError::UnsupportedVersion(buf[2]));
     }
     let quant = Quant::from_u8(buf[3]).ok_or(CodecError::UnknownQuant(buf[3]))?;
+    let record = RecordType::from_u8(buf[RECORD_TYPE_OFFSET])
+        .ok_or(CodecError::UnknownRecordType(buf[RECORD_TYPE_OFFSET]))?;
     let attr_len = u16::from_le_bytes([buf[6], buf[7]]) as usize;
     if attr_len > ATTR_BYTES {
         return Err(CodecError::LayoutMismatch);
@@ -399,7 +240,107 @@ fn parse_header(buf: &[u8]) -> Result<Header, CodecError> {
         quant,
         dim: u16::from_le_bytes([buf[4], buf[5]]) as usize,
         attr_len,
+        record,
     })
+}
+
+/// What an index is, beyond what a vector element's header already says.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MetaRecord {
+    pub metric: String,
+    pub connectivity: usize,
+    pub expansion_add: usize,
+    pub expansion_search: usize,
+    /// Identifies the graph currently built from this Map.
+    pub owner: u64,
+}
+
+/// A token no other node can produce.
+pub fn mint_owner() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(0x4156_0000_0000_0001);
+    h.finish()
+}
+
+impl MetaRecord {
+    /// Serialize into a full element value: header, then JSON in the ATTR region.
+    pub fn encode(&self, layout: Layout) -> Result<Vec<u8>, CodecError> {
+        let json = format!(
+            r#"{{"metric":"{}","m":{},"efc":{},"efs":{},"owner":"{:016x}"}}"#,
+            self.metric, self.connectivity, self.expansion_add, self.expansion_search, self.owner,
+        );
+        if json.len() > ATTR_BYTES {
+            return Err(CodecError::AttrTooLarge {
+                limit: ATTR_BYTES,
+                got: json.len(),
+            });
+        }
+
+        let mut buf = vec![0u8; Layout::VECTOR_OFFSET];
+        buf[0..2].copy_from_slice(&MAGIC);
+        buf[2] = VERSION;
+        buf[3] = layout.quant as u8;
+        buf[4..6].copy_from_slice(&(layout.dim as u16).to_le_bytes());
+        buf[6..8].copy_from_slice(&(json.len() as u16).to_le_bytes());
+        buf[RECORD_TYPE_OFFSET] = RecordType::IndexMeta as u8;
+        buf[ATTR_OFFSET..ATTR_OFFSET + json.len()].copy_from_slice(json.as_bytes());
+        Ok(buf)
+    }
+
+    /// Read one back, along with the layout its header records.
+    pub fn decode(buf: &[u8]) -> Result<(Self, Layout), CodecError> {
+        let head = parse_header(buf)?;
+        if head.record != RecordType::IndexMeta {
+            return Err(CodecError::WrongRecordType {
+                want: RecordType::IndexMeta,
+                got: head.record,
+            });
+        }
+        if buf.len() < ATTR_OFFSET + head.attr_len {
+            return Err(CodecError::Truncated {
+                need: ATTR_OFFSET + head.attr_len,
+                got: buf.len(),
+            });
+        }
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&buf[ATTR_OFFSET..ATTR_OFFSET + head.attr_len])
+                .map_err(|e| CodecError::BadMetadata(e.to_string()))?;
+        let miss = |k: &str| CodecError::BadMetadata(format!("missing '{k}'"));
+        let num = |k: &str| -> Result<usize, CodecError> {
+            json.get(k)
+                .and_then(serde_json::Value::as_u64)
+                .map(|v| v as usize)
+                .ok_or_else(|| miss(k))
+        };
+
+        let owner = json
+            .get("owner")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| u64::from_str_radix(s, 16).ok())
+            .ok_or_else(|| miss("owner"))?;
+
+        Ok((
+            Self {
+                metric: json
+                    .get("metric")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| miss("metric"))?
+                    .to_owned(),
+                connectivity: num("m")?,
+                expansion_add: num("efc")?,
+                expansion_search: num("efs")?,
+                owner,
+            },
+            Layout::new(head.dim, head.quant),
+        ))
+    }
+
+    /// The `owner` alone, for the per-command staleness check.
+    pub fn owner_of(buf: &[u8]) -> Result<u64, CodecError> {
+        Self::decode(buf).map(|(meta, _)| meta.owner)
+    }
 }
 
 /// Borrowed view of a decoded element.
@@ -440,87 +381,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn f32_encoding_is_little_endian_roundtrip() {
-        let v = [1.0f32, -2.5, 0.0];
-        let bytes = encode(&v, Quant::F32);
-        assert_eq!(bytes.len(), 12);
-        let back: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        assert_eq!(back, v);
-    }
-
-    #[test]
-    fn f16_roundtrip_preserves_exactly_representable_values() {
-        for x in [0.0f32, 1.0, -1.0, 0.5, -2.5, 65504.0, -65504.0] {
-            let back = f16_bits_to_f32(f32_to_f16_bits(x));
-            assert_eq!(back, x, "value {x}");
-        }
-    }
-
-    #[test]
-    fn f16_handles_specials_and_overflow() {
-        assert!(f16_bits_to_f32(f32_to_f16_bits(f32::NAN)).is_nan());
-        assert_eq!(
-            f16_bits_to_f32(f32_to_f16_bits(f32::INFINITY)),
-            f32::INFINITY
-        );
-        // Beyond f16's max finite value, so it must saturate to infinity.
-        assert_eq!(f16_bits_to_f32(f32_to_f16_bits(1.0e30)), f32::INFINITY);
-        // Far below f16's smallest subnormal, so it must flush to zero.
-        assert_eq!(f16_bits_to_f32(f32_to_f16_bits(1.0e-30)), 0.0);
-    }
-
-    #[test]
-    fn f16_roundtrip_stays_within_half_precision_error() {
-        for i in 0..2000 {
-            let x = (i as f32 - 1000.0) / 97.0;
-            let back = f16_bits_to_f32(f32_to_f16_bits(x));
-            let err = (back - x).abs();
-            assert!(err <= x.abs() * 1e-3 + 1e-6, "x={x} back={back}");
-        }
-    }
-
-    #[test]
-    fn i8_normalizes_before_scaling() {
-        // A unit vector along one axis maps that axis to full scale.
-        let bytes = encode(&[1.0, 0.0, 0.0], Quant::I8);
-        assert_eq!(bytes[0] as i8, 127);
-        assert_eq!(bytes[1] as i8, 0);
-
-        // Magnitude is discarded: scaling the input must not change the output.
-        let a = encode(&[3.0, 4.0], Quant::I8);
-        let b = encode(&[30.0, 40.0], Quant::I8);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn i8_zero_vector_does_not_divide_by_zero() {
-        let bytes = encode(&[0.0, 0.0, 0.0], Quant::I8);
-        assert_eq!(bytes, vec![0u8; 3]);
-    }
-
-    #[test]
-    fn b1_packs_lsb_first() {
-        // Bit i lives at byte i/8, bit position i%8 — usearch's b1x8 convention.
-        let bytes = encode(&[1.0, -1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], Quant::B1);
-        assert_eq!(bytes.len(), 2);
-        assert_eq!(bytes[0], 0b0000_0101);
-        assert_eq!(bytes[1], 0b0000_0001);
-    }
-
-    #[test]
-    fn quant_names_roundtrip() {
-        for q in [Quant::F32, Quant::F16, Quant::I8, Quant::B1] {
-            assert_eq!(Quant::parse(q.as_str()), Some(q));
-            assert_eq!(Quant::from_u8(q as u8), Some(q));
-        }
-        assert_eq!(Quant::parse("f64"), None);
-        assert_eq!(Quant::from_u8(4), None);
-    }
-
     // -- element layout -----------------------------------------------------
 
     fn layout() -> Layout {
@@ -552,6 +412,37 @@ mod tests {
                 assert_eq!(l.attr_of(&e).unwrap(), b"{}");
             }
         }
+    }
+
+    /// Both element shapes have to read the same.
+    ///
+    /// arcus sizes an element to include a trailing `\r\n` (see
+    /// [`Layout::STORED_TERMINATOR`]), and elements written before this module
+    /// accounted for that are two bytes shorter. A rebuild rewrites them, but it
+    /// only gets the chance if it can read them first, so `decode` has to accept
+    /// the buffer with or without the terminator.
+    #[test]
+    fn decode_accepts_an_element_with_or_without_the_terminator() {
+        let l = Layout::new(4, Quant::F32);
+        let vector = encode(&[1.0, 2.0, 3.0, 4.0], Quant::F32);
+        let bare = l.encode(&vector, b"{}").expect("encodes");
+        assert_eq!(bare.len(), l.element_len());
+
+        let mut terminated = bare.clone();
+        terminated.extend_from_slice(b"\r\n");
+        assert_eq!(terminated.len(), l.stored_len());
+
+        let from_bare = l.decode(&bare).expect("old shape decodes");
+        let from_terminated = l.decode(&terminated).expect("new shape decodes");
+        assert_eq!(from_bare.vector, from_terminated.vector);
+        assert_eq!(from_bare.attr, from_terminated.attr);
+        assert_eq!(from_bare.vector, &vector[..]);
+
+        // One byte short of the payload is still a truncation, terminator or not.
+        assert!(matches!(
+            l.decode(&bare[..bare.len() - 1]),
+            Err(CodecError::Truncated { .. })
+        ));
     }
 
     #[test]
@@ -682,15 +573,16 @@ mod tests {
     #[test]
     fn max_dim_for_is_the_exact_ceiling() {
         let limit = 16 * 1024;
-        assert_eq!(Layout::max_dim_for(Quant::F32, limit), 4060);
-        assert_eq!(Layout::max_dim_for(Quant::F16, limit), 8120);
-        assert_eq!(Layout::max_dim_for(Quant::I8, limit), 16240);
-        assert_eq!(Layout::max_dim_for(Quant::B1, limit), 129_920);
+        // 16384 - 144 header/ATTR - 2 terminator = 16238 bytes of coordinates.
+        assert_eq!(Layout::max_dim_for(Quant::F32, limit), 4059);
+        assert_eq!(Layout::max_dim_for(Quant::F16, limit), 8119);
+        assert_eq!(Layout::max_dim_for(Quant::I8, limit), 16238);
+        assert_eq!(Layout::max_dim_for(Quant::B1, limit), 129_904);
 
         for q in [Quant::F32, Quant::F16, Quant::I8, Quant::B1] {
             let d = Layout::max_dim_for(q, limit);
-            assert!(Layout::new(d, q).element_len() <= limit, "{q:?}");
-            assert!(Layout::new(d + 1, q).element_len() > limit, "{q:?}");
+            assert!(Layout::new(d, q).stored_len() <= limit, "{q:?}");
+            assert!(Layout::new(d + 1, q).stored_len() > limit, "{q:?}");
         }
     }
 
@@ -698,6 +590,18 @@ mod tests {
     fn max_dim_for_handles_a_budget_below_the_fixed_overhead() {
         assert_eq!(Layout::max_dim_for(Quant::I8, 16), 0);
         assert_eq!(Layout::max_dim_for(Quant::I8, Layout::VECTOR_OFFSET), 0);
-        assert_eq!(Layout::max_dim_for(Quant::I8, Layout::VECTOR_OFFSET + 1), 1);
+        // The terminator is part of the budget, so one byte past the vector
+        // offset still leaves no room for a coordinate.
+        assert_eq!(
+            Layout::max_dim_for(Quant::I8, Layout::VECTOR_OFFSET + Layout::STORED_TERMINATOR),
+            0
+        );
+        assert_eq!(
+            Layout::max_dim_for(
+                Quant::I8,
+                Layout::VECTOR_OFFSET + Layout::STORED_TERMINATOR + 1
+            ),
+            1
+        );
     }
 }

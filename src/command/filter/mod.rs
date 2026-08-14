@@ -1,10 +1,7 @@
-//! Metadata filter expressions evaluated against the fixed filter slot.
+//! Metadata filter expressions, evaluated against the stored ATTR region.
 //!
-//! A filter is compiled once per query and then evaluated once per graph node
-//! visited by the search. Evaluation therefore allocates nothing: it scans the
-//! (tiny, flat) JSON in place rather than building a `serde_json::Value`.
-//!
-//! Grammar (base):
+//! Compiled once per query, evaluated once per visited graph node, and therefore
+//! allocation-free.
 //!
 //! ```text
 //! expr  := term (OR term)*
@@ -14,9 +11,12 @@
 //! value := number | "quoted string" | bare_string
 //! ```
 //!
-//! Only top-level JSON fields are addressable; nested paths are a follow-up.
-//! A condition on a missing field is always false — including `!=`, so that
-//! `a != x OR b = y` cannot be satisfied merely by `a` being absent.
+//! Only top-level fields are addressable, and a condition on a missing field is
+//! always false — `!=` included.
+
+mod json;
+
+use json::{JsonVal, lookup};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Op {
@@ -41,8 +41,7 @@ struct Cond {
     value: Operand,
 }
 
-/// A compiled filter: an OR of ANDs (disjunctive normal form by construction,
-/// since the grammar has no parentheses).
+/// A compiled filter: an OR of ANDs — the grammar has no parentheses.
 #[derive(Clone, Debug)]
 pub struct Filter {
     terms: Vec<Vec<Cond>>,
@@ -63,18 +62,18 @@ impl std::error::Error for ParseError {}
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::Empty => write!(f, "empty filter expression"),
-            ParseError::ExpectedField => write!(f, "expected a field name"),
-            ParseError::ExpectedOperator(s) => write!(f, "expected an operator near '{s}'"),
-            ParseError::ExpectedValue(s) => write!(f, "expected a value near '{s}'"),
-            ParseError::UnterminatedString => write!(f, "unterminated quoted string"),
-            ParseError::TrailingInput(s) => write!(f, "unexpected trailing input '{s}'"),
+            Self::Empty => write!(f, "empty filter expression"),
+            Self::ExpectedField => write!(f, "expected a field name"),
+            Self::ExpectedOperator(s) => write!(f, "expected an operator near '{s}'"),
+            Self::ExpectedValue(s) => write!(f, "expected a value near '{s}'"),
+            Self::UnterminatedString => write!(f, "unterminated quoted string"),
+            Self::TrailingInput(s) => write!(f, "unexpected trailing input '{s}'"),
         }
     }
 }
 
 impl Filter {
-    pub fn parse(src: &str) -> Result<Filter, ParseError> {
+    pub fn parse(src: &str) -> Result<Self, ParseError> {
         let mut p = Parser {
             s: src.as_bytes(),
             i: 0,
@@ -98,7 +97,7 @@ impl Filter {
         if !p.eof() {
             return Err(ParseError::TrailingInput(p.rest_snippet()));
         }
-        Ok(Filter { terms })
+        Ok(Self { terms })
     }
 
     /// Evaluate against a raw JSON object. Allocation-free.
@@ -117,9 +116,6 @@ fn eval_cond(c: &Cond, json: &[u8]) -> bool {
     match (&found, &c.value) {
         (JsonVal::Num(a), Operand::Num(b)) => cmp_ord(a.partial_cmp(b), c.op),
         (JsonVal::Str(a), Operand::Str(b)) => cmp_ord(Some((*a).cmp(b.as_bytes())), c.op),
-        // A JSON number compared against an unquoted-but-non-numeric literal, or
-        // a string compared against a number: only (in)equality is meaningful,
-        // and they are never equal.
         (JsonVal::Bool(a), Operand::Str(b)) => match c.op {
             Op::Eq => bool_str_eq(*a, b),
             Op::Ne => !bool_str_eq(*a, b),
@@ -153,10 +149,6 @@ fn cmp_ord(ord: Option<std::cmp::Ordering>, op: Op) -> bool {
         Op::Ge => o != Less,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Filter expression parser
-// ---------------------------------------------------------------------------
 
 struct Parser<'a> {
     s: &'a [u8],
@@ -300,172 +292,6 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.'
 }
 
-// ---------------------------------------------------------------------------
-// Flat JSON scanner (allocation-free)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, PartialEq)]
-enum JsonVal<'a> {
-    Str(&'a [u8]),
-    Num(f64),
-    Bool(bool),
-    Null,
-}
-
-/// Find a top-level field in a JSON object without allocating.
-///
-/// Nested objects and arrays are skipped wholesale; string contents are returned
-/// raw (escape sequences are not decoded), which is sufficient for the small,
-/// flat documents the fixed filter slot is sized for.
-fn lookup<'a>(json: &'a [u8], field: &[u8]) -> Option<JsonVal<'a>> {
-    let mut i = 0;
-    skip_ws(json, &mut i);
-    if i >= json.len() || json[i] != b'{' {
-        return None;
-    }
-    i += 1;
-
-    loop {
-        skip_ws(json, &mut i);
-        if i >= json.len() {
-            return None;
-        }
-        if json[i] == b'}' {
-            return None;
-        }
-        if json[i] != b'"' {
-            return None; // malformed
-        }
-        let key = scan_string(json, &mut i)?;
-
-        skip_ws(json, &mut i);
-        if i >= json.len() || json[i] != b':' {
-            return None;
-        }
-        i += 1;
-        skip_ws(json, &mut i);
-
-        if key == field {
-            return scan_value(json, &mut i);
-        }
-        skip_value(json, &mut i)?;
-
-        skip_ws(json, &mut i);
-        if i >= json.len() {
-            return None;
-        }
-        // A closing brace means the field is absent; anything else is malformed.
-        // Either way the lookup is over.
-        if json[i] != b',' {
-            return None;
-        }
-        i += 1;
-    }
-}
-
-fn skip_ws(s: &[u8], i: &mut usize) {
-    while *i < s.len() && s[*i].is_ascii_whitespace() {
-        *i += 1;
-    }
-}
-
-/// Consume a quoted string starting at `s[*i] == '"'`, returning its raw body.
-fn scan_string<'a>(s: &'a [u8], i: &mut usize) -> Option<&'a [u8]> {
-    if *i >= s.len() || s[*i] != b'"' {
-        return None;
-    }
-    *i += 1;
-    let start = *i;
-    while *i < s.len() {
-        match s[*i] {
-            b'\\' => *i += 2, // skip the escape pair so \" does not end the string
-            b'"' => {
-                let body = &s[start..*i];
-                *i += 1;
-                return Some(body);
-            }
-            _ => *i += 1,
-        }
-    }
-    None
-}
-
-fn scan_value<'a>(s: &'a [u8], i: &mut usize) -> Option<JsonVal<'a>> {
-    if *i >= s.len() {
-        return None;
-    }
-    match s[*i] {
-        b'"' => scan_string(s, i).map(JsonVal::Str),
-        b't' if s[*i..].starts_with(b"true") => {
-            *i += 4;
-            Some(JsonVal::Bool(true))
-        }
-        b'f' if s[*i..].starts_with(b"false") => {
-            *i += 5;
-            Some(JsonVal::Bool(false))
-        }
-        b'n' if s[*i..].starts_with(b"null") => {
-            *i += 4;
-            Some(JsonVal::Null)
-        }
-        b'{' | b'[' => None, // nested values are not addressable in the base grammar
-        _ => {
-            let start = *i;
-            while *i < s.len()
-                && !matches!(s[*i], b',' | b'}' | b']')
-                && !s[*i].is_ascii_whitespace()
-            {
-                *i += 1;
-            }
-            std::str::from_utf8(&s[start..*i])
-                .ok()?
-                .parse::<f64>()
-                .ok()
-                .map(JsonVal::Num)
-        }
-    }
-}
-
-fn skip_value(s: &[u8], i: &mut usize) -> Option<()> {
-    if *i >= s.len() {
-        return None;
-    }
-    match s[*i] {
-        b'"' => {
-            scan_string(s, i)?;
-            Some(())
-        }
-        b'{' | b'[' => {
-            let mut depth = 0i32;
-            while *i < s.len() {
-                match s[*i] {
-                    b'"' => {
-                        scan_string(s, i)?;
-                        continue;
-                    }
-                    b'{' | b'[' => depth += 1,
-                    b'}' | b']' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            *i += 1;
-                            return Some(());
-                        }
-                    }
-                    _ => {}
-                }
-                *i += 1;
-            }
-            None
-        }
-        _ => {
-            while *i < s.len() && !matches!(s[*i], b',' | b'}' | b']') {
-                *i += 1;
-            }
-            Some(())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +304,48 @@ mod tests {
     }
 
     #[test]
+    fn keywords_are_case_insensitive_but_not_prefixes() {
+        assert!(m("cat = tech and lang = ko"));
+        assert!(m("cat = sports or lang = ko"));
+        // A field named ANDROID must not be read as the AND keyword.
+        let f = Filter::parse("ANDROID = 1").unwrap();
+        assert!(f.matches(br#"{"ANDROID":1}"#));
+    }
+
+    #[test]
+    fn parse_rejects_malformed_input() {
+        assert!(matches!(Filter::parse(""), Err(ParseError::Empty)));
+        assert!(matches!(Filter::parse("   "), Err(ParseError::Empty)));
+        assert!(matches!(
+            Filter::parse("cat"),
+            Err(ParseError::ExpectedOperator(_))
+        ));
+        assert!(matches!(
+            Filter::parse("= tech"),
+            Err(ParseError::ExpectedField)
+        ));
+        assert!(matches!(
+            Filter::parse("cat = "),
+            Err(ParseError::ExpectedValue(_))
+        ));
+        assert!(matches!(
+            Filter::parse(r#"cat = "x"#),
+            Err(ParseError::UnterminatedString)
+        ));
+        assert!(matches!(
+            Filter::parse("cat = a b"),
+            Err(ParseError::TrailingInput(_))
+        ));
+    }
+
+    #[test]
+    fn empty_json_matches_nothing() {
+        let f = Filter::parse("cat = tech").unwrap();
+        assert!(!f.matches(b""));
+        assert!(!f.matches(b"{}"));
+    }
+
+    #[test]
     fn lookup_reads_each_value_kind() {
         assert_eq!(lookup(DOC, b"cat"), Some(JsonVal::Str(b"tech")));
         assert_eq!(lookup(DOC, b"ts"), Some(JsonVal::Num(1723248000.0)));
@@ -485,13 +353,6 @@ mod tests {
         assert_eq!(lookup(DOC, b"ok"), Some(JsonVal::Bool(true)));
         assert_eq!(lookup(DOC, b"nil"), Some(JsonVal::Null));
         assert_eq!(lookup(DOC, b"missing"), None);
-    }
-
-    #[test]
-    fn lookup_does_not_match_a_key_prefix() {
-        // "ca" must not match the key "cat".
-        assert_eq!(lookup(DOC, b"ca"), None);
-        assert_eq!(lookup(DOC, b"catx"), None);
     }
 
     #[test]
@@ -543,15 +404,6 @@ mod tests {
     }
 
     #[test]
-    fn keywords_are_case_insensitive_but_not_prefixes() {
-        assert!(m("cat = tech and lang = ko"));
-        assert!(m("cat = sports or lang = ko"));
-        // A field named ANDROID must not be read as the AND keyword.
-        let f = Filter::parse("ANDROID = 1").unwrap();
-        assert!(f.matches(br#"{"ANDROID":1}"#));
-    }
-
-    #[test]
     fn missing_field_is_always_false_even_for_ne() {
         // Otherwise `nope != x` would silently pass for every document.
         assert!(!m("nope = x"));
@@ -576,38 +428,5 @@ mod tests {
         assert!(!m("cat = 5"));
         assert!(m("cat != 5"));
         assert!(!m("ts = tech"));
-    }
-
-    #[test]
-    fn parse_rejects_malformed_input() {
-        assert!(matches!(Filter::parse(""), Err(ParseError::Empty)));
-        assert!(matches!(Filter::parse("   "), Err(ParseError::Empty)));
-        assert!(matches!(
-            Filter::parse("cat"),
-            Err(ParseError::ExpectedOperator(_))
-        ));
-        assert!(matches!(
-            Filter::parse("= tech"),
-            Err(ParseError::ExpectedField)
-        ));
-        assert!(matches!(
-            Filter::parse("cat = "),
-            Err(ParseError::ExpectedValue(_))
-        ));
-        assert!(matches!(
-            Filter::parse(r#"cat = "x"#),
-            Err(ParseError::UnterminatedString)
-        ));
-        assert!(matches!(
-            Filter::parse("cat = a b"),
-            Err(ParseError::TrailingInput(_))
-        ));
-    }
-
-    #[test]
-    fn empty_json_matches_nothing() {
-        let f = Filter::parse("cat = tech").unwrap();
-        assert!(!f.matches(b""));
-        assert!(!f.matches(b"{}"));
     }
 }

@@ -1,41 +1,15 @@
 //! Reserved thread contexts, and the invariant that keeps them from running out.
 //!
-//! usearch's Rust bindings always call into C++ with `any_thread()`, which pops a
-//! context from a **fixed-size pool**. When the pool is empty it does not block —
-//! it fails with "Reserve capacity ahead of insertions!". arcus allows more worker
-//! threads than any constant could assume (`-t` above 64 only warns), so
-//! correctness cannot rest on the worker count.
-//!
-//! Instead every entry into usearch takes a permit from a semaphore sized to the
-//! reserved contexts:
-//!
 //! ```text
 //! concurrent entries <= permits == reserved contexts   =>   the pop cannot fail
 //! ```
 //!
-//! Excess workers wait rather than fail.
+//! `docs/내부구조.md` §9.
 
 use std::sync::{Condvar, Mutex, PoisonError};
 
 /// Thread contexts reserved per index, and therefore the permit count.
-///
-/// Not a client-facing setting: it follows from how many worker threads the server
-/// runs, which the client has no view of. The value is not correctness-critical —
-/// the invariant above holds for any of them — so it is a throughput/memory
-/// tradeoff. Below the worker count, excess workers queue briefly; above it, the
-/// surplus per-thread buffers are wasted (usearch allocates
-/// `bytes_per_vector * threads` for casting, so a 4096-dimension `f32` index costs
-/// about 1 MB here). 64 covers every worker count `-t` reaches without warning
-/// (memcached.c:16107).
-///
-/// Deriving it from `settings.num_threads` was considered and rejected: the symbol
-/// is exported, but reading it needs the `struct settings` layout, whose field
-/// offsets shift with build-time `#ifdef`s.
 pub const THREAD_SLOTS: usize = 64;
-
-// ---------------------------------------------------------------------------
-// Semaphore
-// ---------------------------------------------------------------------------
 
 pub struct Semaphore {
     avail: Mutex<usize>,
@@ -44,7 +18,7 @@ pub struct Semaphore {
 
 impl Semaphore {
     pub fn new(n: usize) -> Self {
-        Semaphore {
+        Self {
             avail: Mutex::new(n.max(1)),
             cv: Condvar::new(),
         }

@@ -1,18 +1,5 @@
 //! Receiving a command, interpreting it, and running it.
 //!
-//! This is the layer between the socket and the two backends. It is split by the
-//! order the work happens in:
-//!
-//! - [`tokens`] reads memcached's token array and writes the one reply. The only
-//!   module that touches `token_t`.
-//! - [`request`] turns those tokens into typed values. Pure — no engine, no index,
-//!   no state.
-//! - [`pending`] holds a parsed request while its body is still arriving, for the
-//!   two commands that have one.
-//! - [`filter`] is the little expression language a `FILTER` clause is written in,
-//!   parsed here and evaluated during a search.
-//! - [`handler`] does the work, calling [`crate::arcus`] and [`crate::usearch`].
-//!
 //! Parsing never touches state and handlers never see a token, so syntax has one
 //! home and handlers can be exercised without a server.
 
@@ -36,7 +23,14 @@ use tokens::Tokens;
 /// `cookie` must be the cookie memcached passed to that callback.
 unsafe fn store_for(cookie: *const c_void) -> Result<Store> {
     // SAFETY: guaranteed by the caller.
-    unsafe { Store::for_cookie(cookie) }.ok_or(Error::Store(StoreError::Unavailable))
+    unsafe { Store::for_cookie(cookie) }.ok_or_else(|| {
+        // A refusal means the load-time ABI check rejected this pairing.
+        Error::Store(if crate::arcus::abi::refused() {
+            StoreError::AbiMismatch
+        } else {
+            StoreError::Unavailable
+        })
+    })
 }
 
 /// Route one command line, or resume one whose body has arrived.
@@ -46,6 +40,13 @@ unsafe fn store_for(cookie: *const c_void) -> Result<Store> {
 /// `tokens` must borrow the argument vector memcached passed to `execute`, and
 /// `cookie` must be that call's connection cookie.
 pub unsafe fn dispatch(cookie: *const c_void, tokens: &Tokens) -> Result<Reply> {
+    // A misaligned vtable was caught mid-call. Nothing the engine reports after
+    // that can be trusted — including "this element is missing", which the
+    // recovery path would otherwise read as damage and answer by deleting a Map.
+    if crate::arcus::abi::mismatched() {
+        return Err(Error::Store(StoreError::AbiMismatch));
+    }
+
     // SAFETY: guaranteed by the caller.
     let store = unsafe { store_for(cookie) };
 
@@ -61,8 +62,7 @@ pub unsafe fn dispatch(cookie: *const c_void, tokens: &Tokens) -> Result<Reply> 
         };
     }
 
-    // A body-carrying line reaching `execute` means `accept` could not size its
-    // body; otherwise the body phase above would have handled it.
+    // Reaching here means `accept` could not size the body.
     if let Some(at) = request::body_length_at(tokens) {
         let what = if at == 3 {
             "vector length"

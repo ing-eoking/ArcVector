@@ -8,7 +8,7 @@ arcus **Map collections**, so they inherit the engine's memory accounting,
 eviction, TTL and replication; the ANN graph is a
 [usearch](https://github.com/unum-cloud/usearch) index kept alongside as a cache.
 
-For how it works inside, see [docs/INTERNALS.md](docs/INTERNALS.md).
+내부 구조는 [docs/내부구조.md](docs/내부구조.md), 모듈별 세부 사항은 [docs/모듈-노트.md](docs/모듈-노트.md)에 있다.
 
 ---
 
@@ -27,6 +27,25 @@ ships rather than the macOS `.dylib` development produces. See
 
 `build.rs` runs bindgen over the vendored arcus headers in `include/`, so libclang
 must be available. usearch compiles a C++ core, so a C++17 toolchain is needed too.
+
+`engine_interface_v1` is a vtable called **by offset**, and its layout follows the
+daemon's `configure` flags — `ENABLE_REPLICATION`, `ENABLE_MIGRATION` and
+`ENABLE_CLUSTER_AWARE` each insert members into it. None of the APIs this crate
+calls lives inside those blocks; what moves is where two of them sit. So the
+bindings have to be generated for the daemon that will load the library.
+
+One cargo feature per flag:
+
+```sh
+cargo build --release --features daemon-replication
+cargo build --release                          # a daemon built without it
+```
+
+If you have the daemon's source tree, its `config.h` lists exactly which to pass.
+
+`ARCVECTOR_ENGINE_INCLUDE` points at a different header tree. A wrong pairing is
+refused at load time with the rebuild command in the log, rather than crashing the
+daemon — see [docs/engine-abi.md](docs/engine-abi.md).
 
 Load it into arcus with `-X`:
 
@@ -67,12 +86,13 @@ carries no magnitude, so it takes only `hamming` or `tanimoto`; conversely those
 two metrics require `b1`. `i8` L2-normalizes before scaling, so distances live in
 the normalized space.
 
-Maximum dimension, with the engine's default 16 KB `max_element_bytes` and the
-fixed 144-byte element overhead:
+Maximum dimension, with the engine's default 16 KB `max_element_bytes`, the fixed
+144-byte element overhead and the 2-byte terminator arcus counts as part of every
+collection element:
 
 | quant | f32 | f16 | i8 | b1 |
 |---|---|---|---|---|
-| max dim | 4,060 | 8,120 | **16,240** | 129,920 |
+| max dim | 4,059 | 8,119 | **16,238** | 129,904 |
 
 ```
 vcreate docs 1024 METRIC cos QUANT i8 MAXCOUNT 1000000
@@ -91,7 +111,9 @@ coordinate count. Both are required: text length does not determine how many
 numbers it holds (`0.1 0.2` is 7 bytes and 2 coordinates; `1 2 3` is 5 bytes and
 3), so each checks the other.
 
-`ATTR` is optional, must be a **JSON object**, and is capped at **128 bytes**.
+`ATTR` is optional, must be a **JSON object**, and is capped at **128 bytes**. It
+has to arrive as a single argument, so **no spaces inside the JSON** — the command
+line is tokenized on spaces and the pieces cannot be reassembled unambiguously.
 
 **Replies** `STORED` · `OVERFLOWED` (at `MAXCOUNT`)
 
@@ -104,6 +126,28 @@ vadd docs v1 7 2 ATTR 23 {"abc":123,"def":"abc"}
 Whitespace inside the JSON is fine (`{"a": 1, "b": 2}`). Only pathological
 spacing — a space around every colon and comma — exhausts memcached's 30-token
 line budget, and that is reported as such.
+
+### Durability under replication
+
+**A write answers before the replica has acknowledged it, even on a cluster
+configured for sync replication.** This applies to every write command here —
+`vcreate`, `vadd`, `vdel`, `vdrop` — and it is the standing behaviour, not an
+occasional case: measured over 500 `vadd`s, all 500 replied ahead of the
+acknowledgement.
+
+The write itself is committed locally and on its way to the replica; what is
+missing is the wait. Parking a connection until the acknowledgement arrives needs
+a `conn` field that memcached exposes to its own commands and not to extensions,
+so a protocol extension cannot do it.
+
+The exposure is narrow but real: a master lost inside that window drops a write
+its client was told had succeeded — the same guarantee arcus gives under
+`no_sync_mode 1`, applied to vector commands only. Everything else is unaffected;
+in particular a failover rebuilds the index from whatever the Map holds, so a
+write that did not reach the replica is simply absent rather than corrupting
+anything.
+
+`docs/내부구조.md` has the mechanism.
 
 ## VSIM
 

@@ -1,16 +1,9 @@
-//! Searching with usearch.
+//! Searching with usearch — a cache of the [`crate::arcus`] side.
 //!
-//! - [`index`] wraps the library: capacity growth, and the `String` ↔ `u64` key
-//!   mapping it needs because usearch keys are integers.
-//! - [`metric`] is the distance measure, and which quantizations it is meaningful
-//!   on.
-//! - [`threads`] holds the invariant that keeps usearch's fixed context pool from
-//!   running dry, which is the one concurrency rule that cannot be got wrong.
-//!
-//! **This side is a cache.** Everything in it is rebuildable from
-//! [`crate::arcus`], which is what makes restart, eviction, TTL expiry and
-//! replication slaves a single case rather than four.
+//! Everything here is rebuildable from Map, which makes restart, eviction, TTL
+//! expiry and replication a single case rather than four.
 
+pub mod idmap;
 pub mod index;
 pub mod metric;
 pub mod threads;

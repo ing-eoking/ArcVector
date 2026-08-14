@@ -138,7 +138,7 @@ pub struct Daemon {
 
 impl Daemon {
     /// Start a daemon, failing with the reason if that is not possible.
-    pub fn start() -> Daemon {
+    pub fn start() -> Self {
         let (Some(memcached), Some(engine)) = (
             from_env("ARCVECTOR_MEMCACHED"),
             from_env("ARCVECTOR_ENGINE"),
@@ -189,7 +189,7 @@ impl Daemon {
             .spawn()
             .unwrap_or_else(|e| panic!("could not run {}: {e}", memcached.display()));
 
-        let mut daemon = Daemon { child, socket, log };
+        let mut daemon = Self { child, socket, log };
         daemon.wait_until_listening();
         daemon.assert_extension_registered(&module);
         daemon

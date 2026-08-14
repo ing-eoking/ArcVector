@@ -1,9 +1,4 @@
 //! Distance metrics, and which quantizations each one is meaningful on.
-//!
-//! The pairing is not free: `b1` packs one bit per dimension and so carries no
-//! magnitude, which leaves only the bitwise metrics; and those metrics have
-//! nothing to compare on anything else. `vcreate` refuses the combinations that
-//! would produce distances with no meaning.
 
 use ::usearch::MetricKind;
 
@@ -21,40 +16,40 @@ pub enum Metric {
 }
 
 impl Metric {
-    pub fn parse(s: &str) -> Option<Metric> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
-            "cos" | "cosine" => Some(Metric::Cos),
-            "l2" | "l2sq" | "euclidean" => Some(Metric::L2),
-            "ip" | "dot" => Some(Metric::IP),
-            "hamming" => Some(Metric::Hamming),
-            "tanimoto" | "jaccard" => Some(Metric::Tanimoto),
+            "cos" | "cosine" => Some(Self::Cos),
+            "l2" | "l2sq" | "euclidean" => Some(Self::L2),
+            "ip" | "dot" => Some(Self::IP),
+            "hamming" => Some(Self::Hamming),
+            "tanimoto" | "jaccard" => Some(Self::Tanimoto),
             _ => None,
         }
     }
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            Metric::Cos => "cos",
-            Metric::L2 => "l2",
-            Metric::IP => "ip",
-            Metric::Hamming => "hamming",
-            Metric::Tanimoto => "tanimoto",
+            Self::Cos => "cos",
+            Self::L2 => "l2",
+            Self::IP => "ip",
+            Self::Hamming => "hamming",
+            Self::Tanimoto => "tanimoto",
         }
     }
 
     pub(super) const fn kind(self) -> MetricKind {
         match self {
-            Metric::Cos => MetricKind::Cos,
-            Metric::L2 => MetricKind::L2sq,
-            Metric::IP => MetricKind::IP,
-            Metric::Hamming => MetricKind::Hamming,
-            Metric::Tanimoto => MetricKind::Tanimoto,
+            Self::Cos => MetricKind::Cos,
+            Self::L2 => MetricKind::L2sq,
+            Self::IP => MetricKind::IP,
+            Self::Hamming => MetricKind::Hamming,
+            Self::Tanimoto => MetricKind::Tanimoto,
         }
     }
 
     /// Reject metric/quantization pairs whose distances would be meaningless.
     pub fn check_quant(self, quant: Quant) -> Result<()> {
-        let bitwise = matches!(self, Metric::Hamming | Metric::Tanimoto);
+        let bitwise = matches!(self, Self::Hamming | Self::Tanimoto);
         match (quant, bitwise) {
             (Quant::B1, false) => Err(Error::bad_request(format!(
                 "quantization b1 requires a bitwise metric (hamming or tanimoto), got {self}"

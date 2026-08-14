@@ -408,3 +408,115 @@ fn many_connections_search_the_same_index_at_once() {
 
     setup.send(&format!("vdrop {ix}"));
 }
+
+/// The reserved metadata field cannot be reached from the protocol.
+///
+/// It is named `AV META`, with a space, and that space is the guarantee. The
+/// ASCII protocol has no way to express a map field containing one:
+///
+/// - `mop insert` takes the field as a command-line token, split on spaces.
+/// - `mop get` / `mop delete` take a space-separated field list and demand
+///   exactly `numfields` tokens, so this name always splits into two.
+/// - The binary protocol has LOP/SOP/BOP opcodes but no MOP at all.
+///
+/// The earlier name began with `\x01` and relied on `vadd` rejecting control
+/// bytes — a rule of ours, not a property of the protocol. `mop insert` accepts
+/// control bytes in a field, so a client could overwrite the metadata element and
+/// take the whole index down with it. This test is what keeps that from coming
+/// back.
+#[test]
+fn the_metadata_field_is_unreachable_from_the_protocol() {
+    session!(_daemon, client);
+    let ix = index_name("reserved");
+    assert_reply(&client.send(&format!("vcreate {ix} 2")), "CREATED\r\n");
+    assert_reply(&client.vadd(&ix, "v1", 2, "1 0"), "STORED\r\n");
+
+    // Writing it: the field arrives as two tokens, so the command is malformed.
+    //
+    // Sent without its body on purpose. The line is rejected before the body is
+    // read, so a body would be parsed as the next command and answer a second
+    // time — leaving a reply in the buffer for whatever runs next.
+    let reply = client.send(&format!("mop insert {ix} AV META 5 0 0 0"));
+    assert!(
+        reply.contains("CLIENT_ERROR"),
+        "a client must not be able to create the reserved field: {reply}"
+    );
+
+    // Reading it by name: one field is declared, two are found.
+    let reply = client.send_body(&format!("mop get {ix} 7 1"), "AV META");
+    assert!(
+        reply.contains("CLIENT_ERROR"),
+        "nor request it by name: {reply}"
+    );
+
+    // A whole-map dump still shows it, so it stays observable to an operator.
+    let dump = client.send(&format!("mop get {ix} 0 0"));
+    assert!(
+        dump.contains("AV META") && dump.contains("\"metric\""),
+        "a full dump must still show the metadata element: {dump}"
+    );
+
+    // And the index is untouched by any of it.
+    assert_reply(
+        &client.send(&format!("vget {ix} v1")),
+        "VALUE v1 0\r\n\r\nEND\r\n",
+    );
+    client.send(&format!("vdrop {ix}"));
+}
+
+/// ATTR JSON is one argument, and a space is refused rather than guessed at.
+///
+/// memcached's tokenizer splits the command line on spaces and overwrites each
+/// token-terminating space with a NUL in place. Putting the pieces back would
+/// mean mapping those NULs to spaces — but a NUL is also a byte a client could
+/// have sent, so the reconstruction is ambiguous. Requiring one token removes the
+/// question, and it costs nothing: with no whitespace, the full 128-byte region
+/// is usable, which is more than the spaced form ever reached.
+#[test]
+fn attr_json_must_arrive_as_one_argument() {
+    session!(_daemon, client);
+    let ix = index_name("attrtok");
+    client.send(&format!("vcreate {ix} 2"));
+
+    let spaced = r#"{"cat": "tech"}"#;
+    let reply = client.send_body(
+        &format!("vadd {ix} v1 3 2 ATTR {} {spaced}", spaced.len()),
+        "1 0",
+    );
+    assert!(
+        reply.contains("no spaces"),
+        "a spaced ATTR must name the reason: {reply}"
+    );
+
+    // The same document without spaces, and then one filling the whole region.
+    let tight = r#"{"cat":"tech"}"#;
+    assert_eq!(
+        client
+            .send_body(
+                &format!("vadd {ix} v1 3 2 ATTR {} {tight}", tight.len()),
+                "1 0"
+            )
+            .trim_end(),
+        "STORED"
+    );
+
+    let full = format!(
+        "{{{}}}",
+        (0..14)
+            .map(|i| format!("\"k{i}\":{i}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    assert!(full.len() <= 128, "{} bytes", full.len());
+    assert_eq!(
+        client
+            .send_body(
+                &format!("vadd {ix} v2 3 2 ATTR {} {full}", full.len()),
+                "1 0"
+            )
+            .trim_end(),
+        "STORED"
+    );
+
+    client.send(&format!("vdrop {ix}"));
+}

@@ -1,14 +1,7 @@
 //! Per-connection state for the two-phase transfer memcached calls `nread`.
 //!
-//! `vadd` and `VSIM VECTOR` announce a byte count on their command line and send
-//! the coordinates afterwards. Between the two, the parsed line and the buffer
-//! memcached will fill live here, keyed by connection cookie.
-//!
-//! The parsed line is stored as a `Result`. The `accept` callback has no way to
-//! answer the client, and refusing there would leave the body unread — memcached
-//! would then parse those coordinates as the next command line. So a body is
-//! always registered and drained, and the failure travels with it for the handler
-//! to report.
+//! The parsed line is stored as a `Result`: refusing in `accept` would leave the
+//! body unread, and memcached would parse it as the next command line.
 
 use std::collections::HashMap;
 use std::os::raw::{c_char, c_void};
@@ -18,10 +11,6 @@ use super::request::Body;
 use crate::error::Error;
 
 /// A command line whose body has still to arrive, with the buffer for it.
-///
-/// The buffer is a plain `Vec`: memcached only writes into it, so ownership stays
-/// here and dropping the entry releases it whether the command completed or was
-/// aborted.
 #[derive(Debug)]
 pub struct Pending {
     request: std::result::Result<Body, Error>,
@@ -31,32 +20,23 @@ pub struct Pending {
 }
 
 impl Pending {
-    fn new(request: std::result::Result<Body, Error>, body_len: usize) -> Pending {
-        Pending {
+    fn new(request: std::result::Result<Body, Error>, body_len: usize) -> Self {
+        Self {
             request,
             buffer: vec![0; body_len + 2],
             body_len,
         }
     }
 
-    /// Fill in the CRLF memcached would have written, for tests that never go
-    /// through a real transfer.
+    /// Fill in the CRLF memcached would have written. Tests only.
     #[cfg(test)]
-    fn terminate(mut self) -> Pending {
+    fn terminate(mut self) -> Self {
         let n = self.body_len;
         self.buffer[n..].copy_from_slice(b"\r\n");
         self
     }
 
     /// Split into the parsed line and its body, dropping the trailing CRLF.
-    ///
-    /// memcached fills the two extra bytes with whatever followed the body. If
-    /// they are not CRLF, the declared length was wrong: the body we were handed
-    /// is truncated and the rest of it is still in the stream, waiting to be
-    /// misread as the next command line. That is refused here the same way
-    /// memcached refuses a `set` whose data chunk does not line up.
-    ///
-    /// Consuming lets the caller move the `Result` out instead of cloning it.
     pub fn into_parts(mut self) -> (std::result::Result<Body, Error>, Vec<u8>) {
         let terminated = self.buffer[self.body_len..] == *b"\r\n";
         self.buffer.truncate(self.body_len);
@@ -101,7 +81,6 @@ pub unsafe fn expect_body(
     }
 }
 
-/// Reclaim the body registered for `cookie`, if any.
 pub fn take_body(cookie: *const c_void) -> Option<Pending> {
     table().remove(&(cookie as usize))
 }

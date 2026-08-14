@@ -1,22 +1,15 @@
-//! The usearch index itself: capacity, the key mapping, and add/search/remove.
+//! The usearch index: capacity, locking, and add/search/remove.
 //!
-//! usearch keys are `u64` while ours are strings, so this owns both directions of
-//! that mapping. The `key -> id` side is lock-free on purpose: the search
-//! predicate reads it once per visited graph node.
-//!
-//! Concurrency has two halves. usearch guards concurrent construction, search and
-//! updates internally, so those take a **read** lock; the `RwLock` exists only to
-//! make `reserve` exclusive, since that reallocates the node arrays. The other
-//! half — not exhausting usearch's thread-context pool — lives in
-//! [`super::threads`].
+//! Two locks with different jobs — `inner` excludes capacity growth, `ids`
+//! serializes the key mapping. `docs/내부구조.md` §10.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
 // `::` because this module shares a name with the crate it wraps.
 use ::usearch::{Index, IndexOptions, ScalarKind, b1x8, f16};
 
+use super::idmap::IdMap;
 use super::metric::Metric;
 use super::threads::Semaphore;
 use crate::arcus::element::Layout;
@@ -26,7 +19,6 @@ use crate::error::Error;
 type Result<T> = std::result::Result<T, Error>;
 
 /// usearch reports failures as a `cxx::Exception`; carry its message through
-/// without depending on the cxx crate directly.
 fn usearch_err(e: impl std::fmt::Display) -> Error {
     Error::Index(e.to_string())
 }
@@ -40,72 +32,6 @@ const fn scalar_kind(q: Quant) -> ScalarKind {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Id mapping
-// ---------------------------------------------------------------------------
-
-/// The `String` ↔ `u64` mapping usearch needs, both directions under one lock so
-/// they cannot disagree with each other.
-///
-/// Keys are handed out by a counter and never reused. They may therefore be
-/// sparse, which usearch does not mind: `reserve` sizes for a member *count*, not
-/// a key range — verified by adding `u64::MAX - 1` to an index reserved for eight.
-/// That is what lets a delete actually free its entry instead of leaving a
-/// tombstone behind, and it removes the reuse hazard a free list would introduce,
-/// where a key could change meaning under a search already in flight.
-#[derive(Default)]
-struct IdMap {
-    by_key: HashMap<u64, Arc<str>>,
-    by_id: HashMap<Arc<str>, u64>,
-    next: u64,
-    /// Total length of the live id strings, kept as a running sum.
-    ///
-    /// Tracked rather than computed so that reporting memory is O(1) instead of
-    /// walking every entry with the lock held — which for a million vectors would
-    /// stall writers for as long as the walk takes.
-    id_bytes: usize,
-}
-
-impl IdMap {
-    /// The key for `id`, minting one if it is new. Returns whether it existed.
-    fn intern(&mut self, id: &str) -> (u64, bool) {
-        if let Some(key) = self.by_id.get(id) {
-            return (*key, true);
-        }
-        let key = self.next;
-        self.next += 1;
-        self.id_bytes += id.len();
-        let id: Arc<str> = Arc::from(id);
-        self.by_key.insert(key, Arc::clone(&id));
-        self.by_id.insert(id, key);
-        (key, false)
-    }
-
-    fn forget(&mut self, id: &str) -> Option<u64> {
-        let key = self.by_id.remove(id)?;
-        if let Some(gone) = self.by_key.remove(&key) {
-            self.id_bytes -= gone.len();
-        }
-        Some(key)
-    }
-
-    /// Module memory held by this mapping.
-    ///
-    /// An estimate: it counts the entries and the id text, but not the slack a
-    /// hash map keeps for its load factor, so the true figure is somewhat higher.
-    /// The point is to show which index is growing, not to balance a ledger.
-    fn bytes(&self) -> usize {
-        const ARC_HEADER: usize = 16; // strong + weak counts
-        let per_entry = size_of::<u64>() + size_of::<Arc<str>>();
-        // Both directions hold a key and an Arc, and the text is shared once.
-        self.by_key.len() * per_entry * 2 + self.by_key.len() * ARC_HEADER + self.id_bytes
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Index
-// ---------------------------------------------------------------------------
-
 const MIN_CAPACITY: usize = 1024;
 
 pub struct AnnIndex {
@@ -113,17 +39,13 @@ pub struct AnnIndex {
     pub metric: Metric,
     threads: usize,
     /// Write-locked only for `reserve`; every other operation takes a read lock,
-    /// because usearch guards concurrent add/search/remove internally.
     inner: RwLock<Index>,
     permits: Semaphore,
     reserved: AtomicUsize,
     /// Both directions of the key mapping.
-    ///
-    /// The search predicate takes a read lock here once per visited graph node.
-    /// That is affordable because the predicate already pays for an engine call on
-    /// the same path — a global mutex and a malloc — against which two atomic
-    /// operations do not register.
     ids: RwLock<IdMap>,
+    /// Set while a rebuild is refilling this index from Map.
+    rebuilding: AtomicBool,
 }
 
 impl AnnIndex {
@@ -134,7 +56,7 @@ impl AnnIndex {
         expansion_add: usize,
         expansion_search: usize,
         threads: usize,
-    ) -> Result<AnnIndex> {
+    ) -> Result<Self> {
         metric.check_quant(layout.quant)?;
 
         let options = IndexOptions {
@@ -152,7 +74,7 @@ impl AnnIndex {
             .reserve_capacity_and_threads(MIN_CAPACITY, threads)
             .map_err(usearch_err)?;
 
-        Ok(AnnIndex {
+        Ok(Self {
             layout,
             metric,
             threads,
@@ -160,6 +82,7 @@ impl AnnIndex {
             permits: Semaphore::new(threads),
             reserved: AtomicUsize::new(MIN_CAPACITY),
             ids: RwLock::new(IdMap::default()),
+            rebuilding: AtomicBool::new(false),
         })
     }
 
@@ -172,12 +95,7 @@ impl AnnIndex {
         self.len() == 0
     }
 
-    /// Lock-free key -> id lookup. Returns `None` for tombstoned slots.
     /// The id a usearch key stands for, or `None` if it has been removed.
-    ///
-    /// Returns an `Arc` rather than a borrow so the lock is released before the
-    /// caller uses it — the predicate goes on to make an engine call, and holding
-    /// this lock across that would serialize every search behind every insert.
     pub fn id_of(&self, key: u64) -> Option<Arc<str>> {
         self.ids().by_key.get(&key).map(Arc::clone)
     }
@@ -191,18 +109,11 @@ impl AnnIndex {
     }
 
     /// Module memory held by the key mapping. Invisible to arcus's own accounting,
-    /// which is why it is worth reporting.
     pub fn id_map_bytes(&self) -> usize {
         self.ids().bytes()
     }
 
     /// Bytes usearch holds from the allocator for this index — measured, not
-    /// estimated, and the figure that shows up in the process's RSS.
-    ///
-    /// usearch allocates its graph and its vectors from two tape allocators that
-    /// grow in **8 MiB chunks**, so this jumps to ~16.8 MiB on the first insert and
-    /// then does not move again for a long time. It is a floor, not a measure of
-    /// how much data an index holds; pair it with [`Self::used_bytes`].
     pub fn held_bytes(&self) -> usize {
         self.inner
             .read()
@@ -211,14 +122,6 @@ impl AnnIndex {
     }
 
     /// Bytes of the held memory that actually carry graph nodes and vectors.
-    ///
-    /// usearch's own `reserved` counters are the *unused* slack inside the chunks
-    /// and `wasted` is alignment padding, so the live figure is what remains after
-    /// subtracting both. This is the number that tracks the vector count.
-    ///
-    /// A high-water mark, not a live figure: the tapes are append-only with no
-    /// per-object free, so a `remove` does not give bytes back. Compare it with
-    /// [`Self::len`] to see how much of it is churn.
     pub fn used_bytes(&self) -> usize {
         let s = self
             .inner
@@ -238,10 +141,6 @@ impl AnnIndex {
     }
 
     /// Grow usearch's capacity so `needed` keys fit.
-    ///
-    /// Taking the write lock is what makes this safe: it drains all readers, so
-    /// no thread is inside usearch while the node arrays are reallocated. Permits
-    /// need not be reclaimed separately.
     fn ensure_capacity(&self, needed: usize) -> Result<()> {
         if needed <= self.reserved.load(Ordering::Acquire) {
             return Ok(());
@@ -261,6 +160,40 @@ impl AnnIndex {
 
     /// Insert or replace `id`. `vector` is the already-quantized byte form.
     pub fn add(&self, id: &str, vector: &[u8]) -> Result<u64> {
+        self.check_vector(vector)?;
+        // Capacity is settled before either lock, because growing takes the
+        self.ensure_capacity(self.live() + 1)?;
+
+        let _permit = self.permits.acquire();
+        // `inner` before `ids`, the order the search predicate uses. Both are held
+        let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
+
+        let (key, existed) = ids.intern(id);
+        if existed {
+            // The index is built with `multi: false`, so usearch rejects a second
+            index.remove(key).map_err(usearch_err)?;
+        }
+        self.typed_add(&index, key, vector)?;
+        Ok(key)
+    }
+
+    /// Add `id` only if a rebuild has no reason to leave it alone.
+    pub fn add_unless_known(&self, id: &str, vector: &[u8]) -> Result<bool> {
+        self.check_vector(vector)?;
+
+        let _permit = self.permits.acquire();
+        let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
+        if ids.is_known(id) {
+            return Ok(false);
+        }
+        let (key, _) = ids.intern(id);
+        self.typed_add(&index, key, vector)?;
+        Ok(true)
+    }
+
+    fn check_vector(&self, vector: &[u8]) -> Result<()> {
         if vector.len() != self.layout.vector_bytes() {
             return Err(Error::bad_request(format!(
                 "vector is {} bytes, expected {}",
@@ -268,31 +201,15 @@ impl AnnIndex {
                 self.layout.vector_bytes()
             )));
         }
+        Ok(())
+    }
 
-        // Allocate (or reuse) the key while holding by_id, so two concurrent
-        // vadds of the same id cannot end up with two different keys: one lock
-        // covers both directions of the mapping.
-        let (key, existed, live) = {
-            let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
-            let (key, existed) = ids.intern(id);
-            (key, existed, ids.by_key.len())
-        };
-
-        // Capacity tracks live members, not keys ever handed out, so churn does not
-        // grow the reservation.
-        self.ensure_capacity(live)?;
-
-        let _permit = self.permits.acquire();
-        let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
-        if existed {
-            // The index is built with `multi: false`, so usearch rejects a second
-            // add under the same key. An update is therefore remove-then-add.
-            // A concurrent search can miss this vector inside that window; Map
-            // remains the source of truth, so nothing is lost.
-            index.remove(key).map_err(usearch_err)?;
-        }
-        self.typed_add(&index, key, vector)?;
-        Ok(key)
+    fn live(&self) -> usize {
+        self.ids
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_key
+            .len()
     }
 
     fn typed_add(&self, index: &Index, key: u64, vector: &[u8]) -> Result<()> {
@@ -305,24 +222,52 @@ impl AnnIndex {
         .map_err(usearch_err)
     }
 
-    /// Remove `id`. Returns false when it was not present.
-    pub fn remove(&self, id: &str) -> Result<bool> {
-        let key = {
-            let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
-            match ids.forget(id) {
-                Some(key) => key,
-                None => return Ok(false),
-            }
-        };
+    /// Reserve room for `count` members up front.
+    pub fn reserve(&self, count: usize) -> Result<()> {
+        self.ensure_capacity(count)
+    }
 
+    /// Throw away every member, keeping the index's shape.
+    pub fn begin_rebuild(&self) -> Result<()> {
+        // Recording deletes starts before the graph is emptied, not after, so
+        self.rebuilding.store(true, Ordering::Release);
+        self.clear()
+    }
+
+    /// Stop recording deletes and drop what was recorded.
+    pub fn end_rebuild(&self) {
+        let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
+        self.rebuilding.store(false, Ordering::Release);
+        ids.tombstones.clear();
+    }
+
+    pub fn clear(&self) -> Result<()> {
+        let index = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+        let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
+        index.reset().map_err(usearch_err)?;
+        self.reserved.store(0, Ordering::Release);
+        *ids = IdMap::default();
+        drop(ids);
+        Ok(())
+    }
+
+    pub fn remove(&self, id: &str) -> Result<bool> {
         let _permit = self.permits.acquire();
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
+
+        // While rebuilding, the id is remembered rather than simply dropped, so
+        let key = if self.rebuilding.load(Ordering::Acquire) {
+            ids.forget_tombstoned(id)
+        } else {
+            ids.forget(id)
+        };
+        let Some(key) = key else { return Ok(false) };
         index.remove(key).map_err(usearch_err)?;
         Ok(true)
     }
 
     /// k-NN search. `accept` is called once per visited graph node and must be
-    /// cheap — it runs inside usearch's traversal.
     pub fn search<F>(&self, query: &[u8], k: usize, accept: F) -> Result<Vec<(u64, f32)>>
     where
         F: Fn(u64) -> bool,
@@ -336,7 +281,6 @@ impl AnnIndex {
         }
 
         // Tombstoned keys must never reach the caller, even if usearch still
-        // holds the node.
         let alive_and_accepted = |key: u64| self.id_of(key).is_some() && accept(key);
 
         let _permit = self.permits.acquire();
@@ -356,8 +300,6 @@ impl AnnIndex {
 }
 
 // The stored bytes come straight out of an arcus item and carry no alignment
-// guarantee, so each conversion copies rather than reinterpreting in place.
-// This is once per operation, not once per visited node.
 
 fn to_f32(bytes: &[u8]) -> Vec<f32> {
     bytes

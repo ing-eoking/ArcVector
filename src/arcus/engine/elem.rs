@@ -1,27 +1,13 @@
-//! arcus Map engine access — the source of truth for every vector.
-//!
-//! One index is one Map item (key = index name); one vector is one Map element
-//! (field = vector id, value = the [`crate::codec`] layout). Map is used rather
-//! than plain KV items because key-based lookup, replication and TTL already
-//! ride on the Map path.
-//!
-//! All unsafety is concentrated in [`Store::for_cookie`]. Everything downstream
-//! takes `&self` and hands out owned or borrowed Rust values, so no other module
-//! deals in raw pointers.
+//! The elements inside a Map item — one per vector, keyed by its id.
 
-use std::ffi::CStr;
-use std::fmt;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicPtr, Ordering};
 
+use super::Store;
+use super::error::{Result, StoreError, as_int, check};
+use crate::arcus::abi;
 use crate::arcus::element::Layout;
-use crate::engine_api::{
-    ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT, ENGINE_ERROR_CODE_ENGINE_EOVERFLOW,
-    ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT, ENGINE_ERROR_CODE_ENGINE_SUCCESS, ENGINE_HANDLE,
-    SERVER_HANDLE_V1, eitem, eitem_info, elems_result, engine_interface_v1, field_t, item_attr,
-};
+use crate::engine_api::{eitem, eitem_info, elems_result, field_t};
 
 unsafe extern "C" {
     fn free(ptr: *mut c_void);
@@ -30,217 +16,7 @@ unsafe extern "C" {
 /// Collection type id for Map, as the engine's `get_elem_info` expects it.
 const ITEM_TYPE_MAP: c_int = 3;
 
-pub const DEFAULT_MAX_ELEMENT_BYTES: u32 = 16 * 1024;
-const DEFAULT_MAX_MAP_SIZE: u32 = 50_000;
-
-static ENGINE: AtomicPtr<engine_interface_v1> = AtomicPtr::new(ptr::null_mut());
-static GET_SERVER_API: OnceLock<unsafe extern "C" fn() -> *mut SERVER_HANDLE_V1> = OnceLock::new();
-
-/// Record the server-API accessor handed to the extension at load time.
-pub fn set_server_api(f: unsafe extern "C" fn() -> *mut SERVER_HANDLE_V1) {
-    let _ = GET_SERVER_API.set(f);
-}
-
-/// Resolve and cache the engine handle.
-///
-/// The engine is not wired up when the extension initializes, so this resolves
-/// lazily on first use.
-fn engine() -> *mut engine_interface_v1 {
-    let cached = ENGINE.load(Ordering::Acquire);
-    if !cached.is_null() {
-        return cached;
-    }
-    let Some(get_api) = GET_SERVER_API.get() else {
-        return ptr::null_mut();
-    };
-    // SAFETY: memcached handed us this function pointer during extension
-    // initialization and it stays valid for the process lifetime.
-    let server = unsafe { get_api() };
-    if server.is_null() {
-        return ptr::null_mut();
-    }
-    // SAFETY: a non-null SERVER_HANDLE_V1 from memcached is fully initialized.
-    let handle = unsafe { (*server).engine }.cast::<engine_interface_v1>();
-    if handle.is_null() {
-        return ptr::null_mut();
-    }
-    // Racing resolvers must agree on a single pointer.
-    match ENGINE.compare_exchange(ptr::null_mut(), handle, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => handle,
-        Err(existing) => existing,
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum StoreError {
-    /// The engine handle or a required vtable entry is missing.
-    Unavailable,
-    /// The Map item is gone — evicted, expired or dropped.
-    KeyGone,
-    /// The Map exists but has no such element.
-    ElemGone,
-    /// Map is full (`maxcount` / `max_map_size`).
-    Overflow,
-    /// An engine code we do not translate individually.
-    Engine(u32),
-}
-
-impl fmt::Display for StoreError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            StoreError::Unavailable => f.write_str("engine unavailable"),
-            StoreError::KeyGone => f.write_str("index not found in engine"),
-            StoreError::ElemGone => f.write_str("element not found"),
-            StoreError::Overflow => f.write_str("index is full"),
-            StoreError::Engine(code) => write!(f, "engine error {code}"),
-        }
-    }
-}
-
-impl std::error::Error for StoreError {}
-
-type Result<T> = std::result::Result<T, StoreError>;
-
-fn translate(code: u32) -> StoreError {
-    match code {
-        ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT => StoreError::KeyGone,
-        ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT => StoreError::ElemGone,
-        ENGINE_ERROR_CODE_ENGINE_EOVERFLOW => StoreError::Overflow,
-        other => StoreError::Engine(other),
-    }
-}
-
-/// Length of a key or field as the engine's `int` parameters want it.
-///
-/// The protocol bounds keys at 250 bytes and fields at `MAX_FIELD_LENG`, so this
-/// cannot truncate in practice; saturate rather than wrap if that ever changes.
-fn as_int(len: usize) -> c_int {
-    c_int::try_from(len).unwrap_or(c_int::MAX)
-}
-
-fn check(code: u32) -> Result<()> {
-    if code == ENGINE_ERROR_CODE_ENGINE_SUCCESS {
-        Ok(())
-    } else {
-        Err(translate(code))
-    }
-}
-
-/// Engine access bound to one connection.
-///
-/// Cheap to copy and never stored: it lives only for the extension callback that
-/// created it, which is what makes the raw pointers inside it safe to use
-/// without synchronization.
-#[derive(Clone, Copy)]
-pub struct Store {
-    engine: *mut engine_interface_v1,
-    cookie: *const c_void,
-}
-
 impl Store {
-    /// # Safety
-    ///
-    /// `cookie` must be the connection cookie memcached passed to the extension
-    /// callback that is currently running, and the returned `Store` must not
-    /// outlive that callback.
-    pub unsafe fn for_cookie(cookie: *const c_void) -> Option<Store> {
-        let engine = engine();
-        (!engine.is_null()).then_some(Store { engine, cookie })
-    }
-
-    fn handle(&self) -> *mut ENGINE_HANDLE {
-        self.engine.cast::<ENGINE_HANDLE>()
-    }
-
-    fn vtable(&self) -> &engine_interface_v1 {
-        // SAFETY: `for_cookie` rejects a null engine, and the engine outlives
-        // every connection.
-        unsafe { &*self.engine }
-    }
-
-    /// Read a `uint32` engine configuration value, falling back to `default`.
-    fn config_u32(&self, key: &CStr, default: u32) -> u32 {
-        let Some(get_config) = self.vtable().get_config else {
-            return default;
-        };
-        let mut out: u32 = 0;
-        // SAFETY: `out` is a live u32, which is what the engine writes for a
-        // uint32-typed configuration key.
-        let code = unsafe {
-            get_config(
-                self.handle(),
-                self.cookie,
-                key.as_ptr(),
-                ptr::from_mut(&mut out).cast::<c_void>(),
-            )
-        };
-        if code == ENGINE_ERROR_CODE_ENGINE_SUCCESS && out > 0 {
-            out
-        } else {
-            default
-        }
-    }
-
-    /// Per-element size limit. This is what caps an index's dimension.
-    pub fn max_element_bytes(&self) -> u32 {
-        self.config_u32(c"max_element_bytes", DEFAULT_MAX_ELEMENT_BYTES)
-    }
-
-    /// Default element-count limit for a new Map.
-    pub fn max_map_size(&self) -> u32 {
-        self.config_u32(c"max_map_size", DEFAULT_MAX_MAP_SIZE)
-    }
-
-    /// Create the Map item backing an index.
-    ///
-    /// `maxcount` and `exptime` are the element-count limit and TTL the index
-    /// inherits from Map.
-    pub fn create_map(&self, key: &str, maxcount: Option<u32>, exptime: Option<u32>) -> Result<()> {
-        let Some(create) = self.vtable().map_struct_create else {
-            return Err(StoreError::Unavailable);
-        };
-        // SAFETY: all-zero is a valid item_attr; the engine reads the fields we
-        // set plus the zeroed defaults.
-        let mut attr: item_attr = unsafe { std::mem::zeroed() };
-        attr.readable = 1;
-        if let Some(m) = maxcount {
-            // Callers validate the range; saturate rather than wrap if one slips.
-            attr.maxcount = i32::try_from(m).unwrap_or(i32::MAX);
-        }
-        if let Some(e) = exptime {
-            attr.exptime = e;
-        }
-        // SAFETY: `key` and `attr` outlive the call.
-        check(unsafe {
-            create(
-                self.handle(),
-                self.cookie,
-                key.as_ptr().cast::<c_void>(),
-                as_int(key.len()),
-                ptr::from_mut(&mut attr),
-                0,
-            )
-        })
-    }
-
-    /// Delete the whole Map item — this is how an index is dropped.
-    pub fn drop_map(&self, key: &str) -> Result<()> {
-        let Some(remove) = self.vtable().remove else {
-            return Err(StoreError::Unavailable);
-        };
-        // SAFETY: `key` outlives the call.
-        check(unsafe {
-            remove(
-                self.handle(),
-                self.cookie,
-                key.as_ptr().cast::<c_void>(),
-                key.len(),
-                0,
-                0,
-            )
-        })
-    }
-
     /// Insert or replace one element.
     pub fn put_elem(&self, key: &str, field: &str, value: &[u8]) -> Result<()> {
         let vt = self.vtable();
@@ -262,7 +38,7 @@ impl Store {
                 key.as_ptr().cast::<c_void>(),
                 as_int(key.len()),
                 field.len(),
-                value.len(),
+                value.len() + Layout::STORED_TERMINATOR,
                 ptr::from_mut(&mut item),
             )
         })?;
@@ -285,18 +61,19 @@ impl Store {
                     info.score.cast::<u8>().cast_mut(),
                     field.len(),
                 );
-                ptr::copy_nonoverlapping(
-                    value.as_ptr(),
-                    info.value.cast::<u8>().cast_mut(),
-                    value.len(),
-                );
+                let dst = info.value.cast::<u8>().cast_mut();
+                ptr::copy_nonoverlapping(value.as_ptr(), dst, value.len());
+                // The engine sized the element for this terminator.
+                ptr::copy_nonoverlapping(b"\r\n".as_ptr(), dst.add(value.len()), 2);
             }
             ok
         };
         if !filled {
             // SAFETY: `item` was never inserted, so it is still ours to free.
             unsafe { elem_free(self.handle(), self.cookie, item) };
-            return Err(StoreError::Unavailable);
+            // The engine allocated the element and then failed to describe it.
+            abi::report_mismatch("get_elem_info did not describe the element it allocated");
+            return Err(StoreError::AbiMismatch);
         }
 
         let mut replaced = false;
@@ -317,7 +94,10 @@ impl Store {
             )
         };
         check(code).inspect_err(|_| {
-            // SAFETY: insert failed, so `item` is still ours to free.
+            // SAFETY: the insert did not complete, so `item` never became part of
+            // the Map and is still ours to free. `check` is what decides that:
+            // EWOULDBLOCK means the element *is* linked, and freeing it there trips
+            // `assert(elem->linked == 0)` inside the engine.
             unsafe { elem_free(self.handle(), self.cookie, item) };
         })
     }
@@ -356,11 +136,6 @@ impl Store {
     }
 
     /// Run `f` over the raw (field, value) pairs of the requested elements.
-    ///
-    /// `map_elem_get` mallocs its result array even for a single field
-    /// (coll_map.c:934) and returns refcounted element pointers, so [`Elems`]
-    /// owns the cleanup and every exit path releases exactly once. Callers get
-    /// borrowed slices and must copy whatever they keep.
     fn with_elems<T>(
         &self,
         key: &str,
@@ -399,7 +174,7 @@ impl Store {
             )
         };
 
-        // Take ownership before the error check so a partial result is still
+        // Take ownership before the error check, so a partial result is released too.
         // released.
         // SAFETY: `result` is exactly what the call above wrote.
         let elems = unsafe { Elems::new(self, &result) };
@@ -434,11 +209,6 @@ impl Store {
     }
 
     /// Copy the fixed ATTR region of one element — the search predicate's hot path.
-    ///
-    /// The region sits at a constant offset ([`super::element::ATTR_OFFSET`]), so
-    /// nothing has to be decoded and one or two cache lines are touched. The
-    /// surrounding `map_elem_get` still costs a global `cache_lock` and a malloc;
-    /// narrowing that is a change to this method's body alone.
     pub fn read_attr_slot(
         &self,
         key: &str,
@@ -456,7 +226,6 @@ impl Store {
         .ok_or(StoreError::ElemGone)
     }
 
-    /// Read one element's full value.
     pub fn get_elem(&self, key: &str, field: &str) -> Result<Vec<u8>> {
         self.with_elems(key, Some(field), |elems| elems[0].1.to_vec())
     }
@@ -502,7 +271,7 @@ impl<'a> Elems<'a> {
     /// `result` must be exactly what a `map_elem_get` call wrote, so `elem_array`
     /// is null or an engine-allocated array of `elem_count` refcounted elements
     /// that has not yet been released.
-    unsafe fn new(store: &'a Store, result: &elems_result) -> Elems<'a> {
+    unsafe fn new(store: &'a Store, result: &elems_result) -> Self {
         Elems {
             store,
             array: result.elem_array,
@@ -545,32 +314,6 @@ impl Drop for Elems<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn engine_codes_map_to_distinguishable_errors() {
-        assert_eq!(
-            translate(ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT),
-            StoreError::KeyGone
-        );
-        assert_eq!(
-            translate(ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT),
-            StoreError::ElemGone
-        );
-        assert_eq!(
-            translate(ENGINE_ERROR_CODE_ENGINE_EOVERFLOW),
-            StoreError::Overflow
-        );
-        assert_eq!(translate(9999), StoreError::Engine(9999));
-    }
-
-    #[test]
-    fn check_only_accepts_success() {
-        assert!(check(ENGINE_ERROR_CODE_ENGINE_SUCCESS).is_ok());
-        assert_eq!(
-            check(ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT),
-            Err(StoreError::KeyGone)
-        );
-    }
 
     #[test]
     fn empty_slices_are_returned_for_null_or_zero_length() {

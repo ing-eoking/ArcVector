@@ -1,9 +1,7 @@
 //! One error type for every command path.
 //!
-//! Handlers return `Result<Reply, Error>` and a single place in [`crate::lib`]
-//! turns that into an ASCII response. Whether a failure is reported as
-//! `CLIENT_ERROR` or `SERVER_ERROR` follows from the error itself, so no call
-//! site has to decide.
+//! Whether a failure is reported as `CLIENT_ERROR` or `SERVER_ERROR` follows from
+//! the error itself, so no call site has to decide.
 
 use std::fmt;
 
@@ -21,8 +19,8 @@ pub enum Blame {
 impl Blame {
     pub const fn prefix(self) -> &'static str {
         match self {
-            Blame::Client => "CLIENT_ERROR",
-            Blame::Server => "SERVER_ERROR",
+            Self::Client => "CLIENT_ERROR",
+            Self::Server => "SERVER_ERROR",
         }
     }
 }
@@ -35,6 +33,8 @@ pub enum Error {
     NoSuchIndex,
     /// The Map backing the index was evicted or expired out from under us.
     IndexEvicted,
+    /// The index exists but its graph is being rebuilt from Map.
+    Unreadable,
     Codec(CodecError),
     Filter(ParseError),
     Store(StoreError),
@@ -43,24 +43,25 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn bad_request(msg: impl Into<String>) -> Error {
-        Error::BadRequest(msg.into())
+    pub fn bad_request(msg: impl Into<String>) -> Self {
+        Self::BadRequest(msg.into())
     }
 
     pub fn blame(&self) -> Blame {
         match self {
-            Error::BadRequest(_) | Error::NoSuchIndex | Error::IndexEvicted | Error::Filter(_) => {
+            Self::BadRequest(_) | Self::NoSuchIndex | Self::IndexEvicted | Self::Filter(_) => {
                 Blame::Client
             }
-            // Encoding failures reflect what the client sent; decoding failures
-            // mean the stored bytes are wrong, which is ours to answer for.
-            Error::Codec(e) => match e {
+            // Encoding failures are the client's; decoding failures are ours.
+            Self::Codec(e) => match e {
                 CodecError::AttrTooLarge { .. } | CodecError::VectorLenMismatch { .. } => {
                     Blame::Client
                 }
                 _ => Blame::Server,
             },
-            Error::Store(_) | Error::Index(_) => Blame::Server,
+            // A well-formed request this node cannot serve right now, which is
+            Self::Unreadable => Blame::Server,
+            Self::Store(_) | Self::Index(_) => Blame::Server,
         }
     }
 }
@@ -68,12 +69,13 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::BadRequest(m) | Error::Index(m) => f.write_str(m),
-            Error::NoSuchIndex => f.write_str("index not found"),
-            Error::IndexEvicted => f.write_str("index was evicted"),
-            Error::Codec(e) => write!(f, "{e}"),
-            Error::Filter(e) => write!(f, "{e}"),
-            Error::Store(e) => write!(f, "{e}"),
+            Self::BadRequest(m) | Self::Index(m) => f.write_str(m),
+            Self::NoSuchIndex => f.write_str("index not found"),
+            Self::IndexEvicted => f.write_str("index was evicted"),
+            Self::Unreadable => f.write_str("index is unreadable while it rebuilds from Map"),
+            Self::Codec(e) => write!(f, "{e}"),
+            Self::Filter(e) => write!(f, "{e}"),
+            Self::Store(e) => write!(f, "{e}"),
         }
     }
 }
@@ -81,29 +83,29 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Codec(e) => Some(e),
-            Error::Filter(e) => Some(e),
-            Error::Store(e) => Some(e),
+            Self::Codec(e) => Some(e),
+            Self::Filter(e) => Some(e),
+            Self::Store(e) => Some(e),
             _ => None,
         }
     }
 }
 
 impl From<CodecError> for Error {
-    fn from(e: CodecError) -> Error {
-        Error::Codec(e)
+    fn from(e: CodecError) -> Self {
+        Self::Codec(e)
     }
 }
 
 impl From<ParseError> for Error {
-    fn from(e: ParseError) -> Error {
-        Error::Filter(e)
+    fn from(e: ParseError) -> Self {
+        Self::Filter(e)
     }
 }
 
 impl From<StoreError> for Error {
-    fn from(e: StoreError) -> Error {
-        Error::Store(e)
+    fn from(e: StoreError) -> Self {
+        Self::Store(e)
     }
 }
 
@@ -124,14 +126,14 @@ pub enum Reply {
 impl Reply {
     pub fn as_str(&self) -> &str {
         match self {
-            Reply::Created => "CREATED\r\n",
-            Reply::Exists => "EXISTS\r\n",
-            Reply::Stored => "STORED\r\n",
-            Reply::Deleted => "DELETED\r\n",
-            Reply::Dropped => "DROPPED\r\n",
-            Reply::NotFound => "NOT_FOUND\r\n",
-            Reply::Overflowed => "OVERFLOWED\r\n",
-            Reply::Body(s) => s,
+            Self::Created => "CREATED\r\n",
+            Self::Exists => "EXISTS\r\n",
+            Self::Stored => "STORED\r\n",
+            Self::Deleted => "DELETED\r\n",
+            Self::Dropped => "DROPPED\r\n",
+            Self::NotFound => "NOT_FOUND\r\n",
+            Self::Overflowed => "OVERFLOWED\r\n",
+            Self::Body(s) => s,
         }
     }
 }
