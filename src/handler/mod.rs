@@ -20,8 +20,8 @@ use index::{vcreate, vdrop, vlist, vstats};
 use search::{vsim_key, vsim_vector};
 use vector::{vadd, vdel, vget};
 
+use crate::command::Request;
 use crate::command::request::{Body, Line};
-use crate::command::tokens::Tokens;
 use crate::error::{Error, Reply, Result};
 
 /// Engine access for the callback currently running.
@@ -41,13 +41,12 @@ unsafe fn store_for(cookie: *const c_void) -> Result<Store> {
     })
 }
 
-/// Route one command line, or resume one whose body has arrived.
+/// Run one parsed command.
 ///
 /// # Safety
 ///
-/// `tokens` must borrow the argument vector memcached passed to `execute`, and
-/// `cookie` must be that call's connection cookie.
-pub unsafe fn dispatch(cookie: *const c_void, tokens: &Tokens) -> Result<Reply> {
+/// `cookie` must be the connection cookie of the `execute` call being served.
+pub unsafe fn run(cookie: *const c_void, request: Request) -> Result<Reply> {
     // A misaligned vtable was caught mid-call. Nothing the engine reports after
     // that can be trusted — including "this element is missing", which the
     // recovery path would otherwise read as damage and answer by deleting a Map.
@@ -56,38 +55,17 @@ pub unsafe fn dispatch(cookie: *const c_void, tokens: &Tokens) -> Result<Reply> 
     }
 
     // SAFETY: guaranteed by the caller.
-    let store = unsafe { store_for(cookie) };
+    let store = &unsafe { store_for(cookie) }?;
 
-    // An empty argument vector means a body arrived for a two-phase command.
-    if tokens.is_empty() {
-        let waiting = crate::command::pending::take_body(cookie)
-            .ok_or_else(|| Error::bad_request("lost command state"))?;
-        let (request, bytes) = waiting.into_parts();
-        let store = store?;
-        return match request? {
-            Body::Add(spec) => vadd(&store, &spec, &bytes),
-            Body::Sim(spec) => vsim_vector(&store, &spec, &bytes),
-        };
-    }
-
-    // Reaching here means `accept` could not size the body.
-    if let Some(at) = crate::command::request::body_length_at(tokens) {
-        let what = if at == 3 {
-            "vector length"
-        } else {
-            "vector bytes"
-        };
-        return Err(crate::command::request::body_length_error(tokens, at, what));
-    }
-
-    let store = &store?;
-    match crate::command::request::parse_line(tokens)? {
-        Line::Create(spec) => vcreate(store, &spec),
-        Line::SimKey(spec) => vsim_key(store, &spec),
-        Line::Get { index, id } => vget(store, index, id),
-        Line::Del { index, id } => vdel(store, index, id),
-        Line::Drop { index } => vdrop(store, index),
-        Line::List => vlist(),
-        Line::Stats => vstats(),
+    match request {
+        Request::Body(Body::Add(spec), bytes) => vadd(store, &spec, &bytes),
+        Request::Body(Body::Sim(spec), bytes) => vsim_vector(store, &spec, &bytes),
+        Request::Line(Line::Create(spec)) => vcreate(store, &spec),
+        Request::Line(Line::SimKey(spec)) => vsim_key(store, &spec),
+        Request::Line(Line::Get { index, id }) => vget(store, index, id),
+        Request::Line(Line::Del { index, id }) => vdel(store, index, id),
+        Request::Line(Line::Drop { index }) => vdrop(store, index),
+        Request::Line(Line::List) => vlist(),
+        Request::Line(Line::Stats) => vstats(),
     }
 }

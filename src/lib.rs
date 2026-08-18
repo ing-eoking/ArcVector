@@ -10,9 +10,14 @@
 //!   error          one error type, and who gets blamed for it
 //! ```
 //!
-//! `command` names no engine and no index: it turns tokens into values and
-//! stops. `handler` owns both backends, so the only way to reach the engine is
-//! through the module that executes commands.
+//! `command` names no engine and no index: it turns tokens into a `Request` and
+//! stops. `handler` owns both backends and takes a `Request`, so the only way to
+//! reach the engine is through the module that executes commands. Neither calls
+//! the other — `lib.rs` is what joins them:
+//!
+//! ```text
+//! execute → command::parse(cookie, tokens) → Request → handler::run(cookie, …)
+//! ```
 //!
 //! The single consistency rule: **the usearch index is a cache rebuildable from
 //! Map. If it is not in Map, it does not exist.**
@@ -120,7 +125,9 @@ unsafe extern "C" fn execute_vector_cmd(
     // SAFETY: guaranteed by the caller.
     let tokens = unsafe { Tokens::new(argv, argc) };
     // SAFETY: `cookie` belongs to the call in progress.
-    let outcome = unsafe { handler::dispatch(cookie, &tokens) };
+    // SAFETY: guaranteed by the caller.
+    let outcome = unsafe { command::parse(cookie, &tokens) }
+        .and_then(|request| unsafe { handler::run(cookie, request) });
     Responder::new(handler, cookie).reply(outcome);
     true
 }
