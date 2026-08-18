@@ -7,12 +7,12 @@ use std::fmt::Write as _;
 
 use super::access::for_read;
 use super::coords::coord_vectors;
-use crate::arcus::element;
-use crate::arcus::engine::{Store, StoreError};
 use crate::command::filter::Filter;
 use crate::command::request::{Sim, SimKey};
 use crate::error::{Error, Reply, Result};
-use crate::registry::VectorIndex;
+use crate::handler::arcus::element;
+use crate::handler::arcus::engine::{Store, StoreError};
+use crate::handler::registry::VectorIndex;
 
 /// One similarity search, appended to `out` as a `QUERY` group.
 fn similar(

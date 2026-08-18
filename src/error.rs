@@ -5,9 +5,9 @@
 
 use std::fmt;
 
-use crate::arcus::element::CodecError;
-use crate::arcus::engine::StoreError;
 use crate::command::filter::ParseError;
+use crate::handler::arcus::element::CodecError;
+use crate::handler::arcus::engine::StoreError;
 
 /// Who is at fault, which picks the ASCII error prefix.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

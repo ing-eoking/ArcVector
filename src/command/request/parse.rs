@@ -207,10 +207,10 @@ fn attr_clause(tokens: &Tokens, at: usize) -> Result<Vec<u8>> {
         )));
     }
     let declared: usize = tokens.parse(at + 1, "ATTR length")?;
-    if declared > element::ATTR_BYTES {
+    if declared > ATTR_BYTES {
         return Err(Error::bad_request(format!(
             "ATTR is {declared} bytes, over the {}-byte limit",
-            element::ATTR_BYTES
+            ATTR_BYTES
         )));
     }
     if declared == 0 {
@@ -467,7 +467,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        assert!(json.len() <= element::ATTR_BYTES);
+        assert!(json.len() <= ATTR_BYTES);
         assert_eq!(
             attr_of(&format!("vadd docs v1 16 4 ATTR {} {json}", json.len())).unwrap(),
             json.as_bytes()
@@ -509,7 +509,7 @@ mod tests {
         // Built from real content: leading spaces are separators to the
         // tokenizer, not part of the value.
         let json = format!(r#"{{"k":"{}"}}"#, "x".repeat(120));
-        assert_eq!(json.len(), element::ATTR_BYTES);
+        assert_eq!(json.len(), ATTR_BYTES);
         assert!(attr_of(&format!("vadd docs v1 16 4 ATTR 128 {json}")).is_ok());
     }
 

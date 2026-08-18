@@ -20,7 +20,7 @@ pub use recovery::{claim_refilled, ensure_builder, take_over};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
-use crate::usearch::AnnIndex;
+use crate::handler::usearch::AnnIndex;
 
 /// `owner` while a rebuild is in flight: claimed by nobody.
 pub const REBUILDING: u64 = 0;

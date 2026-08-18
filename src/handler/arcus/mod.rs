@@ -1,6 +1,6 @@
 //! Storing vectors in the arcus engine — the source of truth.
 //!
-//! An index is one Map item; a vector is one Map element. [`crate::usearch`]
+//! An index is one Map item; a vector is one Map element. [`crate::handler::usearch`]
 //! keeps a cache of this side that can be rebuilt at any time, so the dependency
 //! runs one way: the index knows the stored format, the store knows nothing of
 //! the index.

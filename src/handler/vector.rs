@@ -5,11 +5,11 @@
 
 use super::access::{for_read, for_write};
 use super::coords::coords;
-use crate::arcus::element::{self, Layout};
-use crate::arcus::engine::{Store, StoreError};
+use super::registry;
 use crate::command::request::Add;
 use crate::error::{Error, Reply, Result};
-use crate::registry;
+use crate::handler::arcus::element::{self, Layout};
+use crate::handler::arcus::engine::{Store, StoreError};
 
 /// `vadd <index> <id> <veclen> <dim> [ATTR <attrlen> <attr JSON>]`
 pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {

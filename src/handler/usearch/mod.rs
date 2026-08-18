@@ -1,4 +1,4 @@
-//! Searching with usearch — a cache of the [`crate::arcus`] side.
+//! Searching with usearch — a cache of the [`crate::handler::arcus`] side.
 //!
 //! Everything here is rebuildable from Map, which makes restart, eviction, TTL
 //! expiry and replication a single case rather than four.

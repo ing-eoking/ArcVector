@@ -10,13 +10,13 @@
 
 use std::sync::Arc;
 
-#[cfg(recovery)]
-use crate::arcus::element::{Layout, MetaRecord};
-use crate::arcus::engine::Store;
 use crate::error::{Error, Result};
 #[cfg(recovery)]
-use crate::registry::MetaState;
-use crate::registry::{self, VectorIndex};
+use crate::handler::arcus::element::{Layout, MetaRecord};
+use crate::handler::arcus::engine::Store;
+#[cfg(recovery)]
+use crate::handler::registry::MetaState;
+use crate::handler::registry::{self, VectorIndex};
 
 #[cfg(recovery)]
 /// Resolve a name to its graph, recovering it when missing or stale.
@@ -61,7 +61,7 @@ fn discard_damaged(store: &Store, name: &str, why: &str) {
     if !store.probe_map(name).is_ok_and(|p| p.looks_like_index()) {
         return; // Not ours. Somebody else's Map is none of our business.
     }
-    if crate::arcus::abi::mismatched() {
+    if crate::handler::arcus::abi::mismatched() {
         // "Damaged" is the engine's word, and a misaligned vtable makes it
         // unreliable. Deleting on it would destroy an index over a build mistake.
         return;

@@ -2,12 +2,17 @@
 //!
 //! ```text
 //! lib.rs           the C ABI — registration and memcached's four callbacks
-//!   command/       receive a command, interpret it, run it
-//!   arcus/         store vectors in the arcus engine — the source of truth
-//!   usearch/       search them — a cache of the arcus side
-//!   registry/      the live pairs, and rebuilding one side from the other
+//!   command/       the wire: a command line in, a typed request out   (pure)
+//!   handler/       everything that runs a command
+//!     arcus/         store vectors in the engine — the source of truth
+//!     usearch/       search them — a cache of the arcus side
+//!     registry/      the live pairs, and rebuilding one side from the other
 //!   error          one error type, and who gets blamed for it
 //! ```
+//!
+//! `command` names no engine and no index: it turns tokens into values and
+//! stops. `handler` owns both backends, so the only way to reach the engine is
+//! through the module that executes commands.
 //!
 //! The single consistency rule: **the usearch index is a cache rebuildable from
 //! Map. If it is not in Map, it does not exist.**
@@ -27,11 +32,18 @@ pub mod engine_api {
     include!(concat!(env!("OUT_DIR"), "/engine_api.rs"));
 }
 
-pub mod arcus;
 pub mod command;
 pub mod error;
-pub mod registry;
-pub mod usearch;
+pub mod handler;
+
+/// Vocabulary the command line names, so parsing can spell it without reaching
+/// into the modules that store or search by it.
+///
+/// `ATTR_BYTES` is here for the same reason: the parser has to refuse an
+/// oversized `ATTR` before a handler ever sees it, and the size is a fact about
+/// the stored element rather than about the wire.
+pub use handler::arcus::element::{ATTR_BYTES, Quant};
+pub use handler::usearch::Metric;
 
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
@@ -108,7 +120,7 @@ unsafe extern "C" fn execute_vector_cmd(
     // SAFETY: guaranteed by the caller.
     let tokens = unsafe { Tokens::new(argv, argc) };
     // SAFETY: `cookie` belongs to the call in progress.
-    let outcome = unsafe { command::dispatch(cookie, &tokens) };
+    let outcome = unsafe { handler::dispatch(cookie, &tokens) };
     Responder::new(handler, cookie).reply(outcome);
     true
 }
@@ -142,7 +154,7 @@ pub extern "C" fn memcached_extensions_initialize(
     let Some(get_api) = get_server_api else {
         return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
     };
-    arcus::engine::set_server_api(get_api);
+    handler::arcus::engine::set_server_api(get_api);
 
     // SAFETY: memcached hands us a live SERVER_HANDLE_V1 accessor, and the
     // descriptor is a process-lifetime static that the server only reads.

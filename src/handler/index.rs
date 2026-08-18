@@ -4,12 +4,12 @@ use std::fmt::Write as _;
 
 #[cfg(recovery)]
 use super::access::resolve;
-use crate::arcus::element::{self, Layout, MetaRecord, Quant};
-use crate::arcus::engine::Store;
 use crate::command::request::Create;
 use crate::error::{Error, Reply, Result};
-use crate::registry::{self, VectorIndex};
-use crate::usearch::{AnnIndex, THREAD_SLOTS};
+use crate::handler::arcus::element::{self, Layout, MetaRecord, Quant};
+use crate::handler::arcus::engine::Store;
+use crate::handler::registry::{self, VectorIndex};
+use crate::handler::usearch::{AnnIndex, THREAD_SLOTS};
 
 /// `vcreate <index> <dim> [METRIC …] [QUANT …] [MAXCOUNT …] [EXPTIME …] [M …] …`
 pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {

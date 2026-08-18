@@ -8,9 +8,9 @@ pub use parse::{body_length_at, body_length_error, parse_body, parse_line};
 
 use super::filter::Filter;
 use super::tokens::Tokens;
-use crate::arcus::element::{self, Quant};
+use crate::Quant;
 use crate::error::{Error, Result};
-use crate::usearch::Metric;
+use crate::{ATTR_BYTES, Metric};
 
 /// Upper bound on one transferred body.
 pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;

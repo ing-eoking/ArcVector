@@ -2,8 +2,8 @@
 
 use ::usearch::MetricKind;
 
-use crate::arcus::element::Quant;
 use crate::error::{Error, Result};
+use crate::handler::arcus::element::Quant;
 
 /// Distance metric. Restricted per quantization by [`Metric::check_quant`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

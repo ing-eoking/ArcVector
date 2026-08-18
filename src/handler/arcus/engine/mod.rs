@@ -17,10 +17,10 @@ use std::ptr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use crate::arcus::abi;
 use crate::engine_api::{
     ENGINE_ERROR_CODE_ENGINE_SUCCESS, ENGINE_HANDLE, SERVER_HANDLE_V1, engine_interface_v1,
 };
+use crate::handler::arcus::abi;
 
 pub const DEFAULT_MAX_ELEMENT_BYTES: u32 = 16 * 1024;
 const DEFAULT_MAX_MAP_SIZE: u32 = 50_000;

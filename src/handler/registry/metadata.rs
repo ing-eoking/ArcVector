@@ -1,9 +1,9 @@
 //! The reserved Map element that says what an index is.
 
-use crate::arcus::element::{Layout, META_FIELD, MetaRecord};
-use crate::arcus::engine::{Store, StoreError};
 use crate::error::{Error, Result};
-use crate::usearch::{AnnIndex, Metric, THREAD_SLOTS};
+use crate::handler::arcus::element::{Layout, META_FIELD, MetaRecord};
+use crate::handler::arcus::engine::{Store, StoreError};
+use crate::handler::usearch::{AnnIndex, Metric, THREAD_SLOTS};
 
 /// Read an index's metadata element, or say why it cannot be used.
 pub enum MetaState {
@@ -22,7 +22,7 @@ pub fn read_metadata(store: &Store, name: &str) -> MetaState {
     };
     match MetaRecord::decode(&raw) {
         Ok((meta, layout)) => MetaState::Usable(meta, layout),
-        Err(crate::arcus::element::CodecError::UnsupportedVersion(v)) => {
+        Err(crate::handler::arcus::element::CodecError::UnsupportedVersion(v)) => {
             eprintln!(
                 "ArcVector: index '{name}' carries metadata format version {v}, which this \
                  build does not read. Leaving it untouched — a newer node wrote it."

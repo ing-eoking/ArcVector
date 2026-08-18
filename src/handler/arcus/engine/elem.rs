@@ -5,9 +5,9 @@ use std::ptr;
 
 use super::Store;
 use super::error::{Result, StoreError, as_int, check};
-use crate::arcus::abi;
-use crate::arcus::element::Layout;
 use crate::engine_api::{eitem, eitem_info, elems_result, field_t};
+use crate::handler::arcus::abi;
+use crate::handler::arcus::element::Layout;
 
 unsafe extern "C" {
     fn free(ptr: *mut c_void);

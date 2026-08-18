@@ -9,9 +9,9 @@ use std::sync::{Condvar, LazyLock, Mutex, PoisonError};
 
 use super::metadata::{MetaState, read_metadata, stamp};
 use super::{REBUILDING, VectorIndex, get, remove};
-use crate::arcus::element::{META_FIELD, mint_owner};
-use crate::arcus::engine::Store;
 use crate::error::{Error, Result};
+use crate::handler::arcus::element::{META_FIELD, mint_owner};
+use crate::handler::arcus::engine::Store;
 
 /// Empty a graph this node was not serving and queue its refill.
 pub fn take_over(store: &Store, index: &VectorIndex) -> Result<()> {
