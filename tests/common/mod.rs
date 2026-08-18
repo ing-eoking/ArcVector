@@ -1,11 +1,11 @@
-//! Harness for driving a real arcus daemon with the extension loaded.
+//! Harness for driving a real arcus server with the extension loaded.
 //!
-//! The daemon and engine come from the environment, with no default path:
+//! The server and engine come from the environment, with no default path:
 //!
 //! ```text
 //! ARCVECTOR_MEMCACHED        path to the memcached binary       (required)
 //! ARCVECTOR_ENGINE           path to default_engine.so          (required)
-//! ARCVECTOR_MEMCACHED_ARGS   extra daemon arguments, space separated
+//! ARCVECTOR_MEMCACHED_ARGS   extra server arguments, space separated
 //! ```
 //!
 //! Required rather than defaulted, because guessing at a path in the working tree
@@ -14,7 +14,7 @@
 //! in a container; see `docker/README.md`.
 //!
 //! Building this target at all means the `integration` feature was requested,
-//! which asserts a daemon is reachable. So an unset variable **fails** here. There
+//! which asserts a server is reachable. So an unset variable **fails** here. There
 //! is no skip path left: a test that reports success without running is the one
 //! failure mode this suite has already had twice.
 //!
@@ -24,14 +24,14 @@
 //!
 //! When either is **missing** the tests skip: those artifacts come from building
 //! arcus-memcached, which is not part of this crate's build. When they are present
-//! but the daemon will not come up, or comes up without our extension registered,
+//! but the server will not come up, or comes up without our extension registered,
 //! the tests **fail** — a setup that cannot answer is a broken run, not an absent
 //! one. Conflating the two once turned a container that shipped a placeholder
 //! library into a green suite.
 //!
-//! Each test gets its own daemon on its own **unix socket**. Sockets rather than
+//! Each test gets its own server on its own **unix socket**. Sockets rather than
 //! TCP ports because tests run in parallel: allocating a free port and then
-//! spawning leaves a window in which another test can take it, and the daemon that
+//! spawning leaves a window in which another test can take it, and the server that
 //! loses exits, which showed up as connections being refused mid-suite.
 
 use std::fs::File;
@@ -101,7 +101,7 @@ fn newest_mtime(dir: &Path) -> Option<SystemTime> {
 /// Refuse to run against a library older than the sources.
 ///
 /// `cargo test` builds the rlib the harness links against but **not** the
-/// `cdylib` the daemon loads, so without this check a stale library would be
+/// `cdylib` the server loads, so without this check a stale library would be
 /// silently verified. Panics rather than skips: a stale result is a wrong result,
 /// not a missing one.
 fn assert_fresh(module: &Path) {
@@ -122,22 +122,22 @@ fn assert_fresh(module: &Path) {
     assert!(
         newest.is_none_or(|newest| newest <= built),
         "{} is older than the sources.\n\
-         `cargo test` does not rebuild the cdylib the daemon loads, so these tests \
+         `cargo test` does not rebuild the cdylib the server loads, so these tests \
          would verify stale code.\n\
          Run `cargo build` first.",
         module.display()
     );
 }
 
-/// A daemon with the extension loaded, stopped and cleaned up on drop.
-pub struct Daemon {
+/// A server with the extension loaded, stopped and cleaned up on drop.
+pub struct Server {
     child: Child,
     socket: PathBuf,
     log: PathBuf,
 }
 
-impl Daemon {
-    /// Start a daemon, failing with the reason if that is not possible.
+impl Server {
+    /// Start a server, failing with the reason if that is not possible.
     pub fn start() -> Self {
         let (Some(memcached), Some(engine)) = (
             from_env("ARCVECTOR_MEMCACHED"),
@@ -175,7 +175,7 @@ impl Daemon {
         let _ = std::fs::remove_file(&socket);
 
         // Diagnostics go to a file rather than a pipe: nothing has to drain it, so
-        // a chatty daemon cannot block on a full pipe buffer, and the text is
+        // a chatty server cannot block on a full pipe buffer, and the text is
         // available whenever a failure needs to explain itself.
         let child = Command::new(&memcached)
             .args(["-E".as_ref(), engine.as_os_str()])
@@ -189,19 +189,19 @@ impl Daemon {
             .spawn()
             .unwrap_or_else(|e| panic!("could not run {}: {e}", memcached.display()));
 
-        let mut daemon = Self { child, socket, log };
-        daemon.wait_until_listening();
-        daemon.assert_extension_registered(&module);
-        daemon
+        let mut server = Self { child, socket, log };
+        server.wait_until_listening();
+        server.assert_extension_registered(&module);
+        server
     }
 
-    /// Wait for the socket, failing with the daemon's own diagnostics if it dies.
+    /// Wait for the socket, failing with the server's own diagnostics if it dies.
     fn wait_until_listening(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if let Ok(Some(status)) = self.child.try_wait() {
                 panic!(
-                    "the daemon exited with {status} instead of listening.\n{}",
+                    "the server exited with {status} instead of listening.\n{}",
                     self.diagnostics()
                 );
             }
@@ -211,22 +211,22 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!(
-            "the daemon never accepted a connection on {}.\n{}",
+            "the server never accepted a connection on {}.\n{}",
             self.socket.display(),
             self.diagnostics()
         );
     }
 
-    /// A listening daemon is not enough — it has to have loaded *our* extension.
+    /// A listening server is not enough — it has to have loaded *our* extension.
     ///
     /// Without this a library missing `memcached_extensions_initialize` produced a
-    /// daemon that answered everything with `ERROR`, and every test skipped and
+    /// server that answered everything with `ERROR`, and every test skipped and
     /// reported success.
     fn assert_extension_registered(&self, module: &Path) {
         let reply = self.connect().send("vlist");
         assert!(
             reply == "END\r\n",
-            "the daemon is up but did not answer `vlist`, so {} was not registered \
+            "the server is up but did not answer `vlist`, so {} was not registered \
              as an extension.\nGot {reply:?}.\n{}",
             module.display(),
             self.diagnostics()
@@ -235,13 +235,13 @@ impl Daemon {
 
     fn diagnostics(&self) -> String {
         match std::fs::read_to_string(&self.log) {
-            Ok(text) if !text.trim().is_empty() => format!("daemon output:\n{text}"),
-            _ => "the daemon wrote no diagnostics.".to_owned(),
+            Ok(text) if !text.trim().is_empty() => format!("server output:\n{text}"),
+            _ => "the server wrote no diagnostics.".to_owned(),
         }
     }
 
     pub fn connect(&self) -> Client {
-        let stream = UnixStream::connect(&self.socket).expect("the daemon is listening");
+        let stream = UnixStream::connect(&self.socket).expect("the server is listening");
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("the read timeout is settable");
@@ -249,7 +249,7 @@ impl Daemon {
     }
 }
 
-impl Drop for Daemon {
+impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -258,7 +258,7 @@ impl Drop for Daemon {
     }
 }
 
-/// Daemon arguments the environment adds, such as the `-u` a root container needs.
+/// Server arguments the environment adds, such as the `-u` a root container needs.
 fn extra_args() -> Vec<String> {
     std::env::var("ARCVECTOR_MEMCACHED_ARGS")
         .unwrap_or_default()
@@ -267,12 +267,12 @@ fn extra_args() -> Vec<String> {
         .collect()
 }
 
-/// Explain an absent prerequisite. Building this target asked for a daemon, so
+/// Explain an absent prerequisite. Building this target asked for a server, so
 /// not having one is a failure, not something to pass over quietly.
 fn missing(reason: &str) -> String {
     format!(
         "{reason}.\n\
-         Run `make test` to get a daemon from the container, or point\n\
+         Run `make test` to get a server from the container, or point\n\
          ARCVECTOR_MEMCACHED / ARCVECTOR_ENGINE at an arcus build yourself."
     )
 }
@@ -378,7 +378,7 @@ impl Client {
         self.stream.flush().expect("the connection flushes");
     }
 
-    /// Read until the reply is terminated, so tests never race the daemon.
+    /// Read until the reply is terminated, so tests never race the server.
     fn read_reply(&mut self) -> String {
         let mut reply = String::new();
         let mut buf = [0u8; 8192];
@@ -415,7 +415,7 @@ fn is_complete(reply: &str) -> bool {
     ERROR_PREFIXES.iter().any(|p| last.starts_with(p))
 }
 
-/// A distinct index name per test, so a shared daemon could never confuse them.
+/// A distinct index name per test, so a shared server could never confuse them.
 pub fn index_name(test: &str) -> String {
     format!("it-{test}")
 }

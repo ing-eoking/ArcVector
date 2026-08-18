@@ -32,9 +32,9 @@ fn main() {
     //      `get_elem_info`.
     //
     // Vendoring a tree's `include/` gets (1) for free. Only (2) has to be supplied,
-    // by the `daemon-*` cargo features, and it must match the daemon exactly:
+    // by the `server-*` cargo features, and it must match the server exactly:
     // nothing at runtime tells the variants apart — `interface` is 1 in all of them
-    // — so a mismatch silently calls whatever occupies the offset. An EE daemon
+    // — so a mismatch silently calls whatever occupies the offset. An EE server
     // runs `cachedump` for `get_config`.
     let include = env::var("ARCVECTOR_ENGINE_INCLUDE").unwrap_or_else(|_| "include".to_owned());
     let header = format!("{include}/memcached/engine.h");
@@ -49,9 +49,9 @@ fn main() {
     // `SUPPORT_BOP_*` family matter too, but they live in the tree's `types.h` and
     // arrive with the headers, so they are not knobs.
     for (feature, define) in [
-        ("CARGO_FEATURE_DAEMON_REPLICATION", "ENABLE_REPLICATION"),
-        ("CARGO_FEATURE_DAEMON_MIGRATION", "ENABLE_MIGRATION"),
-        ("CARGO_FEATURE_DAEMON_CLUSTER_AWARE", "ENABLE_CLUSTER_AWARE"),
+        ("CARGO_FEATURE_REPLICATION", "ENABLE_REPLICATION"),
+        ("CARGO_FEATURE_MIGRATION", "ENABLE_MIGRATION"),
+        ("CARGO_FEATURE_CLUSTER_AWARE", "ENABLE_CLUSTER_AWARE"),
     ] {
         if env::var_os(feature).is_some() {
             builder = builder.clang_arg(format!("-D{define}"));
@@ -61,8 +61,8 @@ fn main() {
     // Rebuilding a graph from Map only earns its cost where something can outlive
     // it. Neither flag means nothing can, so the whole machinery compiles out.
     println!("cargo::rustc-check-cfg=cfg(recovery)");
-    let recovery = env::var_os("CARGO_FEATURE_DAEMON_REPLICATION").is_some()
-        || env::var_os("CARGO_FEATURE_DAEMON_PERSISTENCE").is_some();
+    let recovery = env::var_os("CARGO_FEATURE_REPLICATION").is_some()
+        || env::var_os("CARGO_FEATURE_PERSISTENCE").is_some();
     if recovery {
         println!("cargo:rustc-cfg=recovery");
     }
@@ -106,7 +106,7 @@ fn main() {
     }
     // Persistence leaves no trace in the bindings, so it is reported from the
     // feature that declared it.
-    if env::var_os("CARGO_FEATURE_DAEMON_PERSISTENCE").is_some() {
+    if env::var_os("CARGO_FEATURE_PERSISTENCE").is_some() {
         features.push("persistence");
     }
     features.sort_unstable();
@@ -122,7 +122,7 @@ fn main() {
     // from what bindgen kept: the `rp_*` declarations exist only in the EE tree,
     // and looking at the source rather than the output makes the answer
     // independent of which defines were passed. The running library pairs this
-    // with the daemon's own version string to catch a cross-tree build, which is
+    // with the server's own version string to catch a cross-tree build, which is
     // the one mismatch that crashes before anything can inspect it.
     let source = std::fs::read_to_string(&header).expect("bindgen read this header");
     let tree = if source.contains("rp_cmd") {

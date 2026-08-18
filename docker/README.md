@@ -18,10 +18,10 @@ deployment is a Linux `.so`, and this is the only place that one runs. The
 generated bindings are not even the same size on the two platforms — bindgen reads
 the target's own system headers — so "it works locally" is not the same claim.
 
-The image takes the daemon from `jam2in/arcus-memcached:latest` and builds the
-module with the Rust toolchain in the same layer, so the tests spawn the daemon as
+The image takes the server from `jam2in/arcus-memcached:latest` and builds the
+module with the Rust toolchain in the same layer, so the tests spawn the server as
 a local subprocess exactly as they would on a workstation. There is no separate
-daemon service; Docker only supplies the binaries and the platform.
+server service; Docker only supplies the binaries and the platform.
 
 If that image is unavailable, build one from an arcus checkout — its `Dockerfile`
 installs into `/arcus`, the layout expected here:
@@ -34,7 +34,7 @@ docker build -t arcus-local /path/to/arcus-memcached
 ## On the host
 
 ```sh
-make unit     # unit tests only; no daemon involved
+make unit     # unit tests only; no server involved
 make lint     # fmt --check and clippy -D warnings
 ```
 
@@ -52,16 +52,16 @@ export ARCVECTOR_ENGINE=/path/to/arcus/lib/default_engine.so
 cargo build && cargo test --features integration
 ```
 
-Asking for the feature asserts that a daemon is reachable, so an unset variable
+Asking for the feature asserts that a server is reachable, so an unset variable
 fails rather than skipping. There is no skip path left.
 
 **`cargo build` first.** `cargo test` builds the rlib the harness links against
-but *not* the `cdylib` the daemon loads; the harness compares timestamps and fails
+but *not* the `cdylib` the server loads; the harness compares timestamps and fails
 rather than verifying a stale library.
 
 ## How the harness works
 
-Each test starts its own daemon on its own **unix socket** and kills it on drop.
+Each test starts its own server on its own **unix socket** and kills it on drop.
 Sockets rather than TCP ports: tests run in parallel, and allocating a free port
 before spawning leaves a window for another test to take it — which showed up as
 connections being refused partway through the suite.
@@ -74,16 +74,16 @@ miscounts tests the wrong thing. The tests that *want* a wrong length call
 
 ## Skip versus fail
 
-A **missing** daemon or engine skips: this crate cannot build them. Anything that
-is present but does not work **fails**, with the daemon's own output attached.
-`Daemon::start` checks two things beyond "the socket accepted a connection":
+A **missing** server or engine skips: this crate cannot build them. Anything that
+is present but does not work **fails**, with the server's own output attached.
+`Server::start` checks two things beyond "the socket accepted a connection":
 
 - the process did not exit, and
 - `vlist` answers `END`, which only happens if our extension registered.
 
 That second check exists because it was needed. The first version of this image
 shipped a library with no `memcached_extensions_initialize` at all — the
-dependency-caching layer left a placeholder artifact in place — and the daemon
+dependency-caching layer left a placeholder artifact in place — and the server
 refused to start. Every test skipped and the suite reported 18 passed. A setup
 that cannot answer is a broken run, not an absent one.
 

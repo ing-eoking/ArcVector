@@ -1,7 +1,7 @@
 //! Which graph a command may use, and what to do when the answer is "not this
 //! one".
 //!
-//! Two builds of this module. With `cfg(recovery)` — the daemon replicates or
+//! Two builds of this module. With `cfg(recovery)` — the server replicates or
 //! persists, so a Map can outlive the graph — the Map's `owner` token decides,
 //! and a graph that is missing or stale is rebuilt. Without it nothing can
 //! outlive the graph, so the registry is the whole answer.

@@ -1,7 +1,7 @@
 //! How one coordinate is represented, and the bytes it becomes.
 //!
 //! Discriminants are persisted in the element header, so they are part of the
-//! on-disk format. Pure: no engine, no index, no daemon.
+//! on-disk format. Pure: no engine, no index, no server.
 
 /// Scalar kind of a stored vector. Persisted in the header — never renumber.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

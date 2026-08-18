@@ -1,4 +1,4 @@
-//! Checking that the bindings match the daemon that loaded us.
+//! Checking that the bindings match the server that loaded us.
 //!
 //! `engine_interface_v1` is called by offset and arcus has no single layout, so a
 //! wrong pairing calls whatever function sits at the offset. `docs/내부구조.md` §11
@@ -58,18 +58,18 @@ pub fn built_for_ee() -> bool {
     env!("ARCVECTOR_ABI_TREE") == "ee"
 }
 
-/// Whether a daemon version string names an EE build.
+/// Whether a server version string names an EE build.
 pub fn version_is_ee(version: &str) -> bool {
     version.split('-').any(|part| part == "E")
 }
 
-/// The daemon's version string, or `None` if the server API does not offer one.
+/// The server's version string, or `None` if the server API does not offer one.
 ///
 /// # Safety
 ///
 /// `server` must be the live `SERVER_HANDLE_V1` memcached returned from
 /// `get_server_api`.
-pub unsafe fn daemon_version(server: *const SERVER_HANDLE_V1) -> Option<String> {
+pub unsafe fn server_version(server: *const SERVER_HANDLE_V1) -> Option<String> {
     if server.is_null() {
         return None;
     }
@@ -100,7 +100,7 @@ pub fn missing(vt: &engine_interface_v1) -> Vec<&'static str> {
 /// One line naming what loaded us and what we were built for.
 pub fn fingerprint(version: Option<&str>) -> String {
     format!(
-        "ArcVector: daemon {}, built for {}",
+        "ArcVector: memcached {}, built for {}",
         version.unwrap_or("version unknown"),
         built_for(),
     )
@@ -136,9 +136,9 @@ pub fn report_mismatch(symptom: &str) {
              ArcVector: {}\n\
              ArcVector: arcus has no single vtable layout and nothing at runtime\n\
              ArcVector: identifies one, so the bindings must be generated from the\n\
-             ArcVector: daemon's own headers and configure flags:\n\
+             ArcVector: server's own headers and configure flags:\n\
              ArcVector:   ARCVECTOR_ENGINE_INCLUDE=<tree>/include \\\n\
-             ArcVector:   cargo build --features daemon-replication\n\
+             ArcVector:   cargo build --features replication\n\
              ArcVector: see docs/내부구조.md §11.",
             built_for(),
         );
@@ -147,7 +147,7 @@ pub fn report_mismatch(symptom: &str) {
 
 /// Report the pairing, and decide whether the vtable may be used.
 ///
-/// `false` only on hard evidence: a required member the daemon left null.
+/// `false` only on hard evidence: a required member the server left null.
 ///
 /// # Safety
 ///
@@ -155,7 +155,7 @@ pub fn report_mismatch(symptom: &str) {
 pub unsafe fn verify(server: *const SERVER_HANDLE_V1, vt: &engine_interface_v1) -> bool {
     *CHECKED.get_or_init(|| {
         // SAFETY: guaranteed by the caller.
-        let version = unsafe { daemon_version(server) };
+        let version = unsafe { server_version(server) };
         if std::env::var_os("ARCVECTOR_ABI_DEBUG").is_some() {
             for name in REQUIRED {
                 eprintln!("ArcVector: abi {name} = {}", present(vt, name));
@@ -171,16 +171,16 @@ pub unsafe fn verify(server: *const SERVER_HANDLE_V1, vt: &engine_interface_v1) 
                      ArcVector: REFUSING TO RUN — built against the {} tree, loaded by {}.\n\
                      ArcVector: the vtable is called by offset and the two trees do not\n\
                      ArcVector: agree on it, so every engine call would land on the wrong\n\
-                     ArcVector: function. Rebuild against this daemon's headers:\n\
+                     ArcVector: function. Rebuild against this server's headers:\n\
                      ArcVector:   ARCVECTOR_ENGINE_INCLUDE=<tree>/include \\\n\
-                     ArcVector:   cargo build --features daemon-replication\n\
+                     ArcVector:   cargo build --features replication\n\
                      ArcVector: see docs/내부구조.md §11.",
                     fingerprint(version.as_deref()),
                     env!("ARCVECTOR_ABI_TREE"),
                     if version_is_ee(v) {
-                        "an EE daemon"
+                        "an EE server"
                     } else {
-                        "an OSS daemon"
+                        "an OSS server"
                     },
                 );
                 return false;
@@ -195,12 +195,12 @@ pub unsafe fn verify(server: *const SERVER_HANDLE_V1, vt: &engine_interface_v1) 
         eprintln!(
             "{}\n\
              ArcVector: REFUSING TO RUN — the engine vtable is misaligned.\n\
-             ArcVector: the daemon left these required members null: {}\n\
+             ArcVector: the server left these required members null: {}\n\
              ArcVector: arcus has no single vtable layout, and nothing at runtime\n\
              ArcVector: identifies one, so the bindings must be generated against\n\
-             ArcVector: the daemon's own headers and configure flags:\n\
+             ArcVector: the server's own headers and configure flags:\n\
              ArcVector:   ARCVECTOR_ENGINE_INCLUDE=<tree>/include \\\n\
-             ArcVector:   cargo build --features daemon-replication\n\
+             ArcVector:   cargo build --features replication\n\
              ArcVector: see docs/내부구조.md §11.",
             fingerprint(version.as_deref()),
             absent.join(", "),
@@ -224,11 +224,11 @@ mod tests {
         // supply it, whichever tree they came from.
         if env!("ARCVECTOR_ABI_HEADERS") == "include" {
             assert!(text.contains("scan"), "{text}");
-            // The `daemon-replication` feature is the one thing that can put it
+            // The `replication` feature is the one thing that can put it
             // there, which is the whole reason the feature exists.
             assert_eq!(
                 text.contains("replication"),
-                cfg!(feature = "daemon-replication"),
+                cfg!(feature = "replication"),
                 "ENABLE_REPLICATION comes from the feature or not at all: {text}"
             );
         }

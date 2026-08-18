@@ -1,41 +1,41 @@
-//! End-to-end tests against a real arcus daemon with the extension loaded.
+//! End-to-end tests against a real arcus server with the extension loaded.
 //!
 //! These are the only tests that exercise `store.rs` — the engine call path
 //! cannot be reached from unit tests.
 //!
-//! This target is behind the `integration` feature, because it needs a daemon this
+//! This target is behind the `integration` feature, because it needs a server this
 //! crate does not build. `make test` supplies one in a container and turns the
 //! feature on; a plain `cargo test` does not build this file at all, and so says
 //! nothing about tests it never ran.
 //!
-//! Asking for the feature is an assertion that a daemon is reachable, so a missing
+//! Asking for the feature is an assertion that a server is reachable, so a missing
 //! one fails here rather than skipping.
 
 mod common;
 
-use common::{Daemon, assert_contains, assert_reply, index_name};
+use common::{Server, assert_contains, assert_reply, index_name};
 
-/// Start a daemon and open one connection to it.
+/// Start a server and open one connection to it.
 macro_rules! session {
-    ($daemon:ident, $client:ident) => {
-        let $daemon = Daemon::start();
-        let mut $client = $daemon.connect();
+    ($server:ident, $client:ident) => {
+        let $server = Server::start();
+        let mut $client = $server.connect();
     };
 }
 
 #[test]
 fn the_extension_loads_and_claims_its_commands() {
-    session!(daemon, client);
+    session!(server, client);
     // Reaching the extension at all proves registration worked.
     assert_reply(&client.send("vlist"), "END\r\n");
     // An unknown verb must not be claimed, so memcached answers instead.
     assert_contains(&client.send("vnonsense"), "ERROR");
-    drop(daemon);
+    drop(server);
 }
 
 #[test]
 fn an_index_is_created_once_and_listed() {
-    session!(_daemon, client);
+    session!(_server, client);
     let ix = index_name("create");
 
     assert_reply(
@@ -54,7 +54,7 @@ fn an_index_is_created_once_and_listed() {
 
 #[test]
 fn a_vector_round_trips_through_the_engine() {
-    session!(_daemon, client);
+    session!(_server, client);
     let ix = index_name("roundtrip");
     client.send(&format!("vcreate {ix} 2 METRIC l2"));
 
@@ -79,7 +79,7 @@ fn a_vector_round_trips_through_the_engine() {
 
 #[test]
 fn attributes_are_optional_and_come_back_empty() {
-    session!(_daemon, client);
+    session!(_server, client);
     let ix = index_name("noattr");
     client.send(&format!("vcreate {ix} 2"));
 
@@ -93,7 +93,7 @@ fn attributes_are_optional_and_come_back_empty() {
 
 #[test]
 fn search_ranks_by_distance() {
-    session!(_daemon, client);
+    session!(_server, client);
     let ix = index_name("rank");
     client.send(&format!("vcreate {ix} 2 METRIC l2"));
     client.vadd(&ix, "near", 2, "0.1 0.2");
@@ -113,7 +113,7 @@ fn search_ranks_by_distance() {
 
 #[test]
 fn a_batch_of_queries_returns_one_group_each() {
-    session!(_daemon, client);
+    session!(_server, client);
     let ix = index_name("batch");
     client.send(&format!("vcreate {ix} 2 METRIC l2"));
     client.vadd(&ix, "a", 2, "0.1 0.2");
@@ -133,7 +133,7 @@ fn a_batch_of_queries_returns_one_group_each() {
 
 #[test]
 fn a_filter_restricts_results_by_attribute() {
-    session!(_daemon, client);
+    session!(_server, client);
     let ix = index_name("filter");
     client.send(&format!("vcreate {ix} 2 METRIC l2"));
 
@@ -158,7 +158,7 @@ fn a_filter_restricts_results_by_attribute() {
 
 #[test]
 fn search_by_key_uses_the_stored_vector() {
-    session!(_daemon, client);
+    session!(_server, client);
     let ix = index_name("bykey");
     client.send(&format!("vcreate {ix} 2 METRIC l2"));
     client.vadd(&ix, "anchor", 2, "0.1 0.2");
@@ -181,7 +181,7 @@ fn search_by_key_uses_the_stored_vector() {
 
 #[test]
 fn quantizations_all_survive_a_round_trip_through_the_engine() {
-    session!(_daemon, client);
+    session!(_server, client);
     for (quant, metric) in [
         ("f32", "cos"),
         ("f16", "cos"),
@@ -207,7 +207,7 @@ fn quantizations_all_survive_a_round_trip_through_the_engine() {
 
 #[test]
 fn a_mis_declared_body_length_is_refused_without_storing() {
-    session!(_daemon, client);
+    session!(_server, client);
     let ix = index_name("chunk");
     client.send(&format!("vcreate {ix} 2"));
 
@@ -228,7 +228,7 @@ fn a_mis_declared_body_length_is_refused_without_storing() {
 
 #[test]
 fn a_coordinate_count_that_disagrees_with_the_dimension_is_named() {
-    session!(_daemon, client);
+    session!(_server, client);
     let ix = index_name("dim");
     client.send(&format!("vcreate {ix} 2"));
 
@@ -241,7 +241,7 @@ fn a_coordinate_count_that_disagrees_with_the_dimension_is_named() {
 
 #[test]
 fn a_dimension_that_disagrees_with_the_index_is_named() {
-    session!(_daemon, client);
+    session!(_server, client);
     let ix = index_name("indexdim");
     client.send(&format!("vcreate {ix} 2"));
 
@@ -253,7 +253,7 @@ fn a_dimension_that_disagrees_with_the_index_is_named() {
 
 #[test]
 fn a_malformed_attr_is_refused_and_the_connection_survives() {
-    session!(_daemon, client);
+    session!(_server, client);
     let ix = index_name("attr");
     client.send(&format!("vcreate {ix} 2"));
 
@@ -277,7 +277,7 @@ fn a_malformed_attr_is_refused_and_the_connection_survives() {
 
 #[test]
 fn operating_on_a_missing_index_is_a_client_error() {
-    session!(_daemon, client);
+    session!(_server, client);
     let ix = index_name("absent");
     assert_contains(&client.send(&format!("vget {ix} v1")), "CLIENT_ERROR");
     assert_contains(&client.send(&format!("vdel {ix} v1")), "CLIENT_ERROR");
@@ -287,7 +287,7 @@ fn operating_on_a_missing_index_is_a_client_error() {
 
 #[test]
 fn an_incompatible_metric_and_quantization_are_refused() {
-    session!(_daemon, client);
+    session!(_server, client);
     let ix = index_name("badquant");
     // b1 carries no magnitude, so cosine is meaningless on it.
     assert_contains(
@@ -299,7 +299,7 @@ fn an_incompatible_metric_and_quantization_are_refused() {
 
 #[test]
 fn a_dimension_over_the_element_limit_is_refused() {
-    session!(_daemon, client);
+    session!(_server, client);
     let ix = index_name("toobig");
     // f32 tops out at 4060 dimensions with the default 16KB max_element_bytes.
     let reply = client.send(&format!("vcreate {ix} 5000 QUANT f32"));
@@ -315,7 +315,7 @@ fn a_dimension_over_the_element_limit_is_refused() {
 
 #[test]
 fn maxcount_stops_inserts_at_the_limit() {
-    session!(_daemon, client);
+    session!(_server, client);
     let ix = index_name("maxcount");
     client.send(&format!("vcreate {ix} 2 MAXCOUNT 2"));
 
@@ -330,7 +330,7 @@ fn maxcount_stops_inserts_at_the_limit() {
 
 #[test]
 fn vstats_reports_module_memory_and_follows_the_vector_count() {
-    session!(_daemon, client);
+    session!(_server, client);
     let ix = index_name("stats");
     client.send(&format!("vcreate {ix} 4"));
 
@@ -380,10 +380,10 @@ fn vstats_reports_module_memory_and_follows_the_vector_count() {
 #[test]
 fn many_connections_search_the_same_index_at_once() {
     // The concurrency invariants are unit-tested, but only here do they run on
-    // the daemon's own worker threads.
-    let daemon = Daemon::start();
+    // the server's own worker threads.
+    let server = Server::start();
     let ix = index_name("concurrent");
-    let mut setup = daemon.connect();
+    let mut setup = server.connect();
     setup.send(&format!("vcreate {ix} 4 METRIC l2"));
     for i in 0..50 {
         setup.vadd(&ix, &format!("v{i}"), 4, &format!("{i}.0 1.0 2.0 3.0"));
@@ -391,10 +391,10 @@ fn many_connections_search_the_same_index_at_once() {
 
     std::thread::scope(|scope| {
         for t in 0..8 {
-            let daemon = &daemon;
+            let server = &server;
             let ix = ix.clone();
             scope.spawn(move || {
-                let mut client = daemon.connect();
+                let mut client = server.connect();
                 for _ in 0..20 {
                     let hits = client.vsim(&ix, 5, 4, &format!("{t}.0 1.0 2.0 3.0"));
                     assert!(
@@ -426,7 +426,7 @@ fn many_connections_search_the_same_index_at_once() {
 /// back.
 #[test]
 fn the_metadata_field_is_unreachable_from_the_protocol() {
-    session!(_daemon, client);
+    session!(_server, client);
     let ix = index_name("reserved");
     assert_reply(&client.send(&format!("vcreate {ix} 2")), "CREATED\r\n");
     assert_reply(&client.vadd(&ix, "v1", 2, "1 0"), "STORED\r\n");
@@ -474,7 +474,7 @@ fn the_metadata_field_is_unreachable_from_the_protocol() {
 /// is usable, which is more than the spaced form ever reached.
 #[test]
 fn attr_json_must_arrive_as_one_argument() {
-    session!(_daemon, client);
+    session!(_server, client);
     let ix = index_name("attrtok");
     client.send(&format!("vcreate {ix} 2"));
 

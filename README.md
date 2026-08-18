@@ -2,7 +2,7 @@
 
 Vector similarity search as an **arcus-memcached ASCII protocol extension**.
 
-ArcVector loads into a running arcus daemon as a dynamic library and adds
+ArcVector loads into a running arcus server as a dynamic library and adds
 `vcreate` / `vadd` / `VSIM` and friends to the ASCII protocol. Vectors live in
 arcus **Map collections**, so they inherit the engine's memory accounting,
 eviction, TTL and replication; the ANN graph is a
@@ -17,11 +17,11 @@ eviction, TTL and replication; the ANN graph is a
 
 ```sh
 cargo build --release        # -> target/release/libarcusv.{so,dylib}
-make test                    # all tests, in a container with a real daemon
+make test                    # all tests, in a container with a real server
 make unit                    # unit tests only, on the host
 ```
 
-`make test` is the full suite: the integration tests need an arcus daemon that
+`make test` is the full suite: the integration tests need an arcus server that
 this crate does not build, and the container also exercises the Linux `.so` that
 ships rather than the macOS `.dylib` development produces. See
 [docker/README.md](docker/README.md).
@@ -30,23 +30,23 @@ ships rather than the macOS `.dylib` development produces. See
 must be available. usearch compiles a C++ core, so a C++17 toolchain is needed too.
 
 `engine_interface_v1` is a vtable called **by offset**, and its layout follows the
-daemon's `configure` flags — `ENABLE_REPLICATION`, `ENABLE_MIGRATION` and
+server's `configure` flags — `ENABLE_REPLICATION`, `ENABLE_MIGRATION` and
 `ENABLE_CLUSTER_AWARE` each insert members into it. None of the APIs this crate
 calls lives inside those blocks; what moves is where two of them sit. So the
-bindings have to be generated for the daemon that will load the library.
+bindings have to be generated for the server that will load the library.
 
 One cargo feature per flag:
 
 ```sh
-cargo build --release --features daemon-replication
-cargo build --release                          # a daemon built without it
+cargo build --release --features replication
+cargo build --release                          # a server built without it
 ```
 
-If you have the daemon's source tree, its `config.h` lists exactly which to pass.
+If you have the server's source tree, its `config.h` lists exactly which to pass.
 
 `ARCVECTOR_ENGINE_INCLUDE` points at a different header tree. A wrong pairing is
 refused at load time with the rebuild command in the log, rather than crashing the
-daemon — see [docs/내부구조.md §11](docs/내부구조.md).
+server — see [docs/내부구조.md §11](docs/내부구조.md).
 
 Load it into arcus with `-X`:
 

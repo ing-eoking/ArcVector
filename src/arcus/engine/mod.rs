@@ -55,7 +55,7 @@ fn engine() -> *mut engine_interface_v1 {
     }
     // The first moment the bindings can be checked: at registration the engine
     // is not wired up yet.
-    // the first and only moment the bindings can be checked against the daemon
+    // the first and only moment the bindings can be checked against the server
     // that actually loaded us. Registration is too early — the engine is not wired
     // up yet — which is why the check lives here rather than in `lib.rs`.
     // SAFETY: `handle` is the engine's own vtable, non-null and process-lifetime.

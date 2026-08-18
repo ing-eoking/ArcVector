@@ -1,4 +1,4 @@
-# Runs the whole suite — unit and integration — against a real arcus daemon.
+# Runs the whole suite — unit and integration — against a real arcus server.
 #
 #   docker build -f docker/Dockerfile -t arcvector-test .
 #   docker run --rm arcvector-test
@@ -12,7 +12,7 @@
 #      .dylib; deployment is a Linux .so. Only this path exercises that.
 
 # --- arcus -----------------------------------------------------------------
-# The published image already carries a built daemon under /arcus and loads
+# The published image already carries a built server under /arcus and loads
 # extensions with -X, which is the mechanism this module relies on.
 FROM jam2in/arcus-memcached:latest AS arcus
 
@@ -51,11 +51,11 @@ COPY tests ./tests
 # rebuild while leaving the dependency cache, and usearch's C++ core, intact.
 #
 # cargo test would not rebuild the cdylib either: it builds the rlib the harness
-# links against, not the library the daemon loads.
+# links against, not the library the server loads.
 RUN cargo clean -p arcusv \
  && cargo build \
  && cargo build --features integration --tests
 
-# The integration target is behind a feature because it needs a daemon; this is
+# The integration target is behind a feature because it needs a server; this is
 # the environment that has one.
 CMD ["cargo", "test", "--features", "integration"]

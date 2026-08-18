@@ -1,6 +1,6 @@
 //! Where a vector's bytes sit inside a stored element.
 //!
-//! Pure: no engine, no index, no daemon. `docs/내부구조.md` §4.
+//! Pure: no engine, no index, no server. `docs/내부구조.md` §4.
 
 pub use super::quant::{Quant, encode};
 

@@ -1,6 +1,6 @@
 //! Replication tests, against a master/slave pair the developer brings up.
 //!
-//! Deliberately **not** part of `make test`. The pair needs an EE daemon built
+//! Deliberately **not** part of `make test`. The pair needs an EE server built
 //! with `ENABLE_REPLICATION`, a `ZooKeeper` ensemble, and znodes provisioned for the
 //! two nodes — none of which this crate builds or the container supplies. Gating
 //! them behind the `replication-tests` feature keeps the required suite honest: it
@@ -54,7 +54,7 @@ impl Node {
         let addr = format!("127.0.0.1:{port}");
         let sock = TcpStream::connect(&addr).unwrap_or_else(|e| {
             panic!(
-                "no daemon at {addr}: {e}\n\
+                "no server at {addr}: {e}\n\
                  Bring the pair up first — see docs/내부구조.md §2.4."
             )
         });
@@ -135,7 +135,7 @@ impl Node {
 /// The pair is left in its default **sync** mode. It used to be switched to async
 /// here, because a sync master answers every write with `ENGINE_EWOULDBLOCK` and
 /// the module read that as failure — which freed an element the engine had just
-/// linked and took the daemon down on `assert(elem->linked == 0)`. That is fixed;
+/// linked and took the server down on `assert(elem->linked == 0)`. That is fixed;
 /// running these tests in the default mode is what keeps it fixed.
 fn pair() -> (Node, Node) {
     let (mut a, mut b) = (Node::open(node_a()), Node::open(node_b()));
@@ -151,7 +151,7 @@ fn pair() -> (Node, Node) {
 
 /// An index name unique to this run.
 ///
-/// The registry lives in the daemon's memory and the pair outlives any one
+/// The registry lives in the server's memory and the pair outlives any one
 /// `cargo test`, so a run that panicked before its cleanup leaves an index
 /// registered on whichever node happened to own it. A later run asserting "this
 /// node does not know the index" would then fail for a reason that has nothing to

@@ -34,7 +34,7 @@ The consequence appears wherever the Map outlives the process that made it:
 - **Replication switchover.** The promoted node has every element and no index.
 - **EE persistence restart.** Checkpoint and command log restore the Map;
   `metric` and the HNSW parameters are gone.
-- **Any second daemon reading the same data.**
+- **Any second server reading the same data.**
 
 `ensure_built` cannot help. It rebuilds a graph *into an index object that
 already exists*; it cannot construct one, because it does not know the metric.
@@ -237,7 +237,7 @@ calls `set_switchover_node(cookie, …)` and `get_thread_index(cookie)` with no 
 guard, so a write from a detached thread crashes a master that is mid-switchover:
 precisely when a rebuild is most likely to be running. This was not theoretical.
 An earlier revision had the thread stamp its own finishing token and it took the
-daemon down with a SIGSEGV in `get_thread_index`.
+server down with a SIGSEGV in `get_thread_index`.
 
 Reads from a detached thread are clear: `ACTION_BEFORE_READ` is empty without
 `ENABLE_MIGRATION`, `rp_after_check` returns immediately when the thread-local
@@ -253,7 +253,7 @@ thread : read the metadata, get_all, refill the graph   (reads only)
 worker : next command — re-read the Map, mint a token, stamp it, serve again
 ```
 
-With `daemon-migration` even a read reaches `set_not_my_key_info(cookie, …)`, so
+With `migration` even a read reaches `set_not_my_key_info(cookie, …)`, so
 that build stays inline and the caller retries once.
 
 Per queued item, on the thread:
@@ -438,7 +438,7 @@ produce.
 | Candidate | Obtainable? | Distinct across machines? |
 |---|---|---|
 | `ip:port` | **yes** — `get_socket_fd(cookie)` is member 8 of `SERVER_CORE_API`, inside the prefix both trees share, and `getsockname` on that fd works with std alone | **no** — see below |
-| `pid` | `std::process::id()` | no — containers commonly run the daemon as pid 1, so every node reports `1` |
+| `pid` | `std::process::id()` | no — containers commonly run the server as pid 1, so every node reports `1` |
 | hostname | needs `libc` promoted to a direct dependency | by convention only, and a long FQDN does not fit the 128-byte ATTR region |
 | `self_sid` | `stats replication` | it is regenerated on every handshake (`replication.c:2638`), so a node's own value changes without it rebuilding — a permanent source of spurious rebuilds |
 | OS entropy | `RandomState`, std alone | **yes** |
@@ -618,7 +618,7 @@ server is not ready, matching `Error::blame()`'s existing split.
 
 ## 6. Testing
 
-Unit, no daemon:
+Unit, no server:
 
 - metadata element round-trip; record type dispatch; every rejection —
   bad magic, wrong version, wrong record type, malformed JSON, unknown metric
@@ -626,7 +626,7 @@ Unit, no daemon:
 - flags magic encode/decode, and rejection of flags 0 and of a foreign value
 - state transitions including the stale-generation discard
 
-Integration, real daemon:
+Integration, real server:
 
 - **The regression that motivates this:** create an index, add vectors, drop the
   registry entry without touching the Map, `vcreate` again — every vector must
@@ -637,7 +637,7 @@ Integration, real daemon:
 - `vadd` during a rebuild is accepted, and the refill does not overwrite it
 - `vdel` during a rebuild is not undone by the refill
 - `vdrop` during a rebuild leaves nothing registered
-- `get_stats("replication")` on the OSS test daemon returns `KEY_ENOENT` and the
+- `get_stats("replication")` on the OSS test server returns `KEY_ENOENT` and the
   node is treated as standalone
 
 Replication, in `tests/replication.rs` behind the `replication-tests` feature:
@@ -653,7 +653,7 @@ Replication, in `tests/replication.rs` behind the `replication-tests` feature:
   `#[ignore]`d until this lands; it currently shows them disagreeing.
 - `vcreate_must_not_destroy_a_replicated_map`, `#[ignore]`d until this lands
 
-That target needs an EE daemon, a ZooKeeper and a provisioned pair, none of which
+That target needs an EE server, a ZooKeeper and a provisioned pair, none of which
 the `docker/` harness supplies, so it stays **out of `make test` entirely** —
 a green required suite must not imply switchover was covered. Setup is in
 [replication-testing.md](../../replication-testing.md).
@@ -683,7 +683,7 @@ the assertions are `tests/replication.rs`.
 | §1's destructive `vcreate` | reproduced: `vcreate` on the promoted node answers `CREATED` and the replicated elements are gone. Pinned by `vcreate_must_not_destroy_a_replicated_map`, `#[ignore]`d until this design lands |
 
 **Two blockers this design did not account for.** Both are upstream of index
-recovery: they stop ArcVector working on an EE daemon at all.
+recovery: they stop ArcVector working on an EE server at all.
 
 ### 8.1 The vtable layout is not fixed across arcus builds
 
@@ -703,30 +703,30 @@ Observed, in order:
 
 | Build | Symptom |
 |---|---|
-| vendored OSS headers, EE daemon | `SIGSEGV` in `item_cachedump`, called from `Store::config_u32`: OSS slot 60 is `get_config`, EE slot 60 is `cachedump` |
+| vendored OSS headers, EE server | `SIGSEGV` in `item_cachedump`, called from `Store::config_u32`: OSS slot 60 is `get_config`, EE slot 60 is `cachedump` |
 | EE headers, no feature defines | `SERVER_ERROR engine unavailable` on `vadd`: `get_elem_info` read at the wrong slot and came back `NULL` |
 | EE headers, `SCAN_COMMAND ENABLE_REPLICATION` | everything works |
 
-`build.rs` now takes `ARCVECTOR_ENGINE_INCLUDE` and a `daemon-*` cargo feature
-per `configure` flag, so a build can be aimed at a specific daemon, and `arcus::abi` refuses a pairing it
+`build.rs` now takes `ARCVECTOR_ENGINE_INCLUDE` and a `server-*` cargo feature
+per `configure` flag, so a build can be aimed at a specific server, and `arcus::abi` refuses a pairing it
 can prove wrong: the tree the headers came from is a build-time fact (the OSS
-header never mentions `rp_cmd`, even inside an `#ifdef`), and the daemon's tree is
+header never mentions `rp_cmd`, even inside an `#ifdef`), and the server's tree is
 readable at runtime through `server_version()`, which lives in `SERVER_CORE_API`
 rather than the vtable in question. Cross-tree is refused before the first call;
 a feature mismatch within a tree surfaces from `put_elem` as
 `SERVER_ERROR engine ABI mismatch`.
 
 That makes the failure loud rather than fatal. It is still a workaround — the
-artifact remains per-daemon-configuration.
+artifact remains per-server-configuration.
 
 The fix belongs in EE — extend the struct by **appending after `errinfo`** rather
 than inserting, and keep the common prefix identical to OSS. Then one library
 really does serve both, which is what §3.6 assumed. That is EE work with its own
-design; until it happens, ArcVector ships one artifact per daemon configuration
+design; until it happens, ArcVector ships one artifact per server configuration
 and must say which.
 
 ### 8.2 `EWOULDBLOCK` from a sync master is not a failure — and reading it as one
-crashed the daemon
+crashed the server
 
 On a master in sync mode, `rp_after_check` → `rp_wait` (`replication.c`) registers
 the caller as a waiter for the slave's acknowledgement and returns
@@ -745,13 +745,13 @@ vadd on a sync master
                     file coll_map.c, line 444
 ```
 
-The daemon aborts. Observed on the pair: the master died mid-command, its Map was
+The server aborts. Observed on the pair: the master died mid-command, its Map was
 gone, and the slave still held the data. `vcreate` had the milder version of the
 same fault — it `drop_map`ped the Map it had just created and reported an error
 for a Map that had briefly existed.
 
 Fixed by treating `ENGINE_EWOULDBLOCK` as completion (`arcus::engine::completed`).
-The replication tests now run in the daemon's **default sync mode** rather than
+The replication tests now run in the server's **default sync mode** rather than
 switching it off, which is what keeps this from coming back.
 
 **The waiting is not done, and is not going to be.** A built-in command sets

@@ -93,7 +93,7 @@ Map을 유지하는 이유는 **키 기반 조회 · 복제 · TTL**이 이미 M
 (`mop/bop/lop/sop insert`)에만 있고 엔진 API `map_elem_alloc`에는 없어서, 모듈이 엔진 API를
 직접 호출하면 한도를 우회할 수 있다. 실측에서 16KB 한도를 한참 넘는 element가 약 1019KB까지
 저장되었고, 정확히 1MB(`item_size_max`) element를 저장하자 슬랩 할당자 회계가 깨지며
-데몬이 죽었다.
+서버가 죽었다.
 
 ```
 Assertion failed: (cur_length == slen), do_smmgr_free, slabs.c:1006  -> SIGABRT
@@ -428,7 +428,7 @@ END\r\n
 - **순수 단위테스트** (엔진 불필요): `codec` 왕복, `quant` 변환 정확도, `filter` 파서·평가
 - **동시성 테스트**: `T`보다 많은 스레드로 `vsearch`를 때려 세마포어 불변식이
   usearch 컨텍스트 고갈을 막는지 확인. 이 테스트가 없으면 5.1의 함정이 프로덕션에서 드러난다.
-- **통합 테스트**: 실제 arcus 데몬에 붙여 `max_element_bytes` 초과 거부, TTL 만료 후 재구축,
+- **통합 테스트**: 실제 arcus 서버에 붙여 `max_element_bytes` 초과 거부, TTL 만료 후 재구축,
   eviction 후 `KEY_ENOENT` 처리
 
 `store`와 `index`는 얇은 래퍼로 유지해 FFI 표면을 최소화한다.
