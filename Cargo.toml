@@ -20,9 +20,11 @@ crate-type = ["cdylib", "rlib"]
 #
 # `build.rs` reads CARGO_FEATURE_* and passes the matching `-D` to bindgen, so most
 # of the effect is in the generated `engine_api.rs`. See docs/내부구조.md §2.2.
-replication = []    # -DENABLE_REPLICATION
-migration = []      # -DENABLE_MIGRATION
-cluster-aware = []  # -DENABLE_CLUSTER_AWARE
+# Named after the flag with arcus's `ENABLE_` prefix dropped; `build.rs` puts it
+# back, so the name is written once.
+replication = []
+migration = []
+cluster-aware = []
 
 # ENABLE_PERSISTENCE. Unlike the three above it changes no header this crate
 # reads — it lives in `engines/default/*.h`, not `include/memcached/` — so it

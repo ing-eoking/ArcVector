@@ -32,10 +32,10 @@ fn main() {
     //      `get_elem_info`.
     //
     // Vendoring a tree's `include/` gets (1) for free. Only (2) has to be supplied,
-    // by the `server-*` cargo features, and it must match the server exactly:
-    // nothing at runtime tells the variants apart — `interface` is 1 in all of them
-    // — so a mismatch silently calls whatever occupies the offset. An EE server
-    // runs `cachedump` for `get_config`.
+    // by the cargo features, and it must match the server exactly: nothing at
+    // runtime tells the variants apart — `interface` is 1 in all of them — so a
+    // mismatch silently calls whatever occupies the offset. An EE server runs
+    // `cachedump` for `get_config`.
     let include = env::var("ARCVECTOR_ENGINE_INCLUDE").unwrap_or_else(|_| "include".to_owned());
     let header = format!("{include}/memcached/engine.h");
 
@@ -45,25 +45,22 @@ fn main() {
         .clang_arg("-pthread")
         .clang_arg("-D_GNU_SOURCE");
 
-    // Only these three change a struct this crate reads. `SCAN_COMMAND` and the
-    // `SUPPORT_BOP_*` family matter too, but they live in the tree's `types.h` and
-    // arrive with the headers, so they are not knobs.
-    for (feature, define) in [
-        ("CARGO_FEATURE_REPLICATION", "ENABLE_REPLICATION"),
-        ("CARGO_FEATURE_MIGRATION", "ENABLE_MIGRATION"),
-        ("CARGO_FEATURE_CLUSTER_AWARE", "ENABLE_CLUSTER_AWARE"),
-    ] {
-        if env::var_os(feature).is_some() {
-            builder = builder.clang_arg(format!("-D{define}"));
+    // Each feature is named after the server's `configure` flag with arcus's
+    // `ENABLE_` prefix dropped, so the macro to define is derived rather than
+    // written twice. `SCAN_COMMAND` and the `SUPPORT_BOP_*` family matter to the
+    // layout too, but they live in the tree's `types.h` and arrive with the
+    // headers, so they are not knobs.
+    for flag in ["replication", "migration", "cluster-aware"] {
+        if enabled(flag) {
+            builder = builder.clang_arg(format!("-DENABLE_{}", macro_case(flag)));
         }
     }
 
     // Rebuilding a graph from Map only earns its cost where something can outlive
-    // it. Neither flag means nothing can, so the whole machinery compiles out.
+    // it — replication delivers a Map from a peer, persistence restores one on
+    // restart. Neither means nothing can, so the machinery compiles out.
     println!("cargo::rustc-check-cfg=cfg(recovery)");
-    let recovery = env::var_os("CARGO_FEATURE_REPLICATION").is_some()
-        || env::var_os("CARGO_FEATURE_PERSISTENCE").is_some();
-    if recovery {
+    if enabled("replication") || enabled("persistence") {
         println!("cargo:rustc-cfg=recovery");
     }
 
@@ -106,7 +103,7 @@ fn main() {
     }
     // Persistence leaves no trace in the bindings, so it is reported from the
     // feature that declared it.
-    if env::var_os("CARGO_FEATURE_PERSISTENCE").is_some() {
+    if enabled("persistence") {
         features.push("persistence");
     }
     features.sort_unstable();
@@ -131,4 +128,14 @@ fn main() {
         "oss"
     };
     println!("cargo:rustc-env=ARCVECTOR_ABI_TREE={tree}");
+}
+
+/// A cargo feature name as its `CARGO_FEATURE_*` / C macro spelling.
+fn macro_case(feature: &str) -> String {
+    feature.to_uppercase().replace('-', "_")
+}
+
+/// Whether the cargo feature of that name is on.
+fn enabled(feature: &str) -> bool {
+    env::var_os(format!("CARGO_FEATURE_{}", macro_case(feature))).is_some()
 }
