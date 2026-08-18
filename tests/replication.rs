@@ -11,7 +11,7 @@
 //! cargo test --features replication-tests -- --ignored   # the unfixed bug
 //! ```
 //!
-//! See `docs/replication-testing.md` for bringing the pair up.
+//! See `docs/내부구조.md §2.4` for bringing the pair up.
 //!
 //! `--test-threads=1` because the tests share the pair and one of them performs a
 //! switchover, which changes global state every other test reads.
@@ -55,7 +55,7 @@ impl Node {
         let sock = TcpStream::connect(&addr).unwrap_or_else(|e| {
             panic!(
                 "no daemon at {addr}: {e}\n\
-                 Bring the pair up first — see docs/replication-testing.md."
+                 Bring the pair up first — see docs/내부구조.md §2.4."
             )
         });
         sock.set_read_timeout(Some(Duration::from_secs(4))).unwrap();

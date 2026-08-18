@@ -8,7 +8,8 @@ arcus **Map collections**, so they inherit the engine's memory accounting,
 eviction, TTL and replication; the ANN graph is a
 [usearch](https://github.com/unum-cloud/usearch) index kept alongside as a cache.
 
-내부 구조는 [docs/내부구조.md](docs/내부구조.md), 모듈별 세부 사항은 [docs/모듈-노트.md](docs/모듈-노트.md), 알면서 안 고친 것들은 [docs/미해결.md](docs/미해결.md)에 있다.
+내부 구조·빌드·복구 로직은 [docs/내부구조.md](docs/내부구조.md), 알면서 안 고친 것들은
+[docs/미해결.md](docs/미해결.md)에 있다.
 
 ---
 
@@ -45,7 +46,7 @@ If you have the daemon's source tree, its `config.h` lists exactly which to pass
 
 `ARCVECTOR_ENGINE_INCLUDE` points at a different header tree. A wrong pairing is
 refused at load time with the rebuild command in the log, rather than crashing the
-daemon — see [docs/engine-abi.md](docs/engine-abi.md).
+daemon — see [docs/내부구조.md §11](docs/내부구조.md).
 
 Load it into arcus with `-X`:
 
@@ -123,9 +124,8 @@ vadd docs v1 7 2 ATTR 23 {"abc":123,"def":"abc"}
 → STORED
 ```
 
-Whitespace inside the JSON is fine (`{"a": 1, "b": 2}`). Only pathological
-spacing — a space around every colon and comma — exhausts memcached's 30-token
-line budget, and that is reported as such.
+With no whitespace to spend, the full 128-byte region is usable — more than the
+spaced form ever reached.
 
 ### Durability under replication
 
@@ -147,7 +147,7 @@ in particular a failover rebuilds the index from whatever the Map holds, so a
 write that did not reach the replica is simply absent rather than corrupting
 anything.
 
-`docs/내부구조.md` has the mechanism.
+[docs/내부구조.md §12](docs/내부구조.md) has the mechanism.
 
 ## VSIM
 

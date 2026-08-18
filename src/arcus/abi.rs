@@ -1,8 +1,8 @@
 //! Checking that the bindings match the daemon that loaded us.
 //!
 //! `engine_interface_v1` is called by offset and arcus has no single layout, so a
-//! wrong pairing calls whatever function sits at the offset. `docs/내부구조.md` §7
-//! for what can be checked and why; `docs/engine-abi.md` for operators.
+//! wrong pairing calls whatever function sits at the offset. `docs/내부구조.md` §11
+//! for what can be checked and why.
 
 use std::ffi::CStr;
 
@@ -139,7 +139,7 @@ pub fn report_mismatch(symptom: &str) {
              ArcVector: daemon's own headers and configure flags:\n\
              ArcVector:   ARCVECTOR_ENGINE_INCLUDE=<tree>/include \\\n\
              ArcVector:   cargo build --features daemon-replication\n\
-             ArcVector: see docs/engine-abi.md.",
+             ArcVector: see docs/내부구조.md §11.",
             built_for(),
         );
     });
@@ -174,7 +174,7 @@ pub unsafe fn verify(server: *const SERVER_HANDLE_V1, vt: &engine_interface_v1) 
                      ArcVector: function. Rebuild against this daemon's headers:\n\
                      ArcVector:   ARCVECTOR_ENGINE_INCLUDE=<tree>/include \\\n\
                      ArcVector:   cargo build --features daemon-replication\n\
-                     ArcVector: see docs/engine-abi.md.",
+                     ArcVector: see docs/내부구조.md §11.",
                     fingerprint(version.as_deref()),
                     env!("ARCVECTOR_ABI_TREE"),
                     if version_is_ee(v) {
@@ -201,7 +201,7 @@ pub unsafe fn verify(server: *const SERVER_HANDLE_V1, vt: &engine_interface_v1) 
              ArcVector: the daemon's own headers and configure flags:\n\
              ArcVector:   ARCVECTOR_ENGINE_INCLUDE=<tree>/include \\\n\
              ArcVector:   cargo build --features daemon-replication\n\
-             ArcVector: see docs/engine-abi.md.",
+             ArcVector: see docs/내부구조.md §11.",
             fingerprint(version.as_deref()),
             absent.join(", "),
         );

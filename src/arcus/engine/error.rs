@@ -35,7 +35,7 @@ impl fmt::Display for StoreError {
             Self::Unavailable => f.write_str("engine unavailable"),
             Self::AbiMismatch => f.write_str(
                 "engine ABI mismatch — this library was built against a different \
-                 arcus configuration than the daemon; see docs/engine-abi.md",
+                 arcus configuration than the daemon; see docs/내부구조.md §11",
             ),
             Self::KeyGone => f.write_str("index not found in engine"),
             Self::ElemGone => f.write_str("element not found"),

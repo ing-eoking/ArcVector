@@ -5,7 +5,7 @@
 //! runs one way: the index knows the stored format, the store knows nothing of
 //! the index.
 //!
-//! `docs/내부구조.md` §4, `docs/모듈-노트.md`.
+//! `docs/내부구조.md` §6.
 
 pub mod abi;
 pub mod element;
