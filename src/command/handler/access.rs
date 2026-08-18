@@ -1,15 +1,24 @@
 //! Which graph a command may use, and what to do when the answer is "not this
 //! one".
 //!
-//! The Map's `owner` token is the whole test — `docs/내부구조.md` §6.
+//! Two builds of this module. With `cfg(recovery)` — the daemon replicates or
+//! persists, so a Map can outlive the graph — the Map's `owner` token decides,
+//! and a graph that is missing or stale is rebuilt. Without it nothing can
+//! outlive the graph, so the registry is the whole answer.
+//!
+//! `docs/내부구조.md` §6.
 
 use std::sync::Arc;
 
+#[cfg(recovery)]
 use crate::arcus::element::{Layout, MetaRecord};
 use crate::arcus::engine::Store;
 use crate::error::{Error, Result};
-use crate::registry::{self, MetaState, VectorIndex};
+#[cfg(recovery)]
+use crate::registry::MetaState;
+use crate::registry::{self, VectorIndex};
 
+#[cfg(recovery)]
 /// Resolve a name to its graph, recovering it when missing or stale.
 pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
     let (meta, layout) = usable_metadata(store, name)?;
@@ -33,6 +42,7 @@ pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
 }
 
 /// The metadata element, or the reason there is no index to serve.
+#[cfg(recovery)]
 fn usable_metadata(store: &Store, name: &str) -> Result<(MetaRecord, Layout)> {
     match registry::read_metadata(store, name) {
         MetaState::Usable(meta, layout) => Ok((meta, layout)),
@@ -46,6 +56,7 @@ fn usable_metadata(store: &Store, name: &str) -> Result<(MetaRecord, Layout)> {
 }
 
 /// Delete a Map whose metadata cannot be read — the one failure that deletes.
+#[cfg(recovery)]
 fn discard_damaged(store: &Store, name: &str, why: &str) {
     if !store.probe_map(name).is_ok_and(|p| p.looks_like_index()) {
         return; // Not ours. Somebody else's Map is none of our business.
@@ -64,6 +75,7 @@ fn discard_damaged(store: &Store, name: &str, why: &str) {
 }
 
 /// Register an empty graph, and say whether this call is the one that did.
+#[cfg(recovery)]
 fn empty_graph(
     store: &Store,
     name: &str,
@@ -80,16 +92,35 @@ fn empty_graph(
     )))
 }
 
+/// Resolve a name to its graph.
+///
+/// Nothing can outlive the graph in this build, so a name the registry does not
+/// know is a name that does not exist. The Map may still be there — dropped from
+/// the registry by a `vdrop` race, or left by an earlier build that could recover
+/// — and it stays untouched: an operator clears it with `vdrop` and creates the
+/// index again.
+#[cfg(not(recovery))]
+pub(super) fn resolve(_store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
+    registry::get(name).ok_or(Error::NoSuchIndex)
+}
+
 /// The graph, for a command that reads it.
 pub(super) fn for_read(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
     let index = resolve(store, name)?;
+    #[cfg(recovery)]
     if index.is_rebuilding() {
+        // usearch has no notion of "not ready": a search against a half-filled
+        // index answers without complaint, from whatever happens to be in.
         return Err(Error::Unreadable);
     }
     Ok(index)
 }
 
 /// The graph, for a command that writes it.
+///
+/// Writes go through while a rebuild runs. Refusing them would be an outage
+/// lasting as long as the rebuild, and they are safe: Map takes the write first,
+/// and `AnnIndex` keeps the rebuild from replaying an older value over it.
 pub(super) fn for_write(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
     resolve(store, name)
 }

@@ -58,6 +58,15 @@ fn main() {
         }
     }
 
+    // Rebuilding a graph from Map only earns its cost where something can outlive
+    // it. Neither flag means nothing can, so the whole machinery compiles out.
+    println!("cargo::rustc-check-cfg=cfg(recovery)");
+    let recovery = env::var_os("CARGO_FEATURE_DAEMON_REPLICATION").is_some()
+        || env::var_os("CARGO_FEATURE_DAEMON_PERSISTENCE").is_some();
+    if recovery {
+        println!("cargo:rustc-cfg=recovery");
+    }
+
     let generated = out.join("engine_api.rs");
     builder
         .layout_tests(false)
@@ -94,6 +103,11 @@ fn main() {
     .collect();
     if text.contains("pub is_zk_integrated") {
         features.push("cluster_aware");
+    }
+    // Persistence leaves no trace in the bindings, so it is reported from the
+    // feature that declared it.
+    if env::var_os("CARGO_FEATURE_DAEMON_PERSISTENCE").is_some() {
+        features.push("persistence");
     }
     features.sort_unstable();
 

@@ -135,7 +135,29 @@ Nothing is deleted, and the fix is a rebuild.
 `ARCVECTOR_ABI_DEBUG=1` lists every member the module needs and whether it
 resolved.
 
-## 5. The real fix
+## 5. `daemon-persistence`, which is not an ABI flag
+
+`ENABLE_PERSISTENCE` lives in `engines/default/*.h`, not `include/memcached/`, so
+it moves no vtable member and passes no define. The feature exists for a different
+reason: it states that the daemon restores items on restart, so a Map can outlive
+this process's graph.
+
+That is the same thing replication implies, and `build.rs` turns on `cfg(recovery)`
+when either is set. Neither one means nothing can outlive the graph, and the
+ownership token, the per-command metadata read and the rebuild thread all compile
+out. An index whose graph is gone then answers `NOT_FOUND`, and a Map that cannot
+be rebuilt is named rather than deleted:
+
+```
+vcreate docs 128
+  → CLIENT_ERROR a Map already exists at 'docs' and this build cannot rebuild an
+    index from it; drop it with 'vdrop docs' and create it again
+```
+
+Set it if the daemon's `config.h` has `ENABLE_PERSISTENCE`. Getting it wrong costs
+no crash — unlike the three above — only a recovery that does not happen.
+
+## 6. The real fix
 
 All of this exists because EE inserts its members *into* the struct. If they were
 appended after `errinfo`, the common prefix would be stable and one library would

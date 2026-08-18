@@ -2,6 +2,7 @@
 
 use std::fmt::Write as _;
 
+#[cfg(recovery)]
 use super::access::resolve;
 use crate::arcus::element::{self, Layout, MetaRecord, Quant};
 use crate::arcus::engine::Store;
@@ -25,8 +26,19 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
 
     // Replication or persistence may have delivered this Map. Never clear it.
     if store.probe_map(name).is_ok() {
-        resolve(store, name)?;
-        return Ok(Reply::Exists);
+        // Replication or persistence may have delivered this Map. Never clear it.
+        #[cfg(recovery)]
+        {
+            resolve(store, name)?;
+            return Ok(Reply::Exists);
+        }
+        // Nothing here can rebuild an index from it, and guessing would either
+        // destroy it or serve an empty graph. Name the situation instead.
+        #[cfg(not(recovery))]
+        return Err(Error::bad_request(format!(
+            "a Map already exists at '{name}' and this build cannot rebuild an \
+             index from it; drop it with 'vdrop {name}' and create it again"
+        )));
     }
 
     // Before the Map, so an unsupported metric leaves no empty Map behind.

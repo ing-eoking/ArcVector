@@ -17,13 +17,25 @@ crate-type = ["cdylib", "rlib"]
 # `get_item_info` and `get_elem_info` move even though nothing about them changes.
 # The bindings must therefore be generated with the same set the daemon has.
 #
-# They gate no Rust code. `build.rs` reads CARGO_FEATURE_* and passes the matching
-# `-D` to bindgen, so the effect is entirely in the generated `engine_api.rs`.
+# `build.rs` reads CARGO_FEATURE_* and passes the matching `-D` to bindgen, so most
+# of the effect is in the generated `engine_api.rs`.
 #
 # The daemon's own `config.h` lists which to pass. See docs/engine-abi.md.
 daemon-replication = []    # -DENABLE_REPLICATION
 daemon-migration = []      # -DENABLE_MIGRATION
 daemon-cluster-aware = []  # -DENABLE_CLUSTER_AWARE
+
+# ENABLE_PERSISTENCE. Unlike the three above it changes no header this crate
+# reads — it lives in `engines/default/*.h`, not `include/memcached/` — so it
+# passes no define and moves no vtable member. It states one fact: the daemon
+# restores items on restart, so a Map can outlive this process's graph.
+daemon-persistence = []
+
+# Recovery — rebuilding a graph from Map — is what those two facts imply, and
+# `build.rs` turns `cfg(recovery)` on when either is set. Neither replication nor
+# persistence means nothing can outlive the graph, so the ownership token, the
+# metadata read on every command and the rebuild thread are all dead weight; an
+# index whose graph is missing then answers NOT_FOUND and is recreated by hand.
 
 # --- Test targets ------------------------------------------------------------
 #

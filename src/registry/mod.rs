@@ -7,10 +7,14 @@
 //! one this node holds decides whether the graph here may serve, must be rebuilt,
 //! or is already being rebuilt. `docs/내부구조.md` §6.
 
+#[cfg(recovery)]
 mod metadata;
+#[cfg(recovery)]
 mod recovery;
 
+#[cfg(recovery)]
 pub use metadata::{MetaState, build_ann, read_metadata};
+#[cfg(recovery)]
 pub use recovery::{claim_refilled, ensure_builder, take_over};
 
 use std::collections::HashMap;
@@ -28,6 +32,7 @@ pub struct VectorIndex {
     pub maxcount: u32,
     owner: std::sync::atomic::AtomicU64,
     /// Set by the rebuild thread when the graph is complete.
+    #[cfg(recovery)]
     refilled: std::sync::atomic::AtomicBool,
 }
 
@@ -38,6 +43,7 @@ impl VectorIndex {
             ann,
             maxcount,
             owner: std::sync::atomic::AtomicU64::new(owner),
+            #[cfg(recovery)]
             refilled: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -51,15 +57,18 @@ impl VectorIndex {
     }
 
     /// Whether the graph is full again and only the token write is outstanding.
+    #[cfg(recovery)]
     pub fn is_refilled(&self) -> bool {
         self.refilled.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    #[cfg(recovery)]
     fn mark_refilled(&self) {
         self.refilled
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    #[cfg(recovery)]
     fn set_owner(&self, owner: u64) {
         self.owner
             .store(owner, std::sync::atomic::Ordering::Release);
