@@ -8,7 +8,7 @@ arcus **Map collections**, so they inherit the engine's memory accounting,
 eviction, TTL and replication; the ANN graph is a
 [usearch](https://github.com/unum-cloud/usearch) index kept alongside as a cache.
 
-내부 구조는 [docs/내부구조.md](docs/내부구조.md), 모듈별 세부 사항은 [docs/모듈-노트.md](docs/모듈-노트.md)에 있다.
+내부 구조는 [docs/내부구조.md](docs/내부구조.md), 모듈별 세부 사항은 [docs/모듈-노트.md](docs/모듈-노트.md), 알면서 안 고친 것들은 [docs/미해결.md](docs/미해결.md)에 있다.
 
 ---
 
