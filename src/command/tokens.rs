@@ -1,16 +1,14 @@
-//! Wire mechanics: reading a tokenized command line, and writing one response.
+//! Reading a tokenized command line.
 //!
-//! The only module that touches memcached's token array.
+//! The only module that touches memcached's token array. Writing the response
+//! back is [`crate::server::Responder`]'s job.
 
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::c_int;
 use std::str::FromStr;
 
 use super::request::Cmd;
 use crate::engine_api::token_t;
-use crate::error::{Error, Reply, Result};
-
-pub type ResponseHandler =
-    Option<unsafe extern "C" fn(*const c_void, c_int, *const c_char) -> bool>;
+use crate::error::{Error, Result};
 
 #[derive(Clone, Copy)]
 pub struct Tokens<'a> {
@@ -80,43 +78,11 @@ impl<'a> Tokens<'a> {
     }
 }
 
-pub struct Responder {
-    handler: ResponseHandler,
-    cookie: *const c_void,
-}
-
-impl Responder {
-    pub fn new(handler: ResponseHandler, cookie: *const c_void) -> Self {
-        Self { handler, cookie }
-    }
-
-    pub fn send(&self, msg: &str) {
-        let Some(handler) = self.handler else { return };
-        // The handler takes a NUL-terminated string plus its length.
-        let mut buf = Vec::with_capacity(msg.len() + 1);
-        buf.extend_from_slice(msg.as_bytes());
-        buf.push(0);
-        // SAFETY: `buf` stays alive for the call and is NUL-terminated.
-        unsafe {
-            handler(
-                self.cookie,
-                msg.len() as c_int,
-                buf.as_ptr().cast::<c_char>(),
-            );
-        }
-    }
-
-    pub fn reply(&self, outcome: Result<Reply>) {
-        match outcome {
-            Ok(reply) => self.send(reply.as_str()),
-            Err(e) => self.send(&format!("{} {e}\r\n", e.blame().prefix())),
-        }
-    }
-}
-
 /// Tokenize like memcached's `tokenize_command`. Returns the backing buffer.
 #[cfg(test)]
 pub fn tokenize_for_test(line: &str) -> (Vec<u8>, Vec<token_t>) {
+    use std::os::raw::c_char;
+
     let mut buf = line.as_bytes().to_vec();
     let base = buf.as_mut_ptr();
     let mut spans = Vec::new();

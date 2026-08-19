@@ -1,7 +1,7 @@
 //! Command handlers, one module per group, plus the access check they share.
 //!
 //! Every handler returns `Result<Reply>`; turning that into an ASCII response is
-//! [`crate::command::tokens::Responder::reply`]'s job.
+//! [`crate::server::Responder::reply`]'s job.
 
 pub mod arcus;
 pub mod quant;

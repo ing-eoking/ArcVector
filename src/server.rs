@@ -1,13 +1,16 @@
 //! The host memcached gives an extension: `SERVER_HANDLE_V1`.
 //!
 //! Not the storage engine — that is [`crate::handler::arcus::engine`], reached
-//! *through* this handle. What lives here is the accessor itself and the pieces
-//! of `SERVER_CORE_API` that belong to a connection rather than to storage.
+//! *through* this handle. What lives here is the accessor itself and the host
+//! calls that belong to a connection rather than to storage: the one pointer
+//! memcached keeps per `conn`, and the callback that writes a response back to
+//! it. Every unsafe call into the host with a connection cookie is in this file.
 
-use std::os::raw::c_void;
+use std::os::raw::{c_char, c_int, c_void};
 use std::sync::OnceLock;
 
 use crate::engine_api::{SERVER_CORE_API, SERVER_HANDLE_V1};
+use crate::error::{Reply, Result};
 
 static GET_SERVER_API: OnceLock<unsafe extern "C" fn() -> *mut SERVER_HANDLE_V1> = OnceLock::new();
 
@@ -86,5 +89,49 @@ pub unsafe fn take_conn_state(cookie: *const c_void) -> *mut c_void {
             let _ = store_conn_state(cookie, std::ptr::null_mut());
         }
         data
+    }
+}
+
+/// The `execute` callback memcached hands us for writing one response.
+pub type ResponseHandler =
+    Option<unsafe extern "C" fn(*const c_void, c_int, *const c_char) -> bool>;
+
+/// One response, written to the connection the command arrived on.
+///
+/// Unlike the per-connection slot above, the handler is not part of
+/// `SERVER_CORE_API`: memcached passes it as an argument to `execute`, so a
+/// responder is only good for the call it was built in.
+pub struct Responder {
+    handler: ResponseHandler,
+    cookie: *const c_void,
+}
+
+impl Responder {
+    pub fn new(handler: ResponseHandler, cookie: *const c_void) -> Self {
+        Self { handler, cookie }
+    }
+
+    pub fn send(&self, msg: &str) {
+        let Some(handler) = self.handler else { return };
+        // The handler takes a NUL-terminated string plus its length.
+        let mut buf = Vec::with_capacity(msg.len() + 1);
+        buf.extend_from_slice(msg.as_bytes());
+        buf.push(0);
+        // SAFETY: `buf` stays alive for the call and is NUL-terminated.
+        unsafe {
+            handler(
+                self.cookie,
+                msg.len() as c_int,
+                buf.as_ptr().cast::<c_char>(),
+            );
+        }
+    }
+
+    /// Turn a handler's outcome into the ASCII line the client sees.
+    pub fn reply(&self, outcome: Result<Reply>) {
+        match outcome {
+            Ok(reply) => self.send(reply.as_str()),
+            Err(e) => self.send(&format!("{} {e}\r\n", e.blame().prefix())),
+        }
     }
 }

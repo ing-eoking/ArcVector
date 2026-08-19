@@ -37,12 +37,13 @@ use std::ptr;
 
 use command::nread;
 use command::request::{self, MAX_BODY_BYTES};
-use command::tokens::{Responder, ResponseHandler, Tokens};
+use command::tokens::Tokens;
 use engine_api::{
     EXTENSION_ASCII_PROTOCOL_DESCRIPTOR, EXTENSION_ERROR_CODE,
     EXTENSION_ERROR_CODE_EXTENSION_FATAL, EXTENSION_ERROR_CODE_EXTENSION_SUCCESS, GET_SERVER_API,
     extension_type_t_EXTENSION_ASCII_PROTOCOL, token_t,
 };
+use server::{Responder, ResponseHandler};
 
 /// Decide how much body a command needs before it can run.
 ///
