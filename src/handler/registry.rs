@@ -1,21 +1,9 @@
-//! The live index registry and its ownership rule.
+//! The live indexes this process is serving, by name.
 //!
-//! > The usearch index is a cache rebuildable from Map at any time.
-//! > If it is not in Map, it does not exist.
-//!
-//! The Map's metadata element carries an `owner` token; comparing it against the
-//! one this node holds decides whether the graph here may serve, must be rebuilt,
-//! or is already being rebuilt. `docs/내부구조.md` §6.
-
-#[cfg(recovery)]
-mod metadata;
-#[cfg(recovery)]
-mod recovery;
-
-#[cfg(recovery)]
-pub use metadata::{MetaState, build_ann, read_metadata};
-#[cfg(recovery)]
-pub use recovery::{claim_refilled, ensure_builder, take_over};
+//! An entry pairs the Map that holds the vectors with the usearch graph built
+//! from it, and remembers the `owner` token that graph was built under. Deciding
+//! whether that token still means anything, and rebuilding when it does not, is
+//! [`super::recovery`]'s job.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
@@ -33,7 +21,7 @@ pub struct VectorIndex {
     owner: std::sync::atomic::AtomicU64,
     /// Set by the rebuild thread when the graph is complete.
     #[cfg(recovery)]
-    refilled: std::sync::atomic::AtomicBool,
+    pub(super) refilled: std::sync::atomic::AtomicBool,
 }
 
 impl VectorIndex {
@@ -63,13 +51,13 @@ impl VectorIndex {
     }
 
     #[cfg(recovery)]
-    fn mark_refilled(&self) {
+    pub(super) fn mark_refilled(&self) {
         self.refilled
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
     #[cfg(recovery)]
-    fn set_owner(&self, owner: u64) {
+    pub(super) fn set_owner(&self, owner: u64) {
         self.owner
             .store(owner, std::sync::atomic::Ordering::Release);
     }

@@ -1,4 +1,10 @@
-//! Refilling a graph from Map, on a thread that never writes.
+//! Noticing that a graph no longer describes its Map, and rebuilding it.
+//!
+//! [`metadata`] is the reserved Map element this rests on: it carries the metric
+//! and HNSW parameters a graph is rebuilt from, and the `owner` token that says
+//! whose graph is current.
+//!
+//! Refilling happens on a thread that never writes.
 //!
 //! A worker stamps [`super::REBUILDING`] and queues the name; the thread reads
 //! Map and refills; the next worker command stamps a fresh token. The split is
@@ -7,8 +13,11 @@
 
 use std::sync::{Condvar, LazyLock, Mutex, PoisonError};
 
-use super::metadata::{MetaState, read_metadata, stamp};
-use super::{REBUILDING, VectorIndex, get, remove};
+pub mod metadata;
+
+use metadata::{MetaState, read_metadata, stamp};
+
+use super::registry::{REBUILDING, VectorIndex, get, remove};
 use crate::error::{Error, Result};
 use crate::handler::arcus::element::{META_FIELD, mint_owner};
 use crate::handler::arcus::engine::Store;

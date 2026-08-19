@@ -12,6 +12,7 @@ use crate::command::request::{Sim, SimKey};
 use crate::error::{Error, Reply, Result};
 use crate::handler::arcus::element;
 use crate::handler::arcus::engine::{Store, StoreError};
+use crate::handler::quant;
 use crate::handler::registry::VectorIndex;
 
 /// One similarity search, appended to `out` as a `QUERY` group.
@@ -90,7 +91,7 @@ pub fn vsim_vector(store: &Store, spec: &Sim, body: &[u8]) -> Result<Reply> {
 
     let mut out = String::new();
     for (query_no, query) in coord_vectors(body, dim, "query")?.iter().enumerate() {
-        let quantized = element::encode(query, layout.quant);
+        let quantized = quant::encode(query, layout.quant);
         similar(store, &index, &quantized, k, filter, query_no, &mut out)?;
     }
     out.push_str("END\r\n");

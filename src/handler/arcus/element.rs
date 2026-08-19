@@ -2,7 +2,7 @@
 //!
 //! Pure: no engine, no index, no server. `docs/내부구조.md` §4.
 
-pub use super::quant::{Quant, encode};
+use crate::handler::quant::Quant;
 
 const HEADER_LEN: usize = 2;
 
@@ -272,6 +272,7 @@ pub struct Element<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handler::quant::encode;
 
     // -- scalar kinds and conversion ----------------------------------------
 

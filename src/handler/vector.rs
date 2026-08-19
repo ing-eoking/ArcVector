@@ -8,8 +8,9 @@ use super::coords::coords;
 use super::registry;
 use crate::command::request::Add;
 use crate::error::{Error, Reply, Result};
-use crate::handler::arcus::element::{self, Layout};
+use crate::handler::arcus::element::Layout;
 use crate::handler::arcus::engine::{Store, StoreError};
+use crate::handler::quant;
 
 /// `vadd <index> <id> <veclen> <dim> [ATTR <attrlen> <attr JSON>]`
 pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
@@ -40,7 +41,7 @@ pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
         return Ok(Reply::Overflowed);
     }
 
-    let quantized = element::encode(&vector, layout.quant);
+    let quantized = quant::encode(&vector, layout.quant);
     let value = layout.encode(&quantized, attr)?;
 
     // Map first: it is the source of truth.

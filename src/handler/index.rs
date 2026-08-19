@@ -6,8 +6,9 @@ use std::fmt::Write as _;
 use super::access::resolve;
 use crate::command::request::Create;
 use crate::error::{Error, Reply, Result};
-use crate::handler::arcus::element::{self, Layout, MetaRecord, Quant};
+use crate::handler::arcus::element::{self, Layout, MetaRecord};
 use crate::handler::arcus::engine::Store;
+use crate::handler::quant::Quant;
 use crate::handler::registry::{self, VectorIndex};
 use crate::handler::usearch::{AnnIndex, THREAD_SLOTS};
 

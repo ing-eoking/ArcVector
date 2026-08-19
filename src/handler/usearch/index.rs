@@ -14,7 +14,7 @@ use super::metric::Metric;
 use super::threads::Semaphore;
 use crate::error::Error;
 use crate::handler::arcus::element::Layout;
-use crate::handler::arcus::element::Quant;
+use crate::handler::quant::Quant;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -322,7 +322,7 @@ fn to_i8(bytes: &[u8]) -> Vec<i8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::arcus::element::Quant;
+    use crate::handler::quant::Quant;
     use crate::handler::usearch::metric::Metric;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -332,15 +332,12 @@ mod tests {
     }
 
     fn add(idx: &AnnIndex, id: &str, coords: &[f32]) {
-        idx.add(
-            id,
-            &crate::handler::arcus::element::encode(coords, idx.layout.quant),
-        )
-        .unwrap();
+        idx.add(id, &crate::handler::quant::encode(coords, idx.layout.quant))
+            .unwrap();
     }
 
     fn search(idx: &AnnIndex, coords: &[f32], k: usize) -> Vec<String> {
-        let q = crate::handler::arcus::element::encode(coords, idx.layout.quant);
+        let q = crate::handler::quant::encode(coords, idx.layout.quant);
         idx.search(&q, k, |_| true)
             .unwrap()
             .into_iter()
@@ -385,7 +382,7 @@ mod tests {
         add(&idx, "keep", &[1.0, 0.0, 0.0, 0.0]);
         add(&idx, "skip", &[1.0, 0.0, 0.0, 0.0]);
 
-        let q = crate::handler::arcus::element::encode(&[1.0, 0.0, 0.0, 0.0], Quant::F32);
+        let q = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], Quant::F32);
         let hits = idx
             .search(&q, 10, |key| {
                 idx.id_of(key).is_some_and(|id| &*id == "keep")
@@ -502,7 +499,7 @@ mod tests {
             let idx = Arc::clone(&idx);
             let failures = Arc::clone(&failures);
             handles.push(std::thread::spawn(move || {
-                let q = crate::handler::arcus::element::encode(
+                let q = crate::handler::quant::encode(
                     &[t as f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
                     Quant::F32,
                 );
@@ -530,16 +527,11 @@ mod tests {
                     let id = format!("t{t}-{i}");
                     idx.add(
                         &id,
-                        &crate::handler::arcus::element::encode(
-                            &[t as f32, i as f32, 0.0, 0.0],
-                            Quant::F32,
-                        ),
+                        &crate::handler::quant::encode(&[t as f32, i as f32, 0.0, 0.0], Quant::F32),
                     )
                     .unwrap();
-                    let q = crate::handler::arcus::element::encode(
-                        &[t as f32, i as f32, 0.0, 0.0],
-                        Quant::F32,
-                    );
+                    let q =
+                        crate::handler::quant::encode(&[t as f32, i as f32, 0.0, 0.0], Quant::F32);
                     let _ = idx.search(&q, 3, |_| true).unwrap();
                 }
             }));

@@ -4,9 +4,11 @@
 //! lib.rs           the C ABI — registration and memcached's four callbacks
 //!   command/       the wire: a command line in, a typed request out   (pure)
 //!   handler/       everything that runs a command
+//!     quant          how one coordinate is represented — both sides use it
 //!     arcus/         store vectors in the engine — the source of truth
 //!     usearch/       search them — a cache of the arcus side
-//!     registry/      the live pairs, and rebuilding one side from the other
+//!     registry       the live pairs, by name
+//!     recovery/      noticing a pair has come apart, and rebuilding it
 //!   error          one error type, and who gets blamed for it
 //! ```
 //!
@@ -47,7 +49,8 @@ pub mod handler;
 /// `ATTR_BYTES` is here for the same reason: the parser has to refuse an
 /// oversized `ATTR` before a handler ever sees it, and the size is a fact about
 /// the stored element rather than about the wire.
-pub use handler::arcus::element::{ATTR_BYTES, Quant};
+pub use handler::arcus::element::ATTR_BYTES;
+pub use handler::quant::Quant;
 pub use handler::usearch::Metric;
 
 use std::os::raw::{c_char, c_int, c_void};

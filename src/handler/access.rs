@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::handler::arcus::element::{Layout, MetaRecord};
 use crate::handler::arcus::engine::Store;
 #[cfg(recovery)]
-use crate::handler::registry::MetaState;
+use crate::handler::recovery::{self, metadata::MetaState};
 use crate::handler::registry::{self, VectorIndex};
 
 #[cfg(recovery)]
@@ -29,14 +29,14 @@ pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
     };
 
     if fresh || meta.owner != index.owner() {
-        registry::ensure_builder();
-        registry::take_over(store, &index)?;
+        recovery::ensure_builder();
+        recovery::take_over(store, &index)?;
         return Ok(index);
     }
 
     if index.is_rebuilding() && index.is_refilled() {
         // Only a worker has the connection an engine write needs.
-        registry::claim_refilled(store, &index)?;
+        recovery::claim_refilled(store, &index)?;
     }
     Ok(index)
 }
@@ -44,7 +44,7 @@ pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
 /// The metadata element, or the reason there is no index to serve.
 #[cfg(recovery)]
 fn usable_metadata(store: &Store, name: &str) -> Result<(MetaRecord, Layout)> {
-    match registry::read_metadata(store, name) {
+    match recovery::metadata::read_metadata(store, name) {
         MetaState::Usable(meta, layout) => Ok((meta, layout)),
         MetaState::Damaged(why) => {
             discard_damaged(store, name, &why);
@@ -81,7 +81,7 @@ fn empty_graph(
     layout: Layout,
 ) -> Result<(Arc<VectorIndex>, bool)> {
     let probe = store.probe_map(name)?;
-    let ann = registry::build_ann(meta, layout)?;
+    let ann = recovery::metadata::build_ann(meta, layout)?;
     Ok(registry::insert_or_get(VectorIndex::new(
         name.to_owned(),
         ann,

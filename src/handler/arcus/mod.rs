@@ -10,7 +10,6 @@
 pub mod abi;
 pub mod element;
 pub mod engine;
-pub mod quant;
 
-pub use element::{Layout, Quant};
+pub use element::Layout;
 pub use engine::{Store, StoreError};

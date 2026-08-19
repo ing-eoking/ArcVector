@@ -4,6 +4,9 @@
 //! [`crate::command::tokens::Responder::reply`]'s job.
 
 pub mod arcus;
+pub mod quant;
+#[cfg(recovery)]
+pub mod recovery;
 pub mod registry;
 pub mod usearch;
 
