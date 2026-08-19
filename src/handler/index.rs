@@ -62,7 +62,7 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         expansion_search: spec.expansion_search,
         owner,
     };
-    store.put_elem(name, element::META_FIELD, &meta.encode(layout)?)?;
+    store.put_elem(name, element::META_FIELD, &meta.encode(layout))?;
 
     let index = VectorIndex::new(name.to_owned(), ann, maxcount, owner);
     let (_, inserted) = registry::insert_or_get(index);

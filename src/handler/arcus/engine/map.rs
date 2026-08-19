@@ -7,20 +7,17 @@ use super::Store;
 use super::error::{Result, StoreError, as_int, check};
 use crate::engine_api::{ENGINE_ITEM_ATTR_ATTR_FLAGS, ENGINE_ITEM_TYPE_ITEM_TYPE_MAP, item_attr};
 
-/// Item flags marking a Map as ours: `"AV"` in the high half, format version in
-/// the low.
+/// Item flags marking a Map as ours: `"AV"`, and nothing else.
 ///
-/// The version is the only one there is — elements carry none — and it lives here
-/// rather than in an element header because `getattr` reads it *before* any
-/// element, so it survives a change to the element layout itself. Bump it
-/// whenever that layout changes: a build that cannot read an element must not
-/// recognise the Map as its own, or it will read the bytes as if they were.
+/// A hint, never an authority — a client can set any flags through
+/// `mop create <key> <flags> …` — so this only answers "plausibly ours?" cheaply,
+/// with one hash lookup and no element read, before the metadata element decides.
 ///
-/// | version | element layout |
-/// |---|---|
-/// | 1 | 16-byte header (magic, version, quant, dim, alen), ATTR at 16, vector at 144 |
-/// | 2 | `alen` alone, ATTR at 2, vector at 130 |
-pub const INDEX_FLAGS: u32 = 0x4156_0000 | 2;
+/// There is no format version here, and none in an element either. Adding one is
+/// what a change to the stored layout would need, and it has to happen *before*
+/// that change ships: a build with no version reads a newer Map, fails, and
+/// judges it damaged. Nothing is deployed yet, so nothing is at risk today.
+pub const INDEX_FLAGS: u32 = 0x4156_0000;
 
 /// What a Map looks like from the outside, before any element is read.
 #[derive(Clone, Copy, Debug)]

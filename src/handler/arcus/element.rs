@@ -196,9 +196,14 @@ pub fn mint_owner() -> u64 {
 }
 
 impl MetaRecord {
-    /// Serialize into a full element value: header, then JSON in the ATTR region.
-    pub fn encode(&self, layout: Layout) -> Result<Vec<u8>, CodecError> {
-        let json = format!(
+    /// Serialize into the element value, which is **entirely JSON**.
+    ///
+    /// No header. A vector element needs one because its ATTR region is fixed and
+    /// the vector has to start at a constant offset; this one holds nothing else,
+    /// so the engine's own element length says where it ends. That also lifts the
+    /// 128-byte ceiling the ATTR region imposed.
+    pub fn encode(&self, layout: Layout) -> Vec<u8> {
+        format!(
             r#"{{"dim":{},"quant":"{}","metric":"{}","m":{},"efc":{},"efs":{},"owner":"{:016x}"}}"#,
             layout.dim,
             layout.quant,
@@ -207,33 +212,14 @@ impl MetaRecord {
             self.expansion_add,
             self.expansion_search,
             self.owner,
-        );
-        if json.len() > ATTR_BYTES {
-            return Err(CodecError::AttrTooLarge {
-                limit: ATTR_BYTES,
-                got: json.len(),
-            });
-        }
-
-        let mut buf = vec![0u8; Layout::VECTOR_OFFSET];
-        buf[0..2].copy_from_slice(&(json.len() as u16).to_le_bytes());
-        buf[ATTR_OFFSET..ATTR_OFFSET + json.len()].copy_from_slice(json.as_bytes());
-        Ok(buf)
+        )
+        .into_bytes()
     }
 
-    /// Read one back, along with the layout its header records.
+    /// Read one back, along with the layout it records.
     pub fn decode(buf: &[u8]) -> Result<(Self, Layout), CodecError> {
-        let head = parse_header(buf)?;
-        if buf.len() < ATTR_OFFSET + head.attr_len {
-            return Err(CodecError::Truncated {
-                need: ATTR_OFFSET + head.attr_len,
-                got: buf.len(),
-            });
-        }
-
         let json: serde_json::Value =
-            serde_json::from_slice(&buf[ATTR_OFFSET..ATTR_OFFSET + head.attr_len])
-                .map_err(|e| CodecError::BadMetadata(e.to_string()))?;
+            serde_json::from_slice(buf).map_err(|e| CodecError::BadMetadata(e.to_string()))?;
         let miss = |k: &str| CodecError::BadMetadata(format!("missing '{k}'"));
         let num = |k: &str| -> Result<usize, CodecError> {
             json.get(k)
@@ -445,11 +431,9 @@ mod tests {
     }
 
     #[test]
-    fn metadata_json_fits_the_region_at_the_widest_values() {
-        // dim, quant and the HNSW parameters live in this JSON, so the region has
-        // to hold the largest of each that can reach it: the dimension ceiling for
-        // the narrowest quantization, the longest metric name, and the largest
-        // connectivity usearch accepts.
+    fn metadata_round_trips_at_the_widest_values() {
+        // The value is the whole element, so there is no fixed region to overflow.
+        // The widest inputs still have to survive the round trip.
         let layout = Layout::new(Layout::max_dim_for(Quant::B1, 16 * 1024), Quant::F32);
         let meta = MetaRecord {
             metric: "tanimoto".to_owned(),
@@ -458,7 +442,7 @@ mod tests {
             expansion_search: u32::MAX as usize,
             owner: u64::MAX,
         };
-        let encoded = meta.encode(layout).expect("widest metadata must fit");
+        let encoded = meta.encode(layout);
         let (back, back_layout) = MetaRecord::decode(&encoded).unwrap();
         assert_eq!(back, meta);
         assert_eq!(back_layout.dim, layout.dim);

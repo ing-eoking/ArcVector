@@ -51,6 +51,6 @@ pub(super) fn stamp(store: &Store, name: &str, owner: u64) -> Result<()> {
         MetaState::Damaged(why) => return Err(Error::bad_request(why)),
     };
     let claimed = MetaRecord { owner, ..meta };
-    store.put_elem(name, META_FIELD, &claimed.encode(layout)?)?;
+    store.put_elem(name, META_FIELD, &claimed.encode(layout))?;
     Ok(())
 }
