@@ -1,11 +1,8 @@
-//! Distance metrics, and which quantizations each one is meaningful on.
-
 use ::usearch::MetricKind;
 
 use crate::error::{Error, Result};
 use crate::handler::quant::Quant;
 
-/// Distance metric. Restricted per quantization by [`Metric::check_quant`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Metric {
     Cos,

@@ -1,5 +1,3 @@
-//! The Map item behind an index: probing it, creating it, dropping it.
-
 use std::os::raw::c_void;
 use std::ptr;
 
@@ -7,18 +5,9 @@ use super::Store;
 use super::error::{Result, StoreError, as_int, check};
 use crate::engine_api::{ENGINE_ITEM_ATTR_ATTR_FLAGS, ENGINE_ITEM_TYPE_ITEM_TYPE_MAP, item_attr};
 
-/// Item flags marking a Map as ours: `"AV"`, and nothing else.
-///
-/// A hint, never an authority — a client can set any flags through
-/// `mop create <key> <flags> …` — so this only answers "plausibly ours?" cheaply,
-/// before the metadata element decides.
-///
-/// Neither this nor an element carries a format version. Adding one is what a
-/// change to the stored layout would need, and it has to ship *first*: a build
-/// with no version reads a newer Map, fails, and judges it damaged.
+/// A hint, never an authority — a client can set any flags, and nothing carries a format version yet, so adding one has to ship before any layout change.
 pub const INDEX_FLAGS: u32 = 0x4156_0000;
 
-/// What a Map looks like from the outside, before any element is read.
 #[derive(Clone, Copy, Debug)]
 pub struct MapProbe {
     pub is_map: bool,
@@ -28,7 +17,6 @@ pub struct MapProbe {
 }
 
 impl MapProbe {
-    /// Whether this is plausibly ours. A hint; the metadata element decides.
     pub fn looks_like_index(&self) -> bool {
         self.is_map && self.flags == INDEX_FLAGS
     }
@@ -40,8 +28,7 @@ impl Store {
         let Some(getattr) = self.vtable().getattr else {
             return Err(StoreError::Unavailable);
         };
-        // SAFETY: `key`, `ids` and `attr` all outlive the call, and the engine
-        // fills `attr` for the ids it is given.
+        // SAFETY: `key`, `ids` and `attr` outlive the call.
         let (code, attr) = unsafe {
             let mut ids = [ENGINE_ITEM_ATTR_ATTR_FLAGS];
             let mut attr: item_attr = std::mem::zeroed();
@@ -70,8 +57,7 @@ impl Store {
         let Some(create) = self.vtable().map_struct_create else {
             return Err(StoreError::Unavailable);
         };
-        // SAFETY: all-zero is a valid item_attr; the engine reads the fields we
-        // set plus the zeroed defaults.
+        // SAFETY: all-zero is a valid `item_attr`.
         let mut attr: item_attr = unsafe { std::mem::zeroed() };
         attr.readable = 1;
         attr.flags = INDEX_FLAGS;

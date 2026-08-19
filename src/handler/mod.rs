@@ -1,8 +1,3 @@
-//! Command handlers, one module per group, plus the access check they share.
-//!
-//! Every handler returns `Result<Reply>`; turning that into an ASCII response is
-//! [`crate::server::Responder::reply`]'s job.
-
 pub mod arcus;
 pub mod quant;
 #[cfg(recovery)]
@@ -27,13 +22,10 @@ use crate::command::Request;
 use crate::command::request::{Body, Line};
 use crate::error::{Error, Reply, Result};
 
-/// Engine access for the callback currently running.
-///
 /// # Safety
 ///
 /// `cookie` must be the cookie memcached passed to that callback.
 unsafe fn store_for(cookie: *const c_void) -> Result<Store> {
-    // SAFETY: guaranteed by the caller.
     unsafe { Store::for_cookie(cookie) }.ok_or_else(|| {
         // A refusal means the load-time ABI check rejected this pairing.
         Error::Store(if arcus::abi::refused() {
@@ -44,20 +36,15 @@ unsafe fn store_for(cookie: *const c_void) -> Result<Store> {
     })
 }
 
-/// Run one parsed command.
-///
 /// # Safety
 ///
-/// `cookie` must be the connection cookie of the `execute` call being served.
+/// `cookie` must be the `execute` call's connection cookie.
 pub unsafe fn run(cookie: *const c_void, request: Request) -> Result<Reply> {
-    // A misaligned vtable was caught mid-call. Nothing the engine reports after
-    // that can be trusted — including "this element is missing", which the
-    // recovery path would otherwise read as damage and answer by deleting a Map.
+    // A misaligned vtable was caught: nothing the engine reports can be trusted, "this element is missing" least of all.
     if arcus::abi::mismatched() {
         return Err(Error::Store(StoreError::AbiMismatch));
     }
 
-    // SAFETY: guaranteed by the caller.
     let store = &unsafe { store_for(cookie) }?;
 
     match request {

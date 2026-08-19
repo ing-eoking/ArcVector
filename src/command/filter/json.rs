@@ -1,5 +1,3 @@
-//! Reading one field out of a flat JSON object, without allocating.
-
 #[derive(Debug, PartialEq)]
 pub(super) enum JsonVal<'a> {
     Str(&'a [u8]),
@@ -166,7 +164,6 @@ mod tests {
 
     #[test]
     fn lookup_does_not_match_a_key_prefix() {
-        // "ca" must not match the key "cat".
         assert_eq!(lookup(DOC, b"ca"), None);
         assert_eq!(lookup(DOC, b"catx"), None);
     }

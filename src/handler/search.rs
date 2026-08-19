@@ -1,7 +1,3 @@
-//! `vsim`, in both its forms: by query vector and by stored id.
-//!
-//! The graph proposes candidates and Map disposes of them.
-
 use std::cell::RefCell;
 use std::fmt::Write as _;
 
@@ -15,7 +11,6 @@ use crate::handler::arcus::engine::{Store, StoreError};
 use crate::handler::quant;
 use crate::handler::registry::VectorIndex;
 
-/// One similarity search, appended to `out` as a `QUERY` group.
 fn similar(
     store: &Store,
     index: &VectorIndex,

@@ -1,8 +1,5 @@
 //! Metadata filter expressions, evaluated against the stored ATTR region.
 //!
-//! Compiled once per query, evaluated once per visited graph node, and therefore
-//! allocation-free.
-//!
 //! ```text
 //! expr  := term (OR term)*
 //! term  := cond (AND cond)*
@@ -100,7 +97,6 @@ impl Filter {
         Ok(Self { terms })
     }
 
-    /// Evaluate against a raw JSON object.
     pub fn matches(&self, json: &[u8]) -> bool {
         self.terms
             .iter()
@@ -307,7 +303,6 @@ mod tests {
     fn keywords_are_case_insensitive_but_not_prefixes() {
         assert!(m("cat = tech and lang = ko"));
         assert!(m("cat = sports or lang = ko"));
-        // A field named ANDROID must not be read as the AND keyword.
         let f = Filter::parse("ANDROID = 1").unwrap();
         assert!(f.matches(br#"{"ANDROID":1}"#));
     }
@@ -359,7 +354,6 @@ mod tests {
     fn lookup_skips_nested_values() {
         let doc = br#"{"a":{"b":1,"c":[1,2,{"d":3}]},"z":9}"#;
         assert_eq!(lookup(doc, b"z"), Some(JsonVal::Num(9.0)));
-        // Nested containers are not addressable, but must not derail the scan.
         assert_eq!(lookup(doc, b"a"), None);
     }
 
@@ -396,7 +390,6 @@ mod tests {
 
     #[test]
     fn and_or_precedence() {
-        // AND binds tighter than OR.
         assert!(m("cat = sports AND lang = ko OR ts > 1"));
         assert!(!m("cat = sports AND lang = ko OR ts > 9999999999"));
         assert!(m("cat = tech AND lang = ko"));
@@ -405,7 +398,6 @@ mod tests {
 
     #[test]
     fn missing_field_is_always_false_even_for_ne() {
-        // Otherwise `nope != x` would silently pass for every document.
         assert!(!m("nope = x"));
         assert!(!m("nope != x"));
         assert!(!m("nope > 0"));

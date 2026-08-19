@@ -1,15 +1,9 @@
-//! One error type for every command path.
-//!
-//! Whether a failure is reported as `CLIENT_ERROR` or `SERVER_ERROR` follows from
-//! the error itself, so no call site has to decide.
-
 use std::fmt;
 
 use crate::command::filter::ParseError;
 use crate::handler::arcus::element::CodecError;
 use crate::handler::arcus::engine::StoreError;
 
-/// Who is at fault, which picks the ASCII error prefix.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Blame {
     Client,
@@ -27,9 +21,7 @@ impl Blame {
 
 #[derive(Debug)]
 pub enum Error {
-    /// Malformed command line, out-of-range argument, unusable payload.
     BadRequest(String),
-    /// No such index in the registry.
     NoSuchIndex,
     /// The Map backing the index was evicted or expired out from under us.
     IndexEvicted,
@@ -38,7 +30,6 @@ pub enum Error {
     Codec(CodecError),
     Filter(ParseError),
     Store(StoreError),
-    /// usearch reported a failure.
     Index(String),
 }
 
@@ -109,7 +100,6 @@ impl From<StoreError> for Error {
     }
 }
 
-/// A successful command result, ready to be written to the connection.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Reply {
     Created,
@@ -155,7 +145,6 @@ mod tests {
         assert_eq!(Error::bad_request("nope").blame(), Blame::Client);
         assert_eq!(Error::NoSuchIndex.blame(), Blame::Client);
         assert_eq!(Error::Filter(ParseError::Empty).blame(), Blame::Client);
-        // Oversized ATTR: the client sent it.
         assert_eq!(
             Error::Codec(CodecError::AttrTooLarge {
                 limit: 128,
@@ -168,7 +157,6 @@ mod tests {
 
     #[test]
     fn corrupt_stored_data_is_blamed_on_the_server() {
-        // A bad magic byte means what we stored is wrong, not what was sent.
         assert_eq!(
             Error::Codec(CodecError::LayoutMismatch).blame(),
             Blame::Server

@@ -1,8 +1,4 @@
-//! Checking that the bindings match the server that loaded us.
-//!
-//! `engine_interface_v1` is called by offset and arcus has no single layout, so a
-//! wrong pairing calls whatever function sits at the offset. `docs/내부구조.md` §11
-//! for what can be checked and why.
+//! `engine_interface_v1` is called by offset and arcus has no single layout, so a wrong pairing calls whatever sits there.
 
 use std::ffi::CStr;
 
@@ -62,20 +58,14 @@ pub fn version_is_ee(version: &str) -> bool {
     version.split('-').any(|part| part == "E")
 }
 
-/// The server's version string, or `None` if the server API does not offer one.
-///
 /// # Safety
 ///
-/// `server` must be the live `SERVER_HANDLE_V1` memcached returned from
-/// `get_server_api`.
+/// `server` must be the live `SERVER_HANDLE_V1` from `get_server_api`.
 pub unsafe fn server_version(server: *const SERVER_HANDLE_V1) -> Option<String> {
     if server.is_null() {
         return None;
     }
-    // SAFETY: caller guarantees `server` is live. `core` is member 2 of a struct
-    // whose leading members are identical in every arcus tree, and
-    // `server_version` is member 3 of `core` — both inside the stable prefix, so
-    // this call is safe even when the *engine* vtable is misaligned.
+    // SAFETY: `core` and `server_version` sit in the prefix identical in every tree, so this holds even when the engine vtable is misaligned.
     unsafe {
         let core = (*server).core;
         if core.is_null() {
@@ -116,11 +106,7 @@ pub fn refused() -> bool {
 static MISMATCH_REPORTED: std::sync::Once = std::sync::Once::new();
 static MISMATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether a call has behaved in a way only a misaligned vtable explains.
-///
-/// Latched, and never cleared: the vtable does not become correct later. Once it
-/// is set nothing the engine says can be trusted, which is why commands stop
-/// rather than act on what they read.
+/// Latched and never cleared: the vtable does not become correct later, so commands stop rather than act on what they read.
 pub fn mismatched() -> bool {
     MISMATCHED.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -142,16 +128,11 @@ pub fn report_mismatch(symptom: &str) {
     });
 }
 
-/// Report the pairing, and decide whether the vtable may be used.
-///
-/// `false` only on hard evidence: a required member the server left null.
-///
 /// # Safety
 ///
-/// `server` must be the live `SERVER_HANDLE_V1`, and `vt` the engine's own vtable.
+/// `server` is the live handle, `vt` the engine's vtable; `false` only on a null required member.
 pub unsafe fn verify(server: *const SERVER_HANDLE_V1, vt: &engine_interface_v1) -> bool {
     *CHECKED.get_or_init(|| {
-        // SAFETY: guaranteed by the caller.
         let version = unsafe { server_version(server) };
         if std::env::var_os("ARCVECTOR_ABI_DEBUG").is_some() {
             for name in REQUIRED {
@@ -215,9 +196,7 @@ mod tests {
         let text = built_for();
         assert!(text.contains("members"), "{text}");
         assert!(text.contains("headers="), "{text}");
-        // `types.h` defines SCAN_COMMAND, so a default build always carries it.
-        // ENABLE_REPLICATION comes from `configure`, so only the feature can put
-        // it there — which is the whole reason the feature exists.
+        // `types.h` always defines SCAN_COMMAND; ENABLE_REPLICATION can only come from the feature.
         if env!("ARCVECTOR_ABI_HEADERS") == "include" {
             assert!(text.contains("scan"), "{text}");
             assert_eq!(
@@ -230,9 +209,7 @@ mod tests {
 
     #[test]
     fn an_all_null_vtable_reports_every_required_member() {
-        // SAFETY: `engine_interface_v1` is all `Option<fn>` and raw values, so
-        // all-zero is a valid (if useless) instance — which is the point: it is
-        // what a badly misaligned read looks like.
+        // SAFETY: all-zero is a valid `engine_interface_v1` — which is the point: it is what a misaligned read looks like.
         let vt: engine_interface_v1 = unsafe { std::mem::zeroed() };
         assert_eq!(missing(&vt).len(), REQUIRED.len());
     }
@@ -255,8 +232,7 @@ mod tests {
 
     #[test]
     fn the_vendored_headers_name_their_tree() {
-        // Which tree is vendored is a deployment choice; what must hold is that
-        // the fingerprint names it, so a wrong pairing is legible in the log.
+        // Which tree is vendored is a deployment choice; the fingerprint just has to name it.
         let tree = env!("ARCVECTOR_ABI_TREE");
         assert!(tree == "ee" || tree == "oss", "{tree}");
         assert!(built_for().starts_with(tree), "{}", built_for());

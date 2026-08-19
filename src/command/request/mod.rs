@@ -1,5 +1,3 @@
-//! The vocabulary — one type per command, and nothing that touches a token.
-
 mod parse;
 
 pub use parse::{body_length_at, body_length_error, parse_body, parse_line};
@@ -10,8 +8,8 @@ use crate::Quant;
 use crate::error::{Error, Result};
 use crate::{ATTR_BYTES, Metric};
 
-/// Upper bound on one transferred body.
-pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// The body is a single vector, so 16 KB covers 4096 `f32` dimensions.
+pub const MAX_BODY_BYTES: usize = 16 * 1024;
 
 /// The commands this extension answers. Matched case-insensitively.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -45,12 +43,9 @@ impl Cmd {
     }
 }
 
-/// Where a `VSIM` gets its query coordinates.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SimSource {
-    /// Coordinates arrive in the body.
     Vector,
-    /// The query is a vector already stored under a key.
     Key,
 }
 
@@ -66,7 +61,6 @@ impl SimSource {
     }
 }
 
-/// Index geometry and tuning from a `vcreate` line.
 #[derive(Clone, Copy, Debug)]
 pub struct Create<'a> {
     pub index: &'a str,
@@ -96,7 +90,6 @@ impl Create<'_> {
     }
 }
 
-/// A `VSIM KEY` query.
 #[derive(Debug)]
 pub struct SimKey<'a> {
     pub index: &'a str,
@@ -105,7 +98,6 @@ pub struct SimKey<'a> {
     pub filter: Option<Filter>,
 }
 
-/// A request fully determined by its command line.
 #[derive(Debug)]
 pub enum Line<'a> {
     Create(Create<'a>),
@@ -117,7 +109,6 @@ pub enum Line<'a> {
     Stats,
 }
 
-/// A `vadd` line, awaiting its coordinates.
 #[derive(Debug)]
 pub struct Add {
     pub index: String,
@@ -127,7 +118,6 @@ pub struct Add {
     pub attr: Vec<u8>,
 }
 
-/// A `VSIM VECTOR` line, awaiting its coordinates.
 #[derive(Debug)]
 pub struct Sim {
     pub index: String,
@@ -136,7 +126,6 @@ pub struct Sim {
     pub filter: Option<Filter>,
 }
 
-/// A request whose body has still to arrive.
 #[derive(Debug)]
 pub enum Body {
     Add(Add),

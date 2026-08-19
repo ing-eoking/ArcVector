@@ -1,8 +1,3 @@
-//! Commands that act on one vector, named by its id.
-//!
-//! The two that write do so Map first and the graph second, so a failure between
-//! them loses a cache entry rather than data.
-
 use super::access::{for_read, for_write};
 use super::coords::coords;
 use super::registry;
@@ -71,7 +66,6 @@ fn check_attr(attr: &[u8]) -> Result<()> {
     }
 }
 
-/// Re-check the element size against the engine's current limit.
 fn check_still_fits(store: &Store, layout: Layout) -> Result<()> {
     let limit = store.max_element_bytes() as usize;
     if layout.stored_len() <= limit {

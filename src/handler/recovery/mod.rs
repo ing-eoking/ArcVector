@@ -1,15 +1,4 @@
-//! Noticing that a graph no longer describes its Map, and rebuilding it.
-//!
-//! [`metadata`] is the reserved Map element this rests on: it carries the metric
-//! and HNSW parameters a graph is rebuilt from, and the `owner` token that says
-//! whose graph is current.
-//!
-//! Refilling happens on a thread that never writes.
-//!
-//! A worker stamps [`super::REBUILDING`] and queues the name; the thread reads
-//! Map and refills; the next worker command stamps a fresh token. The split is
-//! forced by the engine — a write from a connectionless thread reaches
-//! `do_check_master_switchover_done`, which dereferences the cookie.
+//! A worker queues the name, a connectionless thread refills, the next command stamps a fresh token — that thread must never write, since the engine derefs the cookie.
 
 use std::sync::{Condvar, LazyLock, Mutex, PoisonError};
 
@@ -36,16 +25,13 @@ pub fn take_over(store: &Store, index: &VectorIndex) -> Result<()> {
     }
 
     if let Err(e) = index.ann.begin_rebuild() {
-        // The Map says rebuilding and this node cannot do it, so drop the entry
-        // rather than leave one that claims a graph it does not have.
+        // The Map says rebuilding and this node cannot do it, so drop the entry.
         remove(&index.name);
         return Err(e);
     }
     BUILDER.enqueue(&index.name);
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
 
 /// Asleep until there is work; no polling.
 struct Builder {
@@ -87,7 +73,6 @@ static BUILDER: LazyLock<Builder> = LazyLock::new(|| {
     }
 });
 
-/// Start the rebuild thread if it is not already running.
 pub fn ensure_builder() {
     LazyLock::force(&BUILDER);
 }

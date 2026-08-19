@@ -1,38 +1,13 @@
 //! Harness for driving a real arcus server with the extension loaded.
 //!
-//! The server and engine come from the environment, with no default path:
-//!
 //! ```text
 //! ARCVECTOR_MEMCACHED        path to the memcached binary       (required)
 //! ARCVECTOR_ENGINE           path to default_engine.so          (required)
 //! ARCVECTOR_MEMCACHED_ARGS   extra server arguments, space separated
 //! ```
 //!
-//! Required rather than defaulted, because guessing at a path in the working tree
-//! makes the suite depend on whatever happens to be lying there — which differs
-//! per machine and is not something this crate builds. `make test` supplies both
-//! in a container; see `docker/README.md`.
-//!
-//! Building this target at all means the `integration` feature was requested,
-//! which asserts a server is reachable. So an unset variable **fails** here. There
-//! is no skip path left: a test that reports success without running is the one
-//! failure mode this suite has already had twice.
-//!
-//! `ARCVECTOR_MEMCACHED_ARGS` exists because memcached refuses to run as root
-//! without `-u`, which containers hit and workstations do not. The environment
-//! that needs it declares it, rather than the harness guessing at a uid.
-//!
-//! When either is **missing** the tests skip: those artifacts come from building
-//! arcus-memcached, which is not part of this crate's build. When they are present
-//! but the server will not come up, or comes up without our extension registered,
-//! the tests **fail** — a setup that cannot answer is a broken run, not an absent
-//! one. Conflating the two once turned a container that shipped a placeholder
-//! library into a green suite.
-//!
-//! Each test gets its own server on its own **unix socket**. Sockets rather than
-//! TCP ports because tests run in parallel: allocating a free port and then
-//! spawning leaves a window in which another test can take it, and the server that
-//! loses exits, which showed up as connections being refused mid-suite.
+//! An unset variable panics rather than skips, and each test gets its own server
+//! on its own unix socket so parallel runs cannot collide.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -42,7 +17,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-/// Reply lines that end a response, so a read knows when to stop.
 const TERMINATORS: [&str; 8] = [
     "END\r\n",
     "STORED\r\n",
@@ -66,10 +40,7 @@ fn from_env(var: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// The `cdylib` this crate built.
-///
-/// The test binary lives in `target/<profile>/deps/`, so the library is two
-/// directories up. Cargo does not hand integration tests the artifact path.
+/// The test binary lives in `target/<profile>/deps/`, so the cdylib is two directories up.
 fn extension() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?.parent()?;
@@ -98,12 +69,7 @@ fn newest_mtime(dir: &Path) -> Option<SystemTime> {
     newest
 }
 
-/// Refuse to run against a library older than the sources.
-///
-/// `cargo test` builds the rlib the harness links against but **not** the
-/// `cdylib` the server loads, so without this check a stale library would be
-/// silently verified. Panics rather than skips: a stale result is a wrong result,
-/// not a missing one.
+/// `cargo test` does not rebuild the cdylib the server loads, so a stale one must panic, not skip.
 fn assert_fresh(module: &Path) {
     let Ok(built) = module.metadata().and_then(|m| m.modified()) else {
         return;
@@ -129,7 +95,6 @@ fn assert_fresh(module: &Path) {
     );
 }
 
-/// A server with the extension loaded, stopped and cleaned up on drop.
 pub struct Server {
     child: Child,
     socket: PathBuf,
@@ -137,7 +102,6 @@ pub struct Server {
 }
 
 impl Server {
-    /// Start a server, failing with the reason if that is not possible.
     pub fn start() -> Self {
         let (Some(memcached), Some(engine)) = (
             from_env("ARCVECTOR_MEMCACHED"),
@@ -163,8 +127,7 @@ impl Server {
         };
         assert_fresh(&module);
 
-        // Short path: the sun_path field is about 104 bytes on macOS, and the
-        // system temp dir can be long enough to matter.
+        // `sun_path` is about 104 bytes on macOS, and the temp dir can be long enough to matter.
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let socket = PathBuf::from(format!(
             "/tmp/arcv-{}-{}.sock",
@@ -174,9 +137,7 @@ impl Server {
         let log = socket.with_extension("log");
         let _ = std::fs::remove_file(&socket);
 
-        // Diagnostics go to a file rather than a pipe: nothing has to drain it, so
-        // a chatty server cannot block on a full pipe buffer, and the text is
-        // available whenever a failure needs to explain itself.
+        // A file rather than a pipe: nothing has to drain it, so a chatty server cannot block.
         let child = Command::new(&memcached)
             .args(["-E".as_ref(), engine.as_os_str()])
             .args(["-X".as_ref(), module.as_os_str()])
@@ -195,7 +156,6 @@ impl Server {
         server
     }
 
-    /// Wait for the socket, failing with the server's own diagnostics if it dies.
     fn wait_until_listening(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
@@ -217,11 +177,6 @@ impl Server {
         );
     }
 
-    /// A listening server is not enough — it has to have loaded *our* extension.
-    ///
-    /// Without this a library missing `memcached_extensions_initialize` produced a
-    /// server that answered everything with `ERROR`, and every test skipped and
-    /// reported success.
     fn assert_extension_registered(&self, module: &Path) {
         let reply = self.connect().send("vlist");
         assert!(
@@ -258,7 +213,6 @@ impl Drop for Server {
     }
 }
 
-/// Server arguments the environment adds, such as the `-u` a root container needs.
 fn extra_args() -> Vec<String> {
     std::env::var("ARCVECTOR_MEMCACHED_ARGS")
         .unwrap_or_default()
@@ -267,8 +221,7 @@ fn extra_args() -> Vec<String> {
         .collect()
 }
 
-/// Explain an absent prerequisite. Building this target asked for a server, so
-/// not having one is a failure, not something to pass over quietly.
+/// Building this target asked for a server, so not having one is a failure.
 fn missing(reason: &str) -> String {
     format!(
         "{reason}.\n\
@@ -277,34 +230,26 @@ fn missing(reason: &str) -> String {
     )
 }
 
-/// One connection, speaking the ASCII protocol.
 pub struct Client {
     stream: UnixStream,
 }
 
 impl Client {
-    /// Send a command line and read the whole reply.
     pub fn send(&mut self, line: &str) -> String {
         self.write(&format!("{line}\r\n"));
         self.read_reply()
     }
 
-    /// Send a command line plus a body, as the two-phase commands need.
     pub fn send_body(&mut self, line: &str, body: &str) -> String {
         self.write(&format!("{line}\r\n{body}\r\n"));
         self.read_reply()
     }
 
-    /// `vadd`, with `veclen` derived from the coordinates actually sent.
-    ///
-    /// Every length in this protocol is a chance to miscount, and a test that
-    /// miscounts tests the wrong thing. Tests that *want* a wrong length call
-    /// [`Client::send_body`] directly.
+    /// Tests that *want* a wrong length call [`Client::send_body`] directly.
     pub fn vadd(&mut self, index: &str, id: &str, dim: usize, coords: &str) -> String {
         self.send_body(&format!("vadd {index} {id} {} {dim}", coords.len()), coords)
     }
 
-    /// `vadd` with attributes, both lengths derived.
     pub fn vadd_attr(
         &mut self,
         index: &str,
@@ -323,7 +268,6 @@ impl Client {
         )
     }
 
-    /// `VSIM VECTOR`, with the body byte count derived from the coordinates.
     pub fn vsim(&mut self, index: &str, k: usize, dim: usize, coords: &str) -> String {
         self.send_body(
             &format!("VSIM VECTOR {index} {k} {} {dim}", coords.len()),
@@ -331,7 +275,6 @@ impl Client {
         )
     }
 
-    /// `VSIM VECTOR` with a filter clause appended.
     pub fn vsim_filter(
         &mut self,
         index: &str,
@@ -351,12 +294,7 @@ impl Client {
         )
     }
 
-    /// Read and discard whatever is still buffered.
-    ///
-    /// A body length that disagrees with what was sent leaves the surplus bytes in
-    /// the stream, and memcached answers them as one more (nonsense) command. That
-    /// stray line is inherent to a length-prefixed protocol — memcached's own
-    /// `set` behaves the same way — so a test that provokes it drains it here.
+    /// A wrong body length leaves surplus bytes that memcached answers as one more command.
     pub fn drain(&mut self) {
         let previous = self.stream.read_timeout().ok().flatten();
         let _ = self
@@ -398,10 +336,7 @@ impl Client {
     }
 }
 
-/// Has a complete reply been read?
-///
-/// Every reply ends with one of the fixed status lines or with an error line, so
-/// this does not have to understand the bodies in between.
+/// Every reply ends in a fixed status or error line, so the bodies need no parsing.
 fn is_complete(reply: &str) -> bool {
     if TERMINATORS.iter().any(|t| reply.ends_with(t)) {
         return true;
@@ -415,7 +350,6 @@ fn is_complete(reply: &str) -> bool {
     ERROR_PREFIXES.iter().any(|p| last.starts_with(p))
 }
 
-/// A distinct index name per test, so a shared server could never confuse them.
 pub fn index_name(test: &str) -> String {
     format!("it-{test}")
 }

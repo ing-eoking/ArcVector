@@ -1,5 +1,4 @@
-//! The `String` ↔ `u64` mapping usearch needs, and the deletes a rebuild must
-//! not undo.
+//! The `String` ↔ `u64` mapping usearch needs, and the deletes a rebuild must not undo.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -48,13 +47,11 @@ impl IdMap {
         Some(key)
     }
 
-    /// Whether a rebuild should leave this id alone: already present, or deleted
-    /// by the live path since the rebuild began.
+    /// Whether a rebuild should leave this id alone: already present, or deleted since it began.
     pub(super) fn is_known(&self, id: &str) -> bool {
         self.by_id.contains_key(id) || self.tombstones.contains(id)
     }
 
-    /// Module memory held by this mapping.
     pub(super) fn bytes(&self) -> usize {
         const ARC_HEADER: usize = 16; // strong + weak counts
         let per_entry = size_of::<u64>() + size_of::<Arc<str>>();

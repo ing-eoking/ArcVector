@@ -1,7 +1,4 @@
-//! Reading a tokenized command line.
-//!
-//! The only module that touches memcached's token array. Writing the response
-//! back is [`crate::server::Responder`]'s job.
+//! The only module that touches memcached's token array.
 
 use std::os::raw::c_int;
 use std::str::FromStr;
@@ -24,7 +21,6 @@ impl<'a> Tokens<'a> {
         let tokens = if len == 0 {
             &[][..]
         } else {
-            // SAFETY: guaranteed by the caller.
             unsafe { std::slice::from_raw_parts(argv, len) }
         };
         Tokens { tokens }
@@ -51,13 +47,11 @@ impl<'a> Tokens<'a> {
         if token.value.is_null() || token.length == 0 {
             return Ok("");
         }
-        // SAFETY: the token points to `length` bytes of the connection buffer,
-        // which outlives `'a`.
+        // SAFETY: the token points into the connection buffer, which outlives `'a`.
         let bytes = unsafe { std::slice::from_raw_parts(token.value.cast::<u8>(), token.length) };
         std::str::from_utf8(bytes).map_err(|_| Error::bad_request("argument is not valid UTF-8"))
     }
 
-    /// Parse token `i`, naming it in the error message.
     pub fn parse<T: FromStr>(&self, i: usize, what: &str) -> Result<T> {
         let raw = self.text(i)?;
         raw.parse::<T>()
@@ -128,7 +122,6 @@ mod tests {
         let t = unsafe { Tokens::new(ptr::null(), 0) };
         assert!(t.is_empty());
         assert_eq!(t.command(), None);
-        // A negative argc must read as empty rather than wrapping.
         let t = unsafe { Tokens::new(ptr::null(), -1) };
         assert!(t.is_empty());
     }

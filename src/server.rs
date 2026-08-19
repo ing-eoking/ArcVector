@@ -1,10 +1,4 @@
-//! The host memcached gives an extension: `SERVER_HANDLE_V1`.
-//!
-//! Not the storage engine — that is [`crate::handler::arcus::engine`], reached
-//! *through* this handle. What lives here is the accessor itself and the host
-//! calls that belong to a connection rather than to storage: the one pointer
-//! memcached keeps per `conn`, and the callback that writes a response back to
-//! it. Every unsafe call into the host with a connection cookie is in this file.
+//! The host handle memcached gives an extension, and the per-connection calls that reach through it.
 
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::OnceLock;
@@ -22,8 +16,7 @@ pub fn set_api(f: unsafe extern "C" fn() -> *mut SERVER_HANDLE_V1) {
 /// The host handle, or null before the extension has been initialized.
 pub fn handle() -> *mut SERVER_HANDLE_V1 {
     match GET_SERVER_API.get() {
-        // SAFETY: memcached handed us this function pointer during extension
-        // initialization and it stays valid for the process lifetime.
+        // SAFETY: memcached's accessor stays valid for the process lifetime.
         Some(get_api) => unsafe { get_api() },
         None => std::ptr::null_mut(),
     }
@@ -39,19 +32,9 @@ fn core() -> *const SERVER_CORE_API {
     unsafe { (*server).core }
 }
 
-/// Hang one pointer off a connection, replacing whatever was there.
-///
-/// memcached keeps a single `void *` per `conn` for this. It is nominally the
-/// storage engine's, and no arcus engine in either tree touches it — the field is
-/// written and read only through these two calls.
-///
 /// # Safety
 ///
-/// `cookie` must be a live connection cookie, and `data` either null or a pointer
-/// this crate owns and will reclaim through [`take_conn_state`].
-///
-/// Returns whether the host took it. `false` means there is no host — the
-/// extension has not been initialized — and the caller still owns `data`.
+/// live `cookie`; `data` null or ours to reclaim via [`take_conn_state`]. `false` means no host, and the caller still owns `data`.
 pub unsafe fn store_conn_state(cookie: *const c_void, data: *mut c_void) -> bool {
     let core = core();
     if core.is_null() {
@@ -69,11 +52,9 @@ pub unsafe fn store_conn_state(cookie: *const c_void, data: *mut c_void) -> bool
     }
 }
 
-/// Take back what [`store_conn_state`] left, clearing the slot.
-///
 /// # Safety
 ///
-/// `cookie` must be a live connection cookie.
+/// `cookie` must be a live connection cookie. Clears the slot.
 pub unsafe fn take_conn_state(cookie: *const c_void) -> *mut c_void {
     let core = core();
     if core.is_null() {
@@ -96,11 +77,7 @@ pub unsafe fn take_conn_state(cookie: *const c_void) -> *mut c_void {
 pub type ResponseHandler =
     Option<unsafe extern "C" fn(*const c_void, c_int, *const c_char) -> bool>;
 
-/// One response, written to the connection the command arrived on.
-///
-/// Unlike the per-connection slot above, the handler is not part of
-/// `SERVER_CORE_API`: memcached passes it as an argument to `execute`, so a
-/// responder is only good for the call it was built in.
+/// The handler is `execute`'s argument, not part of `SERVER_CORE_API`, so a responder is good for one call only.
 pub struct Responder {
     handler: ResponseHandler,
     cookie: *const c_void,

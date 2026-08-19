@@ -1,7 +1,3 @@
-//! Where a vector's bytes sit inside a stored element.
-//!
-//! Pure: no engine, no index, no server. `docs/내부구조.md` §4.
-
 use crate::handler::quant::Quant;
 
 const HEADER_LEN: usize = 2;
@@ -17,26 +13,12 @@ pub const ATTR_BYTES: usize = 128;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CodecError {
-    /// The metadata JSON is absent, unparsable, or missing a field.
     BadMetadata(String),
     UnknownQuant(u8),
-    /// Buffer shorter than the layout requires.
-    Truncated {
-        need: usize,
-        got: usize,
-    },
-    /// Header disagrees with the index's declared layout.
+    Truncated { need: usize, got: usize },
     LayoutMismatch,
-    /// Attribute JSON longer than the fixed ATTR region.
-    AttrTooLarge {
-        limit: usize,
-        got: usize,
-    },
-    /// Vector byte count disagrees with `dim` and `quant`.
-    VectorLenMismatch {
-        need: usize,
-        got: usize,
-    },
+    AttrTooLarge { limit: usize, got: usize },
+    VectorLenMismatch { need: usize, got: usize },
 }
 
 impl std::error::Error for CodecError {}
@@ -60,7 +42,6 @@ impl std::fmt::Display for CodecError {
     }
 }
 
-/// Fixed geometry of every element in one index.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Layout {
     pub dim: usize,
@@ -122,8 +103,6 @@ impl Layout {
         Ok(buf)
     }
 
-    /// Borrow the attribute and vector regions out of a stored element value.
-    ///
     /// Every offset comes from `self`; the header is read only for `alen`.
     pub fn decode<'a>(&self, buf: &'a [u8]) -> Result<Element<'a>, CodecError> {
         let head = parse_header(buf)?;
@@ -193,8 +172,7 @@ pub fn mint_owner() -> u64 {
 }
 
 impl MetaRecord {
-    /// Serialize into the element value, which is **entirely JSON** — no header,
-    /// so neither a constant offset nor the 128-byte ATTR ceiling applies.
+    /// The value is **entirely JSON** — no header, so no constant offset and no ATTR ceiling.
     pub fn encode(&self, layout: Layout) -> Vec<u8> {
         format!(
             r#"{{"dim":{},"quant":"{}","metric":"{}","m":{},"efc":{},"efs":{},"owner":"{:016x}"}}"#,
@@ -209,7 +187,6 @@ impl MetaRecord {
         .into_bytes()
     }
 
-    /// Read one back, along with the layout it records.
     pub fn decode(buf: &[u8]) -> Result<(Self, Layout), CodecError> {
         let json: serde_json::Value =
             serde_json::from_slice(buf).map_err(|e| CodecError::BadMetadata(e.to_string()))?;
@@ -266,15 +243,12 @@ mod tests {
     use super::*;
     use crate::handler::quant::encode;
 
-    // -- scalar kinds and conversion ----------------------------------------
-
     #[test]
     fn vector_bytes_matches_scalar_width() {
         assert_eq!(Quant::F32.vector_bytes(1024), 4096);
         assert_eq!(Quant::F16.vector_bytes(1024), 2048);
         assert_eq!(Quant::I8.vector_bytes(1024), 1024);
         assert_eq!(Quant::B1.vector_bytes(1024), 128);
-        // Non-multiple-of-8 dimensions round up to whole bytes.
         assert_eq!(Quant::B1.vector_bytes(1), 1);
         assert_eq!(Quant::B1.vector_bytes(9), 2);
     }
@@ -293,8 +267,6 @@ mod tests {
         }
     }
 
-    // -- element layout -----------------------------------------------------
-
     fn layout() -> Layout {
         Layout::new(4, Quant::I8)
     }
@@ -304,7 +276,6 @@ mod tests {
         assert_eq!(ATTR_OFFSET, 2);
         assert_eq!(Layout::VECTOR_OFFSET, 130);
 
-        // It must not move with dim or quant — that is the whole point.
         for dim in [1usize, 128, 4096] {
             for q in [Quant::F32, Quant::F16, Quant::I8, Quant::B1] {
                 let l = Layout::new(dim, q);
@@ -324,9 +295,7 @@ mod tests {
         }
     }
 
-    /// Elements written before this module accounted for [`Layout::STORED_TERMINATOR`]
-    /// are two bytes shorter, and a rebuild only gets to rewrite them if it can
-    /// read them first.
+    /// Elements written before [`Layout::STORED_TERMINATOR`] are two bytes shorter, and a rebuild has to read them first.
     #[test]
     fn decode_accepts_an_element_with_or_without_the_terminator() {
         let l = Layout::new(4, Quant::F32);
@@ -344,7 +313,6 @@ mod tests {
         assert_eq!(from_bare.attr, from_terminated.attr);
         assert_eq!(from_bare.vector, &vector[..]);
 
-        // One byte short of the payload is still a truncation, terminator or not.
         assert!(matches!(
             l.decode(&bare[..bare.len() - 1]),
             Err(CodecError::Truncated { .. })
@@ -378,8 +346,7 @@ mod tests {
     fn the_attr_region_is_zero_padded() {
         let l = layout();
         let buf = l.encode(&[9, 9, 9, 9], b"{}").unwrap();
-        // Only `alen` bytes are meaningful; the rest of the region must be zeroed
-        // so bytes from an earlier, longer value can never leak.
+        // The region past `alen` must be zeroed so an earlier, longer value cannot leak.
         assert!(
             buf[ATTR_OFFSET + 2..Layout::VECTOR_OFFSET]
                 .iter()
@@ -467,8 +434,7 @@ mod tests {
 
     #[test]
     fn attr_of_survives_a_truncated_vector_tail() {
-        // The predicate only needs attributes, so a damaged tail must not stop it
-        // from making a decision.
+        // The predicate only needs attributes, so a damaged tail must not stop it.
         let l = layout();
         let good = l.encode(&[0, 0, 0, 0], b"{}").unwrap();
         let short = &good[..Layout::VECTOR_OFFSET];
@@ -496,8 +462,7 @@ mod tests {
     fn max_dim_for_handles_a_budget_below_the_fixed_overhead() {
         assert_eq!(Layout::max_dim_for(Quant::I8, 16), 0);
         assert_eq!(Layout::max_dim_for(Quant::I8, Layout::VECTOR_OFFSET), 0);
-        // The terminator is part of the budget, so one byte past the vector
-        // offset still leaves no room for a coordinate.
+        // The terminator is in the budget, so one byte past the vector offset leaves no room.
         assert_eq!(
             Layout::max_dim_for(Quant::I8, Layout::VECTOR_OFFSET + Layout::STORED_TERMINATOR),
             0

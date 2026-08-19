@@ -1,8 +1,3 @@
-//! How one coordinate is represented, and the bytes it becomes.
-//!
-//! Discriminants are persisted in the element header, so they are part of the
-//! on-disk format. Pure: no engine, no index, no server.
-
 /// Scalar kind of a stored vector. Persisted in the header — never renumber.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -215,9 +210,7 @@ mod tests {
             f16_bits_to_f32(f32_to_f16_bits(f32::INFINITY)),
             f32::INFINITY
         );
-        // Beyond f16's max finite value, so it must saturate to infinity.
         assert_eq!(f16_bits_to_f32(f32_to_f16_bits(1.0e30)), f32::INFINITY);
-        // Far below f16's smallest subnormal, so it must flush to zero.
         assert_eq!(f16_bits_to_f32(f32_to_f16_bits(1.0e-30)), 0.0);
     }
 
@@ -233,12 +226,10 @@ mod tests {
 
     #[test]
     fn i8_normalizes_before_scaling() {
-        // A unit vector along one axis maps that axis to full scale.
         let bytes = encode(&[1.0, 0.0, 0.0], Quant::I8);
         assert_eq!(bytes[0] as i8, 127);
         assert_eq!(bytes[1] as i8, 0);
 
-        // Magnitude is discarded: scaling the input must not change the output.
         let a = encode(&[3.0, 4.0], Quant::I8);
         let b = encode(&[30.0, 40.0], Quant::I8);
         assert_eq!(a, b);
@@ -252,7 +243,6 @@ mod tests {
 
     #[test]
     fn b1_packs_lsb_first() {
-        // Bit i lives at byte i/8, bit position i%8 — usearch's b1x8 convention.
         let bytes = encode(&[1.0, -1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], Quant::B1);
         assert_eq!(bytes.len(), 2);
         assert_eq!(bytes[0], 0b0000_0101);

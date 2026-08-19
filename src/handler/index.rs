@@ -1,5 +1,3 @@
-//! Commands that act on an index as a whole.
-
 use std::fmt::Write as _;
 
 #[cfg(recovery)]
@@ -32,8 +30,7 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
             resolve(store, name)?;
             return Ok(Reply::Exists);
         }
-        // Nothing here can rebuild an index from it, and guessing would either
-        // destroy it or serve an empty graph. Name the situation instead.
+        // Nothing can rebuild from it, and guessing would destroy it or serve an empty graph.
         #[cfg(not(recovery))]
         return Err(Error::bad_request(format!(
             "a Map already exists at '{name}' and this build cannot rebuild an \
@@ -73,7 +70,6 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
     })
 }
 
-/// Refuse a dimension whose element would exceed the engine's per-element limit.
 fn check_dimension_fits(store: &Store, layout: Layout, quant: Quant) -> Result<()> {
     let limit = store.max_element_bytes() as usize;
     if layout.stored_len() <= limit {
@@ -87,7 +83,6 @@ fn check_dimension_fits(store: &Store, layout: Layout, quant: Quant) -> Result<(
     )))
 }
 
-/// How large the Map must be for `maxcount` vectors.
 fn map_size_for(store: &Store, maxcount: Option<u32>) -> u32 {
     let ceiling = store.max_map_size();
     maxcount.unwrap_or(ceiling).saturating_add(1).min(ceiling)

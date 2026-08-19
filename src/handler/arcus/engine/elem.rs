@@ -1,5 +1,3 @@
-//! The elements inside a Map item — one per vector, keyed by its id.
-
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
@@ -17,7 +15,6 @@ unsafe extern "C" {
 const ITEM_TYPE_MAP: c_int = 3;
 
 impl Store {
-    /// Insert or replace one element.
     pub fn put_elem(&self, key: &str, field: &str, value: &[u8]) -> Result<()> {
         let vt = self.vtable();
         let (Some(alloc), Some(insert), Some(elem_free), Some(elem_info)) = (
@@ -43,8 +40,7 @@ impl Store {
             )
         })?;
 
-        // SAFETY: `item` came from a successful alloc, so its field and value
-        // regions exist with exactly the sizes requested above.
+        // SAFETY: `item` came from a successful alloc with exactly the sizes requested above.
         let filled = unsafe {
             let mut info: eitem_info = std::mem::zeroed();
             elem_info(
@@ -94,10 +90,7 @@ impl Store {
             )
         };
         check(code).inspect_err(|_| {
-            // SAFETY: the insert did not complete, so `item` never became part of
-            // the Map and is still ours to free. `check` is what decides that:
-            // EWOULDBLOCK means the element *is* linked, and freeing it there trips
-            // `assert(elem->linked == 0)` inside the engine.
+            // SAFETY: `item` never became part of the Map — EWOULDBLOCK means it *is* linked, and freeing it there trips `assert(elem->linked == 0)`.
             unsafe { elem_free(self.handle(), self.cookie, item) };
         })
     }
@@ -174,8 +167,7 @@ impl Store {
             )
         };
 
-        // Take ownership before the error check, so a partial result is released too.
-        // SAFETY: `result` is exactly what the call above wrote.
+        // SAFETY: `result` is what the call above wrote; taken before the error check so a partial result is released too.
         let elems = unsafe { Elems::new(self, &result) };
         check(code)?;
         let Some(items) = elems.as_slice() else {
@@ -185,8 +177,7 @@ impl Store {
         let views: Vec<(&[u8], &[u8])> = items
             .iter()
             .map(|item| {
-                // SAFETY: each entry is a live Map element held by our refcount,
-                // and get_elem_info reports the extents of its own storage.
+                // SAFETY: each entry is a live Map element held by our refcount.
                 unsafe {
                     let mut info: eitem_info = std::mem::zeroed();
                     elem_info(
@@ -247,12 +238,11 @@ impl Store {
 
 /// # Safety
 ///
-/// `ptr` must be null, or point to `len` initialized bytes that outlive `'a`.
+/// `ptr` is null, or `len` initialized bytes that outlive `'a`.
 unsafe fn slice_or_empty<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
     if ptr.is_null() || len == 0 {
         &[]
     } else {
-        // SAFETY: guaranteed by the caller.
         unsafe { std::slice::from_raw_parts(ptr, len) }
     }
 }
@@ -267,9 +257,7 @@ struct Elems<'a> {
 impl<'a> Elems<'a> {
     /// # Safety
     ///
-    /// `result` must be exactly what a `map_elem_get` call wrote, so `elem_array`
-    /// is null or an engine-allocated array of `elem_count` refcounted elements
-    /// that has not yet been released.
+    /// `result` must be exactly what a `map_elem_get` call wrote, not yet released.
     unsafe fn new(store: &'a Store, result: &elems_result) -> Self {
         Elems {
             store,
@@ -293,8 +281,7 @@ impl Drop for Elems<'_> {
             return;
         }
         if let Some(release) = self.store.vtable().map_elem_release {
-            // SAFETY: we hold the only reference to this array and each entry
-            // still carries the refcount `map_elem_get` took.
+            // SAFETY: we hold the only reference, and each entry still carries `map_elem_get`'s refcount.
             unsafe {
                 release(
                     self.store.handle(),
@@ -304,8 +291,7 @@ impl Drop for Elems<'_> {
                 );
             }
         }
-        // SAFETY: the array itself is plain malloc memory owned by the caller
-        // and is not freed anywhere else.
+        // SAFETY: the array is plain malloc memory owned by us and freed nowhere else.
         unsafe { free(self.array.cast::<c_void>()) };
     }
 }
@@ -317,8 +303,7 @@ mod tests {
     #[test]
     fn empty_slices_are_returned_for_null_or_zero_length() {
         let data = [1u8, 2, 3];
-        // SAFETY: a null pointer, and a valid pointer with zero length, are both
-        // handled without dereferencing; the third case reads 3 live bytes.
+        // SAFETY: null and zero-length are handled without dereferencing; the third case reads 3 live bytes.
         unsafe {
             assert!(slice_or_empty(ptr::null(), 8).is_empty());
             assert!(slice_or_empty(data.as_ptr(), 0).is_empty());

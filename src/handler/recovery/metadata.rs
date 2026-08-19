@@ -1,19 +1,11 @@
-//! The reserved Map element that says what an index is.
-
 use crate::error::{Error, Result};
 use crate::handler::arcus::element::{Layout, META_FIELD, MetaRecord};
 use crate::handler::arcus::engine::{Store, StoreError};
 use crate::handler::usearch::{AnnIndex, Metric, THREAD_SLOTS};
 
-/// Read an index's metadata element, or say why it cannot be used.
-///
-/// There is no "written by a newer build" answer here: nothing carries a version
-/// yet. The low half of [`INDEX_FLAGS`](crate::handler::arcus::engine::INDEX_FLAGS)
-/// is where one belongs — it is read through `getattr` before any element, so a
-/// Map a newer build wrote would fail `looks_like_index` and be left alone.
+/// Nothing carries a version yet; the low half of `INDEX_FLAGS` is where one belongs, read before any element.
 pub enum MetaState {
     Usable(MetaRecord, Layout),
-    /// Absent or unparsable.
     Damaged(String),
 }
 

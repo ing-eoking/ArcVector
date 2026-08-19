@@ -1,6 +1,4 @@
-//! Engine result codes, and which of them are actually failures.
-//!
-//! `EWOULDBLOCK` is not one — see [`completed`] and `docs/내부구조.md` §8.
+//! `EWOULDBLOCK` is not a failure — see [`completed`] and `docs/내부구조.md` §8.
 
 use std::fmt;
 use std::os::raw::c_int;
@@ -13,19 +11,12 @@ use crate::engine_api::{
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum StoreError {
-    /// The engine handle or a required vtable entry is missing.
     Unavailable,
-    /// The vtable does not have the shape these bindings were generated for.
     AbiMismatch,
-    /// The Map item is gone — evicted, expired or dropped.
     KeyGone,
-    /// The Map exists but has no such element.
     ElemGone,
-    /// Map is full (`maxcount` / `max_map_size`).
     Overflow,
-    /// The command reached a replica; only the master may write.
     ReplicaSlave,
-    /// An engine code we do not translate individually.
     Engine(u32),
 }
 

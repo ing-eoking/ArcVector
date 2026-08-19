@@ -1,19 +1,3 @@
-//! The two-phase transfer memcached calls `nread`, from this side.
-//!
-//! `vadd` and `VSIM VECTOR` announce a byte count on their command line and send
-//! the coordinates after it. memcached takes a buffer from `accept`, fills it
-//! from the socket (`c->ritem`, `conn_nread`), and calls `execute` a second time
-//! with an empty token array.
-//!
-//! `accept` and `execute` are separate callbacks with only the connection cookie
-//! in common, so what `accept` parsed has to be put somewhere `execute` can find
-//! it. That somewhere is the connection itself: memcached keeps one `void *` per
-//! `conn` and hands it back for the same cookie, so there is no side table and
-//! nothing shared between connections to lock.
-//!
-//! The parsed line is stored as a `Result`: refusing in `accept` would leave the
-//! body unread, and memcached would parse it as the next command line.
-
 use std::os::raw::{c_char, c_void};
 
 use super::request::Body;
@@ -57,12 +41,9 @@ impl Pending {
     }
 }
 
-/// Register `request` for `cookie` and expose the receive buffer to memcached.
-///
 /// # Safety
 ///
-/// `ndata` and `ptr_out` must be the out-parameters of the `accept` callback, and
-/// memcached must write at most `body_len + 2` bytes into the buffer.
+/// `ndata`/`ptr_out` are `accept`'s out-parameters, and memcached writes at most `body_len + 2` bytes.
 pub unsafe fn expect_body(
     cookie: *const c_void,
     request: std::result::Result<Body, Error>,
@@ -70,24 +51,17 @@ pub unsafe fn expect_body(
     ndata: *mut usize,
     ptr_out: *mut *mut c_char,
 ) {
-    // Anything already there is a transfer that never completed. Reclaim it
-    // rather than leak, then take its place.
-    // SAFETY: guaranteed by the caller.
+    // SAFETY: caller-guaranteed. Anything already there is a dead transfer; reclaim it rather than leak.
     drop(unsafe { take_body(cookie) });
 
     let mut state = Box::new(Pending::new(request, body_len));
     let len = state.buffer.len();
     let ptr = state.buffer.as_mut_ptr().cast::<c_char>();
-    // Publish before handing the pointer over, so an immediate abort finds it.
-    // SAFETY: guaranteed by the caller. The box is reclaimed by `take_body`,
-    // which `execute` and `abort` both call — and `conn_close` runs `abort`
-    // before it clears the slot, so a connection that dies mid-transfer still
-    // gives the pointer back.
+    // SAFETY: caller-guaranteed. The box comes back through `take_body`, which `execute` and `abort` both call — and `conn_close` runs `abort` first.
     unsafe {
         let raw = Box::into_raw(state);
         if !server::store_conn_state(cookie, raw.cast::<c_void>()) {
-            // No host to hold it — nothing is running, so take it back rather
-            // than leak and let the body phase report the missing state.
+            // No host to hold it: take it back rather than leak.
             drop(Box::from_raw(raw));
             return;
         }
@@ -96,14 +70,10 @@ pub unsafe fn expect_body(
     }
 }
 
-/// Reclaim the body registered for `cookie`, if any, clearing the slot.
-///
 /// # Safety
 ///
-/// `cookie` must be a live connection cookie, and the slot must hold either null
-/// or a `Pending` this module put there.
+/// live cookie, and the slot holds null or a `Pending` this module put there.
 pub unsafe fn take_body(cookie: *const c_void) -> Option<Box<Pending>> {
-    // SAFETY: guaranteed by the caller.
     let data = unsafe { server::take_conn_state(cookie) };
     if data.is_null() {
         return None;
@@ -137,7 +107,6 @@ mod tests {
 
     #[test]
     fn a_refused_line_still_gets_a_body_to_drain() {
-        // The stream stays in sync only because the bytes are consumed.
         let p = Pending::new(Err(Error::bad_request("nope")), 7);
         let (request, body) = p.terminate().into_parts();
         assert!(request.is_err());
@@ -146,8 +115,7 @@ mod tests {
 
     #[test]
     fn a_body_not_followed_by_crlf_is_a_bad_data_chunk() {
-        // The client declared fewer bytes than it sent, so storing this would keep
-        // a short vector and leave the remainder in the stream.
+        // A short body would store a truncated vector and leave the remainder in the stream.
         let mut p = Pending::new(Ok(add()), 7);
         p.buffer.copy_from_slice(b"0.11 0.21");
         let (request, _body) = p.into_parts();

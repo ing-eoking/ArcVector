@@ -1,9 +1,3 @@
-//! The wire: reading a command line and turning it into a typed request.
-//!
-//! Nothing here touches the engine, an index or any state. [`parse`] is the whole
-//! outward face — it hands back a [`Request`] and stops, and [`crate::handler`]
-//! is what acts on one.
-
 pub mod filter;
 pub mod nread;
 pub mod request;
@@ -22,16 +16,12 @@ pub enum Request<'a> {
     Body(Body, Vec<u8>),
 }
 
-/// Parse one `execute` call: a command line, or the body of one already accepted.
-///
 /// # Safety
 ///
-/// `tokens` must borrow the argument vector memcached passed to `execute`, and
-/// `cookie` must be that call's connection cookie.
+/// `tokens` must borrow `execute`'s argument vector, and `cookie` be that call's cookie.
 pub unsafe fn parse<'a>(cookie: *const c_void, tokens: &Tokens<'a>) -> Result<Request<'a>> {
     // An empty argument vector means a body arrived for a two-phase command.
     if tokens.is_empty() {
-        // SAFETY: guaranteed by the caller.
         let waiting = unsafe { nread::take_body(cookie) }
             .ok_or_else(|| Error::bad_request("lost command state"))?;
         let (parsed, bytes) = waiting.into_parts();

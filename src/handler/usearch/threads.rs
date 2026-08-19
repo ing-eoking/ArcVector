@@ -1,10 +1,6 @@
-//! Reserved thread contexts, and the invariant that keeps them from running out.
-//!
 //! ```text
 //! concurrent entries <= permits == reserved contexts   =>   the pop cannot fail
 //! ```
-//!
-//! `docs/내부구조.md` §9.
 
 use std::sync::{Condvar, Mutex, PoisonError};
 

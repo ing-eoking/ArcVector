@@ -1,21 +1,9 @@
-//! End-to-end tests against a real arcus server with the extension loaded.
-//!
-//! These are the only tests that exercise `store.rs` — the engine call path
-//! cannot be reached from unit tests.
-//!
-//! This target is behind the `integration` feature, because it needs a server this
-//! crate does not build. `make test` supplies one in a container and turns the
-//! feature on; a plain `cargo test` does not build this file at all, and so says
-//! nothing about tests it never ran.
-//!
-//! Asking for the feature is an assertion that a server is reachable, so a missing
-//! one fails here rather than skipping.
+//! End-to-end tests behind the `integration` feature: a plain `cargo test` does not build them, and a missing server fails rather than skips.
 
 mod common;
 
 use common::{Server, assert_contains, assert_reply, index_name};
 
-/// Start a server and open one connection to it.
 macro_rules! session {
     ($server:ident, $client:ident) => {
         let $server = Server::start();
@@ -26,9 +14,7 @@ macro_rules! session {
 #[test]
 fn the_extension_loads_and_claims_its_commands() {
     session!(server, client);
-    // Reaching the extension at all proves registration worked.
     assert_reply(&client.send("vlist"), "END\r\n");
-    // An unknown verb must not be claimed, so memcached answers instead.
     assert_contains(&client.send("vnonsense"), "ERROR");
     drop(server);
 }
@@ -64,7 +50,6 @@ fn a_vector_round_trips_through_the_engine() {
         "STORED\r\n",
     );
 
-    // The attributes must come back byte for byte, spaces and all.
     let got = client.send(&format!("vget {ix} v1"));
     assert_reply(
         &got,
@@ -119,11 +104,9 @@ fn a_batch_of_queries_returns_one_group_each() {
     client.vadd(&ix, "a", 2, "0.1 0.2");
     client.vadd(&ix, "b", 2, "9.0 9.0");
 
-    // Four coordinates at dim 2 is two query vectors.
     let hits = client.vsim(&ix, 1, 2, "0.1 0.2 9.0 9.0");
     assert_contains(&hits, "QUERY 0 1");
     assert_contains(&hits, "QUERY 1 1");
-    // Each query finds its own nearest.
     let first = hits.split("QUERY 1").next().unwrap();
     assert_contains(first, "VALUE a");
     let second = hits.split("QUERY 1").nth(1).unwrap();
@@ -150,7 +133,6 @@ fn a_filter_restricts_results_by_attribute() {
         "the filter must exclude it:\n{hits}"
     );
 
-    // A filter no document satisfies yields an empty group, not an error.
     let none = client.vsim_filter(&ix, 5, 2, "0.1 0.2", &["score>9999"]);
     assert_contains(&none, "QUERY 0 0");
     client.send(&format!("vdrop {ix}"));
@@ -166,7 +148,6 @@ fn search_by_key_uses_the_stored_vector() {
 
     let hits = client.send(&format!("VSIM KEY {ix} 2 anchor"));
     assert_contains(&hits, "QUERY 0 2");
-    // The anchor is its own nearest neighbour.
     assert!(
         hits.find("VALUE anchor").unwrap() < hits.find("VALUE other").unwrap(),
         "{hits}"
@@ -203,25 +184,19 @@ fn quantizations_all_survive_a_round_trip_through_the_engine() {
     }
 }
 
-// -- rejection paths, which is where the wire format is easiest to get wrong --
-
 #[test]
 fn a_mis_declared_body_length_is_refused_without_storing() {
     session!(_server, client);
     let ix = index_name("chunk");
     client.send(&format!("vcreate {ix} 2"));
 
-    // Deliberately wrong: veclen says 7 but "0.11 0.21" is 9 bytes. Not via the
-    // length-deriving helper, since getting it wrong is the point. Before the
-    // terminator check this stored a truncated vector and desynced the connection.
+    // Deliberately wrong: veclen says 7, the body is 9 bytes. This once stored a truncated vector and desynced the connection.
     let reply = client.send_body(&format!("vadd {ix} bad 7 2"), "0.11 0.21");
     assert_contains(&reply, "CLIENT_ERROR bad data chunk");
-    // The two surplus bytes are still in the stream and memcached answers them as
-    // one more nonsense command; discard that before carrying on.
+    // The surplus bytes are answered as one more nonsense command; discard it.
     client.drain();
     assert_contains(&client.send("vlist"), "count=0");
 
-    // The same line with the right length works.
     assert_reply(&client.vadd(&ix, "good", 2, "0.11 0.21"), "STORED\r\n");
     client.send(&format!("vdrop {ix}"));
 }
@@ -257,20 +232,16 @@ fn a_malformed_attr_is_refused_and_the_connection_survives() {
     let ix = index_name("attr");
     client.send(&format!("vcreate {ix} 2"));
 
-    // Length disagrees with the JSON that follows.
     let reply = client.send_body(&format!("vadd {ix} v 7 2 ATTR 99 {{}}"), "0.1 0.2");
     assert_contains(&reply, "CLIENT_ERROR");
 
-    // Not a JSON object.
     let reply = client.vadd_attr(&ix, "v", 2, "0.1 0.2", "[]");
     assert_contains(&reply, "CLIENT_ERROR");
 
-    // Over the fixed 128-byte region.
     let big = format!(r#"{{"k":"{}"}}"#, "x".repeat(200));
     let reply = client.vadd_attr(&ix, "v", 2, "0.1 0.2", &big);
     assert_contains(&reply, "CLIENT_ERROR");
 
-    // The connection is still usable, which is the point of draining the body.
     assert_contains(&client.send("vlist"), &format!("INDEX {ix}"));
     client.send(&format!("vdrop {ix}"));
 }
@@ -305,7 +276,6 @@ fn a_dimension_over_the_element_limit_is_refused() {
     let reply = client.send(&format!("vcreate {ix} 5000 QUANT f32"));
     assert_contains(&reply, "CLIENT_ERROR");
     assert_contains(&reply, "max_element_bytes");
-    // i8 fits the same dimension, which is the point of quantizing.
     assert_reply(
         &client.send(&format!("vcreate {ix} 5000 QUANT i8")),
         "CREATED\r\n",
@@ -356,21 +326,15 @@ fn vstats_reports_module_memory_and_follows_the_vector_count() {
     let used = stat(&full, &format!("{ix}:index_used_bytes"));
     let held = stat(&full, &format!("{ix}:index_held_bytes"));
     assert!(idmap > 0 && used > 0, "idmap {idmap} used {used}");
-    // Held memory is chunked, so it is a floor on used, never below it.
     assert!(held >= used, "held {held} < used {used}");
 
-    // Deleting must give the id-map memory back rather than leaving tombstones.
     for i in 0..40 {
         client.send(&format!("vdel {ix} v{i}"));
     }
     let empty = client.send("vstats");
     assert_contains(&empty, &format!("STAT {ix}:vectors 0"));
     assert_eq!(stat(&empty, &format!("{ix}:idmap_bytes")), 0);
-    // The chunks stay held after the vectors are gone; that is the cost being
-    // reported, and the reason held is worth a line of its own. usearch's tape
-    // allocator has no per-object free, so used does not fall either — it is a
-    // high-water mark, which is why the docs tell readers to compare it to
-    // `vectors` rather than trust it as a live figure.
+    // The chunks stay held after the vectors are gone, and used is a high-water mark — which is why vstats reports both.
     assert_eq!(stat(&empty, &format!("{ix}:index_held_bytes")), held);
     assert_eq!(stat(&empty, &format!("{ix}:index_used_bytes")), used);
 
@@ -379,8 +343,7 @@ fn vstats_reports_module_memory_and_follows_the_vector_count() {
 
 #[test]
 fn many_connections_search_the_same_index_at_once() {
-    // The concurrency invariants are unit-tested, but only here do they run on
-    // the server's own worker threads.
+    // The invariants are unit-tested; only here do they run on the server's worker threads.
     let server = Server::start();
     let ix = index_name("concurrent");
     let mut setup = server.connect();
@@ -409,21 +372,7 @@ fn many_connections_search_the_same_index_at_once() {
     setup.send(&format!("vdrop {ix}"));
 }
 
-/// The reserved metadata field cannot be reached from the protocol.
-///
-/// It is named `AV META`, with a space, and that space is the guarantee. The
-/// ASCII protocol has no way to express a map field containing one:
-///
-/// - `mop insert` takes the field as a command-line token, split on spaces.
-/// - `mop get` / `mop delete` take a space-separated field list and demand
-///   exactly `numfields` tokens, so this name always splits into two.
-/// - The binary protocol has LOP/SOP/BOP opcodes but no MOP at all.
-///
-/// The earlier name began with `\x01` and relied on `vadd` rejecting control
-/// bytes — a rule of ours, not a property of the protocol. `mop insert` accepts
-/// control bytes in a field, so a client could overwrite the metadata element and
-/// take the whole index down with it. This test is what keeps that from coming
-/// back.
+/// `AV META` contains a space, which no ASCII `mop` command can express — the earlier `\x01` name relied on a rule of ours instead.
 #[test]
 fn the_metadata_field_is_unreachable_from_the_protocol() {
     session!(_server, client);
@@ -431,32 +380,25 @@ fn the_metadata_field_is_unreachable_from_the_protocol() {
     assert_reply(&client.send(&format!("vcreate {ix} 2")), "CREATED\r\n");
     assert_reply(&client.vadd(&ix, "v1", 2, "1 0"), "STORED\r\n");
 
-    // Writing it: the field arrives as two tokens, so the command is malformed.
-    //
-    // Sent without its body on purpose. The line is rejected before the body is
-    // read, so a body would be parsed as the next command and answer a second
-    // time — leaving a reply in the buffer for whatever runs next.
+    // Sent without its body on purpose: the line is refused before the body is read.
     let reply = client.send(&format!("mop insert {ix} AV META 5 0 0 0"));
     assert!(
         reply.contains("CLIENT_ERROR"),
         "a client must not be able to create the reserved field: {reply}"
     );
 
-    // Reading it by name: one field is declared, two are found.
     let reply = client.send_body(&format!("mop get {ix} 7 1"), "AV META");
     assert!(
         reply.contains("CLIENT_ERROR"),
         "nor request it by name: {reply}"
     );
 
-    // A whole-map dump still shows it, so it stays observable to an operator.
     let dump = client.send(&format!("mop get {ix} 0 0"));
     assert!(
         dump.contains("AV META") && dump.contains("\"metric\""),
         "a full dump must still show the metadata element: {dump}"
     );
 
-    // And the index is untouched by any of it.
     assert_reply(
         &client.send(&format!("vget {ix} v1")),
         "VALUE v1 0\r\n\r\nEND\r\n",
@@ -464,14 +406,7 @@ fn the_metadata_field_is_unreachable_from_the_protocol() {
     client.send(&format!("vdrop {ix}"));
 }
 
-/// ATTR JSON is one argument, and a space is refused rather than guessed at.
-///
-/// memcached's tokenizer splits the command line on spaces and overwrites each
-/// token-terminating space with a NUL in place. Putting the pieces back would
-/// mean mapping those NULs to spaces — but a NUL is also a byte a client could
-/// have sent, so the reconstruction is ambiguous. Requiring one token removes the
-/// question, and it costs nothing: with no whitespace, the full 128-byte region
-/// is usable, which is more than the spaced form ever reached.
+/// The tokenizer overwrites the terminating space with a NUL, and a NUL is also a byte a client could send, so one token it is.
 #[test]
 fn attr_json_must_arrive_as_one_argument() {
     session!(_server, client);
@@ -488,7 +423,6 @@ fn attr_json_must_arrive_as_one_argument() {
         "a spaced ATTR must name the reason: {reply}"
     );
 
-    // The same document without spaces, and then one filling the whole region.
     let tight = r#"{"cat":"tech"}"#;
     assert_eq!(
         client

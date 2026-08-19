@@ -1,9 +1,4 @@
-//! The live indexes this process is serving, by name.
-//!
-//! An entry pairs the Map that holds the vectors with the usearch graph built
-//! from it, and remembers the `owner` token that graph was built under. Deciding
-//! whether that token still means anything, and rebuilding when it does not, is
-//! [`super::recovery`]'s job.
+//! An entry pairs the Map with the graph built from it and the `owner` token it was built under; [`super::recovery`] judges that token.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};

@@ -1,14 +1,4 @@
-//! Generates Rust bindings for the arcus engine ABI.
-//!
-//! `include/memcached/` holds vendored copies of arcus-memcached's public
-//! interface — `engine.h` and the nine headers it transitively includes, nothing
-//! else. The directory is named `memcached/` because every one of those headers
-//! refers to its siblings by that prefix (`#include <memcached/types.h>`), so the
-//! include path is the parent and the layout matches upstream's exactly.
-//!
-//! Bindings go to `OUT_DIR` rather than into `src/`, so the build never writes to
-//! the source tree: a read-only checkout works, and two targets can build the same
-//! sources at once without fighting over one generated file.
+//! Bindgen for the arcus engine ABI: vendored headers in `include/memcached/` (upstream's own `#include` prefix), output to `OUT_DIR`.
 
 use std::env;
 use std::path::PathBuf;
@@ -19,23 +9,7 @@ fn main() {
 
     let out = PathBuf::from(env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
 
-    // `engine_interface_v1` is a vtable read by offset, and arcus builds do not lay
-    // it out the same way. Two independent things decide the layout:
-    //
-    //   1. the source tree's own `types.h`, which hardcodes `SCAN_COMMAND`,
-    //      `SUPPORT_BOP_SMGET` and `JHPARK_OLD_SMGET_INTERFACE` — the OSS tree
-    //      defines the last one and the EE tree does not, which alone moves
-    //      everything from `btree_elem_smget` on;
-    //   2. `configure`, which sets `ENABLE_REPLICATION`, `ENABLE_MIGRATION` and
-    //      `ENABLE_CLUSTER_AWARE` — no vendored header carries them, and the first
-    //      two add seven and six members ahead of `get_item_info` and
-    //      `get_elem_info`.
-    //
-    // Vendoring a tree's `include/` gets (1) for free. Only (2) has to be supplied,
-    // by the cargo features, and it must match the server exactly: nothing at
-    // runtime tells the variants apart — `interface` is 1 in all of them — so a
-    // mismatch silently calls whatever occupies the offset. An EE server runs
-    // `cachedump` for `get_config`.
+    // The vtable is read by offset and no two arcus builds lay it out alike, so the features must match the server exactly: a mismatch calls whatever sits at the offset.
     let include = env::var("ARCVECTOR_ENGINE_INCLUDE").unwrap_or_else(|_| "include".to_owned());
     let header = format!("{include}/memcached/engine.h");
 
@@ -45,20 +19,14 @@ fn main() {
         .clang_arg("-pthread")
         .clang_arg("-D_GNU_SOURCE");
 
-    // Each feature is named after the server's `configure` flag with arcus's
-    // `ENABLE_` prefix dropped, so the macro to define is derived rather than
-    // written twice. `SCAN_COMMAND` and the `SUPPORT_BOP_*` family matter to the
-    // layout too, but they live in the tree's `types.h` and arrive with the
-    // headers, so they are not knobs.
+    // Feature names are the server's `configure` flags minus `ENABLE_`, so the macro to define is derived rather than written twice.
     for flag in ["replication", "migration", "cluster-aware"] {
         if enabled(flag) {
             builder = builder.clang_arg(format!("-DENABLE_{}", macro_case(flag)));
         }
     }
 
-    // Rebuilding a graph from Map only earns its cost where something can outlive
-    // it — replication delivers a Map from a peer, persistence restores one on
-    // restart. Neither means nothing can, so the machinery compiles out.
+    // Rebuilding a graph from Map only earns its cost where replication or persistence can outlive the graph.
     println!("cargo::rustc-check-cfg=cfg(recovery)");
     if enabled("replication") || enabled("persistence") {
         println!("cargo:rustc-cfg=recovery");
@@ -73,10 +41,7 @@ fn main() {
         .write_to_file(&generated)
         .expect("failed to write engine_api.rs");
 
-    // Describe the layout that was just generated, so the running library can say
-    // what it was built against. A mismatch cannot be detected automatically — see
-    // `arcus::abi` — but it can be made obvious in the log and in `vstats`, which
-    // is the difference between a five-minute diagnosis and a mystery SIGSEGV.
+    // Record the layout so the log and `vstats` can name what this was built against; a mismatch cannot be detected automatically.
     let text = std::fs::read_to_string(&generated).expect("bindgen wrote engine_api.rs");
     let vtable = text
         .split_once("pub struct engine_interface_v1 {")
@@ -84,10 +49,7 @@ fn main() {
         .map(|(body, _)| body)
         .unwrap_or_default();
     let members = vtable.matches("pub ").count();
-    // Read back what was actually generated rather than what was asked for, so a
-    // `config.h` that quietly lacks a flag is reported as it is. The vtable markers
-    // are looked for in `engine_interface_v1`; `cluster_aware` adds to
-    // `SERVER_CORE_API` instead, so it is looked for in the whole file.
+    // Read back what bindgen emitted rather than what was asked for; `cluster_aware` lands in `SERVER_CORE_API`, not the engine vtable.
     let mut features: Vec<&str> = [
         ("replication", "pub rp_cmd"),
         ("migration", "pub mg_prepare"),
@@ -101,8 +63,7 @@ fn main() {
     if text.contains("pub is_zk_integrated") {
         features.push("cluster_aware");
     }
-    // Persistence leaves no trace in the bindings, so it is reported from the
-    // feature that declared it.
+    // Persistence leaves no trace in the bindings, so it is reported from the feature.
     if enabled("persistence") {
         features.push("persistence");
     }
@@ -115,12 +76,7 @@ fn main() {
     );
     println!("cargo:rustc-env=ARCVECTOR_ABI_HEADERS={include}");
 
-    // Which tree these headers came from, read from the header *text* rather than
-    // from what bindgen kept: the `rp_*` declarations exist only in the EE tree,
-    // and looking at the source rather than the output makes the answer
-    // independent of which defines were passed. The running library pairs this
-    // with the server's own version string to catch a cross-tree build, which is
-    // the one mismatch that crashes before anything can inspect it.
+    // `rp_*` declarations exist only in the EE tree, so the header text names the tree independent of the defines passed.
     let source = std::fs::read_to_string(&header).expect("bindgen read this header");
     let tree = if source.contains("rp_cmd") {
         "ee"

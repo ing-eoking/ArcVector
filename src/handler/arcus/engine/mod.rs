@@ -1,8 +1,4 @@
-//! arcus Map engine access.
-//!
-//! All unsafety is concentrated in [`Store::for_cookie`]; everything downstream
-//! takes `&self` and hands out Rust values. Split into `error` (engine codes),
-//! `map` (the Map item) and `elem` (the elements inside it).
+//! All unsafety is concentrated in [`Store::for_cookie`]; everything downstream takes `&self`.
 
 mod elem;
 mod error;
@@ -23,7 +19,6 @@ pub const DEFAULT_MAX_ELEMENT_BYTES: u32 = 16 * 1024;
 const DEFAULT_MAX_MAP_SIZE: u32 = 50_000;
 
 static ENGINE: AtomicPtr<engine_interface_v1> = AtomicPtr::new(ptr::null_mut());
-/// Resolve and cache the engine handle.
 fn engine() -> *mut engine_interface_v1 {
     let cached = ENGINE.load(Ordering::Acquire);
     if !cached.is_null() {
@@ -38,9 +33,7 @@ fn engine() -> *mut engine_interface_v1 {
     if handle.is_null() {
         return ptr::null_mut();
     }
-    // The first moment the bindings can be checked against the server that loaded
-    // us: at registration the engine is not wired up yet.
-    // SAFETY: `handle` is the engine's own vtable, non-null and process-lifetime.
+    // SAFETY: `handle` is the engine's own vtable — and this is the first moment it can be checked.
     if !unsafe { abi::verify(server, &*handle) } {
         return ptr::null_mut();
     }
@@ -51,7 +44,6 @@ fn engine() -> *mut engine_interface_v1 {
     }
 }
 
-/// Engine access bound to one connection.
 #[derive(Clone, Copy)]
 pub struct Store {
     engine: *mut engine_interface_v1,
@@ -61,9 +53,7 @@ pub struct Store {
 impl Store {
     /// # Safety
     ///
-    /// `cookie` must be the connection cookie memcached passed to the extension
-    /// callback that is currently running, and the returned `Store` must not
-    /// outlive that callback.
+    /// `cookie` is the running callback's cookie, and the `Store` must not outlive it.
     pub unsafe fn for_cookie(cookie: *const c_void) -> Option<Self> {
         let engine = engine();
         (!engine.is_null()).then_some(Self { engine, cookie })
@@ -83,8 +73,7 @@ impl Store {
     }
 
     fn vtable(&self) -> &engine_interface_v1 {
-        // SAFETY: `for_cookie` rejects a null engine, and the engine outlives
-        // every connection.
+        // SAFETY: `for_cookie` rejects a null engine, which outlives every connection.
         unsafe { &*self.engine }
     }
 
@@ -94,8 +83,7 @@ impl Store {
             return default;
         };
         let mut out: u32 = 0;
-        // SAFETY: `out` is a live u32, which is what the engine writes for a
-        // uint32-typed configuration key.
+        // SAFETY: `out` is a live u32, which is what the engine writes for a uint32 key.
         let code = unsafe {
             get_config(
                 self.handle(),
@@ -116,7 +104,6 @@ impl Store {
         self.config_u32(c"max_element_bytes", DEFAULT_MAX_ELEMENT_BYTES)
     }
 
-    /// Default element-count limit for a new Map.
     pub fn max_map_size(&self) -> u32 {
         self.config_u32(c"max_map_size", DEFAULT_MAX_MAP_SIZE)
     }

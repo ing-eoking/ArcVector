@@ -1,12 +1,9 @@
-//! Tokens in, typed requests out. Nothing here touches the engine or the index.
-
 use super::*;
 
 fn malformed() -> Error {
     Error::bad_request("bad command line format")
 }
 
-/// Parse a line that needs no body.
 pub fn parse_line<'a>(tokens: &Tokens<'a>) -> Result<Line<'a>> {
     match tokens.command() {
         Some(Cmd::VCreate) => parse_create(tokens).map(Line::Create),
@@ -138,7 +135,6 @@ fn result_count(tokens: &Tokens, at: usize) -> Result<usize> {
     Ok(k)
 }
 
-/// Which token holds the body length, for the two commands that have a body.
 pub fn body_length_at(tokens: &Tokens) -> Option<usize> {
     match tokens.command()? {
         Cmd::VAdd => Some(3),
@@ -149,7 +145,6 @@ pub fn body_length_at(tokens: &Tokens) -> Option<usize> {
     }
 }
 
-/// Parse a line that carries a body.
 pub fn parse_body(tokens: &Tokens) -> Result<Body> {
     match tokens.command() {
         Some(Cmd::VAdd) => parse_add(tokens).map(Body::Add),
@@ -184,7 +179,6 @@ fn parse_sim(tokens: &Tokens) -> Result<Sim> {
     })
 }
 
-/// Why a body-carrying line never reached its body phase.
 pub fn body_length_error(tokens: &Tokens, at: usize, what: &str) -> Error {
     match tokens.parse::<usize>(at, what) {
         Err(e) => e,
@@ -217,9 +211,7 @@ fn attr_clause(tokens: &Tokens, at: usize) -> Result<Vec<u8>> {
         return Ok(Vec::new());
     }
 
-    // One token. A space would make the tokenizer split the JSON, and the pieces
-    // cannot be put back together: the separator it leaves behind is a NUL, which
-    // is also a byte the client could have sent.
+    // One token: a space would split the JSON, and the NUL the tokenizer leaves behind is a byte a client could have sent.
     let json = tokens.text(at + 2)?;
     if tokens.len() > at + 3 {
         return Err(Error::bad_request(
@@ -275,8 +267,7 @@ mod tests {
     use crate::command::tokens::tokenize_for_test as tokenize;
     use std::os::raw::c_int;
 
-    /// Binds `$name` to a `Tokens` view of `$src`, keeping the backing buffer
-    /// alive for the rest of the scope so borrowed results can escape the parse.
+    /// Binds `$name` to a `Tokens` view of `$src`, keeping the buffer alive for the scope.
     macro_rules! tokens {
         ($name:ident = $src:expr) => {
             let (_buf, _raw) = tokenize($src);
@@ -290,9 +281,7 @@ mod tests {
         f(&t)
     }
 
-    /// The message a line is refused with, routed the way the callbacks route it:
-    /// a line that carries a body goes to `parse_body`, everything else to
-    /// `parse_line`.
+    /// The refusal message, routed as the callbacks route it: a body-carrying line goes to `parse_body`.
     fn err(line: &str) -> String {
         tokens!(t = line);
         let outcome = if body_length_at(&t).is_some() {
@@ -305,8 +294,6 @@ mod tests {
             Ok(()) => "accepted".to_owned(),
         }
     }
-
-    // -- command names -------------------------------------------------------
 
     #[test]
     fn command_names_are_case_insensitive() {
@@ -332,8 +319,6 @@ mod tests {
         assert_eq!(SimSource::parse("ID"), None);
     }
 
-    // -- which lines carry a body -------------------------------------------
-
     #[test]
     fn only_vadd_and_vsim_vector_carry_a_body() {
         assert_eq!(on_line("vadd i d 28 7", body_length_at), Some(3));
@@ -341,14 +326,11 @@ mod tests {
             on_line("VSIM VECTOR docs 10 4096 1024", body_length_at),
             Some(4)
         );
-        // VSIM KEY's query is already stored.
         assert_eq!(on_line("VSIM KEY docs 10 v1", body_length_at), None);
         assert_eq!(on_line("vlist", body_length_at), None);
         assert_eq!(on_line("vget docs v1", body_length_at), None);
         assert_eq!(on_line("nonsense", body_length_at), None);
     }
-
-    // -- vcreate ------------------------------------------------------------
 
     #[test]
     fn vcreate_defaults_are_filled_in() {
@@ -376,7 +358,6 @@ mod tests {
         assert!(err("vcreate docs 8 NOPE 1").contains("unknown option"));
         assert!(err("vcreate docs 8 QUANT f64").contains("unknown quantization"));
         assert!(err("vcreate docs 8 METRIC manhattan").contains("unknown metric"));
-        // Removed knobs must not silently succeed.
         assert!(err("vcreate docs 8 FBYTES 128").contains("unknown option"));
         assert!(err("vcreate docs 8 THREADS 8").contains("unknown option"));
     }
@@ -406,8 +387,6 @@ mod tests {
         assert!(parse_create(&t).is_ok());
     }
 
-    // -- vadd ---------------------------------------------------------------
-
     #[test]
     fn vadd_yields_index_id_dimension_and_attr() {
         let Body::Add(a) = on_line(
@@ -434,12 +413,9 @@ mod tests {
 
     #[test]
     fn vadd_needs_a_dimension() {
-        // Without one there is nothing to check the coordinate count against.
         assert!(err("vadd index doc1 28").contains("bad command line format"));
         assert!(err("vadd index doc1 28 abc").contains("dimension"));
     }
-
-    // -- ATTR clause --------------------------------------------------------
 
     fn attr_of(line: &str) -> Result<Vec<u8>> {
         on_line(line, |t| attr_clause(t, 5))
@@ -507,8 +483,6 @@ mod tests {
         assert!(attr_of(&format!("vadd docs v1 16 4 ATTR 128 {json}")).is_ok());
     }
 
-    // -- VSIM ---------------------------------------------------------------
-
     #[test]
     fn vsim_vector_yields_index_k_dimension_and_filter() {
         let Body::Sim(s) = on_line(
@@ -543,8 +517,6 @@ mod tests {
         assert!(err("VSIM VECTOR docs 0 4096 1024").contains("result count"));
     }
 
-    // -- FILTER clause ------------------------------------------------------
-
     fn filter_of(line: &str) -> Result<Option<Filter>> {
         on_line(line, |t| filter_clause(t, 5))
     }
@@ -567,7 +539,6 @@ mod tests {
 
     #[test]
     fn a_filter_count_that_disagrees_with_the_terms_is_rejected() {
-        // Guards against a term being dropped or swept in from elsewhere.
         assert!(
             filter_of("VSIM KEY docs 5 v1 FILTER 3 cat=tech")
                 .unwrap_err()
@@ -592,8 +563,6 @@ mod tests {
         );
         assert!(filter_of("VSIM KEY docs 5 v1 FILTER 1 nonsense").is_err());
     }
-
-    // -- line-only commands -------------------------------------------------
 
     #[test]
     fn simple_lines_parse_and_reject_wrong_arity() {
