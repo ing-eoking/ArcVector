@@ -35,7 +35,7 @@ pub use handler::usearch::Metric;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
-use command::pending;
+use command::nread;
 use command::request::{self, MAX_BODY_BYTES};
 use command::tokens::{Responder, ResponseHandler, Tokens};
 use engine_api::{
@@ -46,7 +46,7 @@ use engine_api::{
 
 /// Decide how much body a command needs before it can run.
 ///
-/// A parse failure is carried into the pending state rather than refusing the
+/// A parse failure is carried into the nread state rather than refusing the
 /// command: refusing would leave the body unread, and memcached would parse those
 /// bytes as the next command line. Returning `true` without setting `ndata` is
 /// therefore reserved for a byte count that cannot be read at all, since without
@@ -80,7 +80,7 @@ unsafe extern "C" fn accept_vector_cmd(
 
     // SAFETY: guaranteed by the caller.
     unsafe {
-        pending::expect_body(
+        nread::expect_body(
             cookie,
             request::parse_body(&tokens),
             body_len,
@@ -113,7 +113,7 @@ unsafe extern "C" fn execute_vector_cmd(
 /// Release a body whose command never completed.
 unsafe extern "C" fn abort_vector_cmd(_cmd_cookie: *const c_void, cookie: *const c_void) {
     // SAFETY: guaranteed by the caller.
-    drop(unsafe { pending::take_body(cookie) });
+    drop(unsafe { nread::take_body(cookie) });
 }
 
 unsafe extern "C" fn get_name_vector(_cmd_cookie: *const c_void) -> *const c_char {

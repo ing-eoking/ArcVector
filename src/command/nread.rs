@@ -1,4 +1,9 @@
-//! Per-connection state for the two-phase transfer memcached calls `nread`.
+//! The two-phase transfer memcached calls `nread`, from this side.
+//!
+//! `vadd` and `VSIM VECTOR` announce a byte count on their command line and send
+//! the coordinates after it. memcached takes a buffer from `accept`, fills it
+//! from the socket (`c->ritem`, `conn_nread`), and calls `execute` a second time
+//! with an empty token array.
 //!
 //! `accept` and `execute` are separate callbacks with only the connection cookie
 //! in common, so what `accept` parsed has to be put somewhere `execute` can find

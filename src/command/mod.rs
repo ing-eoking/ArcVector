@@ -5,7 +5,7 @@
 //! is what acts on one.
 
 pub mod filter;
-pub mod pending;
+pub mod nread;
 pub mod request;
 pub mod tokens;
 
@@ -32,7 +32,7 @@ pub unsafe fn parse<'a>(cookie: *const c_void, tokens: &Tokens<'a>) -> Result<Re
     // An empty argument vector means a body arrived for a two-phase command.
     if tokens.is_empty() {
         // SAFETY: guaranteed by the caller.
-        let waiting = unsafe { pending::take_body(cookie) }
+        let waiting = unsafe { nread::take_body(cookie) }
             .ok_or_else(|| Error::bad_request("lost command state"))?;
         let (parsed, bytes) = waiting.into_parts();
         return Ok(Request::Body(parsed?, bytes));
