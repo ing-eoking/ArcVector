@@ -59,7 +59,7 @@ impl Error {
                 }
                 _ => Blame::Server,
             },
-            // A well-formed request this node cannot serve right now, which is
+            // A well-formed request this node cannot serve right now.
             Self::Unreadable => Blame::Server,
             Self::Store(_) | Self::Index(_) => Blame::Server,
         }

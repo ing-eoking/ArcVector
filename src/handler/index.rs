@@ -27,7 +27,6 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
 
     // Replication or persistence may have delivered this Map. Never clear it.
     if store.probe_map(name).is_ok() {
-        // Replication or persistence may have delivered this Map. Never clear it.
         #[cfg(recovery)]
         {
             resolve(store, name)?;

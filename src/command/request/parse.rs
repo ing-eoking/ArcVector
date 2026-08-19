@@ -447,9 +447,6 @@ mod tests {
 
     #[test]
     fn attr_json_must_be_one_token() {
-        // A space makes the tokenizer split the JSON, and the pieces cannot be
-        // put back: the separator it leaves behind is a NUL, which is also a
-        // byte a client could have sent.
         let json = r#"{"cat": "tech"}"#;
         let msg = attr_of(&format!("vadd docs v1 16 4 ATTR {} {json}", json.len()))
             .unwrap_err()
@@ -459,7 +456,6 @@ mod tests {
 
     #[test]
     fn attr_json_without_spaces_fills_the_whole_region() {
-        // With no whitespace budget to share, the byte limit is the only limit.
         let json = format!(
             "{{{}}}",
             (0..14)
@@ -506,8 +502,6 @@ mod tests {
 
     #[test]
     fn an_attr_exactly_at_the_limit_is_accepted() {
-        // Built from real content: leading spaces are separators to the
-        // tokenizer, not part of the value.
         let json = format!(r#"{{"k":"{}"}}"#, "x".repeat(120));
         assert_eq!(json.len(), ATTR_BYTES);
         assert!(attr_of(&format!("vadd docs v1 16 4 ATTR 128 {json}")).is_ok());
@@ -561,7 +555,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(f.matches(br#"{"cat":"tech","ts":1723248000}"#));
-        // Both terms must hold.
         assert!(!f.matches(br#"{"cat":"tech","ts":1}"#));
         assert!(!f.matches(br#"{"cat":"news","ts":1723248000}"#));
     }

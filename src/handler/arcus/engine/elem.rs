@@ -175,7 +175,6 @@ impl Store {
         };
 
         // Take ownership before the error check, so a partial result is released too.
-        // released.
         // SAFETY: `result` is exactly what the call above wrote.
         let elems = unsafe { Elems::new(self, &result) };
         check(code)?;

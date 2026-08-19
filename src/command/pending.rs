@@ -1,16 +1,20 @@
 //! Per-connection state for the two-phase transfer memcached calls `nread`.
 //!
+//! `accept` and `execute` are separate callbacks with only the connection cookie
+//! in common, so what `accept` parsed has to be put somewhere `execute` can find
+//! it. That somewhere is the connection itself: memcached keeps one `void *` per
+//! `conn` and hands it back for the same cookie, so there is no side table and
+//! nothing shared between connections to lock.
+//!
 //! The parsed line is stored as a `Result`: refusing in `accept` would leave the
 //! body unread, and memcached would parse it as the next command line.
 
-use std::collections::HashMap;
 use std::os::raw::{c_char, c_void};
-use std::sync::{LazyLock, Mutex, PoisonError};
 
 use super::request::Body;
 use crate::error::Error;
+use crate::server;
 
-/// A command line whose body has still to arrive, with the buffer for it.
 #[derive(Debug)]
 pub struct Pending {
     request: std::result::Result<Body, Error>,
@@ -28,7 +32,7 @@ impl Pending {
         }
     }
 
-    /// Fill in the CRLF memcached would have written. Tests only.
+    /// Fill in the CRLF memcached would have written.
     #[cfg(test)]
     fn terminate(mut self) -> Self {
         let n = self.body_len;
@@ -36,7 +40,6 @@ impl Pending {
         self
     }
 
-    /// Split into the parsed line and its body, dropping the trailing CRLF.
     pub fn into_parts(mut self) -> (std::result::Result<Body, Error>, Vec<u8>) {
         let terminated = self.buffer[self.body_len..] == *b"\r\n";
         self.buffer.truncate(self.body_len);
@@ -47,13 +50,6 @@ impl Pending {
         };
         (request, self.buffer)
     }
-}
-
-static PENDING: LazyLock<Mutex<HashMap<usize, Pending>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn table() -> std::sync::MutexGuard<'static, HashMap<usize, Pending>> {
-    PENDING.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Register `request` for `cookie` and expose the receive buffer to memcached.
@@ -69,27 +65,52 @@ pub unsafe fn expect_body(
     ndata: *mut usize,
     ptr_out: *mut *mut c_char,
 ) {
-    let mut state = Pending::new(request, body_len);
+    // Anything already there is a transfer that never completed. Reclaim it
+    // rather than leak, then take its place.
+    // SAFETY: guaranteed by the caller.
+    drop(unsafe { take_body(cookie) });
+
+    let mut state = Box::new(Pending::new(request, body_len));
     let len = state.buffer.len();
     let ptr = state.buffer.as_mut_ptr().cast::<c_char>();
     // Publish before handing the pointer over, so an immediate abort finds it.
-    table().insert(cookie as usize, state);
-    // SAFETY: guaranteed by the caller.
+    // SAFETY: guaranteed by the caller. The box is reclaimed by `take_body`,
+    // which `execute` and `abort` both call — and `conn_close` runs `abort`
+    // before it clears the slot, so a connection that dies mid-transfer still
+    // gives the pointer back.
     unsafe {
+        let raw = Box::into_raw(state);
+        if !server::store_conn_state(cookie, raw.cast::<c_void>()) {
+            // No host to hold it — nothing is running, so take it back rather
+            // than leak and let the body phase report the missing state.
+            drop(Box::from_raw(raw));
+            return;
+        }
         *ndata = len;
         *ptr_out = ptr;
     }
 }
 
-pub fn take_body(cookie: *const c_void) -> Option<Pending> {
-    table().remove(&(cookie as usize))
+/// Reclaim the body registered for `cookie`, if any, clearing the slot.
+///
+/// # Safety
+///
+/// `cookie` must be a live connection cookie, and the slot must hold either null
+/// or a `Pending` this module put there.
+pub unsafe fn take_body(cookie: *const c_void) -> Option<Box<Pending>> {
+    // SAFETY: guaranteed by the caller.
+    let data = unsafe { server::take_conn_state(cookie) };
+    if data.is_null() {
+        return None;
+    }
+    // SAFETY: the slot only ever holds a box this module leaked into it.
+    Some(unsafe { Box::from_raw(data.cast::<Pending>()) })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::request::{Add, Sim};
-    use std::ptr;
+    use crate::command::request::Add;
 
     fn add() -> Body {
         Body::Add(Add {
@@ -120,9 +141,8 @@ mod tests {
 
     #[test]
     fn a_body_not_followed_by_crlf_is_a_bad_data_chunk() {
-        // The client declared fewer bytes than it sent, so what we were handed is
-        // truncated and the remainder is still in the stream. Storing it would
-        // silently keep a short vector and desync the connection.
+        // The client declared fewer bytes than it sent, so storing this would keep
+        // a short vector and leave the remainder in the stream.
         let mut p = Pending::new(Ok(add()), 7);
         p.buffer.copy_from_slice(b"0.11 0.21");
         let (request, _body) = p.into_parts();
@@ -131,57 +151,5 @@ mod tests {
             "bad data chunk",
             "a mis-declared length must be refused"
         );
-    }
-
-    #[test]
-    fn bodies_are_keyed_by_cookie_and_taken_once() {
-        // A cookie is only ever a map key here; never dereferenced.
-        let cookie = ptr::without_provenance::<c_void>(0xF00D);
-        let mut ndata = 0usize;
-        let mut ptr: *mut c_char = ptr::null_mut();
-        // SAFETY: both out-parameters are live locals.
-        unsafe { expect_body(cookie, Ok(add()), 8, &mut ndata, &mut ptr) };
-        assert_eq!(ndata, 10);
-        assert!(!ptr.is_null());
-
-        assert!(take_body(cookie).is_some());
-        // A second take must not resurrect it — that would be a double free.
-        assert!(take_body(cookie).is_none());
-    }
-
-    #[test]
-    fn different_connections_do_not_share_state() {
-        // Two distinct cookie values; never dereferenced.
-        let a = ptr::without_provenance::<c_void>(1);
-        let b = ptr::without_provenance::<c_void>(2);
-        let mut ndata = 0usize;
-        let mut ptr: *mut c_char = ptr::null_mut();
-        // SAFETY: both out-parameters are live locals, and each copy writes
-        // exactly the `body_len + 2` bytes the buffer was sized for — which is
-        // what memcached itself does, body followed by CRLF.
-        unsafe {
-            expect_body(a, Ok(add()), 3, &mut ndata, &mut ptr);
-            ptr::copy_nonoverlapping(b"1 2\r\n".as_ptr(), ptr.cast::<u8>(), 5);
-
-            expect_body(
-                b,
-                Ok(Body::Sim(Sim {
-                    index: "docs".into(),
-                    k: 1,
-                    dim: 2,
-                    filter: None,
-                })),
-                7,
-                &mut ndata,
-                &mut ptr,
-            );
-            ptr::copy_nonoverlapping(b"1 2 3 4\r\n".as_ptr(), ptr.cast::<u8>(), 9);
-        }
-        let (request_a, body_a) = take_body(a).unwrap().into_parts();
-        let (request_b, body_b) = take_body(b).unwrap().into_parts();
-        assert_eq!(body_a, b"1 2");
-        assert_eq!(body_b, b"1 2 3 4");
-        assert!(matches!(request_a, Ok(Body::Add(_))));
-        assert!(matches!(request_b, Ok(Body::Sim(_))));
     }
 }

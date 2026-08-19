@@ -100,7 +100,7 @@ impl Filter {
         Ok(Self { terms })
     }
 
-    /// Evaluate against a raw JSON object. Allocation-free.
+    /// Evaluate against a raw JSON object.
     pub fn matches(&self, json: &[u8]) -> bool {
         self.terms
             .iter()

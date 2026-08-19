@@ -15,7 +15,6 @@ use crate::error::{Error, Result};
 use request::{Body, Line};
 use tokens::Tokens;
 
-/// One command, parsed and ready to run.
 pub enum Request<'a> {
     /// Settled by its command line alone.
     Line(Line<'a>),
@@ -32,8 +31,9 @@ pub enum Request<'a> {
 pub unsafe fn parse<'a>(cookie: *const c_void, tokens: &Tokens<'a>) -> Result<Request<'a>> {
     // An empty argument vector means a body arrived for a two-phase command.
     if tokens.is_empty() {
-        let waiting =
-            pending::take_body(cookie).ok_or_else(|| Error::bad_request("lost command state"))?;
+        // SAFETY: guaranteed by the caller.
+        let waiting = unsafe { pending::take_body(cookie) }
+            .ok_or_else(|| Error::bad_request("lost command state"))?;
         let (parsed, bytes) = waiting.into_parts();
         return Ok(Request::Body(parsed?, bytes));
     }

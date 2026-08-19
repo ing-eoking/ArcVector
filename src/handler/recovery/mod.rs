@@ -36,7 +36,8 @@ pub fn take_over(store: &Store, index: &VectorIndex) -> Result<()> {
     }
 
     if let Err(e) = index.ann.begin_rebuild() {
-        // The Map says rebuilding and this node cannot do it. Drop the entry so
+        // The Map says rebuilding and this node cannot do it, so drop the entry
+        // rather than leave one that claims a graph it does not have.
         remove(&index.name);
         return Err(e);
     }

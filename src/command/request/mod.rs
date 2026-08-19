@@ -1,6 +1,4 @@
 //! The vocabulary — one type per command, and nothing that touches a token.
-//!
-//! `parse` is what turns tokens into these.
 
 mod parse;
 
@@ -83,7 +81,6 @@ pub struct Create<'a> {
 }
 
 impl Create<'_> {
-    /// Defaults for everything a `vcreate` line may omit.
     fn with_defaults(index: &str, dim: usize) -> Create<'_> {
         Create {
             index,

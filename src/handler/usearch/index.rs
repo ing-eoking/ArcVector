@@ -38,7 +38,7 @@ pub struct AnnIndex {
     pub layout: Layout,
     pub metric: Metric,
     threads: usize,
-    /// Write-locked only for `reserve`; every other operation takes a read lock,
+    /// Write-locked only to grow capacity; every other operation reads.
     inner: RwLock<Index>,
     permits: Semaphore,
     reserved: AtomicUsize,
@@ -108,12 +108,13 @@ impl AnnIndex {
         self.ids.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Module memory held by the key mapping. Invisible to arcus's own accounting,
+    /// Module memory held by the key mapping, which arcus cannot see.
     pub fn id_map_bytes(&self) -> usize {
         self.ids().bytes()
     }
 
     /// Bytes usearch holds from the allocator for this index — measured, not
+    /// estimated, and chunked far ahead of the data (see [`Self::used_bytes`]).
     pub fn held_bytes(&self) -> usize {
         self.inner
             .read()
@@ -161,7 +162,7 @@ impl AnnIndex {
     /// Insert or replace `id`. `vector` is the already-quantized byte form.
     pub fn add(&self, id: &str, vector: &[u8]) -> Result<u64> {
         self.check_vector(vector)?;
-        // Capacity is settled before either lock, because growing takes the
+        // Capacity is settled first, because growing takes `inner`'s write lock.
         self.ensure_capacity(self.live() + 1)?;
 
         let _permit = self.permits.acquire();
@@ -229,7 +230,8 @@ impl AnnIndex {
 
     /// Throw away every member, keeping the index's shape.
     pub fn begin_rebuild(&self) -> Result<()> {
-        // Recording deletes starts before the graph is emptied, not after, so
+        // Recording deletes starts before the graph is emptied, so a delete that
+        // races the clear is still remembered.
         self.rebuilding.store(true, Ordering::Release);
         self.clear()
     }
@@ -256,7 +258,8 @@ impl AnnIndex {
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
 
-        // While rebuilding, the id is remembered rather than simply dropped, so
+        // While rebuilding, the id is remembered rather than simply dropped, so the
+        // refill cannot replay the value this delete removed.
         let key = if self.rebuilding.load(Ordering::Acquire) {
             ids.forget_tombstoned(id)
         } else {
@@ -280,7 +283,8 @@ impl AnnIndex {
             )));
         }
 
-        // Tombstoned keys must never reach the caller, even if usearch still
+        // Tombstoned keys must never reach the caller, even while usearch still
+        // has them in the graph.
         let alive_and_accepted = |key: u64| self.id_of(key).is_some() && accept(key);
 
         let _permit = self.permits.acquire();
@@ -407,10 +411,8 @@ mod tests {
 
     #[test]
     fn churn_does_not_grow_the_index() {
-        // The regression this guards: keys used to index an append-only table, so a
-        // removed entry left a tombstone and the reservation tracked every key ever
-        // handed out. A thousand replacements of the same few vectors grew both
-        // without bound while the live count never moved.
+        // Keys once indexed an append-only table, so a removed entry left a
+        // tombstone and the reservation tracked every key ever handed out.
         let idx = build(4, Quant::F32, Metric::L2, 2);
         for round in 0..200 {
             for i in 0..5 {
@@ -422,14 +424,12 @@ mod tests {
             assert_eq!(idx.len(), 0, "round {round} leaked live entries");
         }
 
-        // Keys are never reused, so they climb; what must not climb is the amount
-        // of state kept for them.
+        // Keys climb, because they are never reused; the state kept for them must not.
         assert_eq!(idx.len(), 0);
         assert_eq!(idx.ids().by_key.len(), 0, "key -> id entries leaked");
         assert_eq!(idx.ids().by_id.len(), 0, "id -> key entries leaked");
         assert_eq!(idx.ids().next, 1000, "keys are handed out monotonically");
-        // 1000 keys were issued, but the reservation only ever needed the live
-        // count, which peaked at five.
+        // 1000 keys issued, but the live count peaked at five.
         assert_eq!(
             idx.reserved.load(Ordering::Acquire),
             MIN_CAPACITY,
@@ -480,10 +480,9 @@ mod tests {
 
     #[test]
     fn more_concurrent_searchers_than_threads_still_succeed() {
-        // The trap this guards: usearch pops thread contexts from a fixed pool
-        // and FAILS rather than blocking when it is empty. With 2 reserved
-        // contexts and 16 concurrent searchers, an ungated implementation
-        // returns "Reserve capacity ahead of insertions!" instead of results.
+        // usearch pops thread contexts from a fixed pool and FAILS rather than
+        // blocking when it is empty: 2 reserved contexts against 16 searchers
+        // returns "Reserve capacity ahead of insertions!" if the gate is missing.
         let idx = Arc::new(build(8, Quant::F32, Metric::Cos, 2));
         for i in 0..200 {
             add(
@@ -553,11 +552,10 @@ mod tests {
 
     #[test]
     fn held_memory_is_chunked_while_used_memory_tracks_the_data() {
-        // Why vstats reports both. usearch's tape allocators grow in 8 MiB chunks,
-        // so `held_bytes` leaps on the first insert and then sits still: measured at
-        // 23 KB empty and 16.8 MiB from one vector through a thousand, at dim 4 and
-        // at dim 1024 alike. Reporting only that number would say every index is the
-        // same size. `used_bytes` is the one that moves with the data.
+        // Why vstats reports both: usearch's tape allocators grow in 8 MiB chunks,
+        // so `held_bytes` leaps on the first insert and then sits still — 23 KB
+        // empty, 16.8 MiB from one vector through a thousand, at any dim. Only
+        // `used_bytes` moves with the data.
         let idx = build(4, Quant::F32, Metric::L2, 2);
         let empty = idx.held_bytes();
         add(&idx, "v0", &[0.0, 0.0, 0.0, 0.0]);

@@ -4,7 +4,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// The `String` ↔ `u64` mapping usearch needs, both directions under one lock so
 #[derive(Default)]
 pub(super) struct IdMap {
     pub(super) by_key: HashMap<u64, Arc<str>>,
@@ -49,7 +48,8 @@ impl IdMap {
         Some(key)
     }
 
-    /// Whether a rebuild should leave this id alone: it is either already in the
+    /// Whether a rebuild should leave this id alone: already present, or deleted
+    /// by the live path since the rebuild began.
     pub(super) fn is_known(&self, id: &str) -> bool {
         self.by_id.contains_key(id) || self.tombstones.contains(id)
     }

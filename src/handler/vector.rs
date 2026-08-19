@@ -22,7 +22,7 @@ pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
     } = spec;
     let attr = attr.as_slice();
 
-    // veclen only sized the body; whether the text really holds `dim`
+    // veclen only sized the body; this is what checks it holds `dim` coordinates.
     let vector = coords(body, *dim, "vector")?;
 
     let index = for_write(store, name)?;

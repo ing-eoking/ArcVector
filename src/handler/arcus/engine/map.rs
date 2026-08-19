@@ -11,12 +11,11 @@ use crate::engine_api::{ENGINE_ITEM_ATTR_ATTR_FLAGS, ENGINE_ITEM_TYPE_ITEM_TYPE_
 ///
 /// A hint, never an authority — a client can set any flags through
 /// `mop create <key> <flags> …` — so this only answers "plausibly ours?" cheaply,
-/// with one hash lookup and no element read, before the metadata element decides.
+/// before the metadata element decides.
 ///
-/// There is no format version here, and none in an element either. Adding one is
-/// what a change to the stored layout would need, and it has to happen *before*
-/// that change ships: a build with no version reads a newer Map, fails, and
-/// judges it damaged. Nothing is deployed yet, so nothing is at risk today.
+/// Neither this nor an element carries a format version. Adding one is what a
+/// change to the stored layout would need, and it has to ship *first*: a build
+/// with no version reads a newer Map, fails, and judges it damaged.
 pub const INDEX_FLAGS: u32 = 0x4156_0000;
 
 /// What a Map looks like from the outside, before any element is read.

@@ -7,12 +7,10 @@ use crate::handler::usearch::{AnnIndex, Metric, THREAD_SLOTS};
 
 /// Read an index's metadata element, or say why it cannot be used.
 ///
-/// There is no "written by a newer build" answer here, because the element
-/// carries no version to give one. The item flags do — `INDEX_FLAGS` has the
-/// format version in its low half — and that is the better place for it: it is
-/// read through `getattr` before any element, so it survives a change to the
-/// element layout itself. A Map a newer build wrote fails `looks_like_index`,
-/// and `discard_damaged` leaves it alone on that basis.
+/// There is no "written by a newer build" answer here: nothing carries a version
+/// yet. The low half of [`INDEX_FLAGS`](crate::handler::arcus::engine::INDEX_FLAGS)
+/// is where one belongs — it is read through `getattr` before any element, so a
+/// Map a newer build wrote would fail `looks_like_index` and be left alone.
 pub enum MetaState {
     Usable(MetaRecord, Layout),
     /// Absent or unparsable.

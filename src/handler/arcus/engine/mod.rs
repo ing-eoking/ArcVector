@@ -14,37 +14,22 @@ pub use map::{INDEX_FLAGS, MapProbe};
 use std::ffi::CStr;
 use std::os::raw::c_void;
 use std::ptr;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use crate::engine_api::{
-    ENGINE_ERROR_CODE_ENGINE_SUCCESS, ENGINE_HANDLE, SERVER_HANDLE_V1, engine_interface_v1,
-};
+use crate::engine_api::{ENGINE_ERROR_CODE_ENGINE_SUCCESS, ENGINE_HANDLE, engine_interface_v1};
 use crate::handler::arcus::abi;
 
 pub const DEFAULT_MAX_ELEMENT_BYTES: u32 = 16 * 1024;
 const DEFAULT_MAX_MAP_SIZE: u32 = 50_000;
 
 static ENGINE: AtomicPtr<engine_interface_v1> = AtomicPtr::new(ptr::null_mut());
-static GET_SERVER_API: OnceLock<unsafe extern "C" fn() -> *mut SERVER_HANDLE_V1> = OnceLock::new();
-
-/// Record the server-API accessor handed to the extension at load time.
-pub fn set_server_api(f: unsafe extern "C" fn() -> *mut SERVER_HANDLE_V1) {
-    let _ = GET_SERVER_API.set(f);
-}
-
 /// Resolve and cache the engine handle.
 fn engine() -> *mut engine_interface_v1 {
     let cached = ENGINE.load(Ordering::Acquire);
     if !cached.is_null() {
         return cached;
     }
-    let Some(get_api) = GET_SERVER_API.get() else {
-        return ptr::null_mut();
-    };
-    // SAFETY: memcached handed us this function pointer during extension
-    // initialization and it stays valid for the process lifetime.
-    let server = unsafe { get_api() };
+    let server = crate::server::handle();
     if server.is_null() {
         return ptr::null_mut();
     }
@@ -53,11 +38,8 @@ fn engine() -> *mut engine_interface_v1 {
     if handle.is_null() {
         return ptr::null_mut();
     }
-    // The first moment the bindings can be checked: at registration the engine
-    // is not wired up yet.
-    // the first and only moment the bindings can be checked against the server
-    // that actually loaded us. Registration is too early — the engine is not wired
-    // up yet — which is why the check lives here rather than in `lib.rs`.
+    // The first moment the bindings can be checked against the server that loaded
+    // us: at registration the engine is not wired up yet.
     // SAFETY: `handle` is the engine's own vtable, non-null and process-lifetime.
     if !unsafe { abi::verify(server, &*handle) } {
         return ptr::null_mut();

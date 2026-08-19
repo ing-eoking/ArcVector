@@ -8,7 +8,7 @@ pub(super) enum JsonVal<'a> {
     Null,
 }
 
-/// Find a top-level field in a JSON object without allocating.
+/// Only top-level fields are addressable.
 pub(super) fn lookup<'a>(json: &'a [u8], field: &[u8]) -> Option<JsonVal<'a>> {
     let mut i = 0;
     skip_ws(json, &mut i);

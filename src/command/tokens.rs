@@ -12,7 +12,6 @@ use crate::error::{Error, Reply, Result};
 pub type ResponseHandler =
     Option<unsafe extern "C" fn(*const c_void, c_int, *const c_char) -> bool>;
 
-/// Borrowed view of a tokenized command line.
 #[derive(Clone, Copy)]
 pub struct Tokens<'a> {
     tokens: &'a [token_t],
@@ -46,7 +45,6 @@ impl<'a> Tokens<'a> {
         Cmd::parse(self.text(0).unwrap_or(""))
     }
 
-    /// Borrow token `i` as UTF-8.
     pub fn text(&self, i: usize) -> Result<&'a str> {
         let token = self
             .tokens
@@ -82,7 +80,6 @@ impl<'a> Tokens<'a> {
     }
 }
 
-/// Writes one response back to the connection.
 pub struct Responder {
     handler: ResponseHandler,
     cookie: *const c_void,
@@ -109,7 +106,6 @@ impl Responder {
         }
     }
 
-    /// The single place a command outcome becomes an ASCII response.
     pub fn reply(&self, outcome: Result<Reply>) {
         match outcome {
             Ok(reply) => self.send(reply.as_str()),

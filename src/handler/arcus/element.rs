@@ -100,7 +100,7 @@ impl Layout {
         quant.max_dim(max_element_bytes - overhead)
     }
 
-    /// Build an element value from an already-quantized vector and attribute JSON.
+    /// `vector` must already be quantized to `self`.
     pub fn encode(&self, vector: &[u8], attr: &[u8]) -> Result<Vec<u8>, CodecError> {
         if vector.len() != self.vector_bytes() {
             return Err(CodecError::VectorLenMismatch {
@@ -124,10 +124,7 @@ impl Layout {
 
     /// Borrow the attribute and vector regions out of a stored element value.
     ///
-    /// The header's `dim` and `quant` are not consulted. A write takes them from
-    /// the index's own layout, so they cannot disagree with `self`, and every
-    /// offset below comes from `self` anyway. What the header is read for is the
-    /// magic, the version and `alen`.
+    /// Every offset comes from `self`; the header is read only for `alen`.
     pub fn decode<'a>(&self, buf: &'a [u8]) -> Result<Element<'a>, CodecError> {
         let head = parse_header(buf)?;
         let need = self.element_len();
@@ -176,7 +173,7 @@ fn parse_header(buf: &[u8]) -> Result<Header, CodecError> {
     Ok(Header { attr_len })
 }
 
-/// What an index is, beyond what a vector element's header already says.
+/// Per-index metadata, stored under [`META_FIELD`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct MetaRecord {
     pub metric: String,
@@ -196,12 +193,8 @@ pub fn mint_owner() -> u64 {
 }
 
 impl MetaRecord {
-    /// Serialize into the element value, which is **entirely JSON**.
-    ///
-    /// No header. A vector element needs one because its ATTR region is fixed and
-    /// the vector has to start at a constant offset; this one holds nothing else,
-    /// so the engine's own element length says where it ends. That also lifts the
-    /// 128-byte ceiling the ATTR region imposed.
+    /// Serialize into the element value, which is **entirely JSON** — no header,
+    /// so neither a constant offset nor the 128-byte ATTR ceiling applies.
     pub fn encode(&self, layout: Layout) -> Vec<u8> {
         format!(
             r#"{{"dim":{},"quant":"{}","metric":"{}","m":{},"efc":{},"efs":{},"owner":"{:016x}"}}"#,
@@ -262,7 +255,6 @@ impl MetaRecord {
     }
 }
 
-/// Borrowed view of a decoded element.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Element<'a> {
     pub attr: &'a [u8],
@@ -332,13 +324,9 @@ mod tests {
         }
     }
 
-    /// Both element shapes have to read the same.
-    ///
-    /// arcus sizes an element to include a trailing `\r\n` (see
-    /// [`Layout::STORED_TERMINATOR`]), and elements written before this module
-    /// accounted for that are two bytes shorter. A rebuild rewrites them, but it
-    /// only gets the chance if it can read them first, so `decode` has to accept
-    /// the buffer with or without the terminator.
+    /// Elements written before this module accounted for [`Layout::STORED_TERMINATOR`]
+    /// are two bytes shorter, and a rebuild only gets to rewrite them if it can
+    /// read them first.
     #[test]
     fn decode_accepts_an_element_with_or_without_the_terminator() {
         let l = Layout::new(4, Quant::F32);
@@ -434,7 +422,6 @@ mod tests {
     #[test]
     fn metadata_round_trips_at_the_widest_values() {
         // The value is the whole element, so there is no fixed region to overflow.
-        // The widest inputs still have to survive the round trip.
         let layout = Layout::new(Layout::max_dim_for(Quant::B1, 16 * 1024), Quant::F32);
         let meta = MetaRecord {
             metric: "tanimoto".to_owned(),

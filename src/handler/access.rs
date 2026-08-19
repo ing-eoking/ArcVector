@@ -93,10 +93,8 @@ fn empty_graph(
 /// Resolve a name to its graph.
 ///
 /// Nothing can outlive the graph in this build, so a name the registry does not
-/// know is a name that does not exist. The Map may still be there — dropped from
-/// the registry by a `vdrop` race, or left by an earlier build that could recover
-/// — and it stays untouched: an operator clears it with `vdrop` and creates the
-/// index again.
+/// know does not exist. A Map left behind stays untouched — an operator clears it
+/// with `vdrop`.
 #[cfg(not(recovery))]
 pub(super) fn resolve(_store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
     registry::get(name).ok_or(Error::NoSuchIndex)

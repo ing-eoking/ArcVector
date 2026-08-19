@@ -1,25 +1,7 @@
 //! ArcVector — vector similarity search as an arcus ASCII protocol extension.
 //!
-//! ```text
-//! lib.rs           the C ABI — registration and memcached's four callbacks
-//!   command/       the wire: a command line in, a typed request out   (pure)
-//!   handler/       everything that runs a command
-//!     quant          how one coordinate is represented — both sides use it
-//!     arcus/         store vectors in the engine — the source of truth
-//!     usearch/       search them — a cache of the arcus side
-//!     registry       the live pairs, by name
-//!     recovery/      noticing a pair has come apart, and rebuilding it
-//!   error          one error type, and who gets blamed for it
-//! ```
-//!
-//! `command` names no engine and no index: it turns tokens into a `Request` and
-//! stops. `handler` owns both backends and takes a `Request`, so the only way to
-//! reach the engine is through the module that executes commands. Neither calls
-//! the other — `lib.rs` is what joins them:
-//!
-//! ```text
-//! execute → command::parse(cookie, tokens) → Request → handler::run(cookie, …)
-//! ```
+//! `command` names no engine and no index, `handler` owns both backends; neither
+//! calls the other, and this file is what joins them.
 //!
 //! The single consistency rule: **the usearch index is a cache rebuildable from
 //! Map. If it is not in Map, it does not exist.**
@@ -42,13 +24,10 @@ pub mod engine_api {
 pub mod command;
 pub mod error;
 pub mod handler;
+pub mod server;
 
-/// Vocabulary the command line names, so parsing can spell it without reaching
-/// into the modules that store or search by it.
-///
-/// `ATTR_BYTES` is here for the same reason: the parser has to refuse an
-/// oversized `ATTR` before a handler ever sees it, and the size is a fact about
-/// the stored element rather than about the wire.
+// Re-exported so `command` can spell the vocabulary the command line names
+// without reaching into the modules that store or search by it.
 pub use handler::arcus::element::ATTR_BYTES;
 pub use handler::quant::Quant;
 pub use handler::usearch::Metric;
@@ -67,14 +46,11 @@ use engine_api::{
 
 /// Decide how much body a command needs before it can run.
 ///
-/// Only the byte count is examined. Everything else on the line is parsed too, but
-/// a failure is *carried into* the pending state rather than refusing the command:
-/// refusing would leave the body unread, and memcached would then parse those
-/// bytes as the next command line.
-///
-/// Returning `true` without setting `ndata` is therefore reserved for a byte count
-/// that cannot be read at all, since without one there is no way to know how much
-/// to drain.
+/// A parse failure is carried into the pending state rather than refusing the
+/// command: refusing would leave the body unread, and memcached would parse those
+/// bytes as the next command line. Returning `true` without setting `ndata` is
+/// therefore reserved for a byte count that cannot be read at all, since without
+/// one there is no way to know how much to drain.
 ///
 /// # Safety
 ///
@@ -127,8 +103,7 @@ unsafe extern "C" fn execute_vector_cmd(
 ) -> bool {
     // SAFETY: guaranteed by the caller.
     let tokens = unsafe { Tokens::new(argv, argc) };
-    // SAFETY: `cookie` belongs to the call in progress.
-    // SAFETY: guaranteed by the caller.
+    // SAFETY: guaranteed by the caller; `cookie` belongs to the call in progress.
     let outcome = unsafe { command::parse(cookie, &tokens) }
         .and_then(|request| unsafe { handler::run(cookie, request) });
     Responder::new(handler, cookie).reply(outcome);
@@ -137,7 +112,8 @@ unsafe extern "C" fn execute_vector_cmd(
 
 /// Release a body whose command never completed.
 unsafe extern "C" fn abort_vector_cmd(_cmd_cookie: *const c_void, cookie: *const c_void) {
-    drop(pending::take_body(cookie));
+    // SAFETY: guaranteed by the caller.
+    drop(unsafe { pending::take_body(cookie) });
 }
 
 unsafe extern "C" fn get_name_vector(_cmd_cookie: *const c_void) -> *const c_char {
@@ -164,7 +140,7 @@ pub extern "C" fn memcached_extensions_initialize(
     let Some(get_api) = get_server_api else {
         return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
     };
-    handler::arcus::engine::set_server_api(get_api);
+    server::set_api(get_api);
 
     // SAFETY: memcached hands us a live SERVER_HANDLE_V1 accessor, and the
     // descriptor is a process-lifetime static that the server only reads.

@@ -58,7 +58,6 @@ pub fn built_for_ee() -> bool {
     env!("ARCVECTOR_ABI_TREE") == "ee"
 }
 
-/// Whether a server version string names an EE build.
 pub fn version_is_ee(version: &str) -> bool {
     version.split('-').any(|part| part == "E")
 }
@@ -97,7 +96,6 @@ pub fn missing(vt: &engine_interface_v1) -> Vec<&'static str> {
         .collect()
 }
 
-/// One line naming what loaded us and what we were built for.
 pub fn fingerprint(version: Option<&str>) -> String {
     format!(
         "ArcVector: memcached {}, built for {}",
@@ -127,7 +125,6 @@ pub fn mismatched() -> bool {
     MISMATCHED.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// Say that the engine behaved in a way only a misaligned vtable explains.
 pub fn report_mismatch(symptom: &str) {
     MISMATCHED.store(true, std::sync::atomic::Ordering::Release);
     MISMATCH_REPORTED.call_once(|| {
@@ -219,13 +216,10 @@ mod tests {
         assert!(text.contains("members"), "{text}");
         assert!(text.contains("headers="), "{text}");
         // `types.h` defines SCAN_COMMAND, so a default build always carries it.
-        // ENABLE_REPLICATION comes from `configure` instead, so it is never
-        // present unless the builder asked — the vendored headers alone cannot
-        // supply it, whichever tree they came from.
+        // ENABLE_REPLICATION comes from `configure`, so only the feature can put
+        // it there — which is the whole reason the feature exists.
         if env!("ARCVECTOR_ABI_HEADERS") == "include" {
             assert!(text.contains("scan"), "{text}");
-            // The `replication` feature is the one thing that can put it
-            // there, which is the whole reason the feature exists.
             assert_eq!(
                 text.contains("replication"),
                 cfg!(feature = "replication"),
@@ -261,11 +255,8 @@ mod tests {
 
     #[test]
     fn the_vendored_headers_name_their_tree() {
-        // The OSS header does not mention `rp_cmd` anywhere, not even inside an
-        // `#ifdef`, so the tree is decidable from the header text alone. Which
-        // tree is vendored is a deployment choice, not something to pin here —
-        // what must hold is that the answer is one of the two and that the
-        // fingerprint says which, so a wrong pairing is legible in the log.
+        // Which tree is vendored is a deployment choice; what must hold is that
+        // the fingerprint names it, so a wrong pairing is legible in the log.
         let tree = env!("ARCVECTOR_ABI_TREE");
         assert!(tree == "ee" || tree == "oss", "{tree}");
         assert!(built_for().starts_with(tree), "{}", built_for());
