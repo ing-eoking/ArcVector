@@ -46,8 +46,6 @@ pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
 fn usable_metadata(store: &Store, name: &str) -> Result<(MetaRecord, Layout)> {
     match registry::read_metadata(store, name) {
         MetaState::Usable(meta, layout) => Ok((meta, layout)),
-        // A newer node's format. Not damage, so nothing is touched.
-        MetaState::Newer => Err(Error::NoSuchIndex),
         MetaState::Damaged(why) => {
             discard_damaged(store, name, &why);
             Err(Error::NoSuchIndex)

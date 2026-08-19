@@ -127,7 +127,7 @@ fn refill(store: &Store, index: &VectorIndex) -> Result<usize> {
 pub fn claim_refilled(store: &Store, index: &VectorIndex) -> Result<()> {
     match read_metadata(store, &index.name) {
         MetaState::Usable(meta, _) if meta.owner == REBUILDING => {}
-        MetaState::Usable(..) | MetaState::Newer => return Err(Error::NoSuchIndex),
+        MetaState::Usable(..) => return Err(Error::NoSuchIndex),
         MetaState::Damaged(why) => return Err(Error::bad_request(why)),
     }
     let owner = mint_owner();

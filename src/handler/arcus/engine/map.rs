@@ -7,8 +7,20 @@ use super::Store;
 use super::error::{Result, StoreError, as_int, check};
 use crate::engine_api::{ENGINE_ITEM_ATTR_ATTR_FLAGS, ENGINE_ITEM_TYPE_ITEM_TYPE_MAP, item_attr};
 
-/// Item flags marking a Map as ours: `"AV"` in the high half, version in the low.
-pub const INDEX_FLAGS: u32 = 0x4156_0000 | 1;
+/// Item flags marking a Map as ours: `"AV"` in the high half, format version in
+/// the low.
+///
+/// The version is the only one there is — elements carry none — and it lives here
+/// rather than in an element header because `getattr` reads it *before* any
+/// element, so it survives a change to the element layout itself. Bump it
+/// whenever that layout changes: a build that cannot read an element must not
+/// recognise the Map as its own, or it will read the bytes as if they were.
+///
+/// | version | element layout |
+/// |---|---|
+/// | 1 | 16-byte header (magic, version, quant, dim, alen), ATTR at 16, vector at 144 |
+/// | 2 | `alen` alone, ATTR at 2, vector at 130 |
+pub const INDEX_FLAGS: u32 = 0x4156_0000 | 2;
 
 /// What a Map looks like from the outside, before any element is read.
 #[derive(Clone, Copy, Debug)]

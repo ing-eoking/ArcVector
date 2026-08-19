@@ -4,12 +4,7 @@
 
 pub use super::quant::{Quant, encode};
 
-const MAGIC: [u8; 2] = *b"AV";
-
-/// Layout version. Bumped whenever the on-element byte layout changes.
-const VERSION: u8 = 2;
-
-const HEADER_LEN: usize = 16;
+const HEADER_LEN: usize = 2;
 
 /// Field name of the reserved element holding an index's metadata.
 pub const META_FIELD: &str = "AV META";
@@ -22,8 +17,6 @@ pub const ATTR_BYTES: usize = 128;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CodecError {
-    BadMagic,
-    UnsupportedVersion(u8),
     /// The metadata JSON is absent, unparsable, or missing a field.
     BadMetadata(String),
     UnknownQuant(u8),
@@ -51,8 +44,6 @@ impl std::error::Error for CodecError {}
 impl std::fmt::Display for CodecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BadMagic => f.write_str("bad element magic"),
-            Self::UnsupportedVersion(v) => write!(f, "unsupported layout version {v}"),
             Self::BadMetadata(m) => write!(f, "index metadata is unusable: {m}"),
             Self::UnknownQuant(q) => write!(f, "unknown quantization {q}"),
             Self::Truncated { need, got } => {
@@ -125,11 +116,7 @@ impl Layout {
         }
 
         let mut buf = vec![0u8; self.element_len()];
-        buf[0..2].copy_from_slice(&MAGIC);
-        buf[2] = VERSION;
-        buf[3..5].copy_from_slice(&(attr.len() as u16).to_le_bytes());
-        // buf[5..16] stays zero: reserved.
-
+        buf[0..2].copy_from_slice(&(attr.len() as u16).to_le_bytes());
         buf[ATTR_OFFSET..ATTR_OFFSET + attr.len()].copy_from_slice(attr);
         buf[Self::VECTOR_OFFSET..].copy_from_slice(vector);
         Ok(buf)
@@ -182,13 +169,7 @@ fn parse_header(buf: &[u8]) -> Result<Header, CodecError> {
             got: buf.len(),
         });
     }
-    if buf[0..2] != MAGIC {
-        return Err(CodecError::BadMagic);
-    }
-    if buf[2] != VERSION {
-        return Err(CodecError::UnsupportedVersion(buf[2]));
-    }
-    let attr_len = u16::from_le_bytes([buf[3], buf[4]]) as usize;
+    let attr_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
     if attr_len > ATTR_BYTES {
         return Err(CodecError::LayoutMismatch);
     }
@@ -235,9 +216,7 @@ impl MetaRecord {
         }
 
         let mut buf = vec![0u8; Layout::VECTOR_OFFSET];
-        buf[0..2].copy_from_slice(&MAGIC);
-        buf[2] = VERSION;
-        buf[3..5].copy_from_slice(&(json.len() as u16).to_le_bytes());
+        buf[0..2].copy_from_slice(&(json.len() as u16).to_le_bytes());
         buf[ATTR_OFFSET..ATTR_OFFSET + json.len()].copy_from_slice(json.as_bytes());
         Ok(buf)
     }
@@ -343,16 +322,14 @@ mod tests {
 
     #[test]
     fn the_vector_offset_is_a_constant() {
-        assert_eq!(ATTR_OFFSET, 16);
-        assert_eq!(Layout::VECTOR_OFFSET, 144);
-        // Being 16-byte aligned keeps the vector SIMD-friendly.
-        assert_eq!(Layout::VECTOR_OFFSET % 16, 0);
+        assert_eq!(ATTR_OFFSET, 2);
+        assert_eq!(Layout::VECTOR_OFFSET, 130);
 
         // It must not move with dim or quant — that is the whole point.
         for dim in [1usize, 128, 4096] {
             for q in [Quant::F32, Quant::F16, Quant::I8, Quant::B1] {
                 let l = Layout::new(dim, q);
-                assert_eq!(l.element_len(), 144 + l.vector_bytes());
+                assert_eq!(l.element_len(), 130 + l.vector_bytes());
             }
         }
     }
@@ -407,7 +384,7 @@ mod tests {
 
         let buf = l.encode(&vector, attr).unwrap();
         assert_eq!(buf.len(), l.element_len());
-        assert_eq!(buf.len(), 144 + 4);
+        assert_eq!(buf.len(), 130 + 4);
 
         let e = l.decode(&buf).unwrap();
         assert_eq!(e.attr, attr);
@@ -489,21 +466,12 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_headers_are_detected() {
+    fn an_attr_length_over_the_region_is_rejected() {
         let l = layout();
         let good = l.encode(&[0, 0, 0, 0], b"{}").unwrap();
 
         let mut bad = good.clone();
-        bad[0] = b'X';
-        assert_eq!(l.decode(&bad), Err(CodecError::BadMagic));
-
-        let mut bad = good.clone();
-        bad[2] = 99;
-        assert_eq!(l.decode(&bad), Err(CodecError::UnsupportedVersion(99)));
-
-        // An attr length that cannot fit the fixed region.
-        let mut bad = good.clone();
-        bad[3..5].copy_from_slice(&(ATTR_BYTES as u16 + 1).to_le_bytes());
+        bad[0..2].copy_from_slice(&(ATTR_BYTES as u16 + 1).to_le_bytes());
         assert_eq!(l.decode(&bad), Err(CodecError::LayoutMismatch));
         assert_eq!(l.attr_of(&bad), Err(CodecError::LayoutMismatch));
     }
@@ -520,8 +488,8 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_header(&good[..4]),
-            Err(CodecError::Truncated { need: 16, got: 4 })
+            parse_header(&good[..1]),
+            Err(CodecError::Truncated { need: 2, got: 1 })
         );
     }
 
@@ -539,11 +507,11 @@ mod tests {
     #[test]
     fn max_dim_for_is_the_exact_ceiling() {
         let limit = 16 * 1024;
-        // 16384 - 144 header/ATTR - 2 terminator = 16238 bytes of coordinates.
-        assert_eq!(Layout::max_dim_for(Quant::F32, limit), 4059);
-        assert_eq!(Layout::max_dim_for(Quant::F16, limit), 8119);
-        assert_eq!(Layout::max_dim_for(Quant::I8, limit), 16238);
-        assert_eq!(Layout::max_dim_for(Quant::B1, limit), 129_904);
+        // 16384 - 130 header/ATTR - 2 terminator = 16252 bytes of coordinates.
+        assert_eq!(Layout::max_dim_for(Quant::F32, limit), 4063);
+        assert_eq!(Layout::max_dim_for(Quant::F16, limit), 8126);
+        assert_eq!(Layout::max_dim_for(Quant::I8, limit), 16252);
+        assert_eq!(Layout::max_dim_for(Quant::B1, limit), 130_016);
 
         for q in [Quant::F32, Quant::F16, Quant::I8, Quant::B1] {
             let d = Layout::max_dim_for(q, limit);

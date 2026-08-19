@@ -6,11 +6,16 @@ use crate::handler::arcus::engine::{Store, StoreError};
 use crate::handler::usearch::{AnnIndex, Metric, THREAD_SLOTS};
 
 /// Read an index's metadata element, or say why it cannot be used.
+///
+/// There is no "written by a newer build" answer here, because the element
+/// carries no version to give one. The item flags do — `INDEX_FLAGS` has the
+/// format version in its low half — and that is the better place for it: it is
+/// read through `getattr` before any element, so it survives a change to the
+/// element layout itself. A Map a newer build wrote fails `looks_like_index`,
+/// and `discard_damaged` leaves it alone on that basis.
 pub enum MetaState {
     Usable(MetaRecord, Layout),
-    /// Written by a newer build. **Not** damage — leave everything alone.
-    Newer,
-    /// Absent, wrong magic, wrong record type, or unparsable.
+    /// Absent or unparsable.
     Damaged(String),
 }
 
@@ -22,13 +27,6 @@ pub fn read_metadata(store: &Store, name: &str) -> MetaState {
     };
     match MetaRecord::decode(&raw) {
         Ok((meta, layout)) => MetaState::Usable(meta, layout),
-        Err(crate::handler::arcus::element::CodecError::UnsupportedVersion(v)) => {
-            eprintln!(
-                "ArcVector: index '{name}' carries metadata format version {v}, which this \
-                 build does not read. Leaving it untouched — a newer node wrote it."
-            );
-            MetaState::Newer
-        }
         Err(e) => MetaState::Damaged(e.to_string()),
     }
 }
@@ -50,7 +48,6 @@ pub fn build_ann(meta: &MetaRecord, layout: Layout) -> Result<AnnIndex> {
 pub(super) fn stamp(store: &Store, name: &str, owner: u64) -> Result<()> {
     let (meta, layout) = match read_metadata(store, name) {
         MetaState::Usable(meta, layout) => (meta, layout),
-        MetaState::Newer => return Err(Error::NoSuchIndex),
         MetaState::Damaged(why) => return Err(Error::bad_request(why)),
     };
     let claimed = MetaRecord { owner, ..meta };

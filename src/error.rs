@@ -169,14 +169,17 @@ mod tests {
     #[test]
     fn corrupt_stored_data_is_blamed_on_the_server() {
         // A bad magic byte means what we stored is wrong, not what was sent.
-        assert_eq!(Error::Codec(CodecError::BadMagic).blame(), Blame::Server);
+        assert_eq!(
+            Error::Codec(CodecError::LayoutMismatch).blame(),
+            Blame::Server
+        );
         assert_eq!(Error::Store(StoreError::Unavailable).blame(), Blame::Server);
         assert_eq!(Error::Index("boom".into()).blame(), Blame::Server);
     }
 
     #[test]
     fn errors_convert_from_their_module_types() {
-        let e: Error = CodecError::BadMagic.into();
+        let e: Error = CodecError::LayoutMismatch.into();
         assert!(matches!(e, Error::Codec(_)));
         let e: Error = ParseError::Empty.into();
         assert!(matches!(e, Error::Filter(_)));

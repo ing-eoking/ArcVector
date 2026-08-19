@@ -88,12 +88,12 @@ two metrics require `b1`. `i8` L2-normalizes before scaling, so distances live i
 the normalized space.
 
 Maximum dimension, with the engine's default 16 KB `max_element_bytes`, the fixed
-144-byte element overhead and the 2-byte terminator arcus counts as part of every
+130-byte element overhead and the 2-byte terminator arcus counts as part of every
 collection element:
 
 | quant | f32 | f16 | i8 | b1 |
 |---|---|---|---|---|
-| max dim | 4,059 | 8,119 | **16,238** | 129,904 |
+| max dim | 4,063 | 8,126 | **16,252** | 130,016 |
 
 ```
 vcreate docs 1024 METRIC cos QUANT i8 MAXCOUNT 1000000
