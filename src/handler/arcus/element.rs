@@ -127,10 +127,8 @@ impl Layout {
         let mut buf = vec![0u8; self.element_len()];
         buf[0..2].copy_from_slice(&MAGIC);
         buf[2] = VERSION;
-        buf[3] = self.quant as u8;
-        buf[4..6].copy_from_slice(&(self.dim as u16).to_le_bytes());
-        buf[6..8].copy_from_slice(&(attr.len() as u16).to_le_bytes());
-        // buf[8..16] stays zero: reserved.
+        buf[3..5].copy_from_slice(&(attr.len() as u16).to_le_bytes());
+        // buf[5..16] stays zero: reserved.
 
         buf[ATTR_OFFSET..ATTR_OFFSET + attr.len()].copy_from_slice(attr);
         buf[Self::VECTOR_OFFSET..].copy_from_slice(vector);
@@ -174,8 +172,6 @@ impl Layout {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Header {
-    quant: Quant,
-    dim: usize,
     attr_len: usize,
 }
 
@@ -192,16 +188,11 @@ fn parse_header(buf: &[u8]) -> Result<Header, CodecError> {
     if buf[2] != VERSION {
         return Err(CodecError::UnsupportedVersion(buf[2]));
     }
-    let quant = Quant::from_u8(buf[3]).ok_or(CodecError::UnknownQuant(buf[3]))?;
-    let attr_len = u16::from_le_bytes([buf[6], buf[7]]) as usize;
+    let attr_len = u16::from_le_bytes([buf[3], buf[4]]) as usize;
     if attr_len > ATTR_BYTES {
         return Err(CodecError::LayoutMismatch);
     }
-    Ok(Header {
-        quant,
-        dim: u16::from_le_bytes([buf[4], buf[5]]) as usize,
-        attr_len,
-    })
+    Ok(Header { attr_len })
 }
 
 /// What an index is, beyond what a vector element's header already says.
@@ -227,8 +218,14 @@ impl MetaRecord {
     /// Serialize into a full element value: header, then JSON in the ATTR region.
     pub fn encode(&self, layout: Layout) -> Result<Vec<u8>, CodecError> {
         let json = format!(
-            r#"{{"metric":"{}","m":{},"efc":{},"efs":{},"owner":"{:016x}"}}"#,
-            self.metric, self.connectivity, self.expansion_add, self.expansion_search, self.owner,
+            r#"{{"dim":{},"quant":"{}","metric":"{}","m":{},"efc":{},"efs":{},"owner":"{:016x}"}}"#,
+            layout.dim,
+            layout.quant,
+            self.metric,
+            self.connectivity,
+            self.expansion_add,
+            self.expansion_search,
+            self.owner,
         );
         if json.len() > ATTR_BYTES {
             return Err(CodecError::AttrTooLarge {
@@ -240,9 +237,7 @@ impl MetaRecord {
         let mut buf = vec![0u8; Layout::VECTOR_OFFSET];
         buf[0..2].copy_from_slice(&MAGIC);
         buf[2] = VERSION;
-        buf[3] = layout.quant as u8;
-        buf[4..6].copy_from_slice(&(layout.dim as u16).to_le_bytes());
-        buf[6..8].copy_from_slice(&(json.len() as u16).to_le_bytes());
+        buf[3..5].copy_from_slice(&(json.len() as u16).to_le_bytes());
         buf[ATTR_OFFSET..ATTR_OFFSET + json.len()].copy_from_slice(json.as_bytes());
         Ok(buf)
     }
@@ -286,7 +281,13 @@ impl MetaRecord {
                 expansion_search: num("efs")?,
                 owner,
             },
-            Layout::new(head.dim, head.quant),
+            Layout::new(
+                num("dim")?,
+                json.get("quant")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(Quant::parse)
+                    .ok_or_else(|| miss("quant"))?,
+            ),
         ))
     }
 
@@ -467,6 +468,27 @@ mod tests {
     }
 
     #[test]
+    fn metadata_json_fits_the_region_at_the_widest_values() {
+        // dim, quant and the HNSW parameters live in this JSON, so the region has
+        // to hold the largest of each that can reach it: the dimension ceiling for
+        // the narrowest quantization, the longest metric name, and the largest
+        // connectivity usearch accepts.
+        let layout = Layout::new(Layout::max_dim_for(Quant::B1, 16 * 1024), Quant::F32);
+        let meta = MetaRecord {
+            metric: "tanimoto".to_owned(),
+            connectivity: u32::MAX as usize,
+            expansion_add: u32::MAX as usize,
+            expansion_search: u32::MAX as usize,
+            owner: u64::MAX,
+        };
+        let encoded = meta.encode(layout).expect("widest metadata must fit");
+        let (back, back_layout) = MetaRecord::decode(&encoded).unwrap();
+        assert_eq!(back, meta);
+        assert_eq!(back_layout.dim, layout.dim);
+        assert_eq!(back_layout.quant, layout.quant);
+    }
+
+    #[test]
     fn corrupt_headers_are_detected() {
         let l = layout();
         let good = l.encode(&[0, 0, 0, 0], b"{}").unwrap();
@@ -479,19 +501,9 @@ mod tests {
         bad[2] = 99;
         assert_eq!(l.decode(&bad), Err(CodecError::UnsupportedVersion(99)));
 
-        let mut bad = good.clone();
-        bad[3] = 7;
-        assert_eq!(l.decode(&bad), Err(CodecError::UnknownQuant(7)));
-
-        // `dim` is not compared: a write takes it from the index's own layout, so
-        // it cannot disagree, and nothing downstream reads it.
-        let mut odd = good.clone();
-        odd[4..6].copy_from_slice(&99u16.to_le_bytes());
-        assert!(l.decode(&odd).is_ok());
-
         // An attr length that cannot fit the fixed region.
         let mut bad = good.clone();
-        bad[6..8].copy_from_slice(&(ATTR_BYTES as u16 + 1).to_le_bytes());
+        bad[3..5].copy_from_slice(&(ATTR_BYTES as u16 + 1).to_le_bytes());
         assert_eq!(l.decode(&bad), Err(CodecError::LayoutMismatch));
         assert_eq!(l.attr_of(&bad), Err(CodecError::LayoutMismatch));
     }
