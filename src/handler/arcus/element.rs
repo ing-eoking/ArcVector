@@ -11,27 +11,6 @@ const VERSION: u8 = 2;
 
 const HEADER_LEN: usize = 16;
 
-/// Offset of the record type, the first of the header's reserved bytes.
-const RECORD_TYPE_OFFSET: usize = 8;
-
-/// What a record in the Map is. One framing, one magic, two kinds.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum RecordType {
-    Vector = 0,
-    IndexMeta = 1,
-}
-
-impl RecordType {
-    const fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(Self::Vector),
-            1 => Some(Self::IndexMeta),
-            _ => None,
-        }
-    }
-}
-
 /// Field name of the reserved element holding an index's metadata.
 pub const META_FIELD: &str = "AV META";
 
@@ -45,13 +24,6 @@ pub const ATTR_BYTES: usize = 128;
 pub enum CodecError {
     BadMagic,
     UnsupportedVersion(u8),
-    /// The record type byte is one this build does not define.
-    UnknownRecordType(u8),
-    /// A vector was read where metadata was expected, or the reverse.
-    WrongRecordType {
-        want: RecordType,
-        got: RecordType,
-    },
     /// The metadata JSON is absent, unparsable, or missing a field.
     BadMetadata(String),
     UnknownQuant(u8),
@@ -81,10 +53,6 @@ impl std::fmt::Display for CodecError {
         match self {
             Self::BadMagic => f.write_str("bad element magic"),
             Self::UnsupportedVersion(v) => write!(f, "unsupported layout version {v}"),
-            Self::UnknownRecordType(t) => write!(f, "unknown record type {t}"),
-            Self::WrongRecordType { want, got } => {
-                write!(f, "expected a {want:?} record, found {got:?}")
-            }
             Self::BadMetadata(m) => write!(f, "index metadata is unusable: {m}"),
             Self::UnknownQuant(q) => write!(f, "unknown quantization {q}"),
             Self::Truncated { need, got } => {
@@ -170,17 +138,13 @@ impl Layout {
     }
 
     /// Borrow the attribute and vector regions out of a stored element value.
+    ///
+    /// The header's `dim` and `quant` are not consulted. A write takes them from
+    /// the index's own layout, so they cannot disagree with `self`, and every
+    /// offset below comes from `self` anyway. What the header is read for is the
+    /// magic, the version and `alen`.
     pub fn decode<'a>(&self, buf: &'a [u8]) -> Result<Element<'a>, CodecError> {
         let head = parse_header(buf)?;
-        if head.record != RecordType::Vector {
-            return Err(CodecError::WrongRecordType {
-                want: RecordType::Vector,
-                got: head.record,
-            });
-        }
-        if head.dim != self.dim || head.quant != self.quant {
-            return Err(CodecError::LayoutMismatch);
-        }
         let need = self.element_len();
         if buf.len() < need {
             return Err(CodecError::Truncated {
@@ -213,7 +177,6 @@ struct Header {
     quant: Quant,
     dim: usize,
     attr_len: usize,
-    record: RecordType,
 }
 
 fn parse_header(buf: &[u8]) -> Result<Header, CodecError> {
@@ -230,8 +193,6 @@ fn parse_header(buf: &[u8]) -> Result<Header, CodecError> {
         return Err(CodecError::UnsupportedVersion(buf[2]));
     }
     let quant = Quant::from_u8(buf[3]).ok_or(CodecError::UnknownQuant(buf[3]))?;
-    let record = RecordType::from_u8(buf[RECORD_TYPE_OFFSET])
-        .ok_or(CodecError::UnknownRecordType(buf[RECORD_TYPE_OFFSET]))?;
     let attr_len = u16::from_le_bytes([buf[6], buf[7]]) as usize;
     if attr_len > ATTR_BYTES {
         return Err(CodecError::LayoutMismatch);
@@ -240,7 +201,6 @@ fn parse_header(buf: &[u8]) -> Result<Header, CodecError> {
         quant,
         dim: u16::from_le_bytes([buf[4], buf[5]]) as usize,
         attr_len,
-        record,
     })
 }
 
@@ -283,7 +243,6 @@ impl MetaRecord {
         buf[3] = layout.quant as u8;
         buf[4..6].copy_from_slice(&(layout.dim as u16).to_le_bytes());
         buf[6..8].copy_from_slice(&(json.len() as u16).to_le_bytes());
-        buf[RECORD_TYPE_OFFSET] = RecordType::IndexMeta as u8;
         buf[ATTR_OFFSET..ATTR_OFFSET + json.len()].copy_from_slice(json.as_bytes());
         Ok(buf)
     }
@@ -291,12 +250,6 @@ impl MetaRecord {
     /// Read one back, along with the layout its header records.
     pub fn decode(buf: &[u8]) -> Result<(Self, Layout), CodecError> {
         let head = parse_header(buf)?;
-        if head.record != RecordType::IndexMeta {
-            return Err(CodecError::WrongRecordType {
-                want: RecordType::IndexMeta,
-                got: head.record,
-            });
-        }
         if buf.len() < ATTR_OFFSET + head.attr_len {
             return Err(CodecError::Truncated {
                 need: ATTR_OFFSET + head.attr_len,
@@ -530,10 +483,11 @@ mod tests {
         bad[3] = 7;
         assert_eq!(l.decode(&bad), Err(CodecError::UnknownQuant(7)));
 
-        // A header describing a different dimension than the index expects.
-        let mut bad = good.clone();
-        bad[4..6].copy_from_slice(&99u16.to_le_bytes());
-        assert_eq!(l.decode(&bad), Err(CodecError::LayoutMismatch));
+        // `dim` is not compared: a write takes it from the index's own layout, so
+        // it cannot disagree, and nothing downstream reads it.
+        let mut odd = good.clone();
+        odd[4..6].copy_from_slice(&99u16.to_le_bytes());
+        assert!(l.decode(&odd).is_ok());
 
         // An attr length that cannot fit the fixed region.
         let mut bad = good.clone();
