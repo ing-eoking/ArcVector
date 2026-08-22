@@ -4,6 +4,7 @@ use std::fmt;
 use std::os::raw::c_int;
 
 use crate::engine_api::{
+    ENGINE_ERROR_CODE_ENGINE_EBADTYPE, ENGINE_ERROR_CODE_ENGINE_ELEM_EEXISTS,
     ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT, ENGINE_ERROR_CODE_ENGINE_EOVERFLOW,
     ENGINE_ERROR_CODE_ENGINE_EWOULDBLOCK, ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT,
     ENGINE_ERROR_CODE_ENGINE_SUCCESS,
@@ -15,6 +16,10 @@ pub enum StoreError {
     AbiMismatch,
     KeyGone,
     ElemGone,
+    /// The field is already in the Map. Only an insert that refuses to replace can see it.
+    ElemExists,
+    /// The key holds an item that is not a Map.
+    BadType,
     Overflow,
     ReplicaSlave,
     Engine(u32),
@@ -30,6 +35,8 @@ impl fmt::Display for StoreError {
             ),
             Self::KeyGone => f.write_str("index not found in engine"),
             Self::ElemGone => f.write_str("element not found"),
+            Self::ElemExists => f.write_str("element already exists"),
+            Self::BadType => f.write_str("key holds an item that is not a Map"),
             Self::Overflow => f.write_str("index is full"),
             Self::ReplicaSlave => {
                 f.write_str("this node is a replica; vector commands are served by the master")
@@ -50,6 +57,8 @@ pub(super) fn translate(code: u32) -> StoreError {
     match code {
         ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT => StoreError::KeyGone,
         ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT => StoreError::ElemGone,
+        ENGINE_ERROR_CODE_ENGINE_ELEM_EEXISTS => StoreError::ElemExists,
+        ENGINE_ERROR_CODE_ENGINE_EBADTYPE => StoreError::BadType,
         ENGINE_ERROR_CODE_ENGINE_EOVERFLOW => StoreError::Overflow,
         ENGINE_REPL_SLAVE => StoreError::ReplicaSlave,
         other => StoreError::Engine(other),
@@ -87,6 +96,14 @@ mod tests {
         assert_eq!(
             translate(ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT),
             StoreError::ElemGone
+        );
+        assert_eq!(
+            translate(ENGINE_ERROR_CODE_ENGINE_ELEM_EEXISTS),
+            StoreError::ElemExists
+        );
+        assert_eq!(
+            translate(ENGINE_ERROR_CODE_ENGINE_EBADTYPE),
+            StoreError::BadType
         );
         assert_eq!(
             translate(ENGINE_ERROR_CODE_ENGINE_EOVERFLOW),

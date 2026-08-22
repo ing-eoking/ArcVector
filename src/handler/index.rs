@@ -23,16 +23,6 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
     let layout = Layout::new(dim, quant);
     check_dimension_fits(store, layout, quant)?;
 
-    // Replication or persistence may have delivered this Map. Never clear it.
-    if store.probe_map(name).is_ok() {
-        return already_there(store, name);
-    }
-    // No Map, so any registry entry under this name is a graph whose Map expired or was
-    // evicted. Release it here rather than letting the insert below find it and answer
-    // `EXISTS` — that reply would leave the fresh empty Map paired with the stale graph, and
-    // in a build that cannot rebuild, nothing would ever notice.
-    super::access::map_is_gone(name);
-
     // Before the Map, so an unsupported metric leaves no empty Map behind.
     let ann = AnnIndex::new(
         layout,
@@ -52,32 +42,58 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         expansion_search: spec.expansion_search,
         owner,
     };
+    // One engine call settles the name. Nothing probes it first: a probe answers about a
+    // moment that has already passed, and every case it could report comes back from this
+    // call anyway — decided under the engine's own cache lock, so there is no window between
+    // the look and the act.
+    //
+    //   Ok(true)         the name was free; the engine made the Map and took the element
+    //   Ok(false)        a Map was there without metadata — not an index, and not ours
+    //   Err(ElemExists)  a Map was there with metadata — already an index
+    //   Err(BadType)     the name holds something that is not a Map
+    //
     // A Map without this element is not an index: `resolve` cannot read it and only `vdrop`
-    // can clear it. One call makes both — the engine creates the Map, inserts the element,
-    // and unlinks the Map again if the element cannot go in, all under its cache lock — so
-    // that state has no window to exist in and there is nothing to compensate.
-    let created = store
-        .alloc_elem(name, element::META_FIELD, &meta.encode(layout))?
-        .insert_creating(engine::index_attr(Some(held), spec.exptime))?;
+    // can clear it. The engine unlinks the Map again if the element cannot go in, all under
+    // that same lock, so that state has no window to exist in either.
+    let created = match store
+        .alloc_elem(name, element::META_FIELD, &meta.encode(layout))
+        .and_then(|pending| pending.insert_creating(engine::index_attr(Some(held), spec.exptime)))
+    {
+        Ok(created) => created,
+        Err(StoreError::ElemExists) => return already_there(store, name),
+        Err(StoreError::BadType) => {
+            return Err(Error::bad_request(format!(
+                "'{name}' holds an item that is not a Map"
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
     if !created {
-        // A Map appeared between the probe above and this insert. One that already had
-        // metadata would have refused the element; this one had none, so it is not an index
-        // and the element went into a Map we did not make — a plain `mop` Map, or one a
-        // replication transfer is still filling. Take it back out and answer as the probe
-        // would have. Nothing else was touched: the Map is as we found it.
+        // A Map was already there, and one that already had metadata would have refused the
+        // element above. This one had none, so it is not an index and the element went into a
+        // Map we did not make — a plain `mop` Map, or one a replication transfer is still
+        // filling. Take it back out and answer for the Map that was there. Nothing else was
+        // touched: the Map is as we found it (`delete_elem` passes `drop_if_empty` false, so
+        // emptying it does not drop it).
         let _ = store.delete_elem(name, element::META_FIELD);
         return already_there(store, name);
     }
+
+    // The name was free until this call, so any registry entry under it is a graph whose Map
+    // expired or was evicted. Release it here, or the insert below finds it and answers
+    // `EXISTS` — that reply would leave the fresh empty Map paired with the stale graph, and
+    // in a build that cannot rebuild, nothing would ever notice.
+    super::access::map_is_gone(name);
 
     let index = VectorIndex::new(name.to_owned(), ann, maxcount, owner);
     let (_, inserted) = registry::insert_or_get(index);
     Ok(if inserted {
         Reply::Created
     } else {
-        // Reaching here means the Map did not exist above, and a racing `vcreate` cannot be
-        // the one holding the name: the loser of that race is refused at `insert_creating`
-        // with `ELEM_EEXISTS` and never gets this far. So this is a graph registered between
-        // the release above and now — answer as the probe would have.
+        // We hold the name in the engine, so no racing `vcreate` can be the one registered
+        // here: the loser of that race is refused at `insert_creating` with `ELEM_EEXISTS`
+        // and never gets this far. This is a graph a concurrent `resolve` built from the Map
+        // we just made, between the release above and now — answer that it is already there.
         Reply::Exists
     })
 }

@@ -129,8 +129,11 @@ pub(super) fn for_write(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
 /// outlive it. Without this a `vsim` keeps answering with ids whose elements are gone — and in a
 /// build that cannot rebuild, nothing else ever notices.
 ///
-/// Called only where an engine call already reported `KeyGone`, so it costs nothing: no build
-/// pays an extra probe to find this out.
+/// Only ever called off the back of an engine call that already proved the Map is not there —
+/// a `KeyGone`, or a `vcreate` whose insert reports it created the Map. No build pays an extra
+/// probe to find this out, and nothing here runs on a guess: a probe that merely failed could
+/// have failed for a transient reason, and releasing the graph on that would throw away a
+/// working index.
 pub(super) fn map_is_gone(name: &str) {
     if registry::remove(name) {
         eprintln!("ArcVector: index '{name}' has no Map; releasing the graph it was built from");
