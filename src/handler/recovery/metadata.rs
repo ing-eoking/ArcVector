@@ -1,25 +1,8 @@
 use crate::error::{Error, Result};
 use crate::handler::arcus::element::{Layout, META_FIELD, MetaRecord};
-use crate::handler::arcus::engine::{Store, StoreError};
+use crate::handler::arcus::engine::Store;
+use crate::handler::meta::{MetaState, read_metadata};
 use crate::handler::usearch::{AnnIndex, Metric};
-
-/// The Map's own state, read from its flags and metadata element before any vector element.
-pub enum MetaState {
-    Usable(MetaRecord, Layout),
-    Damaged(String),
-}
-
-pub fn read_metadata(store: &Store, name: &str) -> MetaState {
-    let raw = match store.get_elem(name, META_FIELD) {
-        Ok(bytes) => bytes,
-        Err(StoreError::ElemGone) => return MetaState::Damaged("no metadata element".to_owned()),
-        Err(e) => return MetaState::Damaged(e.to_string()),
-    };
-    match MetaRecord::decode(&raw) {
-        Ok((meta, layout)) => MetaState::Usable(meta, layout),
-        Err(e) => MetaState::Damaged(e.to_string()),
-    }
-}
 
 pub fn build_ann(meta: &MetaRecord, layout: Layout) -> Result<AnnIndex> {
     let metric = Metric::parse(&meta.metric)
@@ -37,7 +20,9 @@ pub fn build_ann(meta: &MetaRecord, layout: Layout) -> Result<AnnIndex> {
 pub(super) fn stamp(store: &Store, name: &str, owner: u64) -> Result<()> {
     let (meta, layout) = match read_metadata(store, name) {
         MetaState::Usable(meta, layout) => (meta, layout),
+        MetaState::NoMap => return Err(Error::NoSuchIndex),
         MetaState::Damaged(why) => return Err(Error::bad_request(why)),
+        MetaState::Unknown(e) => return Err(e.into()),
     };
     let claimed = MetaRecord { owner, ..meta };
     store.put_elem(name, META_FIELD, &claimed.encode(layout))?;

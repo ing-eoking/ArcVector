@@ -131,17 +131,6 @@ pub fn vsim_vector(store: &Store, spec: &Sim, body: &[u8]) -> Result<Reply> {
     let filter = filter.as_ref();
 
     let index = for_read(store, name)?;
-    // Nothing else on this path touches the engine: without recovery `resolve` is a registry
-    // lookup, and a hit rendered without FILTER or WITHATTR reads no element. So this is the
-    // one command that could keep answering from a graph whose Map expired or was evicted.
-    // One `getattr` settles it — liveness is all that is needed here, because a build that
-    // cannot rebuild has no ownership for the metadata to report. Only `KeyGone` counts as
-    // gone: a transient engine failure must not release a working index's graph.
-    #[cfg(not(recovery))]
-    if filter.is_none() && !with_attr && matches!(store.probe_map(name), Err(StoreError::KeyGone)) {
-        map_is_gone(name);
-        return Ok(Reply::NotFound);
-    }
     let layout = index.ann.layout;
     if dim != layout.dim {
         return Err(Error::bad_request(format!(

@@ -8,6 +8,7 @@ pub mod usearch;
 mod access;
 mod coords;
 mod index;
+mod meta;
 mod search;
 mod vector;
 

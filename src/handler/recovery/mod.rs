@@ -4,7 +4,9 @@ use std::sync::{Condvar, LazyLock, Mutex, PoisonError};
 
 pub mod metadata;
 
-use metadata::{MetaState, read_metadata, stamp};
+use metadata::stamp;
+
+use crate::handler::meta::{MetaState, read_metadata};
 
 use super::registry::{REBUILDING, VectorIndex, get, remove};
 use crate::error::{Error, Result};
@@ -135,8 +137,9 @@ fn refill(store: &Store, index: &VectorIndex) -> Result<usize> {
 pub fn claim_refilled(store: &Store, index: &VectorIndex) -> Result<()> {
     match read_metadata(store, &index.name) {
         MetaState::Usable(meta, _) if meta.owner == REBUILDING => {}
-        MetaState::Usable(..) => return Err(Error::NoSuchIndex),
+        MetaState::Usable(..) | MetaState::NoMap => return Err(Error::NoSuchIndex),
         MetaState::Damaged(why) => return Err(Error::bad_request(why)),
+        MetaState::Unknown(e) => return Err(e.into()),
     }
     let owner = mint_owner();
     stamp(store, &index.name, owner)?;

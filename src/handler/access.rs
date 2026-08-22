@@ -1,15 +1,15 @@
-//! With `cfg(recovery)` the Map's `owner` token decides and a stale graph is rebuilt; without it the registry is the whole answer.
+//! Every command starts with the Map's metadata element; with `cfg(recovery)` its `owner` token also decides whether this node's graph is the one to serve.
 
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-#[cfg(recovery)]
 use crate::handler::arcus::element::{Layout, MetaRecord};
 use crate::handler::arcus::engine::Store;
 #[cfg(recovery)]
 use crate::handler::arcus::engine::StoreError;
+use crate::handler::meta::{MetaState, read_metadata};
 #[cfg(recovery)]
-use crate::handler::recovery::{self, metadata::MetaState};
+use crate::handler::recovery;
 use crate::handler::registry::{self, VectorIndex};
 
 #[cfg(recovery)]
@@ -34,38 +34,65 @@ pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
     Ok(index)
 }
 
-#[cfg(recovery)]
+/// Nothing outlives the graph in this build, so the registry holds every index there is — but
+/// the Map under the name can still expire, be evicted, or be replaced by a Map that is not
+/// ours, and the registry cannot see any of that. The metadata read is what does.
+#[cfg(not(recovery))]
+pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
+    let (meta, _) = usable_metadata(store, name)?;
+    let index = registry::get(name).ok_or(Error::NoSuchIndex)?;
+    if meta.owner != index.owner() {
+        // Nothing in this build can produce a second index at one name — no transfer, no
+        // restore, and `vcreate` releases a stale graph before it registers. So this is the
+        // branch that should never run, kept because the guarantee it rests on is a build
+        // configuration rather than anything the code enforces. There is nothing to rebuild
+        // from, so let the graph go and answer as if the name were free.
+        registry::remove(name);
+        return Err(Error::NoSuchIndex);
+    }
+    Ok(index)
+}
+
+/// The metadata element, or the reason there is none — and, where the reason is definitive,
+/// the release of a graph that has nothing left to serve.
 fn usable_metadata(store: &Store, name: &str) -> Result<(MetaRecord, Layout)> {
-    match recovery::metadata::read_metadata(store, name) {
+    match read_metadata(store, name) {
         MetaState::Usable(meta, layout) => Ok((meta, layout)),
+        // Expired, evicted, or dropped by another node.
+        MetaState::NoMap => {
+            map_is_gone(name);
+            Err(Error::NoSuchIndex)
+        }
         MetaState::Damaged(why) => {
             discard_damaged(store, name, &why);
             Err(Error::NoSuchIndex)
         }
+        // Proves nothing about the name, so nothing is released on it — and the client hears
+        // what actually happened. Answering NOT_FOUND here would report a working index as
+        // missing every time the engine hiccups, and an ABI mismatch would say the same.
+        MetaState::Unknown(e) => Err(e.into()),
     }
 }
 
-/// What to do about a name whose metadata will not read.
+/// What to do about a Map whose metadata will not read.
 ///
-/// Three cases, and only the middle one deletes anything in the engine.
+/// The Map is there — `NoMap` was already ruled out — so the question is only whose it is.
 #[cfg(recovery)]
 fn discard_damaged(store: &Store, name: &str, why: &str) {
     match store.probe_map(name) {
-        // No Map at all: expired, evicted, or dropped by another node. There is nothing to
-        // delete and nothing left for the graph to serve, so let the graph go — dropping the
-        // registry entry drops the last `Arc`, and with it usearch's graph and the id
-        // mapping. An in-flight command holding one frees it when it finishes.
-        Err(StoreError::KeyGone) => {
+        // Gone between the metadata read and this probe. Nothing to delete.
+        Err(StoreError::KeyGone) => map_is_gone(name),
+        // Any other engine trouble proves nothing about whether the Map is there.
+        Err(_) => {}
+        // Somebody else's Map is none of our business — but the graph under that name is
+        // ours, and it has nothing left to serve.
+        Ok(probe) if !probe.looks_like_index() => {
             if registry::remove(name) {
                 eprintln!(
-                    "ArcVector: index '{name}' has no Map ({why}); releasing the graph it was built from"
+                    "ArcVector: '{name}' is not our Map ({why}); releasing the graph that used to be there"
                 );
             }
         }
-        // Any other engine trouble proves nothing about whether the Map is there.
-        Err(_) => {}
-        // Somebody else's Map is none of our business.
-        Ok(probe) if !probe.looks_like_index() => {}
         // Ours, present, and unreadable — the one failure that deletes.
         Ok(_) => {
             if crate::handler::arcus::abi::mismatched() {
@@ -79,6 +106,17 @@ fn discard_damaged(store: &Store, name: &str, why: &str) {
             let _ = store.drop_map(name);
             registry::remove(name);
         }
+    }
+}
+
+/// A Map that is not an index. Never deleted here: no build deletes a Map it did not make, and
+/// this one cannot even tell whether it made it — that is what the metadata would have said.
+#[cfg(not(recovery))]
+fn discard_damaged(_store: &Store, name: &str, why: &str) {
+    if registry::remove(name) {
+        eprintln!(
+            "ArcVector: '{name}' is no longer our Map ({why}); releasing the graph it was built from"
+        );
     }
 }
 
@@ -97,12 +135,6 @@ fn empty_graph(
         probe.maxcount.saturating_sub(1),
         registry::REBUILDING,
     )))
-}
-
-/// Nothing outlives the graph in this build, so an unknown name does not exist; a leftover Map waits for `vdrop`.
-#[cfg(not(recovery))]
-pub(super) fn resolve(_store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
-    registry::get(name).ok_or(Error::NoSuchIndex)
 }
 
 pub(super) fn for_read(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
@@ -126,14 +158,13 @@ pub(super) fn for_write(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
 /// mapping. A command already holding one frees it when it finishes.
 ///
 /// Not gated on `recovery`: a Map can expire or be evicted in any build, and the graph must not
-/// outlive it. Without this a `vsim` keeps answering with ids whose elements are gone — and in a
-/// build that cannot rebuild, nothing else ever notices.
+/// outlive it.
 ///
 /// Only ever called off the back of an engine call that already proved the Map is not there —
-/// a `KeyGone`, or a `vcreate` whose insert reports it created the Map. No build pays an extra
-/// probe to find this out, and nothing here runs on a guess: a probe that merely failed could
-/// have failed for a transient reason, and releasing the graph on that would throw away a
-/// working index.
+/// `resolve`'s metadata read, a `KeyGone` from a command's own element call, or a `vcreate`
+/// whose insert reports it created the Map. No build pays an extra probe to find this out, and
+/// nothing here runs on a guess: a probe that merely failed could have failed for a transient
+/// reason, and releasing the graph on that would throw away a working index.
 pub(super) fn map_is_gone(name: &str) {
     if registry::remove(name) {
         eprintln!("ArcVector: index '{name}' has no Map; releasing the graph it was built from");
