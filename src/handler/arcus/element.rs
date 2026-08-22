@@ -1,5 +1,8 @@
 use crate::handler::quant::Quant;
 
+/// `alen: u16`, the stored ATTR length. Nothing about the graph is in here: the node a value
+/// is held under is the mapping's business, so a write never has to read the value it replaces
+/// to find out.
 const HEADER_LEN: usize = 2;
 
 /// Field name of the reserved element holding an index's metadata.
@@ -82,6 +85,7 @@ impl Layout {
     }
 
     /// `vector` must already be quantized to `self`.
+    /// named by; a reader of the stored value learns it from here.
     pub fn encode(&self, vector: &[u8], attr: &[u8]) -> Result<Vec<u8>, CodecError> {
         if vector.len() != self.vector_bytes() {
             return Err(CodecError::VectorLenMismatch {
@@ -97,13 +101,43 @@ impl Layout {
         }
 
         let mut buf = vec![0u8; self.element_len()];
-        buf[0..2].copy_from_slice(&(attr.len() as u16).to_le_bytes());
-        buf[ATTR_OFFSET..ATTR_OFFSET + attr.len()].copy_from_slice(attr);
-        buf[Self::VECTOR_OFFSET..].copy_from_slice(vector);
+        self.write(&mut buf, vector, attr)?;
         Ok(buf)
     }
 
-    /// Every offset comes from `self`; the header is read only for `alen`.
+    /// Write the element into a buffer the caller already reserved.
+    ///
+    /// A `vadd` reserves the engine's element body first, so the bytes are filled in place
+    /// rather than built and copied.
+    pub fn write(&self, buf: &mut [u8], vector: &[u8], attr: &[u8]) -> Result<(), CodecError> {
+        if vector.len() != self.vector_bytes() {
+            return Err(CodecError::VectorLenMismatch {
+                need: self.vector_bytes(),
+                got: vector.len(),
+            });
+        }
+        if attr.len() > ATTR_BYTES {
+            return Err(CodecError::AttrTooLarge {
+                limit: ATTR_BYTES,
+                got: attr.len(),
+            });
+        }
+        if buf.len() != self.element_len() {
+            return Err(CodecError::Truncated {
+                need: self.element_len(),
+                got: buf.len(),
+            });
+        }
+        buf[0..2].copy_from_slice(&(attr.len() as u16).to_le_bytes());
+        // The whole ATTR region, not just what `attr` fills: a reserved engine element body
+        // is whatever the slab held, and those bytes are stored and replicated.
+        buf[ATTR_OFFSET..Self::VECTOR_OFFSET].fill(0);
+        buf[ATTR_OFFSET..ATTR_OFFSET + attr.len()].copy_from_slice(attr);
+        buf[Self::VECTOR_OFFSET..].copy_from_slice(vector);
+        Ok(())
+    }
+
+    /// Every offset comes from `self`; the header carries `alen` and nothing else.
     pub fn decode<'a>(&self, buf: &'a [u8]) -> Result<Element<'a>, CodecError> {
         let head = parse_header(buf)?;
         let need = self.element_len();
@@ -426,9 +460,20 @@ mod tests {
                 got: l.element_len() - 1
             })
         );
+        // The header is `alen` alone, so one byte is not a header at all.
         assert_eq!(
             parse_header(&good[..1]),
-            Err(CodecError::Truncated { need: 2, got: 1 })
+            Err(CodecError::Truncated {
+                need: HEADER_LEN,
+                got: 1
+            })
+        );
+        assert_eq!(
+            parse_header(&good[..HEADER_LEN - 1]),
+            Err(CodecError::Truncated {
+                need: HEADER_LEN,
+                got: HEADER_LEN - 1
+            })
         );
     }
 

@@ -104,14 +104,27 @@ fn refill(store: &Store, index: &VectorIndex) -> Result<usize> {
 
     let layout = index.ann.layout;
     let mut added = 0usize;
-    for (field, value) in store.get_all(&index.name)? {
+    // `get_all` names the elements; each value is read again below. The copy it hands back was
+    // taken before this loop and a live write may have replaced it since, and replaying a
+    // stale value would name a key the graph is not supposed to hold.
+    for (field, _) in store.get_all(&index.name)? {
         if field == META_FIELD {
             continue;
         }
-        let element = layout
-            .decode(&value)
-            .map_err(|e| Error::bad_request(format!("{e} in element '{field}'")))?;
-        if index.ann.add_unless_known(&field, element.vector)? {
+        // The read happens inside the mapping's hold, which is the same hold a live `vadd`
+        // takes across both of its registrations: a refill and a write on one id cannot
+        // interleave, and the read and the add are one step.
+        let replayed = index.ann.add_unless_known(&field, || {
+            let Ok(value) = store.get_elem(&index.name, &field) else {
+                // Deleted since `get_all` listed it. Nothing to replay.
+                return Ok(None);
+            };
+            let element = layout
+                .decode(&value)
+                .map_err(|e| Error::bad_request(format!("{e} in element '{field}'")))?;
+            Ok(Some(element.vector.to_vec()))
+        })?;
+        if replayed {
             added += 1;
         }
     }

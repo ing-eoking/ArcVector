@@ -3,7 +3,7 @@ use std::ptr;
 
 use super::Store;
 use super::error::{Result, StoreError, as_int, check};
-use crate::engine_api::{eitem, eitem_info, elems_result, field_t};
+use crate::engine_api::{eitem, eitem_info, elems_result, field_t, item_attr};
 use crate::handler::arcus::abi;
 use crate::handler::arcus::element::Layout;
 
@@ -14,15 +14,133 @@ unsafe extern "C" {
 /// Collection type id for Map, as the engine's `get_elem_info` expects it.
 const ITEM_TYPE_MAP: c_int = 3;
 
+/// An element the engine has allocated and we have filled, but that is not part of the Map
+/// yet. Nothing can observe it until [`PendingElem::insert`] — not even a `vget` on the same
+/// id, which reads the Map. Dropping it hands the space back.
+///
+/// This is what lets a `vadd` do every fallible step before anything becomes visible: the
+/// element body is reserved here, and only `insert` publishes it. `insert` can still fail —
+/// `maxcount` and the hash-node allocation are both checked in `do_map_elem_link`, which it
+/// calls — so its caller has to be able to undo whatever else it did.
+///
+/// It is also the point of no return: `do_map_elem_link` emits `CLOG_MAP_ELEM_INSERT`, which
+/// is what carries the write to replicas and the persistence log. Allocating logs nothing, so
+/// everything that can fail belongs on this side of it.
+#[must_use = "an uninserted element is invisible; insert it or drop it"]
+pub struct PendingElem<'a> {
+    store: &'a Store,
+    /// The Map this element was reserved for; `insert` cannot be pointed at another.
+    key: &'a str,
+    item: *mut eitem,
+    /// The element's value bytes, inside the engine's allocation. Reserving before the value
+    /// is known is the point: allocation is the step most likely to fail, and doing it first
+    /// means a graph insert is never paid for and thrown away.
+    value: *mut u8,
+    value_len: usize,
+}
+
+impl Drop for PendingElem<'_> {
+    fn drop(&mut self) {
+        if self.item.is_null() {
+            return;
+        }
+        let Some(elem_free) = self.store.vtable().map_elem_free else {
+            return;
+        };
+        // SAFETY: a non-null `item` here was never inserted, so it is still ours to free.
+        unsafe { elem_free(self.store.handle(), self.store.cookie, self.item) };
+    }
+}
+
+impl PendingElem<'_> {
+    /// The reserved value bytes, to be filled before `insert`.
+    ///
+    /// Nothing can read them: the element is not part of the Map until `insert`, so this is
+    /// writing into memory only this handle can reach.
+    pub fn value_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `value`/`value_len` came from the engine describing this allocation, and
+        // `&mut self` is the only handle to it.
+        unsafe { std::slice::from_raw_parts_mut(self.value, self.value_len) }
+    }
+
+    /// Publish the element into a Map that already exists, replacing whatever was under the
+    /// same field. On failure `Drop` hands the space back.
+    pub fn insert(self) -> Result<()> {
+        self.publish(ptr::null_mut(), true).map(|_| ())
+    }
+
+    /// Publish the element, creating the Map with `attr` when it is not there. Reports
+    /// whether this call is what created it.
+    ///
+    /// The engine does both under one cache lock and unlinks the Map again if the element
+    /// cannot go in, so **a Map without this element cannot exist** — no window, and nothing
+    /// for the caller to compensate. This is why there is no separate create call.
+    ///
+    /// Existing elements are not replaced, so a racing creator's metadata survives and the
+    /// loser is told the element is already there. But a Map that exists *without* the
+    /// element takes it: `false` means the element went into somebody else's Map, and the
+    /// caller has to take it back out — see `vcreate`.
+    pub fn insert_creating(self, mut attr: item_attr) -> Result<bool> {
+        self.publish(ptr::from_mut(&mut attr), false)
+    }
+
+    /// `attr` non-null lets the engine create the Map; null requires it to exist. Reports
+    /// whether the Map was created by this call.
+    fn publish(mut self, attr: *mut item_attr, replace_if_exist: bool) -> Result<bool> {
+        let Some(insert) = self.store.vtable().map_elem_insert else {
+            return Err(StoreError::Unavailable);
+        };
+        let mut replaced = false;
+        let mut created = false;
+        // SAFETY: ownership of `item` passes to the engine only when the code says completed.
+        // `attr` is either null or a live local of the caller frame.
+        let code = unsafe {
+            insert(
+                self.store.handle(),
+                self.store.cookie,
+                self.key.as_ptr().cast::<c_void>(),
+                as_int(self.key.len()),
+                self.item,
+                replace_if_exist,
+                attr,
+                ptr::from_mut(&mut replaced),
+                ptr::from_mut(&mut created),
+                0,
+            )
+        };
+        // `check` counts EWOULDBLOCK as completed, which matters here: the element *is*
+        // linked in that case, and freeing it would trip `assert(elem->linked == 0)`.
+        check(code)?;
+        // The engine owns it now; keep `Drop` from freeing it.
+        self.item = ptr::null_mut();
+        Ok(created)
+    }
+}
+
 impl Store {
-    pub fn put_elem(&self, key: &str, field: &str, value: &[u8]) -> Result<()> {
+    /// Reserve and fill the element for `field`, without making it part of the Map.
+    pub fn alloc_elem<'a>(
+        &'a self,
+        key: &'a str,
+        field: &str,
+        value: &[u8],
+    ) -> Result<PendingElem<'a>> {
+        let mut pending = self.reserve_elem(key, field, value.len())?;
+        pending.value_mut().copy_from_slice(value);
+        Ok(pending)
+    }
+
+    /// Reserve `len` value bytes for `field`, leaving them unwritten.
+    pub fn reserve_elem<'a>(
+        &'a self,
+        key: &'a str,
+        field: &str,
+        len: usize,
+    ) -> Result<PendingElem<'a>> {
         let vt = self.vtable();
-        let (Some(alloc), Some(insert), Some(elem_free), Some(elem_info)) = (
-            vt.map_elem_alloc,
-            vt.map_elem_insert,
-            vt.map_elem_free,
-            vt.get_elem_info,
-        ) else {
+        let (Some(alloc), Some(elem_free), Some(elem_info)) =
+            (vt.map_elem_alloc, vt.map_elem_free, vt.get_elem_info)
+        else {
             return Err(StoreError::Unavailable);
         };
 
@@ -35,12 +153,13 @@ impl Store {
                 key.as_ptr().cast::<c_void>(),
                 as_int(key.len()),
                 field.len(),
-                value.len() + Layout::STORED_TERMINATOR,
+                len + Layout::STORED_TERMINATOR,
                 ptr::from_mut(&mut item),
             )
         })?;
 
         // SAFETY: `item` came from a successful alloc with exactly the sizes requested above.
+        let mut value: *mut u8 = ptr::null_mut();
         let filled = unsafe {
             let mut info: eitem_info = std::mem::zeroed();
             elem_info(
@@ -58,9 +177,10 @@ impl Store {
                     field.len(),
                 );
                 let dst = info.value.cast::<u8>().cast_mut();
-                ptr::copy_nonoverlapping(value.as_ptr(), dst, value.len());
-                // The engine sized the element for this terminator.
-                ptr::copy_nonoverlapping(b"\r\n".as_ptr(), dst.add(value.len()), 2);
+                // The engine sized the element for this terminator, so it can be written now
+                // and the value bytes handed back on their own.
+                ptr::copy_nonoverlapping(b"\r\n".as_ptr(), dst.add(len), 2);
+                value = dst;
             }
             ok
         };
@@ -72,27 +192,18 @@ impl Store {
             return Err(StoreError::AbiMismatch);
         }
 
-        let mut replaced = false;
-        let mut created = false;
-        // SAFETY: ownership of `item` passes to the engine only on success.
-        let code = unsafe {
-            insert(
-                self.handle(),
-                self.cookie,
-                key.as_ptr().cast::<c_void>(),
-                as_int(key.len()),
-                item,
-                true, // replace_if_exist
-                ptr::null_mut(),
-                ptr::from_mut(&mut replaced),
-                ptr::from_mut(&mut created),
-                0,
-            )
-        };
-        check(code).inspect_err(|_| {
-            // SAFETY: `item` never became part of the Map — EWOULDBLOCK means it *is* linked, and freeing it there trips `assert(elem->linked == 0)`.
-            unsafe { elem_free(self.handle(), self.cookie, item) };
+        Ok(PendingElem {
+            store: self,
+            key,
+            item,
+            value,
+            value_len: len,
         })
+    }
+
+    /// Allocate and insert in one step, for writes with nothing to undo.
+    pub fn put_elem(&self, key: &str, field: &str, value: &[u8]) -> Result<()> {
+        self.alloc_elem(key, field, value)?.insert()
     }
 
     pub fn delete_elem(&self, key: &str, field: &str) -> Result<()> {
@@ -135,8 +246,35 @@ impl Store {
         field: Option<&str>,
         f: impl FnOnce(&[(&[u8], &[u8])]) -> T,
     ) -> Result<T> {
+        let elems = self.fetch(key, field)?;
+        let Some(items) = elems.as_slice() else {
+            return Err(StoreError::ElemGone);
+        };
+        let views: Vec<(&[u8], &[u8])> = items.iter().map(|item| elems.view(*item)).collect();
+        Ok(f(&views))
+    }
+
+    /// Read one element and delete it in the same call.
+    ///
+    /// `map_elem_get` takes a `delete` flag, so the value and its removal are one engine
+    /// operation. `vdel` needs to know there was an element and needs it gone, and
+    /// doing that as two calls would let a write land between them.
+    pub fn take_elem(&self, key: &str, field: &str) -> Result<Vec<u8>> {
+        self.fetch_with(key, Some(field), true)
+            .and_then(|elems| match elems.as_slice() {
+                Some(items) => Ok(elems.view(items[0]).1.to_vec()),
+                None => Err(StoreError::ElemGone),
+            })
+    }
+
+    /// `map_elem_get`, with the hold it takes still in place.
+    fn fetch(&self, key: &str, field: Option<&str>) -> Result<Elems<'_>> {
+        self.fetch_with(key, field, false)
+    }
+
+    fn fetch_with(&self, key: &str, field: Option<&str>, delete: bool) -> Result<Elems<'_>> {
         let vt = self.vtable();
-        let (Some(get), Some(elem_info)) = (vt.map_elem_get, vt.get_elem_info) else {
+        let Some(get) = vt.map_elem_get else {
             return Err(StoreError::Unavailable);
         };
 
@@ -160,7 +298,8 @@ impl Store {
                 as_int(key.len()),
                 numfields,
                 flist,
-                false, // delete
+                delete,
+                // An emptied index must keep existing.
                 false, // drop_if_empty
                 ptr::from_mut(&mut result),
                 0,
@@ -170,50 +309,25 @@ impl Store {
         // SAFETY: `result` is what the call above wrote; taken before the error check so a partial result is released too.
         let elems = unsafe { Elems::new(self, &result) };
         check(code)?;
-        let Some(items) = elems.as_slice() else {
-            return Err(StoreError::ElemGone);
-        };
-
-        let views: Vec<(&[u8], &[u8])> = items
-            .iter()
-            .map(|item| {
-                // SAFETY: each entry is a live Map element held by our refcount.
-                unsafe {
-                    let mut info: eitem_info = std::mem::zeroed();
-                    elem_info(
-                        self.handle(),
-                        self.cookie,
-                        ITEM_TYPE_MAP,
-                        *item,
-                        ptr::from_mut(&mut info),
-                    );
-                    (
-                        slice_or_empty(info.score.cast::<u8>(), info.nscore as usize),
-                        slice_or_empty(info.value.cast::<u8>(), info.nbytes as usize),
-                    )
-                }
-            })
-            .collect();
-
-        Ok(f(&views))
+        Ok(elems)
     }
 
-    /// Copy the fixed ATTR region of one element — the search predicate's hot path.
-    pub fn read_attr_slot(
-        &self,
-        key: &str,
-        field: &str,
-        layout: &Layout,
-        out: &mut Vec<u8>,
-    ) -> Result<()> {
-        self.with_elems(key, Some(field), |elems| {
-            let (_, value) = elems[0];
-            let slot = layout.attr_of(value).ok()?;
-            out.clear();
-            out.extend_from_slice(slot);
-            Some(())
-        })?
-        .ok_or(StoreError::ElemGone)
+    /// Fetch one element and keep the engine's hold on it.
+    ///
+    /// `map_elem_get` raises the element's refcount and `map_elem_release` lowers it; while
+    /// raised the engine will not free the bytes, so they can be read again later without a
+    /// second lookup. A concurrent overwrite links a new element and leaves this one
+    /// unlinked-but-alive, so what is read stays the value this call saw. `Drop` releases.
+    ///
+    /// The caller is what bounds how many are held at once — each one keeps an element's
+    /// memory from being reclaimed.
+    pub fn hold_elem(&self, key: &str, field: &str) -> Result<HeldElem<'_>> {
+        self.fetch(key, Some(field)).and_then(|elems| {
+            if elems.as_slice().is_none() {
+                return Err(StoreError::ElemGone);
+            }
+            Ok(HeldElem { elems })
+        })
     }
 
     pub fn get_elem(&self, key: &str, field: &str) -> Result<Vec<u8>> {
@@ -266,6 +380,29 @@ impl<'a> Elems<'a> {
         }
     }
 
+    /// The field and value bytes of one held element. `get_elem_info` fills in pointers the
+    /// engine already has, so this is not a second lookup.
+    fn view(&self, item: *mut eitem) -> (&'a [u8], &'a [u8]) {
+        let Some(elem_info) = self.store.vtable().get_elem_info else {
+            return (&[], &[]);
+        };
+        // SAFETY: `item` is a live Map element held by our refcount.
+        unsafe {
+            let mut info: eitem_info = std::mem::zeroed();
+            elem_info(
+                self.store.handle(),
+                self.store.cookie,
+                ITEM_TYPE_MAP,
+                item,
+                ptr::from_mut(&mut info),
+            );
+            (
+                slice_or_empty(info.score.cast::<u8>(), info.nscore as usize),
+                slice_or_empty(info.value.cast::<u8>(), info.nbytes as usize),
+            )
+        }
+    }
+
     fn as_slice(&self) -> Option<&[*mut eitem]> {
         if self.array.is_null() || self.count == 0 {
             return None;
@@ -293,6 +430,21 @@ impl Drop for Elems<'_> {
         }
         // SAFETY: the array is plain malloc memory owned by us and freed nowhere else.
         unsafe { free(self.array.cast::<c_void>()) };
+    }
+}
+
+/// One element the engine is still holding for us. Dropping it releases the hold.
+pub struct HeldElem<'a> {
+    elems: Elems<'a>,
+}
+
+impl HeldElem<'_> {
+    /// The stored bytes, as they were when the hold was taken.
+    pub fn value(&self) -> &[u8] {
+        match self.elems.as_slice() {
+            Some(items) => self.elems.view(items[0]).1,
+            None => &[],
+        }
     }
 }
 

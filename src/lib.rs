@@ -25,7 +25,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
 use command::nread;
-use command::request::{self, MAX_BODY_BYTES};
+use command::request::{self, MAX_BODY_BYTES, Parsed};
 use command::tokens::Tokens;
 use engine_api::{
     EXTENSION_ASCII_PROTOCOL_DESCRIPTOR, EXTENSION_ERROR_CODE,
@@ -47,25 +47,18 @@ unsafe extern "C" fn accept_vector_cmd(
 ) -> bool {
     let tokens = unsafe { Tokens::new(argv, argc) };
 
-    let Some(at) = request::body_length_at(&tokens) else {
+    // Anything but a sizeable body — a line command, a bad length, an alien name — is
+    // `execute`'s to answer or decline.
+    let Ok(Parsed::Body { len, request }) = request::parse(&tokens) else {
         return tokens.command().is_some();
     };
-    let Ok(body_len) = tokens.parse::<usize>(at, "length") else {
-        return true;
-    };
-    if body_len > MAX_BODY_BYTES {
+    if len > MAX_BODY_BYTES {
         return true;
     }
 
     // A parse failure rides into the nread state; refusing leaves the body unread.
     unsafe {
-        nread::expect_body(
-            cookie,
-            request::parse_body(&tokens),
-            body_len,
-            ndata,
-            ptr_out,
-        );
+        nread::expect_body(cookie, request, len, ndata, ptr_out);
     }
     true
 }

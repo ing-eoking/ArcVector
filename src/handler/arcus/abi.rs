@@ -4,35 +4,37 @@ use std::ffi::CStr;
 
 use crate::engine_api::{SERVER_HANDLE_V1, engine_interface_v1};
 
-/// Vtable members this crate calls, in the order the struct declares them.
-const REQUIRED: [&str; 12] = [
-    "map_struct_create",
+/// Vtable members this crate calls, in the order `engine_interface_v1` declares them.
+///
+/// Declaration order, not call order: this list is read alongside the header when a layout
+/// mismatch is suspected, and one that drifts out of order is useless for that.
+///
+/// No `map_struct_create`: `map_elem_insert` creates the Map from the attributes handed to it,
+/// which is the only way to get a Map and its metadata element without a window.
+const REQUIRED: [&str; 10] = [
+    "remove",
     "map_elem_alloc",
     "map_elem_free",
+    "map_elem_release",
     "map_elem_insert",
     "map_elem_delete",
     "map_elem_get",
-    "map_elem_release",
-    "remove",
-    "get_stats",
+    "getattr",
     "get_config",
-    "get_item_info",
     "get_elem_info",
 ];
 
 fn present(vt: &engine_interface_v1, name: &str) -> bool {
     match name {
-        "map_struct_create" => vt.map_struct_create.is_some(),
+        "remove" => vt.remove.is_some(),
         "map_elem_alloc" => vt.map_elem_alloc.is_some(),
         "map_elem_free" => vt.map_elem_free.is_some(),
+        "map_elem_release" => vt.map_elem_release.is_some(),
         "map_elem_insert" => vt.map_elem_insert.is_some(),
         "map_elem_delete" => vt.map_elem_delete.is_some(),
         "map_elem_get" => vt.map_elem_get.is_some(),
-        "map_elem_release" => vt.map_elem_release.is_some(),
-        "remove" => vt.remove.is_some(),
-        "get_stats" => vt.get_stats.is_some(),
+        "getattr" => vt.getattr.is_some(),
         "get_config" => vt.get_config.is_some(),
-        "get_item_info" => vt.get_item_info.is_some(),
         "get_elem_info" => vt.get_elem_info.is_some(),
         _ => true,
     }

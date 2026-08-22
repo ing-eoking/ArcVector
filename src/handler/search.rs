@@ -1,65 +1,119 @@
 use std::cell::RefCell;
 use std::fmt::Write as _;
 
-use super::access::for_read;
+use super::access::{for_read, map_is_gone};
 use super::coords::coord_vectors;
 use crate::command::filter::Filter;
 use crate::command::request::{Sim, SimKey};
 use crate::error::{Error, Reply, Result};
-use crate::handler::arcus::element;
-use crate::handler::arcus::engine::{Store, StoreError};
+use crate::handler::arcus::element::Layout;
+use crate::handler::arcus::engine::{HeldElem, Store, StoreError};
 use crate::handler::quant;
 use crate::handler::registry::VectorIndex;
+use crate::handler::usearch::Accept;
 
+/// The attributes of a held element, if the `FILTER` held this key.
+fn held_attr(
+    held: &RefCell<Vec<(u64, HeldElem<'_>)>>,
+    key: u64,
+    layout: &Layout,
+) -> Option<String> {
+    let held = held.borrow();
+    let (_, elem) = held.iter().find(|(k, _)| *k == key)?;
+    let attr = layout.attr_of(elem.value()).ok()?;
+    Some(String::from_utf8_lossy(attr).into_owned())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn similar(
     store: &Store,
     index: &VectorIndex,
     query: &[u8],
     k: usize,
     filter: Option<&Filter>,
+    with_attr: bool,
     query_no: usize,
     out: &mut String,
 ) -> Result<()> {
     let layout = index.ann.layout;
 
-    // Reused across predicate calls: the hot path allocates nothing.
-    let scratch = RefCell::new(Vec::with_capacity(element::ATTR_BYTES));
-    let accept = |key: u64| -> bool {
+    // Elements the FILTER read, kept by the engine's own hold rather than copied. A hit that
+    // is in here needs no second lookup to render, and what the reply carries is the same
+    // bytes the filter judged — reading twice could have straddled a write.
+    let held: RefCell<Vec<(u64, HeldElem<'_>)>> = RefCell::new(Vec::new());
+    let by_attr = |key: u64, id: &str| -> bool {
         let Some(filter) = filter else {
             return true;
         };
-        let Some(id) = index.ann.id_of(key) else {
+        let Ok(elem) = store.hold_elem(&index.name, id) else {
+            // Evicted or vanished mid-search: no longer a candidate.
             return false;
         };
-        let mut slot = scratch.borrow_mut();
-        match store.read_attr_slot(&index.name, &id, &layout, &mut slot) {
-            Ok(()) => filter.matches(&slot),
-            // Evicted or vanished mid-search: no longer a candidate.
-            Err(_) => false,
+        let Ok(attr) = layout.attr_of(elem.value()) else {
+            return false;
+        };
+        if !filter.matches(attr) {
+            return false;
         }
+        held.borrow_mut().push((key, elem));
+        true
     };
 
-    let hits = index.ann.search(query, k, accept)?;
+    // No FILTER means no callback: usearch runs its own path and a staged node that slips
+    // into the results is dropped below, where `id_of` comes back empty.
+    let accept: Option<Accept> = filter.map(|_| &by_attr as Accept);
+    // `search` translates its own hits: the whole list under one hold on the mapping, which is
+    // the hold a write takes across both of its registrations — so a hit is either fully
+    // published or not named at all. Keys nothing names never come back.
+    let named = index.ann.search(query, k, accept)?;
 
-    let mut rendered = Vec::with_capacity(hits.len());
-    for (key, distance) in hits {
-        let Some(id) = index.ann.id_of(key) else {
-            continue;
+    // It may hand back more than `k`, having asked for extras to cover the slots writes in
+    // flight take. Take the first `k` that survive rendering.
+    let mut rendered = Vec::with_capacity(k);
+    for (key, id, distance) in named {
+        if rendered.len() == k {
+            break;
+        }
+        // Only `WITHATTR` reads the element. Without it a hit costs no engine call at all,
+        // and the reply cannot report an element that was deleted since the search — a
+        // `FILTER` still catches that, because it could not have read it either.
+        let attr = if !with_attr {
+            None
+        } else if let Some(attr) = held_attr(&held, key, &layout) {
+            // The FILTER already holds this element; read it again from the hold.
+            Some(attr)
+        } else {
+            let stored = match store.get_elem(&index.name, &id) {
+                Ok(stored) => stored,
+                // Every remaining hit would fail the same way, and the graph should not
+                // outlive the Map it was built from.
+                Err(StoreError::KeyGone) => {
+                    map_is_gone(&index.name);
+                    break;
+                }
+                Err(_) => continue,
+            };
+            Some(
+                layout
+                    .decode(&stored)
+                    .map(|e| String::from_utf8_lossy(e.attr).into_owned())
+                    .unwrap_or_default(),
+            )
         };
-        let Ok(stored) = store.get_elem(&index.name, &id) else {
-            continue;
-        };
-        let attr = layout
-            .decode(&stored)
-            .map(|e| String::from_utf8_lossy(e.attr).into_owned())
-            .unwrap_or_default();
         rendered.push((id.to_owned(), distance, attr));
     }
 
     // Counted after filtering, so the header agrees with the rows.
     let _ = writeln!(out, "QUERY {query_no} {}\r", rendered.len());
     for (id, distance, attr) in rendered {
-        let _ = write!(out, "VALUE {id} {distance} {}\r\n{attr}\r\n", attr.len());
+        match attr {
+            Some(attr) => {
+                let _ = write!(out, "VALUE {id} {distance} {}\r\n{attr}\r\n", attr.len());
+            }
+            None => {
+                let _ = write!(out, "VALUE {id} {distance}\r\n");
+            }
+        }
     }
     Ok(())
 }
@@ -71,8 +125,9 @@ pub fn vsim_vector(store: &Store, spec: &Sim, body: &[u8]) -> Result<Reply> {
         k,
         dim,
         filter,
+        with_attr,
     } = spec;
-    let (k, dim) = (*k, *dim);
+    let (k, dim, with_attr) = (*k, *dim, *with_attr);
     let filter = filter.as_ref();
 
     let index = for_read(store, name)?;
@@ -87,7 +142,9 @@ pub fn vsim_vector(store: &Store, spec: &Sim, body: &[u8]) -> Result<Reply> {
     let mut out = String::new();
     for (query_no, query) in coord_vectors(body, dim, "query")?.iter().enumerate() {
         let quantized = quant::encode(query, layout.quant);
-        similar(store, &index, &quantized, k, filter, query_no, &mut out)?;
+        similar(
+            store, &index, &quantized, k, filter, with_attr, query_no, &mut out,
+        )?;
     }
     out.push_str("END\r\n");
     Ok(Reply::Body(out))
@@ -100,20 +157,26 @@ pub fn vsim_key(store: &Store, spec: &SimKey) -> Result<Reply> {
         key,
         k,
         filter,
+        with_attr,
     } = spec;
-    let (k, filter) = (*k, filter.as_ref());
+    let (k, with_attr, filter) = (*k, *with_attr, filter.as_ref());
 
     let index = for_read(store, name)?;
 
     let stored = match store.get_elem(name, key) {
         Ok(v) => v,
-        Err(StoreError::ElemGone | StoreError::KeyGone) => return Ok(Reply::NotFound),
+        Err(StoreError::ElemGone) => return Ok(Reply::NotFound),
+        // The Map is gone, so the graph has nothing left to answer with.
+        Err(StoreError::KeyGone) => {
+            map_is_gone(name);
+            return Ok(Reply::NotFound);
+        }
         Err(e) => return Err(e.into()),
     };
     let query = index.ann.layout.decode(&stored)?.vector.to_vec();
 
     let mut out = String::new();
-    similar(store, &index, &query, k, filter, 0, &mut out)?;
+    similar(store, &index, &query, k, filter, with_attr, 0, &mut out)?;
     out.push_str("END\r\n");
     Ok(Reply::Body(out))
 }

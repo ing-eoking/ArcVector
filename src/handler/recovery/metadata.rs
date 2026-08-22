@@ -1,9 +1,9 @@
 use crate::error::{Error, Result};
 use crate::handler::arcus::element::{Layout, META_FIELD, MetaRecord};
 use crate::handler::arcus::engine::{Store, StoreError};
-use crate::handler::usearch::{AnnIndex, Metric, THREAD_SLOTS};
+use crate::handler::usearch::{AnnIndex, Metric};
 
-/// Nothing carries a version yet; the low half of `INDEX_FLAGS` is where one belongs, read before any element.
+/// The Map's own state, read from its flags and metadata element before any vector element.
 pub enum MetaState {
     Usable(MetaRecord, Layout),
     Damaged(String),
@@ -30,7 +30,6 @@ pub fn build_ann(meta: &MetaRecord, layout: Layout) -> Result<AnnIndex> {
         meta.connectivity,
         meta.expansion_add,
         meta.expansion_search,
-        THREAD_SLOTS,
     )
 }
 

@@ -1,6 +1,7 @@
+mod layout;
 mod parse;
 
-pub use parse::{body_length_at, body_length_error, parse_body, parse_line};
+pub use parse::parse;
 
 use super::filter::Filter;
 use super::tokens::Tokens;
@@ -10,6 +11,27 @@ use crate::{ATTR_BYTES, Metric};
 
 /// The body is a single vector, so 16 KB covers 4096 `f32` dimensions.
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
+
+/// What one command line asks for.
+#[derive(Debug)]
+pub enum Parsed<'a> {
+    /// Settled by the line alone.
+    Line(Line<'a>),
+    /// A two-phase command. `len` is known even when the rest of the line is not,
+    /// so a refused request still says how many bytes to drain.
+    Body { len: usize, request: Result<Body> },
+}
+
+/// Why a two-phase line reached `execute` instead of its body phase.
+pub fn body_refused(len: usize) -> Error {
+    if len > MAX_BODY_BYTES {
+        Error::bad_request(format!(
+            "vector length {len} exceeds the {MAX_BODY_BYTES}-byte transfer limit"
+        ))
+    } else {
+        Error::bad_request("lost command state")
+    }
+}
 
 /// The commands this extension answers. Matched case-insensitively.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,12 +112,21 @@ impl Create<'_> {
     }
 }
 
+/// What a `vsim` asked for after its required arguments.
+#[derive(Debug, Default)]
+pub struct Trailing {
+    pub filter: Option<Filter>,
+    /// `WITHATTR`: put each hit's stored attributes in the reply.
+    pub with_attr: bool,
+}
+
 #[derive(Debug)]
 pub struct SimKey<'a> {
     pub index: &'a str,
     pub key: &'a str,
     pub k: usize,
     pub filter: Option<Filter>,
+    pub with_attr: bool,
 }
 
 #[derive(Debug)]
@@ -124,6 +155,7 @@ pub struct Sim {
     pub k: usize,
     pub dim: usize,
     pub filter: Option<Filter>,
+    pub with_attr: bool,
 }
 
 #[derive(Debug)]

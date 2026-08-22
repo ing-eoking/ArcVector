@@ -5,10 +5,10 @@ use super::access::resolve;
 use crate::command::request::Create;
 use crate::error::{Error, Reply, Result};
 use crate::handler::arcus::element::{self, Layout, MetaRecord};
-use crate::handler::arcus::engine::Store;
+use crate::handler::arcus::engine::{self, Store, StoreError};
 use crate::handler::quant::Quant;
 use crate::handler::registry::{self, VectorIndex};
-use crate::handler::usearch::{AnnIndex, THREAD_SLOTS};
+use crate::handler::usearch::AnnIndex;
 
 /// `vcreate <index> <dim> [METRIC …] [QUANT …] [MAXCOUNT …] [EXPTIME …] [M …] …`
 pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
@@ -25,18 +25,13 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
 
     // Replication or persistence may have delivered this Map. Never clear it.
     if store.probe_map(name).is_ok() {
-        #[cfg(recovery)]
-        {
-            resolve(store, name)?;
-            return Ok(Reply::Exists);
-        }
-        // Nothing can rebuild from it, and guessing would destroy it or serve an empty graph.
-        #[cfg(not(recovery))]
-        return Err(Error::bad_request(format!(
-            "a Map already exists at '{name}' and this build cannot rebuild an \
-             index from it; drop it with 'vdrop {name}' and create it again"
-        )));
+        return already_there(store, name);
     }
+    // No Map, so any registry entry under this name is a graph whose Map expired or was
+    // evicted. Release it here rather than letting the insert below find it and answer
+    // `EXISTS` — that reply would leave the fresh empty Map paired with the stale graph, and
+    // in a build that cannot rebuild, nothing would ever notice.
+    super::access::map_is_gone(name);
 
     // Before the Map, so an unsupported metric leaves no empty Map behind.
     let ann = AnnIndex::new(
@@ -45,11 +40,9 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         spec.connectivity,
         spec.expansion_add,
         spec.expansion_search,
-        THREAD_SLOTS,
     )?;
 
     let held = map_size_for(store, spec.maxcount);
-    store.create_map(name, Some(held), spec.exptime)?;
     let maxcount = held - 1;
     let owner = element::mint_owner();
     let meta = MetaRecord {
@@ -59,15 +52,53 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         expansion_search: spec.expansion_search,
         owner,
     };
-    store.put_elem(name, element::META_FIELD, &meta.encode(layout))?;
+    // A Map without this element is not an index: `resolve` cannot read it and only `vdrop`
+    // can clear it. One call makes both — the engine creates the Map, inserts the element,
+    // and unlinks the Map again if the element cannot go in, all under its cache lock — so
+    // that state has no window to exist in and there is nothing to compensate.
+    let created = store
+        .alloc_elem(name, element::META_FIELD, &meta.encode(layout))?
+        .insert_creating(engine::index_attr(Some(held), spec.exptime))?;
+    if !created {
+        // A Map appeared between the probe above and this insert. One that already had
+        // metadata would have refused the element; this one had none, so it is not an index
+        // and the element went into a Map we did not make — a plain `mop` Map, or one a
+        // replication transfer is still filling. Take it back out and answer as the probe
+        // would have. Nothing else was touched: the Map is as we found it.
+        let _ = store.delete_elem(name, element::META_FIELD);
+        return already_there(store, name);
+    }
 
     let index = VectorIndex::new(name.to_owned(), ann, maxcount, owner);
     let (_, inserted) = registry::insert_or_get(index);
     Ok(if inserted {
         Reply::Created
     } else {
+        // Reaching here means the Map did not exist above, and a racing `vcreate` cannot be
+        // the one holding the name: the loser of that race is refused at `insert_creating`
+        // with `ELEM_EEXISTS` and never gets this far. So this is a graph registered between
+        // the release above and now — answer as the probe would have.
         Reply::Exists
     })
+}
+
+/// The answer for a name a Map already occupies. Never clears it.
+fn already_there(store: &Store, name: &str) -> Result<Reply> {
+    #[cfg(recovery)]
+    {
+        // Reads the metadata: an index gets adopted, an unreadable one gets discarded.
+        resolve(store, name)?;
+        Ok(Reply::Exists)
+    }
+    // Nothing can rebuild from it, and guessing would destroy it or serve an empty graph.
+    #[cfg(not(recovery))]
+    {
+        let _ = store;
+        Err(Error::bad_request(format!(
+            "a Map already exists at '{name}' and this build cannot rebuild an \
+             index from it; drop it with 'vdrop {name}' and create it again"
+        )))
+    }
 }
 
 fn check_dimension_fits(store: &Store, layout: Layout, quant: Quant) -> Result<()> {
@@ -89,9 +120,15 @@ fn map_size_for(store: &Store, maxcount: Option<u32>) -> u32 {
 }
 
 pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {
+    // The Map goes first: a real failure has to leave the registry alone, or the index
+    // stops serving a Map that is still there and the client hears DROPPED anyway.
+    // Attempted regardless of the registry, so vdrop can clear an orphan Map.
+    let dropped = match store.drop_map(name) {
+        Ok(()) => true,
+        Err(StoreError::KeyGone) => false,
+        Err(e) => return Err(e.into()),
+    };
     let known = registry::remove(name);
-    // Regardless of the registry, so vdrop can clear an orphan Map.
-    let dropped = store.drop_map(name).is_ok();
 
     Ok(if known || dropped {
         Reply::Dropped

@@ -7,6 +7,8 @@ use crate::error::{Error, Result};
 use crate::handler::arcus::element::{Layout, MetaRecord};
 use crate::handler::arcus::engine::Store;
 #[cfg(recovery)]
+use crate::handler::arcus::engine::StoreError;
+#[cfg(recovery)]
 use crate::handler::recovery::{self, metadata::MetaState};
 use crate::handler::registry::{self, VectorIndex};
 
@@ -43,22 +45,41 @@ fn usable_metadata(store: &Store, name: &str) -> Result<(MetaRecord, Layout)> {
     }
 }
 
-/// Delete a Map whose metadata cannot be read — the one failure that deletes.
+/// What to do about a name whose metadata will not read.
+///
+/// Three cases, and only the middle one deletes anything in the engine.
 #[cfg(recovery)]
 fn discard_damaged(store: &Store, name: &str, why: &str) {
-    if !store.probe_map(name).is_ok_and(|p| p.looks_like_index()) {
-        return; // Not ours. Somebody else's Map is none of our business.
+    match store.probe_map(name) {
+        // No Map at all: expired, evicted, or dropped by another node. There is nothing to
+        // delete and nothing left for the graph to serve, so let the graph go — dropping the
+        // registry entry drops the last `Arc`, and with it usearch's graph and the id
+        // mapping. An in-flight command holding one frees it when it finishes.
+        Err(StoreError::KeyGone) => {
+            if registry::remove(name) {
+                eprintln!(
+                    "ArcVector: index '{name}' has no Map ({why}); releasing the graph it was built from"
+                );
+            }
+        }
+        // Any other engine trouble proves nothing about whether the Map is there.
+        Err(_) => {}
+        // Somebody else's Map is none of our business.
+        Ok(probe) if !probe.looks_like_index() => {}
+        // Ours, present, and unreadable — the one failure that deletes.
+        Ok(_) => {
+            if crate::handler::arcus::abi::mismatched() {
+                // "Damaged" is unreliable under a misaligned vtable, and deleting on it would destroy an index over a build mistake.
+                return;
+            }
+            eprintln!(
+                "ArcVector: index '{name}' has unusable metadata ({why}); deleting the Map, \
+                 which cannot become an index again without it"
+            );
+            let _ = store.drop_map(name);
+            registry::remove(name);
+        }
     }
-    if crate::handler::arcus::abi::mismatched() {
-        // "Damaged" is unreliable under a misaligned vtable, and deleting on it would destroy an index over a build mistake.
-        return;
-    }
-    eprintln!(
-        "ArcVector: index '{name}' has unusable metadata ({why}); deleting the Map, \
-         which cannot become an index again without it"
-    );
-    let _ = store.drop_map(name);
-    registry::remove(name);
 }
 
 #[cfg(recovery)]
@@ -97,4 +118,21 @@ pub(super) fn for_read(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
 /// Writes go through during a rebuild: Map takes them first, and the refill cannot replay an older value over them.
 pub(super) fn for_write(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
     resolve(store, name)
+}
+
+/// The Map is gone, so the graph built from it has nothing left to serve.
+///
+/// Dropping the registry entry drops the last `Arc`, and with it usearch's graph and the id
+/// mapping. A command already holding one frees it when it finishes.
+///
+/// Not gated on `recovery`: a Map can expire or be evicted in any build, and the graph must not
+/// outlive it. Without this a `vsim` keeps answering with ids whose elements are gone — and in a
+/// build that cannot rebuild, nothing else ever notices.
+///
+/// Called only where an engine call already reported `KeyGone`, so it costs nothing: no build
+/// pays an extra probe to find this out.
+pub(super) fn map_is_gone(name: &str) {
+    if registry::remove(name) {
+        eprintln!("ArcVector: index '{name}' has no Map; releasing the graph it was built from");
+    }
 }

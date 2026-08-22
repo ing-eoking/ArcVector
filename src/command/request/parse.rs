@@ -1,38 +1,68 @@
+use super::layout;
 use super::*;
 
 fn malformed() -> Error {
     Error::bad_request("bad command line format")
 }
 
-pub fn parse_line<'a>(tokens: &Tokens<'a>) -> Result<Line<'a>> {
+/// Sort one command line into a line-only request or a two-phase one.
+///
+/// The two-phase forms read their body length here, before anything else can fail:
+/// a line whose remainder is unusable still has to say how many bytes to drain.
+pub fn parse<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
     match tokens.command() {
-        Some(Cmd::VCreate) => parse_create(tokens).map(Line::Create),
-        Some(Cmd::VSim) => parse_sim_key(tokens).map(Line::SimKey),
+        Some(Cmd::VAdd) => two_phase(tokens, layout::add::BODY_LEN, |t| {
+            parse_add(t).map(Body::Add)
+        }),
+        Some(Cmd::VSim) => match sim_source(tokens)? {
+            SimSource::Vector => two_phase(tokens, layout::sim_vector::BODY_LEN, |t| {
+                parse_sim(t).map(Body::Sim)
+            }),
+            SimSource::Key => parse_sim_key(tokens).map(|s| Parsed::Line(Line::SimKey(s))),
+        },
+        Some(Cmd::VCreate) => parse_create(tokens).map(|c| Parsed::Line(Line::Create(c))),
         Some(Cmd::VGet) => {
             let (index, id) = two_names(tokens)?;
-            Ok(Line::Get { index, id })
+            Ok(Parsed::Line(Line::Get { index, id }))
         }
         Some(Cmd::VDel) => {
             let (index, id) = two_names(tokens)?;
-            Ok(Line::Del { index, id })
+            Ok(Parsed::Line(Line::Del { index, id }))
         }
         Some(Cmd::VDrop) => {
-            if tokens.len() != 2 {
+            if tokens.len() != layout::drop::TAIL {
                 return Err(malformed());
             }
-            Ok(Line::Drop {
-                index: tokens.text(1)?,
-            })
+            Ok(Parsed::Line(Line::Drop {
+                index: tokens.text(layout::drop::INDEX)?,
+            }))
         }
-        Some(Cmd::VList) => no_arguments(tokens).map(|()| Line::List),
-        Some(Cmd::VStats) => no_arguments(tokens).map(|()| Line::Stats),
-        // These carry a body and are parsed by `parse_body`.
-        Some(Cmd::VAdd) => Err(malformed()),
+        Some(Cmd::VList) => no_arguments(tokens).map(|()| Parsed::Line(Line::List)),
+        Some(Cmd::VStats) => no_arguments(tokens).map(|()| Parsed::Line(Line::Stats)),
         None => Err(Error::bad_request(format!(
             "unknown command {}",
             tokens.text(0).unwrap_or("")
         ))),
     }
+}
+
+/// A command whose coordinates arrive as a body: size it, then parse the rest.
+fn two_phase<'a>(
+    tokens: &Tokens,
+    at: usize,
+    parse_rest: impl FnOnce(&Tokens) -> Result<Body>,
+) -> Result<Parsed<'a>> {
+    let len = tokens.parse(at, "vector length")?;
+    Ok(Parsed::Body {
+        len,
+        request: parse_rest(tokens),
+    })
+}
+
+fn sim_source(tokens: &Tokens) -> Result<SimSource> {
+    let raw = tokens.text(layout::SIM_SOURCE)?;
+    SimSource::parse(raw)
+        .ok_or_else(|| Error::bad_request(format!("expected VECTOR or KEY, got '{raw}'")))
 }
 
 fn no_arguments(tokens: &Tokens) -> Result<()> {
@@ -44,24 +74,27 @@ fn no_arguments(tokens: &Tokens) -> Result<()> {
 }
 
 fn two_names<'a>(tokens: &Tokens<'a>) -> Result<(&'a str, &'a str)> {
-    if tokens.len() != 3 {
+    if tokens.len() != layout::names::TAIL {
         return Err(malformed());
     }
-    Ok((tokens.text(1)?, tokens.text(2)?))
+    Ok((
+        tokens.text(layout::names::INDEX)?,
+        tokens.text(layout::names::ID)?,
+    ))
 }
 
 /// `vcreate <index> <dim> [METRIC m] [QUANT q] [M n] [EFC n] [EFS n]
 fn parse_create<'a>(tokens: &Tokens<'a>) -> Result<Create<'a>> {
-    if tokens.len() < 3 {
+    if tokens.len() < layout::create::TAIL {
         return Err(malformed());
     }
-    let dim: usize = tokens.parse(2, "dimension")?;
+    let dim: usize = tokens.parse(layout::create::DIM, "dimension")?;
     if dim == 0 || dim > u16::MAX as usize {
         return Err(Error::bad_request("dimension out of range (1..65535)"));
     }
-    let mut create = Create::with_defaults(tokens.text(1)?, dim);
+    let mut create = Create::with_defaults(tokens.text(layout::create::INDEX)?, dim);
 
-    for (key, raw) in tokens.options(3)? {
+    for (key, raw) in tokens.options(layout::create::TAIL)? {
         let number = |what: &str| -> Result<usize> {
             raw.parse::<usize>()
                 .map_err(|_| Error::bad_request(format!("invalid {what} '{raw}'")))
@@ -105,25 +138,17 @@ fn parse_create<'a>(tokens: &Tokens<'a>) -> Result<Create<'a>> {
 
 /// `VSIM KEY <index> <num> <key> [FILTER <n> <term>...]`
 fn parse_sim_key<'a>(tokens: &Tokens<'a>) -> Result<SimKey<'a>> {
-    if tokens.len() < 5 {
+    use layout::sim_key as at;
+    if tokens.len() < at::TAIL {
         return Err(malformed());
     }
-    let source = tokens.text(1)?;
-    match SimSource::parse(source) {
-        Some(SimSource::Key) => {}
-        // VECTOR reaches this path only when its body phase was refused.
-        Some(SimSource::Vector) => return Err(malformed()),
-        None => {
-            return Err(Error::bad_request(format!(
-                "expected VECTOR or KEY, got '{source}'"
-            )));
-        }
-    }
+    let Trailing { filter, with_attr } = trailing(tokens, at::TAIL)?;
     Ok(SimKey {
-        index: tokens.text(2)?,
-        k: result_count(tokens, 3)?,
-        key: tokens.text(4)?,
-        filter: filter_clause(tokens, 5)?,
+        index: tokens.text(at::INDEX)?,
+        k: result_count(tokens, at::K)?,
+        key: tokens.text(at::KEY)?,
+        filter,
+        with_attr,
     })
 }
 
@@ -135,58 +160,34 @@ fn result_count(tokens: &Tokens, at: usize) -> Result<usize> {
     Ok(k)
 }
 
-pub fn body_length_at(tokens: &Tokens) -> Option<usize> {
-    match tokens.command()? {
-        Cmd::VAdd => Some(3),
-        Cmd::VSim if tokens.text(1).ok().and_then(SimSource::parse)? == SimSource::Vector => {
-            Some(4)
-        }
-        _ => None,
-    }
-}
-
-pub fn parse_body(tokens: &Tokens) -> Result<Body> {
-    match tokens.command() {
-        Some(Cmd::VAdd) => parse_add(tokens).map(Body::Add),
-        Some(Cmd::VSim) => parse_sim(tokens).map(Body::Sim),
-        _ => Err(malformed()),
-    }
-}
-
 /// `vadd <index> <id> <veclen> <dim> [ATTR <attrlen> <attr JSON>]`
 fn parse_add(tokens: &Tokens) -> Result<Add> {
-    if tokens.len() < 5 {
+    use layout::add as at;
+    if tokens.len() < at::TAIL {
         return Err(malformed());
     }
     Ok(Add {
-        index: tokens.text(1)?.to_owned(),
-        id: tokens.text(2)?.to_owned(),
-        dim: tokens.parse(4, "dimension")?,
-        attr: attr_clause(tokens, 5)?,
+        index: tokens.text(at::INDEX)?.to_owned(),
+        id: tokens.text(at::ID)?.to_owned(),
+        dim: tokens.parse(at::DIM, "dimension")?,
+        attr: attr_clause(tokens, at::TAIL)?,
     })
 }
 
-/// `VSIM VECTOR <index> <num> <bytes> <dim> [FILTER <n> <term>...]`
+/// `VSIM VECTOR <index> <num> <veclen> <dim> [FILTER <n> <term>...]`
 fn parse_sim(tokens: &Tokens) -> Result<Sim> {
-    if tokens.len() < 6 {
+    use layout::sim_vector as at;
+    if tokens.len() < at::TAIL {
         return Err(malformed());
     }
+    let Trailing { filter, with_attr } = trailing(tokens, at::TAIL)?;
     Ok(Sim {
-        index: tokens.text(2)?.to_owned(),
-        k: result_count(tokens, 3)?,
-        dim: tokens.parse(5, "dimension")?,
-        filter: filter_clause(tokens, 6)?,
+        index: tokens.text(at::INDEX)?.to_owned(),
+        k: result_count(tokens, at::K)?,
+        dim: tokens.parse(at::DIM, "dimension")?,
+        filter,
+        with_attr,
     })
-}
-
-pub fn body_length_error(tokens: &Tokens, at: usize, what: &str) -> Error {
-    match tokens.parse::<usize>(at, what) {
-        Err(e) => e,
-        Ok(n) if n > MAX_BODY_BYTES => Error::bad_request(format!(
-            "{what} {n} exceeds the {MAX_BODY_BYTES}-byte transfer limit"
-        )),
-        Ok(_) => Error::bad_request("lost command state"),
-    }
 }
 
 /// `ATTR <attrlen> <attr JSON>`, starting at token `at`. Optional.
@@ -227,30 +228,43 @@ fn attr_clause(tokens: &Tokens, at: usize) -> Result<Vec<u8>> {
     Ok(json.as_bytes().to_vec())
 }
 
-/// `FILTER <n> <term>...`, starting at token `at`. Optional.
-fn filter_clause(tokens: &Tokens, at: usize) -> Result<Option<Filter>> {
-    if tokens.len() <= at {
-        return Ok(None);
+/// The optional clauses a `vsim` can end with, in any order, from token `at`.
+///
+/// `FILTER <n> <term>...` narrows the results, and `WITHATTR` asks for each hit's stored
+/// attributes. They are read together because a `FILTER` already reads the element the
+/// attributes live in — see `handler::search`.
+fn trailing(tokens: &Tokens, at: usize) -> Result<Trailing> {
+    let mut out = Trailing::default();
+    let mut i = at;
+    while i < tokens.len() {
+        let word = tokens.text(i)?;
+        if word.eq_ignore_ascii_case("FILTER") {
+            let count: usize = tokens.parse(i + 1, "filter term count")?;
+            let first = i + 2;
+            let supplied = tokens.len().saturating_sub(first);
+            if supplied < count {
+                return Err(Error::bad_request(format!(
+                    "FILTER declares {count} terms but {supplied} were supplied"
+                )));
+            }
+            if count > 0 {
+                out.filter = Some(and_terms(tokens, first, count)?);
+            }
+            i = first + count;
+        } else if word.eq_ignore_ascii_case("WITHATTR") {
+            out.with_attr = true;
+            i += 1;
+        } else {
+            return Err(Error::bad_request(format!(
+                "expected FILTER or WITHATTR, got '{word}'"
+            )));
+        }
     }
-    let keyword = tokens.text(at)?;
-    if !keyword.eq_ignore_ascii_case("FILTER") {
-        return Err(Error::bad_request(format!(
-            "expected FILTER, got '{keyword}'"
-        )));
-    }
-    let count: usize = tokens.parse(at + 1, "filter term count")?;
-    if count == 0 {
-        return Ok(None);
-    }
+    Ok(out)
+}
 
-    let first = at + 2;
-    let supplied = tokens.len().saturating_sub(first);
-    if supplied != count {
-        return Err(Error::bad_request(format!(
-            "FILTER declares {count} terms but {supplied} were supplied"
-        )));
-    }
-
+/// `count` terms from token `first`, joined as one expression.
+fn and_terms(tokens: &Tokens, first: usize, count: usize) -> Result<Filter> {
     let mut expression = String::new();
     for i in first..first + count {
         if i > first {
@@ -258,7 +272,7 @@ fn filter_clause(tokens: &Tokens, at: usize) -> Result<Option<Filter>> {
         }
         expression.push_str(tokens.text(i)?);
     }
-    Filter::parse(&expression).map(Some).map_err(Error::from)
+    Filter::parse(&expression).map_err(Error::from)
 }
 
 #[cfg(test)]
@@ -281,13 +295,27 @@ mod tests {
         f(&t)
     }
 
-    /// The refusal message, routed as the callbacks route it: a body-carrying line goes to `parse_body`.
+    fn line_of<'a>(tokens: &Tokens<'a>) -> Result<Line<'a>> {
+        match parse(tokens)? {
+            Parsed::Line(line) => Ok(line),
+            Parsed::Body { .. } => panic!("expected a line-only command"),
+        }
+    }
+
+    fn body_of(tokens: &Tokens) -> Result<Body> {
+        match parse(tokens)? {
+            Parsed::Body { request, .. } => request,
+            Parsed::Line(_) => panic!("expected a body-carrying command"),
+        }
+    }
+
+    /// The refusal message, routed as the callbacks route it: the line phase first, then the body.
     fn err(line: &str) -> String {
         tokens!(t = line);
-        let outcome = if body_length_at(&t).is_some() {
-            parse_body(&t).map(|_| ())
-        } else {
-            parse_line(&t).map(|_| ())
+        let outcome = match parse(&t) {
+            Err(e) => Err(e),
+            Ok(Parsed::Line(_)) => Ok(()),
+            Ok(Parsed::Body { request, .. }) => request.map(|_| ()),
         };
         match outcome {
             Err(e) => e.to_string(),
@@ -321,15 +349,48 @@ mod tests {
 
     #[test]
     fn only_vadd_and_vsim_vector_carry_a_body() {
-        assert_eq!(on_line("vadd i d 28 7", body_length_at), Some(3));
-        assert_eq!(
-            on_line("VSIM VECTOR docs 10 4096 1024", body_length_at),
-            Some(4)
+        fn body_len(line: &str) -> Option<usize> {
+            tokens!(t = line);
+            match parse(&t) {
+                Ok(Parsed::Body { len, .. }) => Some(len),
+                _ => None,
+            }
+        }
+        assert_eq!(body_len("vadd i d 28 7"), Some(28));
+        assert_eq!(body_len("VSIM VECTOR docs 10 4096 1024"), Some(4096));
+        assert_eq!(body_len("VSIM KEY docs 10 v1"), None);
+        assert_eq!(body_len("vlist"), None);
+        assert_eq!(body_len("vget docs v1"), None);
+        assert_eq!(body_len("nonsense"), None);
+    }
+
+    #[test]
+    fn a_body_length_survives_an_unusable_remainder() {
+        // The body still has to be drained, so the length outlives the rest of the line.
+        tokens!(t = "vadd i d 28 abc");
+        let Ok(Parsed::Body { len, request }) = parse(&t) else {
+            panic!("expected a body-carrying command")
+        };
+        assert_eq!(len, 28);
+        assert!(request.unwrap_err().to_string().contains("dimension"));
+    }
+
+    #[test]
+    fn an_unusable_body_length_refuses_the_whole_line() {
+        // Nothing can be drained without a length, so there is no body phase to enter.
+        tokens!(t = "vadd i d abc 7");
+        let msg = parse(&t).unwrap_err().to_string();
+        assert!(msg.contains("vector length"), "{msg}");
+    }
+
+    #[test]
+    fn a_body_line_that_reached_execute_names_the_limit_it_broke() {
+        assert!(
+            body_refused(MAX_BODY_BYTES + 1)
+                .to_string()
+                .contains("transfer limit")
         );
-        assert_eq!(on_line("VSIM KEY docs 10 v1", body_length_at), None);
-        assert_eq!(on_line("vlist", body_length_at), None);
-        assert_eq!(on_line("vget docs v1", body_length_at), None);
-        assert_eq!(on_line("nonsense", body_length_at), None);
+        assert_eq!(body_refused(28).to_string(), "lost command state");
     }
 
     #[test]
@@ -391,7 +452,7 @@ mod tests {
     fn vadd_yields_index_id_dimension_and_attr() {
         let Body::Add(a) = on_line(
             r#"vadd index doc1 7 2 ATTR 23 {"abc":123,"def":"abc"}"#,
-            parse_body,
+            body_of,
         )
         .unwrap() else {
             panic!("expected an Add")
@@ -404,7 +465,7 @@ mod tests {
 
     #[test]
     fn vadd_attr_is_optional() {
-        let Body::Add(a) = on_line("vadd index doc1 7 2", parse_body).unwrap() else {
+        let Body::Add(a) = on_line("vadd index doc1 7 2", body_of).unwrap() else {
             panic!("expected an Add")
         };
         assert_eq!(a.dim, 2);
@@ -418,7 +479,7 @@ mod tests {
     }
 
     fn attr_of(line: &str) -> Result<Vec<u8>> {
-        on_line(line, |t| attr_clause(t, 5))
+        on_line(line, |t| attr_clause(t, layout::add::TAIL))
     }
 
     #[test]
@@ -485,11 +546,9 @@ mod tests {
 
     #[test]
     fn vsim_vector_yields_index_k_dimension_and_filter() {
-        let Body::Sim(s) = on_line(
-            "VSIM VECTOR docs 10 8192 1024 FILTER 1 cat=tech",
-            parse_body,
-        )
-        .unwrap() else {
+        let Body::Sim(s) =
+            on_line("VSIM VECTOR docs 10 8192 1024 FILTER 1 cat=tech", body_of).unwrap()
+        else {
             panic!("expected a Sim")
         };
         assert_eq!(s.index, "docs");
@@ -501,7 +560,7 @@ mod tests {
     #[test]
     fn vsim_key_yields_index_k_and_key() {
         tokens!(t = "VSIM KEY docs 5 v1");
-        let Line::SimKey(s) = parse_line(&t).unwrap() else {
+        let Line::SimKey(s) = line_of(&t).unwrap() else {
             panic!("expected a SimKey")
         };
         assert_eq!(s.index, "docs");
@@ -518,7 +577,11 @@ mod tests {
     }
 
     fn filter_of(line: &str) -> Result<Option<Filter>> {
-        on_line(line, |t| filter_clause(t, 5))
+        on_line(line, |t| trailing(t, layout::sim_key::TAIL)).map(|t| t.filter)
+    }
+
+    fn trailing_of(line: &str) -> Result<Trailing> {
+        on_line(line, |t| trailing(t, layout::sim_key::TAIL))
     }
 
     #[test]
@@ -538,19 +601,44 @@ mod tests {
     }
 
     #[test]
-    fn a_filter_count_that_disagrees_with_the_terms_is_rejected() {
+    fn a_filter_short_of_its_declared_terms_is_rejected() {
         assert!(
             filter_of("VSIM KEY docs 5 v1 FILTER 3 cat=tech")
                 .unwrap_err()
                 .to_string()
                 .contains("declares 3 terms but 1")
         );
-        assert!(
-            filter_of("VSIM KEY docs 5 v1 FILTER 1 cat=tech lang=ko")
-                .unwrap_err()
-                .to_string()
-                .contains("declares 1 terms but 2")
-        );
+    }
+
+    #[test]
+    fn a_term_past_the_declared_count_reads_as_a_clause() {
+        // With trailing clauses allowed, a token after the terms is a clause name, not a
+        // miscount — the count says where the terms end.
+        let msg = filter_of("VSIM KEY docs 5 v1 FILTER 1 cat=tech lang=ko")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("expected FILTER or WITHATTR"), "{msg}");
+        assert!(msg.contains("lang=ko"), "{msg}");
+    }
+
+    #[test]
+    fn withattr_is_read_with_or_without_a_filter() {
+        let bare = trailing_of("VSIM KEY docs 5 v1").unwrap();
+        assert!(bare.filter.is_none() && !bare.with_attr);
+
+        let only = trailing_of("VSIM KEY docs 5 v1 WITHATTR").unwrap();
+        assert!(only.filter.is_none() && only.with_attr);
+
+        let both = trailing_of("VSIM KEY docs 5 v1 FILTER 1 cat=tech WITHATTR").unwrap();
+        assert!(both.filter.is_some() && both.with_attr);
+
+        // Either order, and case-insensitive like every other keyword.
+        let flipped = trailing_of("VSIM KEY docs 5 v1 withattr FILTER 1 cat=tech").unwrap();
+        assert!(flipped.filter.is_some() && flipped.with_attr);
+
+        // `FILTER 0` still means no filtering, and says nothing about attributes.
+        let empty = trailing_of("VSIM KEY docs 5 v1 FILTER 0").unwrap();
+        assert!(empty.filter.is_none() && !empty.with_attr);
     }
 
     #[test]
@@ -567,15 +655,15 @@ mod tests {
     #[test]
     fn simple_lines_parse_and_reject_wrong_arity() {
         tokens!(get = "vget docs v1");
-        assert!(matches!(parse_line(&get), Ok(Line::Get { .. })));
+        assert!(matches!(line_of(&get), Ok(Line::Get { .. })));
         tokens!(del = "vdel docs v1");
-        assert!(matches!(parse_line(&del), Ok(Line::Del { .. })));
+        assert!(matches!(line_of(&del), Ok(Line::Del { .. })));
         tokens!(drop_ = "vdrop docs");
-        assert!(matches!(parse_line(&drop_), Ok(Line::Drop { .. })));
+        assert!(matches!(line_of(&drop_), Ok(Line::Drop { .. })));
         tokens!(list = "vlist");
-        assert!(matches!(parse_line(&list), Ok(Line::List)));
+        assert!(matches!(line_of(&list), Ok(Line::List)));
         tokens!(stats = "vstats");
-        assert!(matches!(parse_line(&stats), Ok(Line::Stats)));
+        assert!(matches!(line_of(&stats), Ok(Line::Stats)));
 
         assert!(err("vget docs").contains("bad command line format"));
         assert!(err("vdel docs v1 extra").contains("bad command line format"));
@@ -583,20 +671,5 @@ mod tests {
         assert!(err("vlist extra").contains("bad command line format"));
         assert!(err("vstats extra").contains("bad command line format"));
         assert!(err("nonsense").contains("unknown command"));
-    }
-
-    #[test]
-    fn an_unusable_body_length_is_reported_not_guessed() {
-        let msg = on_line("vadd i d abc 7", |t| {
-            body_length_error(t, 3, "vector length")
-        })
-        .to_string();
-        assert!(msg.contains("vector length"), "{msg}");
-
-        let msg = on_line("vadd i d 99999999999 7", |t| {
-            body_length_error(t, 3, "vector length")
-        })
-        .to_string();
-        assert!(msg.contains("transfer limit"), "{msg}");
     }
 }

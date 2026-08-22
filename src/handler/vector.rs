@@ -1,6 +1,5 @@
-use super::access::{for_read, for_write};
+use super::access::{for_read, for_write, map_is_gone};
 use super::coords::coords;
-use super::registry;
 use crate::command::request::Add;
 use crate::error::{Error, Reply, Result};
 use crate::handler::arcus::element::Layout;
@@ -32,26 +31,56 @@ pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
     check_attr(attr)?;
     check_still_fits(store, layout)?;
 
-    if index.ann.key_of(id).is_none() && index.ann.len() >= index.maxcount as usize {
-        return Ok(Reply::Overflowed);
-    }
+    // No capacity pre-check here. The engine already refuses the link with EOVERFLOW at
+    // exactly `maxcount` vectors — the Map is sized `maxcount + 1` for the metadata element
+    // — and it counts elements, which is the authority. The graph's `len` is not: a write
+    // whose link failed can leave a node named for an element the Map no longer holds, and
+    // a count that runs high would answer OVERFLOWED for an id that fits.
 
     let quantized = quant::encode(&vector, layout.quant);
-    let value = layout.encode(&quantized, attr)?;
 
-    // Map first: it is the source of truth.
-    match store.put_elem(name, id, &value) {
-        Ok(()) => {}
-        Err(StoreError::Overflow) => return Ok(Reply::Overflowed),
-        Err(StoreError::KeyGone) => {
-            registry::remove(name);
-            return Err(Error::IndexEvicted);
+    // ① The element body first. Allocation is the step most likely to fail under memory
+    // pressure, and taking it before the graph insert means a failure costs nothing but this
+    // call — no node to unwind.
+    let mut pending = match store.reserve_elem(name, id, layout.element_len()) {
+        Ok(pending) => pending,
+        Err(e) => return store_failed(name, e),
+    };
+
+    // ② ③ ④ Mint the key, count the write in flight, insert the node. Nothing names it yet,
+    // so no reader can reach it and there is nothing to publish or undo — which is what lets
+    // all of this happen outside the lock below. It is also the expensive part: measured at
+    // ~370us for a 768-dimension vector against ~0.2us for the mapping write it feeds.
+    //
+    // Staged under the owner this write started with; the publish compares it against the
+    // owner then, so a takeover in between voids the node instead of naming a wiped one.
+    let staged = index.ann.stage(&quantized, index.owner())?;
+    layout.write(pending.value_mut(), &quantized, attr)?;
+
+    // ⑤ The locked pair, and ⑦ the count coming back down when `staged` drops on the way out.
+    // The node this write displaces comes from the mapping, so the hold contains one engine
+    // call and nothing else.
+    //
+    // That call is the step which leaves this node: `CLOG_MAP_ELEM_INSERT` is emitted from
+    // `do_map_elem_link`, so replicas and the persistence log learn of the write there and
+    // nowhere earlier — reserving logs nothing. Everything fallible is already done.
+    index
+        .ann
+        .insert_published(id, staged, index.owner(), || pending.insert())
+        .map(|()| Reply::Stored)
+        .or_else(|e| store_failed(name, e))
+}
+
+/// How a failed Map write answers: a full index and an evicted one are replies, not errors.
+fn store_failed(name: &str, e: StoreError) -> Result<Reply> {
+    match e {
+        StoreError::Overflow => Ok(Reply::Overflowed),
+        StoreError::KeyGone => {
+            map_is_gone(name);
+            Err(Error::IndexEvicted)
         }
-        Err(e) => return Err(e.into()),
+        e => Err(e.into()),
     }
-
-    index.ann.add(id, &quantized)?;
-    Ok(Reply::Stored)
 }
 
 /// `vadd`'s ATTR must be a JSON object: it is stored as one and queried by field.
@@ -92,7 +121,12 @@ pub fn vget(store: &Store, name: &str, id: &str) -> Result<Reply> {
                 json.len()
             )))
         }
-        Err(StoreError::ElemGone | StoreError::KeyGone) => Ok(Reply::NotFound),
+        Err(StoreError::ElemGone) => Ok(Reply::NotFound),
+        // The Map itself is gone, which no read path used to act on.
+        Err(StoreError::KeyGone) => {
+            map_is_gone(name);
+            Ok(Reply::NotFound)
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -101,17 +135,30 @@ pub fn vget(store: &Store, name: &str, id: &str) -> Result<Reply> {
 pub fn vdel(store: &Store, name: &str, id: &str) -> Result<Reply> {
     let index = for_write(store, name)?;
 
-    // Map first. A leftover graph node is filtered out of searches.
-    let existed = match store.delete_elem(name, id) {
-        Ok(()) => true,
-        Err(StoreError::ElemGone | StoreError::KeyGone) => false,
-        Err(e) => return Err(e.into()),
-    };
-    index.ann.remove(id)?;
+    // Engine first, always: the Map is the copy replicas and the persistence log follow, so a
+    // delete that only reached the graph would come back. Under the mapping's hold, so no
+    // reader sees one store without the other.
+    let mut map_gone = false;
+    let removed = index
+        .ann
+        .remove_published(id, || match store.take_elem(name, id) {
+            Ok(_) => Ok(true),
+            Err(StoreError::ElemGone) => Ok(false),
+            Err(StoreError::KeyGone) => {
+                map_gone = true;
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        });
 
-    Ok(if existed {
-        Reply::Deleted
-    } else {
-        Reply::NotFound
-    })
+    // Outside the hold: releasing the registry entry drops the graph, and the mapping lock is
+    // inside it.
+    if map_gone {
+        map_is_gone(name);
+    }
+    match removed {
+        Ok(Some(_)) => Ok(Reply::Deleted),
+        Ok(None) => Ok(Reply::NotFound),
+        Err(e) => Err(e.into()),
+    }
 }

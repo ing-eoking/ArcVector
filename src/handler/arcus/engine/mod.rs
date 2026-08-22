@@ -4,8 +4,9 @@ mod elem;
 mod error;
 mod map;
 
+pub use elem::{HeldElem, PendingElem};
 pub use error::StoreError;
-pub use map::{INDEX_FLAGS, MapProbe};
+pub use map::{FORMAT_VERSION, INDEX_FLAGS, MapProbe, index_attr};
 
 use std::ffi::CStr;
 use std::os::raw::c_void;
