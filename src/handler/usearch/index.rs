@@ -164,6 +164,7 @@ pub struct AnnIndex {
     rebuilding: AtomicBool,
 
     readers: [AtomicU64; READER_SLOTS],
+    stuck: std::sync::Mutex<Vec<u64>>,
     unslotted: AtomicUsize,
     retired: std::sync::Mutex<Vec<(u64, u64)>>,
 }
@@ -227,6 +228,7 @@ impl AnnIndex {
             held: RwLock::new(HeldSet::default()),
             rebuilding: AtomicBool::new(false),
             readers: std::array::from_fn(|_| AtomicU64::new(NO_READER)),
+            stuck: std::sync::Mutex::new(Vec::new()),
             unslotted: AtomicUsize::new(0),
             retired: std::sync::Mutex::new(Vec::new()),
         })
@@ -373,7 +375,7 @@ impl AnnIndex {
         if let Some(old) = displaced {
             if !unlinked {
                 self.retire(&[old]);
-            } else if self.drop_node(old) {
+            } else if self.unlink_node(old) {
                 self.retire(&[old, old]);
             } else {
                 self.retire(&[old]);
@@ -414,7 +416,7 @@ impl AnnIndex {
             drop(held);
             drop(index);
             eprintln!("ArcVector: could not move a node to its new element: {e}");
-            if self.drop_node(old) {
+            if self.unlink_node(old) {
                 self.retire(&[old]);
             }
             return Ok(Some(()));
@@ -435,7 +437,7 @@ impl AnnIndex {
                 held.take(addr)
             };
         drop(held);
-        if self.drop_node(addr) && was_held {
+        if self.unlink_node(addr) && was_held {
             self.retire(&[addr]);
         }
         was_held
@@ -496,11 +498,36 @@ impl AnnIndex {
 
     fn drop_node(&self, key: u64) -> bool {
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
-        match index.remove(key) {
-            Ok(_) => true,
-            Err(e) => {
-                eprintln!("ArcVector: a node stayed in the graph: {e}");
-                false
+        index.remove(key).is_ok()
+    }
+
+    fn unlink_node(&self, addr: u64) -> bool {
+        if self.drop_node(addr) {
+            return true;
+        }
+        let mut stuck = self.stuck.lock().unwrap_or_else(PoisonError::into_inner);
+        if stuck.try_reserve(1).is_err() {
+            eprintln!(
+                "ArcVector: node {addr:#x} is still in the graph and cannot be queued for \
+                 another attempt; its element stays held"
+            );
+            return false;
+        }
+        stuck.push(addr);
+        false
+    }
+
+    pub fn retry_stuck(&self) {
+        let pending = {
+            let mut stuck = self.stuck.lock().unwrap_or_else(PoisonError::into_inner);
+            if stuck.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *stuck)
+        };
+        for addr in pending {
+            if self.unlink_node(addr) {
+                self.retire(&[addr]);
             }
         }
     }
@@ -662,7 +689,7 @@ impl AnnIndex {
         };
         drop(held);
 
-        if had_node && self.drop_node(addr) {
+        if had_node && self.unlink_node(addr) {
             self.retire(&[addr]);
         }
         Ok(Some(had_node))
@@ -999,6 +1026,37 @@ mod tests {
 
     /// Searches do not finish in the order they started. A counter of how many have ended
     /// cannot say the early ones are among them, so the floor is the oldest ticket still out.
+    /// `index.remove` can fail — usearch grows a free list to record the slot, and that
+    /// allocation can refuse. The address is then still a live node, so its refcount stays put
+    /// and the removal is tried again later rather than left as a hole.
+    #[test]
+    fn a_node_that_would_not_come_out_is_taken_out_on_a_later_pass() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let addr = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
+
+        let taken: std::result::Result<Option<bool>, PublishError<()>> =
+            idx.remove_published(|| Ok(Some(addr)));
+        assert_eq!(taken.unwrap(), Some(true));
+        idx.reclaim();
+        assert!(FAKE.id_at(addr).is_none(), "the ordinary path releases it");
+
+        // Now the same address as if the removal had refused: pinned, queued, and retried.
+        let addr = add(&idx, "b", &[0.0, 1.0, 0.0, 0.0]);
+        idx.stuck.lock().unwrap().push(addr);
+        assert!(
+            FAKE.id_at(addr).is_some(),
+            "a stuck node keeps its element alive"
+        );
+
+        idx.retry_stuck();
+        idx.reclaim();
+        assert!(
+            FAKE.id_at(addr).is_none(),
+            "the retry took the node out, so the element went back"
+        );
+        assert!(idx.stuck.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn a_later_search_finishing_does_not_free_what_an_earlier_one_may_hold() {
         let idx = build(4, Quant::F32, Metric::L2, 4);

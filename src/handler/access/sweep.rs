@@ -116,6 +116,7 @@ fn run() {
             last_round = Instant::now();
             crate::server::tick();
             for index in registry::indexes() {
+                index.ann.retry_stuck();
                 index.ann.reclaim();
             }
             offer_round();
