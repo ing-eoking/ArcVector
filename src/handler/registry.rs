@@ -197,6 +197,16 @@ pub fn remove_observed(name: &str, observed: &VectorIndex) -> bool {
     }
 }
 
+pub(in crate::handler) fn indexes() -> Vec<Arc<VectorIndex>> {
+    let reg = read();
+    let mut all = Vec::new();
+    if all.try_reserve(reg.len()).is_err() {
+        return Vec::new();
+    }
+    all.extend(reg.values().cloned());
+    all
+}
+
 pub(in crate::handler) fn coldest(limit: usize) -> Vec<String> {
     let reg = read();
     coldest_of(

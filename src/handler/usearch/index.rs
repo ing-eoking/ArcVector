@@ -62,6 +62,22 @@ impl Drop for Staged<'_> {
     }
 }
 
+#[must_use = "the search is only counted while this is alive"]
+struct Searching<'a>(&'a AnnIndex);
+
+impl<'a> Searching<'a> {
+    fn new(index: &'a AnnIndex) -> Self {
+        index.entered.fetch_add(1, Ordering::AcqRel);
+        Searching(index)
+    }
+}
+
+impl Drop for Searching<'_> {
+    fn drop(&mut self) {
+        self.0.exited.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 impl Drop for AnnIndex {
     fn drop(&mut self) {
         let outgoing = self
@@ -117,6 +133,10 @@ pub struct AnnIndex {
     in_flight: AtomicUsize,
 
     rebuilding: AtomicBool,
+
+    entered: AtomicU64,
+    exited: AtomicU64,
+    retired: std::sync::Mutex<Vec<(u64, u64)>>,
 }
 
 impl AnnIndex {
@@ -177,6 +197,9 @@ impl AnnIndex {
             epoch: AtomicU64::new(0),
             held: RwLock::new(HeldSet::default()),
             rebuilding: AtomicBool::new(false),
+            entered: AtomicU64::new(0),
+            exited: AtomicU64::new(0),
+            retired: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -268,7 +291,7 @@ impl AnnIndex {
             drop(index);
             let key = staged.key;
             drop(staged);
-            self.drop_node(key);
+            let _ = self.drop_node(key);
             return Err(PublishError::Mapping(Error::Index(format!(
                 "the held set could not grow: {e}"
             ))));
@@ -287,7 +310,7 @@ impl AnnIndex {
                 }
                 drop(held);
                 drop(index);
-                self.drop_node(key);
+                let _ = self.drop_node(key);
                 return Err(PublishError::Store(e));
             }
         };
@@ -298,7 +321,7 @@ impl AnnIndex {
             self.elements.release(&back);
             drop(held);
             drop(index);
-            self.drop_node(key);
+            let _ = self.drop_node(key);
             return Ok(());
         }
 
@@ -310,20 +333,22 @@ impl AnnIndex {
             drop(held);
             drop(index);
             eprintln!("ArcVector: could not name a published node: {e}");
-            self.drop_node(key);
+            let _ = self.drop_node(key);
             return Ok(());
         }
         held.publish(addr);
 
-        let retired = displaced.is_some_and(|old| held.take(old));
-        if let Some(old) = displaced {
-            let back = if retired { vec![old, old] } else { vec![old] };
-            self.elements.release(&back);
-        }
+        let unlinked = displaced.is_some_and(|old| held.take(old));
         drop(held);
         drop(index);
-        if retired && let Some(old) = displaced {
-            self.drop_node(old);
+        if let Some(old) = displaced {
+            if !unlinked {
+                self.retire(&[old]);
+            } else if self.drop_node(old) {
+                self.retire(&[old, old]);
+            } else {
+                self.retire(&[old]);
+            }
         }
         Ok(())
     }
@@ -355,17 +380,20 @@ impl AnnIndex {
             return Ok(Some(()));
         }
 
-        self.elements.release(&[old]);
-
         if let Err(e) = index.rename(old, new) {
             self.elements.release(&[new]);
             drop(held);
             drop(index);
             eprintln!("ArcVector: could not move a node to its new element: {e}");
-            self.drop_node(old);
+            if self.drop_node(old) {
+                self.retire(&[old]);
+            }
             return Ok(Some(()));
         }
         held.publish(new);
+        drop(held);
+        drop(index);
+        self.retire(&[old]);
         Ok(Some(()))
     }
 
@@ -377,21 +405,64 @@ impl AnnIndex {
             } else {
                 held.take(addr)
             };
-        if was_held {
-            self.elements.release(&[addr]);
-        }
         drop(held);
-        self.drop_node(addr);
+        if self.drop_node(addr) && was_held {
+            self.retire(&[addr]);
+        }
         was_held
     }
 
     pub fn discard(&self, staged: Staged<'_>) {
-        self.drop_node(staged.key);
+        let _ = self.drop_node(staged.key);
     }
 
-    fn drop_node(&self, key: u64) {
+    fn retire(&self, addrs: &[u64]) {
+        if addrs.is_empty() {
+            return;
+        }
+        let after = self.entered.load(Ordering::Acquire);
+        {
+            let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
+            if retired.try_reserve(addrs.len()).is_err() {
+                drop(retired);
+                self.drain_then_release(addrs, after);
+                return;
+            }
+            retired.extend(addrs.iter().map(|addr| (*addr, after)));
+        }
+        self.reclaim();
+    }
+
+    fn drain_then_release(&self, addrs: &[u64], after: u64) {
+        while self.exited.load(Ordering::Acquire) < after {
+            std::thread::yield_now();
+        }
+        self.elements.release(addrs);
+    }
+
+    pub fn reclaim(&self) {
+        let done = self.exited.load(Ordering::Acquire);
+        let mut ready: Vec<u64> = Vec::new();
+        {
+            let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
+            let cut = retired.partition_point(|(_, after)| *after <= done);
+            if cut == 0 || ready.try_reserve(cut).is_err() {
+                return;
+            }
+            ready.extend(retired.drain(..cut).map(|(addr, _)| addr));
+        }
+        self.elements.release(&ready);
+    }
+
+    fn drop_node(&self, key: u64) -> bool {
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
-        let _ = index.remove(key);
+        match index.remove(key) {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("ArcVector: a node stayed in the graph: {e}");
+                false
+            }
+        }
     }
 
     pub fn add_unless_known(
@@ -519,11 +590,10 @@ impl AnnIndex {
         self.reserved.store(MIN_CAPACITY, Ordering::Release);
 
         let outgoing = held.take_all();
-        if !outgoing.is_empty() {
-            self.elements.release(&outgoing);
-        }
         self.epoch.fetch_add(1, Ordering::Release);
         drop(held);
+        drop(index);
+        self.retire(&outgoing);
         Ok(())
     }
 
@@ -550,39 +620,27 @@ impl AnnIndex {
         } else {
             held.take(addr)
         };
-        if had_node {
-            self.elements.release(&[addr]);
-        }
         drop(held);
 
-        if had_node {
-            self.drop_node(addr);
+        if had_node && self.drop_node(addr) {
+            self.retire(&[addr]);
         }
         Ok(Some(had_node))
     }
 
     fn resolve(&self, hits: &[(u64, f32)], entered: u64) -> Vec<(u64, Arc<str>, f32)> {
-        let held = self.held();
         if self.epoch.load(Ordering::Acquire) != entered {
             return Vec::new();
         }
         hits.iter()
             .filter_map(|(key, distance)| {
-                let id = self.name(&held, *key)?;
+                if held::is_staged(*key) {
+                    return None;
+                }
+                let id = self.elements.id_at(*key)?;
                 Some((*key, id, *distance))
             })
             .collect()
-    }
-
-    fn name(&self, held: &HeldSet, key: u64) -> Option<Arc<str>> {
-        if !Self::is_named(held, key) {
-            return None;
-        }
-        self.elements.id_at(key)
-    }
-
-    fn is_named(held: &HeldSet, key: u64) -> bool {
-        !held::is_staged(key) && held.contains(key)
     }
 
     fn unfiltered(&self, index: &Index, query: &[u8], k: usize) -> Result<::usearch::ffi::Matches> {
@@ -625,6 +683,7 @@ impl AnnIndex {
             )));
         }
 
+        let _searching = Searching::new(self);
         let entered = self.epoch.load(Ordering::Acquire);
 
         let k = k.saturating_add(self.in_flight.load(Ordering::Relaxed));
@@ -635,8 +694,7 @@ impl AnnIndex {
                 None => self.unfiltered(&index, query, k),
 
                 Some(matches) => self.matches(&index, query, k, |key| {
-                    let held = self.held();
-                    Self::is_named(&held, key) && matches(key)
+                    !held::is_staged(key) && matches(key)
                 }),
             }?
         };
@@ -897,6 +955,56 @@ mod tests {
             let hits = search(&idx, &[1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0], 1);
             assert_eq!(hits, vec!["x"], "quant {q:?}");
         }
+    }
+
+    #[test]
+    fn an_address_a_search_may_still_be_reading_is_not_released_until_it_ends() {
+        let idx = Arc::new(build(4, Quant::F32, Metric::L2, 4));
+        let addr = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
+        add(&idx, "b", &[0.9, 0.1, 0.0, 0.0]);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (deleted_tx, deleted_rx) = std::sync::mpsc::channel::<bool>();
+
+        let other = Arc::clone(&idx);
+        let deleter = std::thread::spawn(move || {
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the search never reported that it was inside a callback");
+            let taken: std::result::Result<Option<bool>, PublishError<()>> =
+                other.remove_published(|| Ok(Some(addr)));
+            deleted_tx.send(taken.unwrap().unwrap_or(false)).unwrap();
+        });
+
+        let query = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], Quant::F32);
+        let reported = std::cell::Cell::new(false);
+        let still_there = std::cell::Cell::new(false);
+        let probe = |_key: u64| {
+            if !reported.replace(true) {
+                entered_tx.send(()).unwrap();
+                assert!(
+                    deleted_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("the delete did not finish while the search was inside"),
+                    "the delete found no node"
+                );
+                still_there.set(FAKE.id_at(addr).is_some());
+            }
+            true
+        };
+        let _ = idx.search(&query, 2, Some(&probe as Accept)).unwrap();
+        deleter.join().unwrap();
+
+        assert!(
+            still_there.get(),
+            "the element was released while a search could still dereference its address"
+        );
+
+        idx.reclaim();
+        assert!(
+            FAKE.id_at(addr).is_none(),
+            "the search has ended, so the address should have gone back"
+        );
     }
 
     #[test]
