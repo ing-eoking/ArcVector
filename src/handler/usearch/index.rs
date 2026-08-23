@@ -167,6 +167,7 @@ pub struct AnnIndex {
     stuck: std::sync::Mutex<Vec<u64>>,
     unslotted: AtomicUsize,
     retired: std::sync::Mutex<Vec<(u64, u64)>>,
+    queued: AtomicUsize,
 }
 
 impl AnnIndex {
@@ -231,6 +232,7 @@ impl AnnIndex {
             stuck: std::sync::Mutex::new(Vec::new()),
             unslotted: AtomicUsize::new(0),
             retired: std::sync::Mutex::new(Vec::new()),
+            queued: AtomicUsize::new(0),
         })
     }
 
@@ -452,6 +454,15 @@ impl AnnIndex {
             return;
         }
         let after = crate::server::coarse_now() + 1;
+
+        if self.oldest_reader() >= after {
+            self.elements.release(addrs);
+            if self.queued.load(Ordering::Relaxed) > 0 {
+                self.reclaim();
+            }
+            return;
+        }
+
         {
             let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
             if retired.try_reserve(addrs.len()).is_err() {
@@ -460,6 +471,7 @@ impl AnnIndex {
                 return;
             }
             retired.extend(addrs.iter().map(|addr| (*addr, after)));
+            self.queued.store(retired.len(), Ordering::Relaxed);
         }
         self.reclaim();
     }
@@ -483,6 +495,9 @@ impl AnnIndex {
     }
 
     pub fn reclaim(&self) {
+        if self.queued.load(Ordering::Relaxed) == 0 {
+            return;
+        }
         let done = self.oldest_reader();
         let mut ready: Vec<u64> = Vec::new();
         {
@@ -492,6 +507,7 @@ impl AnnIndex {
                 return;
             }
             ready.extend(retired.drain(..cut).map(|(addr, _)| addr));
+            self.queued.store(retired.len(), Ordering::Relaxed);
         }
         self.elements.release(&ready);
     }
@@ -1063,6 +1079,29 @@ mod tests {
             "the retry took the node out, so the element went back"
         );
         assert!(idx.stuck.lock().unwrap().is_empty());
+    }
+
+    /// With nothing reading, the address does not go on the queue at all — it is handed back
+    /// inside the delete, on the thread that asked for it.
+    #[test]
+    fn a_delete_with_no_search_running_releases_without_queueing() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let addr = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
+
+        let taken: std::result::Result<Option<bool>, PublishError<()>> =
+            idx.remove_published(|| Ok(Some(addr)));
+        assert_eq!(taken.unwrap(), Some(true));
+
+        assert!(
+            FAKE.id_at(addr).is_none(),
+            "it should be back already, without waiting for a reclaim"
+        );
+        assert_eq!(
+            idx.queued.load(Ordering::Relaxed),
+            0,
+            "the queue was not used"
+        );
+        assert!(idx.retired.lock().unwrap().is_empty());
     }
 
     #[test]
