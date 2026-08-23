@@ -1,16 +1,3 @@
-//! Metadata filter expressions, evaluated against the stored ATTR region.
-//!
-//! ```text
-//! expr  := term (OR term)*
-//! term  := cond (AND cond)*
-//! cond  := field op value
-//! op    := "=" | "!=" | "<" | "<=" | ">" | ">="
-//! value := number | "quoted string" | bare_string
-//! ```
-//!
-//! Only top-level fields are addressable, and a condition on a missing field is
-//! always false — `!=` included.
-
 mod json;
 
 use json::{JsonVal, lookup};
@@ -38,7 +25,6 @@ struct Cond {
     value: Operand,
 }
 
-/// A compiled filter: an OR of ANDs — the grammar has no parentheses.
 #[derive(Clone, Debug)]
 pub struct Filter {
     terms: Vec<Vec<Cond>>,
@@ -105,7 +91,6 @@ impl Filter {
 }
 
 fn eval_cond(c: &Cond, json: &[u8]) -> bool {
-    // A missing field never satisfies a condition, not even `!=`.
     let Some(found) = lookup(json, c.field.as_bytes()) else {
         return false;
     };
@@ -132,7 +117,7 @@ fn bool_str_eq(a: bool, b: &str) -> bool {
 
 fn cmp_ord(ord: Option<std::cmp::Ordering>, op: Op) -> bool {
     use std::cmp::Ordering::{Equal, Greater, Less};
-    // NaN comparisons yield None and must be false for every operator except Ne.
+
     let Some(o) = ord else {
         return matches!(op, Op::Ne);
     };
@@ -166,7 +151,6 @@ impl<'a> Parser<'a> {
         String::from_utf8_lossy(&self.s[self.i..self.s.len().min(self.i + 16)]).into_owned()
     }
 
-    /// Consume `kw` (case-insensitive) when it appears as a whole word.
     fn eat_keyword(&mut self, kw: &str) -> bool {
         let end = self.i + kw.len();
         if end > self.s.len() {
@@ -175,7 +159,7 @@ impl<'a> Parser<'a> {
         if !self.s[self.i..end].eq_ignore_ascii_case(kw.as_bytes()) {
             return false;
         }
-        // Must not be a prefix of a longer identifier ("ANDROID" is not "AND").
+
         if end < self.s.len() && is_ident_byte(self.s[end]) {
             return false;
         }
@@ -265,7 +249,7 @@ impl<'a> Parser<'a> {
                 return Err(ParseError::UnterminatedString);
             }
             let v = String::from_utf8_lossy(&self.s[start..self.i]).into_owned();
-            self.i += 1; // closing quote
+            self.i += 1;
             return Ok(Operand::Str(v));
         }
 

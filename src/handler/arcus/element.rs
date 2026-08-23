@@ -1,17 +1,11 @@
 use crate::handler::quant::Quant;
 
-/// `alen: u16`, the stored ATTR length. Nothing about the graph is in here: the node a value
-/// is held under is the mapping's business, so a write never has to read the value it replaces
-/// to find out.
 const HEADER_LEN: usize = 2;
 
-/// Field name of the reserved element holding an index's metadata.
 pub const META_FIELD: &str = "AV META";
 
-/// Constant offset of the ATTR region within an element value.
 pub const ATTR_OFFSET: usize = HEADER_LEN;
 
-/// Fixed size of the ATTR region.
 pub const ATTR_BYTES: usize = 128;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -52,7 +46,6 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// Where the vector begins. Constant, because ATTR has a fixed size.
     pub const VECTOR_OFFSET: usize = HEADER_LEN + ATTR_BYTES;
 
     pub const fn new(dim: usize, quant: Quant) -> Self {
@@ -63,15 +56,8 @@ impl Layout {
         self.quant.vector_bytes(self.dim)
     }
 
-    /// Bytes the engine appends to every collection element for the terminator.
     pub const STORED_TERMINATOR: usize = 2;
 
-    /// What a stored element holds.
-    ///
-    /// The vector is in it only where something reads it back: a rebuild from Map. usearch
-    /// already holds one copy, and outside a recovery build nothing ever asks the Map for it —
-    /// `vsim KEY` takes its query straight from the graph. At 768 dimensions the vector is
-    /// 3072 of the element's 3204 bytes, so leaving it out is most of what an element costs.
     #[cfg(recovery)]
     pub const fn element_len(&self) -> usize {
         Self::VECTOR_OFFSET + self.vector_bytes()
@@ -82,22 +68,14 @@ impl Layout {
         Self::VECTOR_OFFSET
     }
 
-    /// What the engine allocates.
     pub const fn stored_len(&self) -> usize {
         self.element_len() + Self::STORED_TERMINATOR
     }
 
-    /// What an element would take with the vector in it, whatever this build stores.
-    ///
-    /// The dimension limit is measured against this in every build. It could be relaxed where
-    /// the vector is left out, but then the same server would accept a dimension on one build
-    /// and refuse it on another, and an index would stop being describable independently of how
-    /// the module was compiled.
     pub const fn full_stored_len(&self) -> usize {
         Self::VECTOR_OFFSET + self.vector_bytes() + Self::STORED_TERMINATOR
     }
 
-    /// Largest dimension whose element fits `budget`. Zero if not even one does.
     pub const fn max_dim_for(quant: Quant, max_element_bytes: usize) -> usize {
         let overhead = Self::VECTOR_OFFSET + Self::STORED_TERMINATOR;
         if max_element_bytes <= overhead {
@@ -106,8 +84,6 @@ impl Layout {
         quant.max_dim(max_element_bytes - overhead)
     }
 
-    /// `vector` must already be quantized to `self`.
-    /// named by; a reader of the stored value learns it from here.
     pub fn encode(&self, vector: &[u8], attr: &[u8]) -> Result<Vec<u8>, CodecError> {
         if vector.len() != self.vector_bytes() {
             return Err(CodecError::VectorLenMismatch {
@@ -127,10 +103,6 @@ impl Layout {
         Ok(buf)
     }
 
-    /// Write the element into a buffer the caller already reserved.
-    ///
-    /// A `vadd` reserves the engine's element body first, so the bytes are filled in place
-    /// rather than built and copied.
     pub fn write(&self, buf: &mut [u8], vector: &[u8], attr: &[u8]) -> Result<(), CodecError> {
         if vector.len() != self.vector_bytes() {
             return Err(CodecError::VectorLenMismatch {
@@ -151,8 +123,7 @@ impl Layout {
             });
         }
         buf[0..2].copy_from_slice(&(attr.len() as u16).to_le_bytes());
-        // The whole ATTR region, not just what `attr` fills: a reserved engine element body
-        // is whatever the slab held, and those bytes are stored and replicated.
+
         buf[ATTR_OFFSET..Self::VECTOR_OFFSET].fill(0);
         buf[ATTR_OFFSET..ATTR_OFFSET + attr.len()].copy_from_slice(attr);
         #[cfg(recovery)]
@@ -160,7 +131,6 @@ impl Layout {
         Ok(())
     }
 
-    /// Every offset comes from `self`; the header carries `alen` and nothing else.
     pub fn decode<'a>(&self, buf: &'a [u8]) -> Result<Element<'a>, CodecError> {
         let head = parse_header(buf)?;
         let need = self.element_len();
@@ -177,12 +147,6 @@ impl Layout {
         })
     }
 
-    /// Overwrite the ATTR region of a stored value, leaving everything else byte for byte.
-    ///
-    /// The region is a fixed 128 bytes whatever the ATTR is, so the value's length does not
-    /// move — which is what lets `vsetattr` hand the engine the same number of bytes back.
-    /// The whole region is rewritten, not just what `attr` fills: the tail is stored and
-    /// replicated, so leaving the old ATTR's bytes there would ship them.
     pub fn set_attr(&self, buf: &mut [u8], attr: &[u8]) -> Result<(), CodecError> {
         if attr.len() > ATTR_BYTES {
             return Err(CodecError::AttrTooLarge {
@@ -202,7 +166,6 @@ impl Layout {
         Ok(())
     }
 
-    /// Read only the ATTR region — the hot path used by the search predicate.
     pub fn attr_of<'a>(&self, buf: &'a [u8]) -> Result<&'a [u8], CodecError> {
         let head = parse_header(buf)?;
         let end = ATTR_OFFSET + head.attr_len;
@@ -235,18 +198,16 @@ fn parse_header(buf: &[u8]) -> Result<Header, CodecError> {
     Ok(Header { attr_len })
 }
 
-/// Per-index metadata, stored under [`META_FIELD`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct MetaRecord {
     pub metric: String,
     pub connectivity: usize,
     pub expansion_add: usize,
     pub expansion_search: usize,
-    /// Identifies the graph currently built from this Map.
+
     pub owner: u64,
 }
 
-/// A token no other node can produce.
 pub fn mint_owner() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
@@ -255,7 +216,6 @@ pub fn mint_owner() -> u64 {
 }
 
 impl MetaRecord {
-    /// The value is **entirely JSON** — no header, so no constant offset and no ATTR ceiling.
     pub fn encode(&self, layout: Layout) -> Vec<u8> {
         format!(
             r#"{{"dim":{},"quant":"{}","metric":"{}","m":{},"efc":{},"efs":{},"owner":"{:016x}"}}"#,
@@ -309,7 +269,6 @@ impl MetaRecord {
         ))
     }
 
-    /// The `owner` alone, for the per-command staleness check.
     pub fn owner_of(buf: &[u8]) -> Result<u64, CodecError> {
         Self::decode(buf).map(|(meta, _)| meta.owner)
     }
@@ -318,8 +277,7 @@ impl MetaRecord {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Element<'a> {
     pub attr: &'a [u8],
-    /// Only where a rebuild reads it back. Gated rather than left empty, so a build that does
-    /// not store the vector cannot compile a reader for one.
+
     #[cfg(recovery)]
     pub vector: &'a [u8],
 }
@@ -341,7 +299,6 @@ mod tests {
 
     #[test]
     fn max_dim_is_the_inverse_of_vector_bytes() {
-        // 16KB element limit minus a 16B header and a 64B filter slot.
         let budget = 16 * 1024 - 16 - 64;
         assert_eq!(Quant::F32.max_dim(budget), 4076);
         assert_eq!(Quant::F16.max_dim(budget), 8152);
@@ -367,7 +324,7 @@ mod tests {
                 let l = Layout::new(dim, q);
                 #[cfg(recovery)]
                 assert_eq!(l.element_len(), 130 + l.vector_bytes());
-                // Without a rebuild to feed, the vector is not stored — see `element_len`.
+
                 #[cfg(not(recovery))]
                 assert_eq!(l.element_len(), 130);
                 assert_eq!(l.full_stored_len(), 132 + l.vector_bytes());
@@ -386,7 +343,6 @@ mod tests {
         }
     }
 
-    /// Elements written before [`Layout::STORED_TERMINATOR`] are two bytes shorter, and a rebuild has to read them first.
     #[test]
     fn decode_accepts_an_element_with_or_without_the_terminator() {
         let l = Layout::new(4, Quant::F32);
@@ -443,7 +399,7 @@ mod tests {
     fn the_attr_region_is_zero_padded() {
         let l = layout();
         let buf = l.encode(&[9, 9, 9, 9], b"{}").unwrap();
-        // The region past `alen` must be zeroed so an earlier, longer value cannot leak.
+
         assert!(
             buf[ATTR_OFFSET + 2..Layout::VECTOR_OFFSET]
                 .iter()
@@ -486,7 +442,6 @@ mod tests {
 
     #[test]
     fn metadata_round_trips_at_the_widest_values() {
-        // The value is the whole element, so there is no fixed region to overflow.
         let layout = Layout::new(Layout::max_dim_for(Quant::B1, 16 * 1024), Quant::F32);
         let meta = MetaRecord {
             metric: "tanimoto".to_owned(),
@@ -524,7 +479,7 @@ mod tests {
                 got: l.element_len() - 1
             })
         );
-        // The header is `alen` alone, so one byte is not a header at all.
+
         assert_eq!(
             parse_header(&good[..1]),
             Err(CodecError::Truncated {
@@ -543,13 +498,11 @@ mod tests {
 
     #[test]
     fn attr_of_survives_a_truncated_vector_tail() {
-        // The predicate only needs attributes, so a damaged tail must not stop it.
         let l = layout();
         let good = l.encode(&[0, 0, 0, 0], b"{}").unwrap();
         let short = &good[..Layout::VECTOR_OFFSET];
         assert_eq!(l.attr_of(short).unwrap(), b"{}");
-        // Only where a vector is stored is this a truncation at all; without one the element
-        // ends at the ATTR region and there is no tail to lose.
+
         #[cfg(recovery)]
         assert!(l.decode(short).is_err());
     }
@@ -557,15 +510,13 @@ mod tests {
     #[test]
     fn max_dim_for_is_the_exact_ceiling() {
         let limit = 16 * 1024;
-        // 16384 - 130 header/ATTR - 2 terminator = 16252 bytes of coordinates.
+
         assert_eq!(Layout::max_dim_for(Quant::F32, limit), 4063);
         assert_eq!(Layout::max_dim_for(Quant::F16, limit), 8126);
         assert_eq!(Layout::max_dim_for(Quant::I8, limit), 16252);
         assert_eq!(Layout::max_dim_for(Quant::B1, limit), 130_016);
 
         for q in [Quant::F32, Quant::F16, Quant::I8, Quant::B1] {
-            // `max_dim_for` is the dimension cap, and that is measured with the vector in the
-            // element whatever this build stores — see `full_stored_len`.
             let d = Layout::max_dim_for(q, limit);
             assert!(Layout::new(d, q).full_stored_len() <= limit, "{q:?}");
             assert!(Layout::new(d + 1, q).full_stored_len() > limit, "{q:?}");
@@ -576,7 +527,7 @@ mod tests {
     fn max_dim_for_handles_a_budget_below_the_fixed_overhead() {
         assert_eq!(Layout::max_dim_for(Quant::I8, 16), 0);
         assert_eq!(Layout::max_dim_for(Quant::I8, Layout::VECTOR_OFFSET), 0);
-        // The terminator is in the budget, so one byte past the vector offset leaves no room.
+
         assert_eq!(
             Layout::max_dim_for(Quant::I8, Layout::VECTOR_OFFSET + Layout::STORED_TERMINATOR),
             0

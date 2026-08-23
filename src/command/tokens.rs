@@ -1,5 +1,3 @@
-//! The only module that touches memcached's token array.
-
 use std::os::raw::c_int;
 use std::str::FromStr;
 
@@ -13,9 +11,6 @@ pub struct Tokens<'a> {
 }
 
 impl<'a> Tokens<'a> {
-    /// # Safety
-    ///
-    /// `argv` must point to `argc` tokens that stay valid for `'a`.
     pub unsafe fn new(argv: *const token_t, argc: c_int) -> Self {
         let len = argc.max(0) as usize;
         let tokens = if len == 0 {
@@ -34,7 +29,6 @@ impl<'a> Tokens<'a> {
         self.tokens.is_empty()
     }
 
-    /// The command, or `None` for a body-only invocation or an unknown name.
     pub fn command(&self) -> Option<Cmd> {
         Cmd::parse(self.text(0).unwrap_or(""))
     }
@@ -47,7 +41,7 @@ impl<'a> Tokens<'a> {
         if token.value.is_null() || token.length == 0 {
             return Ok("");
         }
-        // SAFETY: the token points into the connection buffer, which outlives `'a`.
+
         let bytes = unsafe { std::slice::from_raw_parts(token.value.cast::<u8>(), token.length) };
         std::str::from_utf8(bytes).map_err(|_| Error::bad_request("argument is not valid UTF-8"))
     }
@@ -58,7 +52,6 @@ impl<'a> Tokens<'a> {
             .map_err(|_| Error::bad_request(format!("invalid {what} '{raw}'")))
     }
 
-    /// Trailing `KEY value` options from token `from`, keys upper-cased.
     pub fn options(&self, from: usize) -> Result<Vec<(String, &'a str)>> {
         let rest = self.len().saturating_sub(from);
         if !rest.is_multiple_of(2) {
@@ -72,7 +65,6 @@ impl<'a> Tokens<'a> {
     }
 }
 
-/// Tokenize like memcached's `tokenize_command`. Returns the backing buffer.
 #[cfg(test)]
 pub fn tokenize_for_test(line: &str) -> (Vec<u8>, Vec<token_t>) {
     use std::os::raw::c_char;
@@ -98,7 +90,6 @@ pub fn tokenize_for_test(line: &str) -> (Vec<u8>, Vec<token_t>) {
     let tokens = spans
         .into_iter()
         .map(|(off, len)| token_t {
-            // SAFETY: `off` lies within `buf`, which the caller keeps alive.
             value: unsafe { base.add(off) }.cast::<c_char>(),
             length: len,
         })
@@ -112,13 +103,11 @@ mod tests {
     use std::ptr;
 
     fn view<'a>(raw: &'a [token_t]) -> Tokens<'a> {
-        // SAFETY: `raw` outlives the returned view.
         unsafe { Tokens::new(raw.as_ptr(), raw.len() as c_int) }
     }
 
     #[test]
     fn empty_token_lists_are_safe_to_view() {
-        // SAFETY: a zero count never dereferences the pointer.
         let t = unsafe { Tokens::new(ptr::null(), 0) };
         assert!(t.is_empty());
         assert_eq!(t.command(), None);

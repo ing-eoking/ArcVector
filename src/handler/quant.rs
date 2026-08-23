@@ -1,4 +1,3 @@
-/// Scalar kind of a stored vector. Persisted in the header — never renumber.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Quant {
@@ -90,7 +89,6 @@ pub fn encode(v: &[f32], quant: Quant) -> Vec<u8> {
                 .collect()
         }
         Quant::B1 => {
-            // LSB-first within each byte, matching usearch's `b1x8` bit addressing.
             let mut out = vec![0u8; v.len().div_ceil(8)];
             for (i, x) in v.iter().enumerate() {
                 if *x > 0.0 {
@@ -106,7 +104,6 @@ fn l2_norm(v: &[f32]) -> f32 {
     v.iter().map(|x| x * x).sum::<f32>().sqrt()
 }
 
-/// IEEE 754 binary16, as the raw bits usearch wants in its `i16` container.
 pub fn f32_to_f16_bits(x: f32) -> i16 {
     let bits = x.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
@@ -114,27 +111,24 @@ pub fn f32_to_f16_bits(x: f32) -> i16 {
     let mant = bits & 0x007f_ffff;
 
     if exp == 0xff {
-        // Inf or NaN. Preserve NaN-ness by forcing a non-zero mantissa.
         let m = if mant != 0 { 0x0200 } else { 0 };
         return (sign | 0x7c00 | m).cast_signed();
     }
 
-    // Rebase exponent: f32 bias 127 -> f16 bias 15.
     let new_exp = exp - 127 + 15;
 
     if new_exp >= 0x1f {
-        return (sign | 0x7c00).cast_signed(); // overflow -> infinity
+        return (sign | 0x7c00).cast_signed();
     }
 
     if new_exp <= 0 {
-        // Subnormal, or too small to represent at all.
         if new_exp < -10 {
             return sign.cast_signed();
         }
         let mant_with_implicit = mant | 0x0080_0000;
         let shift = (14 - new_exp) as u32;
         let mut half = (mant_with_implicit >> shift) as u16;
-        // Round to nearest, ties away from zero.
+
         if (mant_with_implicit >> (shift - 1)) & 1 == 1 {
             half += 1;
         }
@@ -143,12 +137,11 @@ pub fn f32_to_f16_bits(x: f32) -> i16 {
 
     let mut half = (sign as u32) | ((new_exp as u32) << 10) | (mant >> 13);
     if (mant >> 12) & 1 == 1 {
-        half += 1; // carries into the exponent naturally
+        half += 1;
     }
     (half as u16).cast_signed()
 }
 
-/// Inverse of [`f32_to_f16_bits`]. Tests only.
 #[cfg(test)]
 pub fn f16_bits_to_f32(bits: i16) -> f32 {
     let h = bits.cast_unsigned();
@@ -160,7 +153,7 @@ pub fn f16_bits_to_f32(bits: i16) -> f32 {
         if mant == 0 {
             return f32::from_bits(sign);
         }
-        // Subnormal: renormalize into f32's range.
+
         let mut e = -1i32;
         let mut m = mant;
         while m & 0x0400 == 0 {
@@ -174,7 +167,7 @@ pub fn f16_bits_to_f32(bits: i16) -> f32 {
     if exp == 0x1f {
         return f32::from_bits(sign | 0x7f80_0000 | (mant << 13));
     }
-    // Signed arithmetic: exp < 15 for every value below 1.0, and u32 would wrap.
+
     let new_exp = (exp as i32 - 15 + 127) as u32;
     f32::from_bits(sign | (new_exp << 23) | (mant << 13))
 }

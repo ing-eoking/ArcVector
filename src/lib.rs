@@ -1,5 +1,4 @@
-//! ArcVector — vector similarity search as an arcus ASCII protocol extension.
-
+#![allow(clippy::missing_safety_doc)]
 #[allow(
     non_upper_case_globals,
     non_camel_case_types,
@@ -34,9 +33,6 @@ use engine_api::{
 };
 use server::{Responder, ResponseHandler};
 
-/// # Safety
-///
-/// `argv`, `ndata` and `ptr_out` must be `accept`'s parameters.
 unsafe extern "C" fn accept_vector_cmd(
     _cmd_cookie: *const c_void,
     cookie: *mut c_void,
@@ -47,8 +43,6 @@ unsafe extern "C" fn accept_vector_cmd(
 ) -> bool {
     let tokens = unsafe { Tokens::new(argv, argc) };
 
-    // Anything but a sizeable body — a line command, a bad length, an alien name — is
-    // `execute`'s to answer or decline.
     let Ok(Parsed::Body { len, request }) = request::parse(&tokens) else {
         return tokens.command().is_some();
     };
@@ -56,16 +50,12 @@ unsafe extern "C" fn accept_vector_cmd(
         return true;
     }
 
-    // A parse failure rides into the nread state; refusing leaves the body unread.
     unsafe {
         nread::expect_body(cookie, request, len, ndata, ptr_out);
     }
     true
 }
 
-/// # Safety
-///
-/// `argv` and `handler` must be `execute`'s parameters.
 unsafe extern "C" fn execute_vector_cmd(
     _cmd_cookie: *const c_void,
     cookie: *const c_void,
@@ -74,7 +64,7 @@ unsafe extern "C" fn execute_vector_cmd(
     handler: ResponseHandler,
 ) -> bool {
     let tokens = unsafe { Tokens::new(argv, argc) };
-    // SAFETY: guaranteed by the caller; `cookie` belongs to the call in progress.
+
     let outcome = unsafe { command::parse(cookie, &tokens) }
         .and_then(|request| unsafe { handler::run(cookie, request) });
     Responder::new(handler, cookie).reply(outcome);
@@ -110,7 +100,6 @@ pub extern "C" fn memcached_extensions_initialize(
     };
     server::set_api(get_api);
 
-    // SAFETY: the accessor is live and the descriptor is a process-lifetime static the server only reads.
     unsafe {
         let server = get_api();
         if server.is_null() {

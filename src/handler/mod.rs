@@ -17,12 +17,8 @@ use crate::command::Request;
 use crate::command::request::{Body, Line};
 use crate::error::{Error, Reply, Result};
 
-/// # Safety
-///
-/// `cookie` must be the cookie memcached passed to that callback.
 unsafe fn store_for(cookie: *const c_void) -> Result<Store> {
     unsafe { Store::for_cookie(cookie) }.ok_or_else(|| {
-        // A refusal means the load-time ABI check rejected this pairing.
         Error::Store(if arcus::abi::refused() {
             StoreError::AbiMismatch
         } else {
@@ -31,11 +27,7 @@ unsafe fn store_for(cookie: *const c_void) -> Result<Store> {
     })
 }
 
-/// # Safety
-///
-/// `cookie` must be the `execute` call's connection cookie.
 pub unsafe fn run(cookie: *const c_void, request: Request) -> Result<Reply> {
-    // A misaligned vtable was caught: nothing the engine reports can be trusted, "this element is missing" least of all.
     if arcus::abi::mismatched() {
         return Err(Error::Store(StoreError::AbiMismatch));
     }
@@ -55,9 +47,6 @@ pub unsafe fn run(cookie: *const c_void, request: Request) -> Result<Reply> {
         Request::Line(Line::Stats) => vstats(),
     };
 
-    // The answer is decided but not sent, so this is still on the connection's clock — and it
-    // is one `getattr`, on a name the sweeper's thread picked. Choosing and tearing down happen
-    // over there; the cookie is the only reason a connection is involved at all.
     access::sweep::maybe(store);
     reply
 }

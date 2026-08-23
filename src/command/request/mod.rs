@@ -9,20 +9,15 @@ use crate::Quant;
 use crate::error::{Error, Result};
 use crate::{ATTR_BYTES, Metric};
 
-/// The body is a single vector, so 16 KB covers 4096 `f32` dimensions.
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
 
-/// What one command line asks for.
 #[derive(Debug)]
 pub enum Parsed<'a> {
-    /// Settled by the line alone.
     Line(Line<'a>),
-    /// A two-phase command. `len` is known even when the rest of the line is not,
-    /// so a refused request still says how many bytes to drain.
+
     Body { len: usize, request: Result<Body> },
 }
 
-/// Why a two-phase line reached `execute` instead of its body phase.
 pub fn body_refused(len: usize) -> Error {
     if len > MAX_BODY_BYTES {
         Error::bad_request(format!(
@@ -33,7 +28,6 @@ pub fn body_refused(len: usize) -> Error {
     }
 }
 
-/// The commands this extension answers. Matched case-insensitively.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cmd {
     VCreate,
@@ -114,11 +108,10 @@ impl Create<'_> {
     }
 }
 
-/// What a `vsim` asked for after its required arguments.
 #[derive(Debug, Default)]
 pub struct Trailing {
     pub filter: Option<Filter>,
-    /// `WITHATTR`: put each hit's stored attributes in the reply.
+
     pub with_attr: bool,
 }
 
@@ -139,7 +132,7 @@ pub enum Line<'a> {
         index: &'a str,
         id: &'a str,
     },
-    /// The whole ATTR is replaced, so an empty one clears it.
+
     SetAttr {
         index: &'a str,
         id: &'a str,
@@ -160,7 +153,7 @@ pub enum Line<'a> {
 pub struct Add {
     pub index: String,
     pub id: String,
-    /// Dimension the client declared.
+
     pub dim: usize,
     pub attr: Vec<u8>,
 }

@@ -1,16 +1,7 @@
-//! `engine_interface_v1` is called by offset and arcus has no single layout, so a wrong pairing calls whatever sits there.
-
 use std::ffi::CStr;
 
 use crate::engine_api::{SERVER_HANDLE_V1, engine_interface_v1};
 
-/// Vtable members this crate calls, in the order `engine_interface_v1` declares them.
-///
-/// Declaration order, not call order: this list is read alongside the header when a layout
-/// mismatch is suspected, and one that drifts out of order is useless for that.
-///
-/// No `map_struct_create`: `map_elem_insert` creates the Map from the attributes handed to it,
-/// which is the only way to get a Map and its metadata element without a window.
 const REQUIRED: [&str; 10] = [
     "remove",
     "map_elem_alloc",
@@ -40,7 +31,6 @@ fn present(vt: &engine_interface_v1, name: &str) -> bool {
     }
 }
 
-/// The layout these bindings were generated against, recorded by `build.rs`.
 pub fn built_for() -> String {
     format!(
         "{} tree, {} members, features=[{}], headers={}",
@@ -51,7 +41,6 @@ pub fn built_for() -> String {
     )
 }
 
-/// Whether the headers came from the EE tree. Decided at build time.
 pub fn built_for_ee() -> bool {
     env!("ARCVECTOR_ABI_TREE") == "ee"
 }
@@ -60,14 +49,11 @@ pub fn version_is_ee(version: &str) -> bool {
     version.split('-').any(|part| part == "E")
 }
 
-/// # Safety
-///
-/// `server` must be the live `SERVER_HANDLE_V1` from `get_server_api`.
 pub unsafe fn server_version(server: *const SERVER_HANDLE_V1) -> Option<String> {
     if server.is_null() {
         return None;
     }
-    // SAFETY: `core` and `server_version` sit in the prefix identical in every tree, so this holds even when the engine vtable is misaligned.
+
     unsafe {
         let core = (*server).core;
         if core.is_null() {
@@ -96,19 +82,15 @@ pub fn fingerprint(version: Option<&str>) -> String {
     )
 }
 
-/// Runs once, the first time the engine handle resolves.
 static CHECKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// Whether the load-time check ran and rejected this pairing.
 pub fn refused() -> bool {
     CHECKED.get() == Some(&false)
 }
 
-/// Reported once, however many commands trip over it.
 static MISMATCH_REPORTED: std::sync::Once = std::sync::Once::new();
 static MISMATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Latched and never cleared: the vtable does not become correct later, so commands stop rather than act on what they read.
 pub fn mismatched() -> bool {
     MISMATCHED.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -130,9 +112,6 @@ pub fn report_mismatch(symptom: &str) {
     });
 }
 
-/// # Safety
-///
-/// `server` is the live handle, `vt` the engine's vtable; `false` only on a null required member.
 pub unsafe fn verify(server: *const SERVER_HANDLE_V1, vt: &engine_interface_v1) -> bool {
     *CHECKED.get_or_init(|| {
         let version = unsafe { server_version(server) };
@@ -198,7 +177,7 @@ mod tests {
         let text = built_for();
         assert!(text.contains("members"), "{text}");
         assert!(text.contains("headers="), "{text}");
-        // `types.h` always defines SCAN_COMMAND; ENABLE_REPLICATION can only come from the feature.
+
         if env!("ARCVECTOR_ABI_HEADERS") == "include" {
             assert!(text.contains("scan"), "{text}");
             assert_eq!(
@@ -211,7 +190,6 @@ mod tests {
 
     #[test]
     fn an_all_null_vtable_reports_every_required_member() {
-        // SAFETY: all-zero is a valid `engine_interface_v1` — which is the point: it is what a misaligned read looks like.
         let vt: engine_interface_v1 = unsafe { std::mem::zeroed() };
         assert_eq!(missing(&vt).len(), REQUIRED.len());
     }
@@ -227,14 +205,13 @@ mod tests {
         assert!(version_is_ee("0.9.5-E-139"));
         assert!(version_is_ee("1.2.3-E"));
         assert!(!version_is_ee("1.16.1"));
-        // Substring matching would call both of these EE.
+
         assert!(!version_is_ee("1.2.3-EXPERIMENTAL"));
         assert!(!version_is_ee("1.2.3-EE"));
     }
 
     #[test]
     fn the_vendored_headers_name_their_tree() {
-        // Which tree is vendored is a deployment choice; the fingerprint just has to name it.
         let tree = env!("ARCVECTOR_ABI_TREE");
         assert!(tree == "ee" || tree == "oss", "{tree}");
         assert!(built_for().starts_with(tree), "{}", built_for());

@@ -44,7 +44,6 @@ impl Metric {
         }
     }
 
-    /// Reject metric/quantization pairs whose distances would be meaningless.
     pub fn check_quant(self, quant: Quant) -> Result<()> {
         let bitwise = matches!(self, Self::Hamming | Self::Tanimoto);
         match (quant, bitwise) {
@@ -76,9 +75,8 @@ mod tests {
         assert!(Metric::Hamming.check_quant(Quant::B1).is_ok());
         assert!(Metric::Tanimoto.check_quant(Quant::B1).is_ok());
 
-        // b1 vectors carry no magnitude, so cosine/L2/IP are meaningless.
         assert!(Metric::Cos.check_quant(Quant::B1).is_err());
-        // ...and bitwise metrics are meaningless on non-bit vectors.
+
         assert!(Metric::Hamming.check_quant(Quant::F32).is_err());
     }
 

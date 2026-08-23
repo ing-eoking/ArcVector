@@ -7,7 +7,7 @@ use crate::server;
 #[derive(Debug)]
 pub struct Pending {
     request: std::result::Result<Body, Error>,
-    /// Body plus the two trailing CRLF bytes memcached appends.
+
     buffer: Vec<u8>,
     body_len: usize,
 }
@@ -21,7 +21,6 @@ impl Pending {
         }
     }
 
-    /// Fill in the CRLF memcached would have written.
     #[cfg(test)]
     fn terminate(mut self) -> Self {
         let n = self.body_len;
@@ -41,9 +40,6 @@ impl Pending {
     }
 }
 
-/// # Safety
-///
-/// `ndata`/`ptr_out` are `accept`'s out-parameters, and memcached writes at most `body_len + 2` bytes.
 pub unsafe fn expect_body(
     cookie: *const c_void,
     request: std::result::Result<Body, Error>,
@@ -51,17 +47,15 @@ pub unsafe fn expect_body(
     ndata: *mut usize,
     ptr_out: *mut *mut c_char,
 ) {
-    // SAFETY: caller-guaranteed. Anything already there is a dead transfer; reclaim it rather than leak.
     drop(unsafe { take_body(cookie) });
 
     let mut state = Box::new(Pending::new(request, body_len));
     let len = state.buffer.len();
     let ptr = state.buffer.as_mut_ptr().cast::<c_char>();
-    // SAFETY: caller-guaranteed. The box comes back through `take_body`, which `execute` and `abort` both call — and `conn_close` runs `abort` first.
+
     unsafe {
         let raw = Box::into_raw(state);
         if !server::store_conn_state(cookie, raw.cast::<c_void>()) {
-            // No host to hold it: take it back rather than leak.
             drop(Box::from_raw(raw));
             return;
         }
@@ -70,15 +64,12 @@ pub unsafe fn expect_body(
     }
 }
 
-/// # Safety
-///
-/// live cookie, and the slot holds null or a `Pending` this module put there.
 pub unsafe fn take_body(cookie: *const c_void) -> Option<Box<Pending>> {
     let data = unsafe { server::take_conn_state(cookie) };
     if data.is_null() {
         return None;
     }
-    // SAFETY: the slot only ever holds a box this module leaked into it.
+
     Some(unsafe { Box::from_raw(data.cast::<Pending>()) })
 }
 
@@ -115,7 +106,6 @@ mod tests {
 
     #[test]
     fn a_body_not_followed_by_crlf_is_a_bad_data_chunk() {
-        // A short body would store a truncated vector and leave the remainder in the stream.
         let mut p = Pending::new(Ok(add()), 7);
         p.buffer.copy_from_slice(b"0.11 0.21");
         let (request, _body) = p.into_parts();

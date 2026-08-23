@@ -1,33 +1,3 @@
-//! Releasing the graphs of indexes whose Map is gone, without waiting for a command to ask.
-//!
-//! Every command already drops the entry for a name it finds missing, but only for the name it
-//! was given. An index nobody queries again — expired by `EXPTIME`, or evicted under memory
-//! pressure — keeps its usearch graph and the element refcounts that graph holds for the life of
-//! the process. Those are the largest things this module has, and nothing else is going to
-//! notice.
-//!
-//! **A thread does the work; a connection lends the one call that needs a cookie.** The engine
-//! puts `ACTION_BEFORE_READ` on every keyed API and hands it the cookie: with `ENABLE_MIGRATION`
-//! the EE build routes that to `mg_before_check` → `set_not_my_key_info(cookie, …)`, so a
-//! connectionless thread calling `getattr` is a null dereference waiting for a migration
-//! ([§7.5](../../../docs/내부구조.md)). `getattr` is therefore the *only* part a connection does,
-//! and it does one:
-//!
-//! ```text
-//! sweeper thread        picks the BATCH coldest names        ← reads every entry
-//!   connection ①        getattr(name₁) → gone, hand back     ← one call, nothing else
-//!   connection ②        getattr(name₂) → alive, forget it
-//!   …
-//! sweeper thread        removes the gone ones, tears them down
-//! ```
-//!
-//! Choosing is what reads the whole registry, and tearing down is what takes real time — a
-//! refcount handed back per vector, then the HNSW destructor. Neither belongs in front of an
-//! answer that has not gone out yet, and neither needs a cookie.
-//!
-//! Coldest first because an index a command touched a moment ago is one whose Map was there a
-//! moment ago. The sweep looks where something is likely to be gone.
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -35,22 +5,13 @@ use std::time::{Duration, Instant};
 use crate::handler::arcus::engine::{Store, StoreError};
 use crate::handler::registry::{self, VectorIndex};
 
-/// How often the sweeper wakes to hand out work and to tick the access clock.
 const TICK: Duration = Duration::from_secs(1);
 
-/// Names put up for probing at a time.
-///
-/// One connection takes one of them, so this is how many commands it takes to get through a
-/// round — not how much any of them carries. A round per [`TICK`] walks a registry of five
-/// hundred in under a minute, and reclaiming memory nobody is asking about does not need to be
-/// faster than that.
 const BATCH: usize = 10;
 
-/// A name waiting to be probed, or one that came back gone.
 struct Probe {
     name: String,
-    /// Taken before the name went up for probing, so a `vcreate` that publishes while it is out
-    /// there is out of the verdict's reach — the rule every release here follows.
+
     stamp: u64,
 }
 
@@ -61,18 +22,13 @@ struct Sweeper {
 
 #[derive(Default)]
 struct State {
-    /// Put up by the thread, taken one at a time by connections. Coldest last, because that is
-    /// the end [`take_offer`] pops.
     offered: Vec<Probe>,
-    /// Handed back by connections: probed, and the Map was gone.
+
     gone: Vec<Probe>,
-    /// Left the registry and needs dropping somewhere that is not a connection.
+
     retired: Vec<Arc<VectorIndex>>,
 }
 
-/// `offered.len()`, so a command with nothing to do finds out in one relaxed load and never
-/// reaches for the lock. Only ever written under it, so the two cannot disagree for long, and a
-/// command that misreads it either takes the lock for nothing or waits one more command.
 static OFFERED: AtomicUsize = AtomicUsize::new(0);
 
 static SWEEPER: LazyLock<Sweeper> = LazyLock::new(|| {
@@ -90,12 +46,6 @@ fn state() -> MutexGuard<'static, State> {
     SWEEPER.state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Probe one offered name, if any is offered.
-///
-/// Called with a command's answer decided but not yet sent, so it does one `getattr` and
-/// nothing else — no registry scan, no removal, no teardown. A name that comes back gone goes
-/// to the thread; one that answers anything else is dropped, since only `KeyGone` proves
-/// something and a transient engine failure must not cost a working index its graph.
 pub fn maybe(store: &Store) {
     if OFFERED.load(Ordering::Relaxed) == 0 {
         return;
@@ -106,12 +56,6 @@ pub fn maybe(store: &Store) {
     }
 }
 
-/// Take one offered name, or `None` if another connection took the last of them.
-///
-/// The pop is what makes a name one connection's to probe: the lock is held across taking it and
-/// updating [`OFFERED`], so two connections cannot come away with the same one. It is a short
-/// lock and a rare one — a round is ten names a second, and every other command turns back at
-/// the atomic above.
 fn take_offer() -> Option<Probe> {
     let mut state = state();
     let probe = state.offered.pop();
@@ -119,8 +63,6 @@ fn take_offer() -> Option<Probe> {
     probe
 }
 
-/// Report a probed name whose Map was gone. Dropped if the queue cannot grow — the name will be
-/// offered again in a later round.
 fn hand_back(probe: Probe) {
     let mut state = state();
     if state.gone.try_reserve(1).is_ok() {
@@ -129,22 +71,10 @@ fn hand_back(probe: Probe) {
     }
 }
 
-/// Hand an entry that has left the registry to the sweeper. **Call with no registry guard held.**
-///
-/// The last `Arc` runs `AnnIndex::drop`, which hands back a refcount per vector —
-/// `map_elem_release` takes the engine's cache lock every hundred — and then destroys the HNSW
-/// index. On a large graph that is a long time to spend in front of an answer, and longer still
-/// to spend holding the registry's write lock that every name lookup needs.
-///
-/// If it is not the last `Arc` this only moves a reference, and whichever command still holds
-/// one pays when it finishes — that thread was using the index anyway. What this covers is the
-/// case the sweep makes: nobody is using it, so nobody but the sweep would pay.
 pub(in crate::handler) fn retire(evicted: Option<Arc<VectorIndex>>) {
     let Some(index) = evicted else { return };
     let mut state = state();
     if state.retired.try_reserve(1).is_err() {
-        // Nowhere to put it. Tearing it down here costs this thread the time, which still beats
-        // leaking the graph.
         drop(state);
         drop(index);
         return;
@@ -171,7 +101,6 @@ fn run() {
             )
         };
 
-        // Everything below is outside both locks, because all of it is the expensive part.
         for probe in gone {
             if registry::remove_if_stale(&probe.name, probe.stamp) {
                 let name = &probe.name;
@@ -180,7 +109,7 @@ fn run() {
                 );
             }
         }
-        // Whatever the removals just retired comes round on the next turn.
+
         drop(retired);
 
         if last_round.elapsed() >= TICK {
@@ -191,16 +120,11 @@ fn run() {
     }
 }
 
-/// Put the coldest names up for probing, if the last round has been taken.
-///
-/// A round that connections have not finished is left alone: refilling it would keep re-offering
-/// the same coldest names and the rest of the registry would never come up.
 fn offer_round() {
     if OFFERED.load(Ordering::Relaxed) != 0 {
         return;
     }
-    // Stamped before the names are chosen, let alone probed, so any publish that races the round
-    // reads as newer than the verdict — which is what spares it.
+
     let stamp = registry::now();
     let round: Vec<Probe> = registry::coldest(BATCH)
         .into_iter()
@@ -211,8 +135,6 @@ fn offer_round() {
         return;
     }
 
-    // Nothing was offered when this round was chosen and only connections take from it, so
-    // there is nothing here to overwrite.
     let mut state = state();
     state.offered = round;
     OFFERED.store(state.offered.len(), Ordering::Relaxed);

@@ -1,5 +1,3 @@
-//! End-to-end tests behind the `integration` feature: a plain `cargo test` does not build them, and a missing server fails rather than skips.
-
 mod common;
 
 use common::{Server, assert_contains, assert_reply, index_name};
@@ -76,8 +74,6 @@ fn attributes_are_optional_and_come_back_empty() {
     client.send(&format!("vdrop {ix}"));
 }
 
-/// `vsetattr` replaces the attributes and leaves the vector where it was — the search still
-/// finds the id, and at the same coordinates.
 #[test]
 fn set_attr_replaces_the_attributes_and_keeps_the_vector() {
     session!(_server, client);
@@ -97,10 +93,8 @@ fn set_attr_replaces_the_attributes_and_keeps_the_vector() {
         &format!("VALUE v1 {}\r\n{second}\r\nEND\r\n", second.len()),
     );
 
-    // The graph followed the element rather than being rebuilt: same id, same place.
     assert_contains(&client.vsim(&ix, 1, 2, "1.0 0.0"), "VALUE v1 0");
 
-    // A zero length clears them.
     assert_reply(&client.send(&format!("vsetattr {ix} v1 0")), "STORED\r\n");
     assert_reply(
         &client.send(&format!("vgetattr {ix} v1")),
@@ -176,9 +170,6 @@ fn a_filter_restricts_results_by_attribute() {
     client.send(&format!("vdrop {ix}"));
 }
 
-/// The two render paths must agree. A hit the `FILTER` read is answered from what the filter
-/// judged; one it did not is read back here — and that read used to hand over the whole stored
-/// value, header and vector included, instead of the ATTR.
 #[test]
 fn withattr_answers_the_attributes_by_either_route() {
     session!(_server, client);
@@ -188,11 +179,9 @@ fn withattr_answers_the_attributes_by_either_route() {
     let attr = r#"{"score":900}"#;
     client.vadd_attr(&ix, "one", 2, "0.1 0.2", attr);
 
-    // No FILTER: the hit is read back at render time.
     let plain = client.vsim_withattr(&ix, 5, 2, "0.1 0.2", &[]);
     assert_contains(&plain, &format!("VALUE one 0 {}\r\n{attr}", attr.len()));
 
-    // With FILTER: the hit carries the bytes the filter judged.
     let filtered = client.vsim_withattr(&ix, 5, 2, "0.1 0.2", &["score>500"]);
     assert_contains(&filtered, &format!("VALUE one 0 {}\r\n{attr}", attr.len()));
 
@@ -251,10 +240,9 @@ fn a_mis_declared_body_length_is_refused_without_storing() {
     let ix = index_name("chunk");
     client.send(&format!("vcreate {ix} 2"));
 
-    // Deliberately wrong: veclen says 7, the body is 9 bytes. This once stored a truncated vector and desynced the connection.
     let reply = client.send_body(&format!("vadd {ix} bad 7 2"), "0.11 0.21");
     assert_contains(&reply, "CLIENT_ERROR bad data chunk");
-    // The surplus bytes are answered as one more nonsense command; discard it.
+
     client.drain();
     assert_contains(&client.send("vlist"), "count=0");
 
@@ -321,7 +309,7 @@ fn operating_on_a_missing_index_is_a_client_error() {
 fn an_incompatible_metric_and_quantization_are_refused() {
     session!(_server, client);
     let ix = index_name("badquant");
-    // b1 carries no magnitude, so cosine is meaningless on it.
+
     assert_contains(
         &client.send(&format!("vcreate {ix} 8 QUANT b1 METRIC cos")),
         "CLIENT_ERROR",
@@ -333,7 +321,7 @@ fn an_incompatible_metric_and_quantization_are_refused() {
 fn a_dimension_over_the_element_limit_is_refused() {
     session!(_server, client);
     let ix = index_name("toobig");
-    // f32 tops out at 4060 dimensions with the default 16KB max_element_bytes.
+
     let reply = client.send(&format!("vcreate {ix} 5000 QUANT f32"));
     assert_contains(&reply, "CLIENT_ERROR");
     assert_contains(&reply, "max_element_bytes");
@@ -354,7 +342,7 @@ fn maxcount_stops_inserts_at_the_limit() {
         assert_reply(&client.vadd(&ix, id, 2, "0.1 0.2"), "STORED\r\n");
     }
     assert_reply(&client.vadd(&ix, "c", 2, "0.1 0.2"), "OVERFLOWED\r\n");
-    // Replacing an existing id is not a new insert, so it still fits.
+
     assert_reply(&client.vadd(&ix, "a", 2, "0.3 0.4"), "STORED\r\n");
     client.send(&format!("vdrop {ix}"));
 }
@@ -395,7 +383,7 @@ fn vstats_reports_module_memory_and_follows_the_vector_count() {
     let empty = client.send("vstats");
     assert_contains(&empty, &format!("STAT {ix}:vectors 0"));
     assert_eq!(stat(&empty, &format!("{ix}:idmap_bytes")), 0);
-    // The chunks stay held after the vectors are gone, and used is a high-water mark — which is why vstats reports both.
+
     assert_eq!(stat(&empty, &format!("{ix}:index_held_bytes")), held);
     assert_eq!(stat(&empty, &format!("{ix}:index_used_bytes")), used);
 
@@ -404,7 +392,6 @@ fn vstats_reports_module_memory_and_follows_the_vector_count() {
 
 #[test]
 fn many_connections_search_the_same_index_at_once() {
-    // The invariants are unit-tested; only here do they run on the server's worker threads.
     let server = Server::start();
     let ix = index_name("concurrent");
     let mut setup = server.connect();
@@ -433,7 +420,6 @@ fn many_connections_search_the_same_index_at_once() {
     setup.send(&format!("vdrop {ix}"));
 }
 
-/// `AV META` contains a space, which no ASCII `mop` command can express — the earlier `\x01` name relied on a rule of ours instead.
 #[test]
 fn the_metadata_field_is_unreachable_from_the_protocol() {
     session!(_server, client);
@@ -441,7 +427,6 @@ fn the_metadata_field_is_unreachable_from_the_protocol() {
     assert_reply(&client.send(&format!("vcreate {ix} 2")), "CREATED\r\n");
     assert_reply(&client.vadd(&ix, "v1", 2, "1 0"), "STORED\r\n");
 
-    // Sent without its body on purpose: the line is refused before the body is read.
     let reply = client.send(&format!("mop insert {ix} AV META 5 0 0 0"));
     assert!(
         reply.contains("CLIENT_ERROR"),
@@ -467,7 +452,6 @@ fn the_metadata_field_is_unreachable_from_the_protocol() {
     client.send(&format!("vdrop {ix}"));
 }
 
-/// The tokenizer overwrites the terminating space with a NUL, and a NUL is also a byte a client could send, so one token it is.
 #[test]
 fn attr_json_must_arrive_as_one_argument() {
     session!(_server, client);

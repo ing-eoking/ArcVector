@@ -5,10 +5,6 @@ fn malformed() -> Error {
     Error::bad_request("bad command line format")
 }
 
-/// Sort one command line into a line-only request or a two-phase one.
-///
-/// The two-phase forms read their body length here, before anything else can fail:
-/// a line whose remainder is unusable still has to say how many bytes to drain.
 pub fn parse<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
     match tokens.command() {
         Some(Cmd::VAdd) => two_phase(tokens, layout::add::BODY_LEN, |t| {
@@ -47,7 +43,6 @@ pub fn parse<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
     }
 }
 
-/// A command whose coordinates arrive as a body: size it, then parse the rest.
 fn two_phase<'a>(
     tokens: &Tokens,
     at: usize,
@@ -84,7 +79,6 @@ fn two_names<'a>(tokens: &Tokens<'a>) -> Result<(&'a str, &'a str)> {
     ))
 }
 
-/// `vcreate <index> <dim> [METRIC m] [QUANT q] [M n] [EFC n] [EFS n]
 fn parse_create<'a>(tokens: &Tokens<'a>) -> Result<Create<'a>> {
     if tokens.len() < layout::create::TAIL {
         return Err(malformed());
@@ -112,7 +106,7 @@ fn parse_create<'a>(tokens: &Tokens<'a>) -> Result<Create<'a>> {
             "M" => create.connectivity = number("M")?,
             "EFC" => create.expansion_add = number("EFC")?,
             "EFS" => create.expansion_search = number("EFS")?,
-            // item_attr.maxcount is an i32; larger wraps to a negative limit.
+
             "MAXCOUNT" => {
                 let n = number("MAXCOUNT")?;
                 if n == 0 || n > i32::MAX as usize {
@@ -137,7 +131,6 @@ fn parse_create<'a>(tokens: &Tokens<'a>) -> Result<Create<'a>> {
     Ok(create)
 }
 
-/// `VSIM KEY <index> <num> <key> [FILTER <n> <term>...]`
 fn parse_sim_key<'a>(tokens: &Tokens<'a>) -> Result<SimKey<'a>> {
     use layout::sim_key as at;
     if tokens.len() < at::TAIL {
@@ -161,7 +154,6 @@ fn result_count(tokens: &Tokens, at: usize) -> Result<usize> {
     Ok(k)
 }
 
-/// `vadd <index> <id> <veclen> <dim> [ATTR <attrlen> <attr JSON>]`
 fn parse_add(tokens: &Tokens) -> Result<Add> {
     use layout::add as at;
     if tokens.len() < at::TAIL {
@@ -175,7 +167,6 @@ fn parse_add(tokens: &Tokens) -> Result<Add> {
     })
 }
 
-/// `VSIM VECTOR <index> <num> <veclen> <dim> [FILTER <n> <term>...]`
 fn parse_sim(tokens: &Tokens) -> Result<Sim> {
     use layout::sim_vector as at;
     if tokens.len() < at::TAIL {
@@ -191,9 +182,6 @@ fn parse_sim(tokens: &Tokens) -> Result<Sim> {
     })
 }
 
-/// `vsetattr <index> <id> <attrlen> <attr JSON>`
-///
-/// The whole ATTR region is replaced, so `<attrlen> 0` with no JSON clears it.
 fn parse_set_attr<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
     use layout::setattr as at;
     let declared: usize = tokens.parse(at::ATTR_LEN, "ATTR length")?;
@@ -210,7 +198,6 @@ fn parse_set_attr<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
         &[]
     } else {
         if tokens.len() != at::TAIL {
-            // One token: a space would split the JSON, as it would in `vadd`.
             return Err(Error::bad_request(
                 "ATTR JSON must be a single argument with no spaces in it",
             ));
@@ -232,7 +219,6 @@ fn parse_set_attr<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
     }))
 }
 
-/// `ATTR <attrlen> <attr JSON>`, starting at token `at`. Optional.
 fn attr_clause(tokens: &Tokens, at: usize) -> Result<Vec<u8>> {
     if tokens.len() <= at {
         return Ok(Vec::new());
@@ -254,7 +240,6 @@ fn attr_clause(tokens: &Tokens, at: usize) -> Result<Vec<u8>> {
         return Ok(Vec::new());
     }
 
-    // One token: a space would split the JSON, and the NUL the tokenizer leaves behind is a byte a client could have sent.
     let json = tokens.text(at + 2)?;
     if tokens.len() > at + 3 {
         return Err(Error::bad_request(
@@ -270,11 +255,6 @@ fn attr_clause(tokens: &Tokens, at: usize) -> Result<Vec<u8>> {
     Ok(json.as_bytes().to_vec())
 }
 
-/// The optional clauses a `vsim` can end with, in any order, from token `at`.
-///
-/// `FILTER <n> <term>...` narrows the results, and `WITHATTR` asks for each hit's stored
-/// attributes. They are read together because a `FILTER` already reads the element the
-/// attributes live in — see `handler::search`.
 fn trailing(tokens: &Tokens, at: usize) -> Result<Trailing> {
     let mut out = Trailing::default();
     let mut i = at;
@@ -305,7 +285,6 @@ fn trailing(tokens: &Tokens, at: usize) -> Result<Trailing> {
     Ok(out)
 }
 
-/// `count` terms from token `first`, joined as one expression.
 fn and_terms(tokens: &Tokens, first: usize, count: usize) -> Result<Filter> {
     let mut expression = String::new();
     for i in first..first + count {
@@ -323,11 +302,10 @@ mod tests {
     use crate::command::tokens::tokenize_for_test as tokenize;
     use std::os::raw::c_int;
 
-    /// Binds `$name` to a `Tokens` view of `$src`, keeping the buffer alive for the scope.
     macro_rules! tokens {
         ($name:ident = $src:expr) => {
             let (_buf, _raw) = tokenize($src);
-            // SAFETY: `_buf` and `_raw` outlive `$name` within this scope.
+
             let $name = unsafe { Tokens::new(_raw.as_ptr(), _raw.len() as c_int) };
         };
     }
@@ -351,7 +329,6 @@ mod tests {
         }
     }
 
-    /// The refusal message, routed as the callbacks route it: the line phase first, then the body.
     fn err(line: &str) -> String {
         tokens!(t = line);
         let outcome = match parse(&t) {
@@ -408,7 +385,6 @@ mod tests {
 
     #[test]
     fn a_body_length_survives_an_unusable_remainder() {
-        // The body still has to be drained, so the length outlives the rest of the line.
         tokens!(t = "vadd i d 28 abc");
         let Ok(Parsed::Body { len, request }) = parse(&t) else {
             panic!("expected a body-carrying command")
@@ -419,7 +395,6 @@ mod tests {
 
     #[test]
     fn an_unusable_body_length_refuses_the_whole_line() {
-        // Nothing can be drained without a length, so there is no body phase to enter.
         tokens!(t = "vadd i d abc 7");
         let msg = parse(&t).unwrap_err().to_string();
         assert!(msg.contains("vector length"), "{msg}");
@@ -483,7 +458,6 @@ mod tests {
 
     #[test]
     fn incompatible_metric_and_quantization_are_rejected_at_parse_time() {
-        // b1 vectors carry no magnitude, so cosine is meaningless on them.
         assert!(err("vcreate docs 8 QUANT b1 METRIC cos").contains("b1"));
         assert!(err("vcreate docs 8 QUANT f32 METRIC hamming").contains("b1"));
         tokens!(t = "vcreate docs 8 QUANT b1 METRIC hamming");
@@ -654,8 +628,6 @@ mod tests {
 
     #[test]
     fn a_term_past_the_declared_count_reads_as_a_clause() {
-        // With trailing clauses allowed, a token after the terms is a clause name, not a
-        // miscount — the count says where the terms end.
         let msg = filter_of("VSIM KEY docs 5 v1 FILTER 1 cat=tech lang=ko")
             .unwrap_err()
             .to_string();
@@ -674,11 +646,9 @@ mod tests {
         let both = trailing_of("VSIM KEY docs 5 v1 FILTER 1 cat=tech WITHATTR").unwrap();
         assert!(both.filter.is_some() && both.with_attr);
 
-        // Either order, and case-insensitive like every other keyword.
         let flipped = trailing_of("VSIM KEY docs 5 v1 withattr FILTER 1 cat=tech").unwrap();
         assert!(flipped.filter.is_some() && flipped.with_attr);
 
-        // `FILTER 0` still means no filtering, and says nothing about attributes.
         let empty = trailing_of("VSIM KEY docs 5 v1 FILTER 0").unwrap();
         assert!(empty.filter.is_none() && !empty.with_attr);
     }
@@ -704,8 +674,6 @@ mod tests {
         assert_eq!(attr, br#"{"cat":"tech"}"#);
     }
 
-    /// The whole region is replaced, so a zero length is how a client clears the attributes —
-    /// and then there is no JSON token to give.
     #[test]
     fn set_attr_with_zero_length_clears_and_takes_no_json() {
         tokens!(clear = "vsetattr docs v1 0");

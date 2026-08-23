@@ -11,7 +11,6 @@ use crate::handler::quant::Quant;
 use crate::handler::registry::{self, VectorIndex};
 use crate::handler::usearch::AnnIndex;
 
-/// `vcreate <index> <dim> [METRIC …] [QUANT …] [MAXCOUNT …] [EXPTIME …] [M …] …`
 pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
     let Create {
         index: name,
@@ -24,7 +23,6 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
     let layout = Layout::new(dim, quant);
     check_dimension_fits(store, layout, quant)?;
 
-    // Before the Map, so an unsupported metric leaves no empty Map behind.
     let ann = AnnIndex::new(
         layout,
         metric,
@@ -46,14 +44,6 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
     };
     let index = VectorIndex::new(name.to_owned(), ann, maxcount, owner);
 
-    // Registered first, written to the engine last. The engine write is what carries this
-    // create off the node — `map_elem_insert` emits `CLOG_MAP_ELEM_INSERT` — so everything that
-    // can fail goes in front of it, the registry's own growth included. Answering for a Map
-    // already made and then failing would leave only a delete to take it back.
-    //
-    // The entry lands unpublished, which is what makes the gap safe without holding a lock
-    // across the engine call. A command that reads the metadata in here finds no Map and is
-    // right about what it saw — so the entry says "not yet" itself, and nothing releases it.
     let (registered, previous) = match registry::put(index) {
         Ok(pair) => pair,
         Err(e) => {
@@ -63,44 +53,23 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         }
     };
 
-    // One engine call settles the name. Nothing probes it first: a probe answers about a
-    // moment that has already passed, and every case it could report comes back from this
-    // call anyway — decided under the engine's own cache lock, so there is no window between
-    // the look and the act.
-    //
-    //   Ok(true)         the name was free; the engine made the Map and took the element
-    //   Ok(false)        a Map was there without metadata — not an index, and not ours
-    //   Err(ElemExists)  a Map was there with metadata — already an index
-    //   Err(BadType)     the name holds something that is not a Map
-    //
-    // A Map without this element is not an index: `resolve` cannot read it and only `vdrop`
-    // can clear it. The engine unlinks the Map again if the element cannot go in, all under
-    // that same lock, so that state has no window to exist in either.
     let settled = store
         .alloc_elem(name, element::META_FIELD, &meta.encode(layout))
         .and_then(|pending| pending.insert_creating(engine::index_attr(Some(held), spec.exptime)));
 
     match settled {
-        // Ours, both of them. Publishing is the last step and the only one that cannot fail:
-        // from here the entry answers, and a release may take it. Whatever the name held before
-        // is a graph whose Map had expired or been evicted, and dropping it here frees the
-        // usearch graph and the element refcounts it holds.
         Ok(true) => {
             registered.publish();
             if previous.is_some() {
                 eprintln!(
                     "ArcVector: index '{name}' had no Map; released the graph it was built from"
                 );
-                // Not on this connection's clock: the graph may hold millions of refcounts.
+
                 sweep::retire(previous);
             }
             Ok(Reply::Created)
         }
-        // Not ours. Put the registry back — only if the name still holds this call's entry,
-        // since a racing `vcreate` displacing it owns what it put — and take the element back
-        // out of a Map we did not make: a plain `mop` Map, or one a replication transfer is
-        // still filling. The Map is as we found it, since `delete_elem` passes `drop_if_empty`
-        // false and emptying it does not drop it.
+
         Ok(false) => {
             registry::unput(&registered, previous);
             let _ = store.delete_elem(name, element::META_FIELD);
@@ -119,15 +88,13 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
     }
 }
 
-/// The answer for a name a Map already occupies. Never clears it.
 fn already_there(store: &Store, name: &str) -> Result<Reply> {
     #[cfg(recovery)]
     {
-        // Reads the metadata: an index gets adopted, an unreadable one gets discarded.
         resolve(store, name)?;
         Ok(Reply::Exists)
     }
-    // Nothing can rebuild from it, and guessing would destroy it or serve an empty graph.
+
     #[cfg(not(recovery))]
     {
         let _ = store;
@@ -140,8 +107,7 @@ fn already_there(store: &Store, name: &str) -> Result<Reply> {
 
 fn check_dimension_fits(store: &Store, layout: Layout, quant: Quant) -> Result<()> {
     let limit = store.max_element_bytes() as usize;
-    // Measured with the vector in the element even where this build leaves it out, so the
-    // dimension a server accepts does not depend on how the module was compiled.
+
     if layout.full_stored_len() <= limit {
         return Ok(());
     }
@@ -159,9 +125,6 @@ fn map_size_for(store: &Store, maxcount: Option<u32>) -> u32 {
 }
 
 pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {
-    // The Map goes first: a real failure has to leave the registry alone, or the index
-    // stops serving a Map that is still there and the client hears DROPPED anyway.
-    // Attempted regardless of the registry, so vdrop can clear an orphan Map.
     let dropped = match store.drop_map(name) {
         Ok(()) => true,
         Err(StoreError::KeyGone) => false,
@@ -176,7 +139,6 @@ pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {
     })
 }
 
-/// `vstats` — module memory, which arcus's own accounting cannot see.
 pub fn vstats() -> Result<Reply> {
     let indexes = registry::snapshot();
 

@@ -23,9 +23,9 @@ impl Blame {
 pub enum Error {
     BadRequest(String),
     NoSuchIndex,
-    /// The Map backing the index was evicted or expired out from under us.
+
     IndexEvicted,
-    /// The index exists but its graph is being rebuilt from Map.
+
     Unreadable,
     Codec(CodecError),
     Filter(ParseError),
@@ -43,14 +43,14 @@ impl Error {
             Self::BadRequest(_) | Self::NoSuchIndex | Self::IndexEvicted | Self::Filter(_) => {
                 Blame::Client
             }
-            // Encoding failures are the client's; decoding failures are ours.
+
             Self::Codec(e) => match e {
                 CodecError::AttrTooLarge { .. } | CodecError::VectorLenMismatch { .. } => {
                     Blame::Client
                 }
                 _ => Blame::Server,
             },
-            // A well-formed request this node cannot serve right now.
+
             Self::Unreadable => Blame::Server,
             Self::Store(_) | Self::Index(_) => Blame::Server,
         }
@@ -109,7 +109,7 @@ pub enum Reply {
     Dropped,
     NotFound,
     Overflowed,
-    /// Pre-rendered multi-line body, already terminated by `END\r\n`.
+
     Body(String),
 }
 

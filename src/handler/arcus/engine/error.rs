@@ -1,5 +1,3 @@
-//! `EWOULDBLOCK` is not a failure — see [`completed`] and `docs/내부구조.md` §8.
-
 use std::fmt;
 use std::os::raw::c_int;
 
@@ -16,16 +14,11 @@ pub enum StoreError {
     AbiMismatch,
     KeyGone,
     ElemGone,
-    /// The field is already in the Map. Only an insert that refuses to replace can see it.
+
     ElemExists,
-    /// The key holds an item that is not a Map.
+
     BadType,
-    /// `get_elem_info` described an element that cannot be one.
-    ///
-    /// Reading the bytes it points at would go outside the allocation, so the caller is handed
-    /// this instead. It is not a use-after-free detector — freed slab memory usually still
-    /// reads, and holds another element by then — but the description of *that* element does
-    /// not fit the one we asked for, and the mismatch is what shows up here.
+
     CorruptElement,
     Overflow,
     ReplicaSlave,
@@ -60,7 +53,6 @@ impl std::error::Error for StoreError {}
 
 pub(super) type Result<T> = std::result::Result<T, StoreError>;
 
-/// `ENGINE_REPL_SLAVE`, which the engine returns for a write on a replica.
 const ENGINE_REPL_SLAVE: u32 = 0x61;
 
 pub(super) fn translate(code: u32) -> StoreError {
@@ -75,12 +67,10 @@ pub(super) fn translate(code: u32) -> StoreError {
     }
 }
 
-/// Length of a key or field as the engine's `int` parameters want it.
 pub(super) fn as_int(len: usize) -> c_int {
     c_int::try_from(len).unwrap_or(c_int::MAX)
 }
 
-/// Whether an engine code means the operation completed.
 pub(super) fn completed(code: u32) -> bool {
     code == ENGINE_ERROR_CODE_ENGINE_SUCCESS || code == ENGINE_ERROR_CODE_ENGINE_EWOULDBLOCK
 }
@@ -131,7 +121,6 @@ mod tests {
         );
     }
 
-    /// The check exists so a bad length never becomes a slice; the messages have to name that.
     #[test]
     fn a_corrupt_element_reads_as_a_server_side_failure() {
         let e: crate::error::Error = StoreError::CorruptElement.into();

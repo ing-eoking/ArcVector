@@ -6,7 +6,6 @@ pub(super) enum JsonVal<'a> {
     Null,
 }
 
-/// Only top-level fields are addressable.
 pub(super) fn lookup<'a>(json: &'a [u8], field: &[u8]) -> Option<JsonVal<'a>> {
     let mut i = 0;
     skip_ws(json, &mut i);
@@ -24,7 +23,7 @@ pub(super) fn lookup<'a>(json: &'a [u8], field: &[u8]) -> Option<JsonVal<'a>> {
             return None;
         }
         if json[i] != b'"' {
-            return None; // malformed
+            return None;
         }
         let key = scan_string(json, &mut i)?;
 
@@ -44,7 +43,7 @@ pub(super) fn lookup<'a>(json: &'a [u8], field: &[u8]) -> Option<JsonVal<'a>> {
         if i >= json.len() {
             return None;
         }
-        // A closing brace means the field is absent; anything else is malformed.
+
         if json[i] != b',' {
             return None;
         }
@@ -58,7 +57,6 @@ fn skip_ws(s: &[u8], i: &mut usize) {
     }
 }
 
-/// Consume a quoted string starting at `s[*i] == '"'`, returning its raw body.
 fn scan_string<'a>(s: &'a [u8], i: &mut usize) -> Option<&'a [u8]> {
     if *i >= s.len() || s[*i] != b'"' {
         return None;
@@ -67,7 +65,7 @@ fn scan_string<'a>(s: &'a [u8], i: &mut usize) -> Option<&'a [u8]> {
     let start = *i;
     while *i < s.len() {
         match s[*i] {
-            b'\\' => *i += 2, // skip the escape pair so \" does not end the string
+            b'\\' => *i += 2,
             b'"' => {
                 let body = &s[start..*i];
                 *i += 1;
@@ -97,7 +95,7 @@ fn scan_value<'a>(s: &'a [u8], i: &mut usize) -> Option<JsonVal<'a>> {
             *i += 4;
             Some(JsonVal::Null)
         }
-        b'{' | b'[' => None, // nested values are not addressable in the base grammar
+        b'{' | b'[' => None,
         _ => {
             let start = *i;
             while *i < s.len()

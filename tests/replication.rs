@@ -32,12 +32,10 @@ impl Node {
         Self(sock)
     }
 
-    /// Read until the socket goes quiet: these tests drive `mop` and `stats` too, and terminators differ per family.
     fn cmd(&mut self, line: &str, body: Option<&str>) -> String {
         self.cmd_raw(line, body.map(str::as_bytes))
     }
 
-    /// A stored element is not text (`1.0` is `00 00 80 3F`), so the body cannot travel as a `&str`.
     fn cmd_raw(&mut self, line: &str, body: Option<&[u8]>) -> String {
         let mut out = line.as_bytes().to_vec();
         out.extend_from_slice(b"\r\n");
@@ -66,7 +64,6 @@ impl Node {
         String::from_utf8_lossy(&buf).trim().to_owned()
     }
 
-    /// A rebuild answers `SERVER_ERROR index is unreadable` by design; a client polls, so does this.
     fn cmd_settled(&mut self, line: &str, body: Option<&str>) -> String {
         for _ in 0..40 {
             let reply = self.cmd(line, body);
@@ -87,7 +84,6 @@ impl Node {
     }
 }
 
-/// Left in default **sync** mode on purpose: EWOULDBLOCK on every write once freed a linked element and took the server down.
 fn pair() -> (Node, Node) {
     let (mut a, mut b) = (Node::open(node_a()), Node::open(node_b()));
     let (mode_a, mode_b) = (a.mode(), b.mode());
@@ -100,7 +96,6 @@ fn pair() -> (Node, Node) {
     if mode_a == "master" { (a, b) } else { (b, a) }
 }
 
-/// The pair outlives any one `cargo test`, so a panicked run's leftover index must not collide with this one.
 fn index_name(base: &str) -> String {
     format!("{base}_{}", std::process::id())
 }
@@ -117,12 +112,10 @@ fn seed(master: &mut Node, index: &str) {
     }
 }
 
-/// One element is the metadata, so the element count runs one ahead of the vector count.
 fn vectors_in(node: &mut Node, key: &str) -> Option<u32> {
     map_head(node, key).map(|(_, elements)| elements.saturating_sub(1))
 }
 
-/// `mop get` answers `VALUE <flags> <count>` — the only way to read a collection's flags over ASCII.
 fn map_head(node: &mut Node, key: &str) -> Option<(u32, u32)> {
     let reply = node.cmd(&format!("mop get {key} 0 0"), None);
     let head = reply.lines().next()?.trim().to_owned();
@@ -133,7 +126,6 @@ fn map_head(node: &mut Node, key: &str) -> Option<(u32, u32)> {
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
-/// `stats replication` is answered by the engine, so `get_stats` reaches it with no new server API.
 #[test]
 fn stats_replication_reports_the_role() {
     let (mut master, mut slave) = pair();
@@ -141,7 +133,6 @@ fn stats_replication_reports_the_role() {
     assert_eq!(slave.mode(), "slave");
 }
 
-/// Vectors are Map elements, so replication carries them — which is what makes rebuilding from Map possible.
 #[test]
 fn vector_elements_replicate_to_the_slave() {
     let index = index_name("repl_elems");
@@ -163,12 +154,11 @@ fn vector_elements_replicate_to_the_slave() {
     master.cmd(&format!("vdrop {index}"), None);
 }
 
-/// Item flags survive replication byte for byte; recovery uses them as the cheap "is this Map ours?" check.
 #[test]
 fn item_flags_replicate_verbatim() {
     let key = index_name("repl_flags");
     let (mut master, mut slave) = pair();
-    const MARKER: u32 = 0x4156_0001; // "AV" << 16 | format version
+    const MARKER: u32 = 0x4156_0001;
 
     master.cmd(&format!("mop delete {key} 0 0 drop"), None);
     assert_eq!(
@@ -191,7 +181,6 @@ fn item_flags_replicate_verbatim() {
     master.cmd(&format!("mop delete {key} 0 0 drop"), None);
 }
 
-/// A slave that was never master has no token, so it tries to take over — and the engine refuses a stamp on a replica.
 #[test]
 fn the_slave_has_no_index() {
     let index = index_name("repl_slave");
@@ -213,7 +202,6 @@ fn the_slave_has_no_index() {
     master.cmd(&format!("vdrop {index}"), None);
 }
 
-/// The promoted node rebuilds from Map alone. Runs a switchover, so it leaves the roles swapped.
 #[test]
 fn a_promoted_node_recovers_its_index() {
     let index = index_name("repl_promote");
@@ -231,7 +219,6 @@ fn a_promoted_node_recovers_its_index() {
         "the promoted node must still hold every vector"
     );
 
-    // A query is enough: the registry misses, the flags say ours, the metadata element supplies the parameters.
     let hits = promoted.cmd_settled(&format!("vsim VECTOR {index} 3 7 4"), Some("1 0 0 0"));
     for id in ["v1", "v2", "v3"] {
         assert!(hits.contains(id), "recovered index is missing {id}: {hits}");
@@ -244,7 +231,6 @@ fn a_promoted_node_recovers_its_index() {
     promoted.cmd(&format!("vdrop {index}"), None);
 }
 
-/// Ignored until recovery lands: `vcreate` treats a replicated Map as an orphan and drops it.
 #[test]
 fn vcreate_must_not_destroy_a_replicated_map() {
     let index = index_name("repl_destroy");
@@ -269,7 +255,6 @@ fn vcreate_must_not_destroy_a_replicated_map() {
         "vcreate destroyed the replicated vectors"
     );
 
-    // `EXISTS` alone would be satisfied by doing nothing; recovery has to make the index usable.
     let hits = promoted.cmd_settled(&format!("vsim VECTOR {index} 3 7 4"), Some("1 0 0 0"));
     for id in ["v1", "v2", "v3"] {
         assert!(hits.contains(id), "rebuilt index is missing {id}: {hits}");
@@ -278,7 +263,6 @@ fn vcreate_must_not_destroy_a_replicated_map() {
     promoted.cmd(&format!("vdrop {index}"), None);
 }
 
-/// Switch A→B→A: B's writes reached A's Map below the extension, so A's graph no longer describes it — the `owner` token, not role polling, is what catches that.
 #[test]
 fn a_double_switchover_does_not_leave_a_stale_index() {
     let index = index_name("repl_stale");
@@ -289,7 +273,6 @@ fn a_double_switchover_does_not_leave_a_stale_index() {
     assert_eq!(first.cmd("replication switchover", None), "OK");
     std::thread::sleep(Duration::from_secs(8));
 
-    // B adds a fourth vector at `0 1 0 0`, so a query that way must return it at distance 0.
     let (mut second, _) = pair();
     assert_eq!(
         second.cmd_settled(&format!("vadd {index} v4 7 4"), Some("0 1 0 0")),
@@ -322,7 +305,6 @@ fn a_double_switchover_does_not_leave_a_stale_index() {
     back.cmd(&format!("vdrop {index}"), None);
 }
 
-/// A master stamps a new token before writing any element, so a replica can never hold a matching token and stale data at once.
 #[test]
 fn a_demoted_node_answers_until_the_new_master_takes_over() {
     let index = index_name("repl_demoted");
@@ -347,7 +329,6 @@ fn a_demoted_node_answers_until_the_new_master_takes_over() {
         );
     }
 
-    // One write on the promoted node stamps a new token, which replication carries over.
     let (mut promoted, _) = pair();
     assert_eq!(
         promoted.cmd_settled(&format!("vadd {index} v4 7 4"), Some("0 1 0 0")),
@@ -365,7 +346,6 @@ fn a_demoted_node_answers_until_the_new_master_takes_over() {
     promoted.cmd(&format!("vdrop {index}"), None);
 }
 
-/// Untranslated, `ENGINE_REPL_SLAVE` (0x61) surfaced as `SERVER_ERROR engine error 97`.
 #[test]
 fn a_write_to_a_replica_names_the_reason() {
     let (mut master, mut slave) = pair();

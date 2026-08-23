@@ -1,14 +1,3 @@
-//! Harness for driving a real arcus server with the extension loaded.
-//!
-//! ```text
-//! ARCVECTOR_MEMCACHED        path to the memcached binary       (required)
-//! ARCVECTOR_ENGINE           path to default_engine.so          (required)
-//! ARCVECTOR_MEMCACHED_ARGS   extra server arguments, space separated
-//! ```
-//!
-//! An unset variable panics rather than skips, and each test gets its own server
-//! on its own unix socket so parallel runs cannot collide.
-
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -40,7 +29,6 @@ fn from_env(var: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// The test binary lives in `target/<profile>/deps/`, so the cdylib is two directories up.
 fn extension() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?.parent()?;
@@ -69,7 +57,6 @@ fn newest_mtime(dir: &Path) -> Option<SystemTime> {
     newest
 }
 
-/// `cargo test` does not rebuild the cdylib the server loads, so a stale one must panic, not skip.
 fn assert_fresh(module: &Path) {
     let Ok(built) = module.metadata().and_then(|m| m.modified()) else {
         return;
@@ -127,7 +114,6 @@ impl Server {
         };
         assert_fresh(&module);
 
-        // `sun_path` is about 104 bytes on macOS, and the temp dir can be long enough to matter.
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let socket = PathBuf::from(format!(
             "/tmp/arcv-{}-{}.sock",
@@ -137,12 +123,10 @@ impl Server {
         let log = socket.with_extension("log");
         let _ = std::fs::remove_file(&socket);
 
-        // A file rather than a pipe: nothing has to drain it, so a chatty server cannot block.
         let child = Command::new(&memcached)
             .args(["-E".as_ref(), engine.as_os_str()])
             .args(["-X".as_ref(), module.as_os_str()])
             .args(["-s".as_ref(), socket.as_os_str()])
-            // Several workers, so the concurrency paths are actually live.
             .args(["-t", "4"])
             .args(extra_args())
             .stdout(Stdio::null())
@@ -221,7 +205,6 @@ fn extra_args() -> Vec<String> {
         .collect()
 }
 
-/// Building this target asked for a server, so not having one is a failure.
 fn missing(reason: &str) -> String {
     format!(
         "{reason}.\n\
@@ -245,7 +228,6 @@ impl Client {
         self.read_reply()
     }
 
-    /// Tests that *want* a wrong length call [`Client::send_body`] directly.
     pub fn vadd(&mut self, index: &str, id: &str, dim: usize, coords: &str) -> String {
         self.send_body(&format!("vadd {index} {id} {} {dim}", coords.len()), coords)
     }
@@ -294,7 +276,6 @@ impl Client {
         )
     }
 
-    /// `WITHATTR`, with an optional `FILTER` — the two render hits by different routes.
     pub fn vsim_withattr(
         &mut self,
         index: &str,
@@ -317,7 +298,6 @@ impl Client {
         )
     }
 
-    /// A wrong body length leaves surplus bytes that memcached answers as one more command.
     pub fn drain(&mut self) {
         let previous = self.stream.read_timeout().ok().flatten();
         let _ = self
@@ -339,7 +319,6 @@ impl Client {
         self.stream.flush().expect("the connection flushes");
     }
 
-    /// Read until the reply is terminated, so tests never race the server.
     fn read_reply(&mut self) -> String {
         let mut reply = String::new();
         let mut buf = [0u8; 8192];
@@ -352,14 +331,13 @@ impl Client {
                         break;
                     }
                 }
-                Err(_) => break, // timed out: return what arrived
+                Err(_) => break,
             }
         }
         reply
     }
 }
 
-/// Every reply ends in a fixed status or error line, so the bodies need no parsing.
 fn is_complete(reply: &str) -> bool {
     if TERMINATORS.iter().any(|t| reply.ends_with(t)) {
         return true;
