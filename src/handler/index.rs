@@ -42,10 +42,24 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         expansion_search: spec.expansion_search,
         owner,
     };
-    // Read before the insert, because that is what a release below can be about: an entry
-    // registered after this point was built from the Map this call is about to make, and is
-    // the opposite of stale.
-    let stale = registry::get(name);
+    let index = VectorIndex::new(name.to_owned(), ann, maxcount, owner);
+
+    // Registered first, written to the engine last. The engine write is what carries this
+    // create off the node — `map_elem_insert` emits `CLOG_MAP_ELEM_INSERT` — so everything that
+    // can fail goes in front of it, the registry's own growth included. Answering for a Map
+    // already made and then failing would leave only a delete to take it back.
+    //
+    // The hold is what makes the two one step. Registered without the Map, the name describes
+    // an index whose Map is not there, and a command arriving in that gap releases the entry —
+    // correctly, on what it can see. Every lookup takes this lock, so no one sees between them.
+    let mut reg = registry::hold();
+    if let Err(e) = reg.reserve() {
+        return Err(Error::Index(format!(
+            "the index registry could not grow: {e}"
+        )));
+    }
+    let previous = reg.put(index);
+
     // One engine call settles the name. Nothing probes it first: a probe answers about a
     // moment that has already passed, and every case it could report comes back from this
     // call anyway — decided under the engine's own cache lock, so there is no window between
@@ -59,62 +73,46 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
     // A Map without this element is not an index: `resolve` cannot read it and only `vdrop`
     // can clear it. The engine unlinks the Map again if the element cannot go in, all under
     // that same lock, so that state has no window to exist in either.
-    let created = match store
+    let settled = store
         .alloc_elem(name, element::META_FIELD, &meta.encode(layout))
-        .and_then(|pending| pending.insert_creating(engine::index_attr(Some(held), spec.exptime)))
-    {
-        Ok(created) => created,
-        Err(StoreError::ElemExists) => return already_there(store, name),
-        Err(StoreError::BadType) => {
-            return Err(Error::bad_request(format!(
-                "'{name}' holds an item that is not a Map"
-            )));
+        .and_then(|pending| pending.insert_creating(engine::index_attr(Some(held), spec.exptime)));
+
+    match settled {
+        // Ours, both of them. Whatever the name held before is a graph whose Map had expired
+        // or been evicted — `put` already displaced it, and dropping it here frees the usearch
+        // graph and the mapping with it.
+        Ok(true) => {
+            drop(reg);
+            if previous.is_some() {
+                eprintln!(
+                    "ArcVector: index '{name}' had no Map; released the graph it was built from"
+                );
+            }
+            Ok(Reply::Created)
         }
-        Err(e) => return Err(e.into()),
-    };
-    if !created {
-        // A Map was already there, and one that already had metadata would have refused the
-        // element above. This one had none, so it is not an index and the element went into a
-        // Map we did not make — a plain `mop` Map, or one a replication transfer is still
-        // filling. Take it back out and answer for the Map that was there. Nothing else was
-        // touched: the Map is as we found it (`delete_elem` passes `drop_if_empty` false, so
-        // emptying it does not drop it).
-        let _ = store.delete_elem(name, element::META_FIELD);
-        return already_there(store, name);
-    }
-
-    // The name was free until this call, so the entry read above is a graph whose Map expired
-    // or was evicted. Release it here, or the insert below finds it and answers `EXISTS` —
-    // that reply would leave the fresh empty Map paired with the stale graph, and in a build
-    // that cannot rebuild, nothing would ever notice.
-    if let Some(index) = &stale {
-        super::access::map_is_gone(name, index);
-    }
-
-    let index = VectorIndex::new(name.to_owned(), ann, maxcount, owner);
-    let (_, inserted) = match registry::insert_or_get(index) {
-        Ok(pair) => pair,
-        // The Map exists and nothing serves it. This is the one place in `vcreate` with
-        // something to undo: the insert above is what created it, so taking it back leaves the
-        // name as free as we found it. `vdrop` is otherwise the only path that deletes a Map,
-        // and this stays inside that rule — we are deleting the Map we made, in the call that
-        // made it, having never answered for it.
+        // Not ours. Put the registry back the way it was — allocation-free, so this cannot
+        // fail — and take the element back out of a Map we did not make: a plain `mop` Map, or
+        // one a replication transfer is still filling. The Map is as we found it, since
+        // `delete_elem` passes `drop_if_empty` false and emptying it does not drop it.
+        Ok(false) => {
+            reg.restore(name, previous);
+            let _ = store.delete_elem(name, element::META_FIELD);
+            drop(reg);
+            already_there(store, name)
+        }
         Err(e) => {
-            let _ = store.drop_map(name);
-            return Err(Error::Index(format!(
-                "the index registry could not grow: {e}"
-            )));
+            reg.restore(name, previous);
+            // Before `already_there`, which resolves the name and would take this lock again.
+            drop(reg);
+            match e {
+                StoreError::ElemExists => already_there(store, name),
+                StoreError::BadType => Err(Error::bad_request(format!(
+                    "'{name}' holds an item that is not a Map"
+                ))),
+                e => Err(e.into()),
+            }
         }
-    };
-    Ok(if inserted {
-        Reply::Created
-    } else {
-        // We hold the name in the engine, so no racing `vcreate` can be the one registered
-        // here: the loser of that race is refused at `insert_creating` with `ELEM_EEXISTS`
-        // and never gets this far. This is a graph a concurrent `resolve` built from the Map
-        // we just made, between the release above and now — answer that it is already there.
-        Reply::Exists
-    })
+    }
 }
 
 /// The answer for a name a Map already occupies. Never clears it.

@@ -1,7 +1,7 @@
 //! An entry pairs the Map with the graph built from it and the `owner` token it was built under; [`super::recovery`] judges that token.
 
 use std::collections::{HashMap, TryReserveError};
-use std::sync::{Arc, LazyLock, PoisonError, RwLock};
+use std::sync::{Arc, LazyLock, PoisonError, RwLock, RwLockWriteGuard};
 
 use crate::handler::usearch::AnnIndex;
 
@@ -76,6 +76,54 @@ pub fn get(name: &str) -> Option<Arc<VectorIndex>> {
 
 pub fn contains(name: &str) -> bool {
     read().contains_key(name)
+}
+
+/// The registry held across the engine write that makes a Map.
+///
+/// `vcreate` registers first and writes to the engine last, which is the module's rule
+/// everywhere: the engine write emits `CLOG_MAP_ELEM_INSERT` and is what carries the write off
+/// this node, so everything that can fail belongs in front of it. Registering is one of those
+/// things — the map has to grow — and doing it after would mean answering for a Map already
+/// made, with only a delete to take it back.
+///
+/// The hold is what makes the pair atomic. Without it the name is registered while its Map does
+/// not exist yet, and a command arriving there reads no Map and releases the entry — correctly,
+/// on what it can see. Every lookup goes through this lock, so no one sees between the two.
+pub struct Held(RwLockWriteGuard<'static, HashMap<String, Arc<VectorIndex>>>);
+
+/// Take the registry for a create. Nothing else may take an engine lock and then this one.
+pub fn hold() -> Held {
+    Held(write())
+}
+
+impl Held {
+    /// Room for one entry, taken before anything is written anywhere.
+    pub fn reserve(&mut self) -> Result<(), TryReserveError> {
+        self.0.try_reserve(1)
+    }
+
+    /// Register `index`, handing back whatever the name held before.
+    ///
+    /// Call [`Self::reserve`] first: the insert grows the map on its own, and a std collection
+    /// that cannot grow aborts. The key clone is a single small allocation and has no fallible
+    /// form on stable — see `미해결.md §7`.
+    pub fn put(&mut self, index: VectorIndex) -> Option<Arc<VectorIndex>> {
+        self.0.insert(index.name.clone(), Arc::new(index))
+    }
+
+    /// Undo a [`Self::put`], allocation-free: the key is already in the map either way.
+    pub fn restore(&mut self, name: &str, previous: Option<Arc<VectorIndex>>) {
+        match previous {
+            Some(index) => {
+                if let Some(slot) = self.0.get_mut(name) {
+                    *slot = index;
+                }
+            }
+            None => {
+                self.0.remove(name);
+            }
+        }
+    }
 }
 
 /// Register `index` unless the name is taken, returning whichever ends up live.

@@ -51,10 +51,31 @@ pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
     let held = registry::get(name);
     let (meta, _) = usable_metadata(store, name, held.as_deref())?;
 
-    // The metadata read said this name is an index, so a missing entry means the graph went
-    // without the Map going with it. Nothing here can rebuild one, and the Map is not ours to
-    // delete over it — that is `vdrop`'s call, and this build tells the client as much.
-    let index = held.ok_or(Error::NoSuchIndex)?;
+    let index = match held {
+        Some(index) => index,
+        // The note above was taken before the metadata read, and a `vcreate` can have finished
+        // in between — registry and Map both, under one hold. So look again before concluding
+        // anything: a different question from the note, and only asked when the note was empty.
+        // The read lock is the same one `vcreate` holds across its engine write, so this sees
+        // either the whole create or none of it.
+        None => match registry::get(name) {
+            Some(index) => index,
+            // A Map that is an index, with no graph serving it, in a build that cannot build
+            // one. It answers nothing and `vcreate` will not take the name while its metadata
+            // element stands, so the name is bricked until somebody runs `vdrop` by hand.
+            // Nothing reachable produces this — the two races that used to are closed — so it
+            // means a bug, and leaving a dead name behind is the worse half of that. Delete
+            // it, loudly, and let the name be usable again.
+            None => {
+                eprintln!(
+                    "ArcVector: '{name}' has an index Map with no graph, which this build \
+                     cannot rebuild; deleting the Map so the name can be used again"
+                );
+                let _ = store.drop_map(name);
+                return Err(Error::NoSuchIndex);
+            }
+        },
+    };
     if meta.owner != index.owner() {
         // Identity, not name: see `map_is_gone`.
         // Nothing in this build can produce a second index at one name — no transfer, no
