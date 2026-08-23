@@ -52,7 +52,7 @@ impl VectorIndex {
     }
 
     fn touch(&self) {
-        let now = ACCESS_TICK.load(Ordering::Relaxed);
+        let now = crate::server::coarse_now();
         if self.last_access.load(Ordering::Relaxed) != now {
             self.last_access.store(now, Ordering::Relaxed);
         }
@@ -84,12 +84,6 @@ impl VectorIndex {
     pub(super) fn set_owner(&self, owner: u64) {
         self.owner.store(owner, Ordering::Release);
     }
-}
-
-static ACCESS_TICK: AtomicU64 = AtomicU64::new(1);
-
-pub(in crate::handler) fn tick() {
-    ACCESS_TICK.fetch_add(1, Ordering::Relaxed);
 }
 
 static INDICES: LazyLock<RwLock<HashMap<String, Arc<VectorIndex>>>> =

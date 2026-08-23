@@ -26,6 +26,34 @@ fn core() -> *const SERVER_CORE_API {
     unsafe { (*server).core }
 }
 
+static COARSE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn coarse_now() -> u64 {
+    COARSE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn tick() {
+    advance(now());
+}
+
+fn advance(seen: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let _ = COARSE.fetch_update(Relaxed, Relaxed, |cur| Some(seen.max(cur + 1)));
+}
+
+fn now() -> u64 {
+    let core = core();
+    if core.is_null() {
+        return 0;
+    }
+    unsafe {
+        match (*core).get_current_time {
+            Some(get) => u64::from(get()),
+            None => 0,
+        }
+    }
+}
+
 pub unsafe fn store_conn_state(cookie: *const c_void, data: *mut c_void) -> bool {
     let core = core();
     if core.is_null() {
@@ -95,5 +123,43 @@ impl Responder {
             Ok(reply) => self.send(reply.as_str()),
             Err(e) => self.send(&format!("{} {e}\r\n", e.blame().prefix())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{COARSE, advance, coarse_now};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// `get_current_time` is `gettimeofday` minus the process start, so it can step backwards.
+    /// Reclamation compares stamps to decide when an address is nobody's to read, and a stamp
+    /// that goes back would free one out from under a search.
+    #[test]
+    fn the_coarse_clock_never_goes_back_and_never_stalls() {
+        COARSE.store(100, Relaxed);
+
+        advance(140);
+        assert_eq!(coarse_now(), 140, "it follows the server's clock forward");
+
+        advance(50);
+        assert_eq!(
+            coarse_now(),
+            141,
+            "a step backwards still moves it on by one"
+        );
+
+        advance(50);
+        assert_eq!(
+            coarse_now(),
+            142,
+            "and keeps moving, so reclamation cannot stall"
+        );
+
+        advance(200);
+        assert_eq!(
+            coarse_now(),
+            200,
+            "once the clock catches up it takes over again"
+        );
     }
 }

@@ -114,7 +114,7 @@ fn run() {
 
         if last_round.elapsed() >= TICK {
             last_round = Instant::now();
-            registry::tick();
+            crate::server::tick();
             for index in registry::indexes() {
                 index.ann.reclaim();
             }

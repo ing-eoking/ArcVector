@@ -72,15 +72,21 @@ struct Searching<'a> {
     slot: Option<usize>,
 }
 
+static NEXT_HOME: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static HOME: usize = NEXT_HOME.fetch_add(1, Ordering::Relaxed) % READER_SLOTS;
+}
+
 impl<'a> Searching<'a> {
     fn new(index: &'a AnnIndex) -> Self {
-        let ticket = index.next_ticket.fetch_add(1, Ordering::AcqRel);
-        let start = (ticket % READER_SLOTS as u64) as usize;
+        let stamp = crate::server::coarse_now();
+        let home = HOME.with(|home| *home);
         let slot = (0..READER_SLOTS)
-            .map(|step| (start + step) % READER_SLOTS)
+            .map(|step| (home + step) % READER_SLOTS)
             .find(|slot| {
                 index.readers[*slot]
-                    .compare_exchange(NO_READER, ticket, Ordering::AcqRel, Ordering::Relaxed)
+                    .compare_exchange(NO_READER, stamp, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             });
         if slot.is_none() {
@@ -157,7 +163,6 @@ pub struct AnnIndex {
 
     rebuilding: AtomicBool,
 
-    next_ticket: AtomicU64,
     readers: [AtomicU64; READER_SLOTS],
     unslotted: AtomicUsize,
     retired: std::sync::Mutex<Vec<(u64, u64)>>,
@@ -221,7 +226,6 @@ impl AnnIndex {
             epoch: AtomicU64::new(0),
             held: RwLock::new(HeldSet::default()),
             rebuilding: AtomicBool::new(false),
-            next_ticket: AtomicU64::new(0),
             readers: std::array::from_fn(|_| AtomicU64::new(NO_READER)),
             unslotted: AtomicUsize::new(0),
             retired: std::sync::Mutex::new(Vec::new()),
@@ -445,7 +449,7 @@ impl AnnIndex {
         if addrs.is_empty() {
             return;
         }
-        let after = self.next_ticket.load(Ordering::Acquire);
+        let after = crate::server::coarse_now() + 1;
         {
             let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
             if retired.try_reserve(addrs.len()).is_err() {
