@@ -4,7 +4,7 @@ mod elem;
 mod error;
 mod map;
 
-pub use elem::{HeldElem, PendingElem};
+pub use elem::{HeldElem, HeldMap, PendingElem};
 pub use error::StoreError;
 pub use map::{FORMAT_VERSION, INDEX_FLAGS, MapProbe, index_attr};
 

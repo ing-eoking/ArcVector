@@ -350,19 +350,30 @@ impl Store {
             .map_err(|_| StoreError::CorruptElement)
     }
 
-    /// Read every element — used to rebuild the usearch index from Map.
-    pub fn get_all(&self, key: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        let all = self.with_elems(key, None, |elems| {
-            elems
-                .iter()
-                .map(|(field, value)| (String::from_utf8_lossy(field).into_owned(), value.to_vec()))
-                .collect::<Vec<_>>()
-        });
-        match all {
+    /// Take and keep the engine's hold on every element of a Map.
+    ///
+    /// For a refill: the fetch happens here, on a thread with a connection, and the result goes
+    /// to the rebuild thread — see [`HeldMap`]. Nothing is copied, so this costs the pointer
+    /// array the engine allocates and a refcount on each element, not the Map's contents.
+    pub fn hold_all(&self, key: &str) -> Result<HeldMap> {
+        let elems = match self.fetch(key, None) {
+            Ok(elems) => elems,
             // An index with no elements yet is empty, not missing.
-            Err(StoreError::ElemGone) => Ok(Vec::new()),
-            other => other,
-        }
+            Err(StoreError::ElemGone) => {
+                return Ok(HeldMap {
+                    array: ptr::null_mut(),
+                    count: 0,
+                });
+            }
+            Err(e) => return Err(e),
+        };
+        let held = HeldMap {
+            array: elems.array,
+            count: elems.count,
+        };
+        // Ownership of the array and the refcounts moves to `held`.
+        std::mem::forget(elems);
+        Ok(held)
     }
 }
 
@@ -474,6 +485,95 @@ impl Drop for Elems<'_> {
             }
         }
         // SAFETY: the array is plain malloc memory owned by us and freed nowhere else.
+        unsafe { free(self.array.cast::<c_void>()) };
+    }
+}
+
+/// Every element of a Map, held, and detached from the connection that fetched them.
+///
+/// `map_elem_get` is the one call in a refill that the engine may route through
+/// `ACTION_BEFORE_READ`, and with `ENABLE_MIGRATION` that path hands the cookie on — a
+/// connectionless thread has none. So the worker that detects the takeover fetches, and the
+/// rebuild thread gets this. What is left for that thread is `get_elem_info`, which ignores
+/// both handle and cookie, and `map_elem_release`, which ignores them too and takes the
+/// engine's cache lock itself.
+///
+/// The hold is also what makes the bytes safe to read later: an element unlinked in the
+/// meantime is not freed while its refcount stands. Stale, possibly — a live write may have
+/// replaced it — but a refill skips any id the mapping already knows, so a stale value is never
+/// the one replayed.
+pub struct HeldMap {
+    array: *mut *mut eitem,
+    count: usize,
+}
+
+// SAFETY: the array and the elements are plain engine memory with no thread affinity, and the
+// only call made on them from another thread — `map_elem_release` — locks the cache itself.
+unsafe impl Send for HeldMap {}
+
+impl HeldMap {
+    /// Read every element as `(field, value)`, skipping any the engine cannot describe.
+    ///
+    /// Needs a `Store` only for the engine handle; the cookie is unused on this path, so a
+    /// detached one is what the rebuild thread passes.
+    pub fn read(&self, store: &Store) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let Some(items) = self.as_slice() else {
+            return Vec::new();
+        };
+        let elems = Elems {
+            store,
+            array: self.array,
+            count: self.count,
+        };
+        let views = items
+            .iter()
+            .filter_map(|item| elems.view(*item).ok())
+            .map(|(field, value)| (field.to_vec(), value.to_vec()))
+            .collect();
+        // The hold belongs to `self`, not to the borrowed view.
+        std::mem::forget(elems);
+        views
+    }
+
+    /// How many elements the snapshot holds — what a refill reserves capacity for.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn as_slice(&self) -> Option<&[*mut eitem]> {
+        if self.array.is_null() || self.count == 0 {
+            return None;
+        }
+        // SAFETY: the engine allocated `count` entries at `array`.
+        Some(unsafe { std::slice::from_raw_parts(self.array, self.count) })
+    }
+}
+
+impl Drop for HeldMap {
+    fn drop(&mut self) {
+        if self.array.is_null() {
+            return;
+        }
+        let Some(store) = Store::detached() else {
+            return;
+        };
+        if let Some(release) = store.vtable().map_elem_release {
+            // SAFETY: each entry still carries `map_elem_get`'s refcount, and release ignores
+            // the cookie — see the type's documentation.
+            unsafe {
+                release(
+                    store.handle(),
+                    store.cookie,
+                    self.array,
+                    self.count as c_int,
+                );
+            }
+        }
+        // SAFETY: the engine allocated it for this result.
         unsafe { free(self.array.cast::<c_void>()) };
     }
 }

@@ -11,7 +11,7 @@ use crate::handler::meta::{MetaState, read_metadata};
 use super::registry::{REBUILDING, VectorIndex, get, remove};
 use crate::error::{Error, Result};
 use crate::handler::arcus::element::{META_FIELD, mint_owner};
-use crate::handler::arcus::engine::Store;
+use crate::handler::arcus::engine::{HeldMap, Store};
 
 /// Empty a graph this node was not serving and queue its refill.
 pub fn take_over(store: &Store, index: &VectorIndex) -> Result<()> {
@@ -31,30 +31,47 @@ pub fn take_over(store: &Store, index: &VectorIndex) -> Result<()> {
         remove(&index.name);
         return Err(e);
     }
-    BUILDER.enqueue(&index.name);
+
+    // The snapshot is taken here, on this thread, because this is the one with a connection.
+    // `map_elem_get` is the refill's only call the engine may route through
+    // `ACTION_BEFORE_READ`, and with `ENABLE_MIGRATION` that path passes the cookie on — the
+    // rebuild thread has none. What it gets instead is the hold, which needs neither.
+    //
+    // After `begin_rebuild`, so every delete from here on is tombstoned and the refill cannot
+    // put one back.
+    let held = match store.hold_all(&index.name) {
+        Ok(held) => held,
+        Err(e) => {
+            remove(&index.name);
+            return Err(e.into());
+        }
+    };
+    BUILDER.enqueue(&index.name, held);
     Ok(())
 }
 
 /// Asleep until there is work; no polling.
 struct Builder {
-    queue: Mutex<Vec<String>>,
+    queue: Mutex<Vec<(String, HeldMap)>>,
     wake: Condvar,
 }
 
 impl Builder {
-    fn enqueue(&self, name: &str) {
+    fn enqueue(&self, name: &str, held: HeldMap) {
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
-        if !queue.iter().any(|q| q == name) {
-            queue.push(name.to_owned());
-        }
+        // A second takeover of the same name supersedes the first: its snapshot is the newer
+        // one, and dropping the older releases those holds now rather than after a refill that
+        // is no longer wanted.
+        queue.retain(|(q, _)| q != name);
+        queue.push((name.to_owned(), held));
         self.wake.notify_one();
     }
 
-    fn take(&self) -> String {
+    fn take(&self) -> (String, HeldMap) {
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
-            if let Some(name) = queue.pop() {
-                return name;
+            if let Some(work) = queue.pop() {
+                return work;
             }
             queue = self
                 .wake
@@ -81,12 +98,15 @@ pub fn ensure_builder() {
 
 fn run_builder() {
     loop {
-        let name = BUILDER.take();
+        let (name, held) = BUILDER.take();
         let Some(index) = get(&name) else { continue };
+        // Only for the engine handle. Every call this thread makes from here — `get_elem_info`
+        // and, when `held` drops, `map_elem_release` — ignores the cookie, which is why a
+        // connectionless thread may make them and why the fetch happened on a worker.
         let Some(store) = Store::detached() else {
             continue;
         };
-        match refill(&store, &index) {
+        match refill(&store, &index, &held) {
             Ok(count) => {
                 index.mark_refilled();
                 eprintln!("ArcVector: refilled index '{name}' from {count} element(s)");
@@ -100,32 +120,35 @@ fn run_builder() {
 }
 
 /// Replay Map into the graph, leaving anything the live path has touched alone.
-fn refill(store: &Store, index: &VectorIndex) -> Result<usize> {
-    let probe = store.probe_map(&index.name)?;
-    index.ann.reserve(probe.count as usize)?;
+///
+/// `held` is the snapshot the worker took at takeover, still held. Reading it needs no engine
+/// call that wants a connection, and the hold is what keeps the bytes readable: an element
+/// unlinked since is not freed while the refcount stands.
+///
+/// A held value can be *stale* — a live write may have replaced its element — but never
+/// replayed. `add_unless_known` decides under the mapping's write lock, the same one a `vadd`
+/// holds across both of its registrations and a `vdel` across its tombstone, so any id the live
+/// path has touched is already known here and skipped.
+fn refill(store: &Store, index: &VectorIndex, held: &HeldMap) -> Result<usize> {
+    index.ann.reserve(held.len())?;
 
     let layout = index.ann.layout;
     let mut added = 0usize;
-    // `get_all` names the elements; each value is read again below. The copy it hands back was
-    // taken before this loop and a live write may have replaced it since, and replaying a
-    // stale value would name a key the graph is not supposed to hold.
-    for (field, _) in store.get_all(&index.name)? {
+    for (field, value) in held.read(store) {
+        let Ok(field) = std::str::from_utf8(&field) else {
+            continue;
+        };
+        let field = field.to_owned();
         if field == META_FIELD {
             continue;
         }
-        // The read happens inside the mapping's hold, which is the same hold a live `vadd`
-        // takes across both of its registrations: a refill and a write on one id cannot
-        // interleave, and the read and the add are one step.
-        let replayed = index.ann.add_unless_known(&field, || {
-            let Ok(value) = store.get_elem(&index.name, &field) else {
-                // Deleted since `get_all` listed it. Nothing to replay.
-                return Ok(None);
-            };
-            let element = layout
-                .decode(&value)
-                .map_err(|e| Error::bad_request(format!("{e} in element '{field}'")))?;
-            Ok(Some(element.vector.to_vec()))
-        })?;
+        let element = layout
+            .decode(&value)
+            .map_err(|e| Error::bad_request(format!("{e} in element '{field}'")))?;
+        let vector = element.vector.to_vec();
+        let replayed = index
+            .ann
+            .add_unless_known(&field, || Ok(Some(vector.clone())))?;
         if replayed {
             added += 1;
         }
