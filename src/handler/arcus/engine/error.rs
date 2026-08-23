@@ -20,6 +20,13 @@ pub enum StoreError {
     ElemExists,
     /// The key holds an item that is not a Map.
     BadType,
+    /// `get_elem_info` described an element that cannot be one.
+    ///
+    /// Reading the bytes it points at would go outside the allocation, so the caller is handed
+    /// this instead. It is not a use-after-free detector — freed slab memory usually still
+    /// reads, and holds another element by then — but the description of *that* element does
+    /// not fit the one we asked for, and the mismatch is what shows up here.
+    CorruptElement,
     Overflow,
     ReplicaSlave,
     Engine(u32),
@@ -37,6 +44,9 @@ impl fmt::Display for StoreError {
             Self::ElemGone => f.write_str("element not found"),
             Self::ElemExists => f.write_str("element already exists"),
             Self::BadType => f.write_str("key holds an item that is not a Map"),
+            Self::CorruptElement => {
+                f.write_str("the engine described an element that cannot be read")
+            }
             Self::Overflow => f.write_str("index is full"),
             Self::ReplicaSlave => {
                 f.write_str("this node is a replica; vector commands are served by the master")
@@ -118,6 +128,17 @@ mod tests {
         assert_eq!(
             check(ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT),
             Err(StoreError::KeyGone)
+        );
+    }
+
+    /// The check exists so a bad length never becomes a slice; the messages have to name that.
+    #[test]
+    fn a_corrupt_element_reads_as_a_server_side_failure() {
+        let e: crate::error::Error = StoreError::CorruptElement.into();
+        assert_eq!(e.blame(), crate::error::Blame::Server);
+        assert!(
+            StoreError::CorruptElement.to_string().contains("read"),
+            "the wire message should say the element could not be read"
         );
     }
 }

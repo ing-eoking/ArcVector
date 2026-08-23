@@ -250,7 +250,10 @@ impl Store {
         let Some(items) = elems.as_slice() else {
             return Err(StoreError::ElemGone);
         };
-        let views: Vec<(&[u8], &[u8])> = items.iter().map(|item| elems.view(*item)).collect();
+        let views: Vec<(&[u8], &[u8])> = items
+            .iter()
+            .map(|item| elems.view(*item))
+            .collect::<Result<_>>()?;
         Ok(f(&views))
     }
 
@@ -262,7 +265,7 @@ impl Store {
     pub fn take_elem(&self, key: &str, field: &str) -> Result<Vec<u8>> {
         self.fetch_with(key, Some(field), true)
             .and_then(|elems| match elems.as_slice() {
-                Some(items) => Ok(elems.view(items[0]).1.to_vec()),
+                Some(items) => Ok(elems.view(items[0])?.1.to_vec()),
                 None => Err(StoreError::ElemGone),
             })
     }
@@ -382,12 +385,21 @@ impl<'a> Elems<'a> {
 
     /// The field and value bytes of one held element. `get_elem_info` fills in pointers the
     /// engine already has, so this is not a second lookup.
-    fn view(&self, item: *mut eitem) -> (&'a [u8], &'a [u8]) {
+    ///
+    /// Everything it reports is checked before a slice is built from it. The lengths come
+    /// straight out of the element header, so a description that cannot belong to a
+    /// `map_elem_item` means the bytes under `item` are not one — and turning that into a
+    /// slice is how a bad length becomes a read past the end of the allocation.
+    ///
+    /// This is a sanity check, not a use-after-free detector. Freed slab memory is still
+    /// mapped and usually holds another element by the time it is read, so there is nothing
+    /// to trap; what this catches is a description that does not add up.
+    fn view(&self, item: *mut eitem) -> Result<(&'a [u8], &'a [u8])> {
         let Some(elem_info) = self.store.vtable().get_elem_info else {
-            return (&[], &[]);
+            return Err(StoreError::Unavailable);
         };
         // SAFETY: `item` is a live Map element held by our refcount.
-        unsafe {
+        let info = unsafe {
             let mut info: eitem_info = std::mem::zeroed();
             elem_info(
                 self.store.handle(),
@@ -396,11 +408,31 @@ impl<'a> Elems<'a> {
                 item,
                 ptr::from_mut(&mut info),
             );
-            (
-                slice_or_empty(info.score.cast::<u8>(), info.nscore as usize),
-                slice_or_empty(info.value.cast::<u8>(), info.nbytes as usize),
-            )
+            info
+        };
+        let field = info.score.cast::<u8>();
+        let value = info.value.cast::<u8>();
+        let (nfield, nvalue) = (info.nscore as usize, info.nbytes as usize);
+
+        // `nfield` is a `uint8_t` in the element header and `nbytes` a `uint16_t`, so a larger
+        // value did not come from one. A Map element is never chunked — the engine sets
+        // `naddnl` to zero for this type — and `value` sits exactly `nfield` bytes past the
+        // field, which is the one relation that ties the two pointers to the same allocation.
+        let sane = !field.is_null()
+            && !value.is_null()
+            && info.naddnl == 0
+            && nfield <= u8::MAX as usize
+            && nvalue <= u16::MAX as usize
+            && nvalue <= self.store.max_element_bytes() as usize
+            // SAFETY: comparing addresses only; neither pointer is read.
+            && std::ptr::eq(unsafe { field.add(nfield) }, value);
+        if !sane {
+            return Err(StoreError::CorruptElement);
         }
+
+        // SAFETY: both pointers are non-null and the lengths are the element's own, checked
+        // above against what the header can hold and against each other.
+        unsafe { Ok((slice_or_empty(field, nfield), slice_or_empty(value, nvalue))) }
     }
 
     fn as_slice(&self) -> Option<&[*mut eitem]> {
@@ -440,9 +472,12 @@ pub struct HeldElem<'a> {
 
 impl HeldElem<'_> {
     /// The stored bytes, as they were when the hold was taken.
+    ///
+    /// A description that does not add up reads as no bytes: the caller is a search predicate,
+    /// which cannot fail a command and drops the candidate instead.
     pub fn value(&self) -> &[u8] {
         match self.elems.as_slice() {
-            Some(items) => self.elems.view(items[0]).1,
+            Some(items) => self.elems.view(items[0]).unwrap_or((&[], &[])).1,
             None => &[],
         }
     }

@@ -435,6 +435,35 @@ impl AnnIndex {
         }
     }
 
+    /// Drop `id` from the graph without touching the Map.
+    ///
+    /// For an element the engine describes in a way that cannot be read. The Map is left alone —
+    /// deleting on a description we do not trust would be acting on the same bad reading — but
+    /// the graph must stop offering the id, or every search returns a row that cannot render.
+    ///
+    /// Reports whether the mapping had a key for it.
+    pub fn forget_unreadable(&self, id: &str) -> bool {
+        let key = {
+            let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
+            if self.rebuilding.load(Ordering::Acquire) {
+                // A refill must not put it back.
+                if ids.reserve_tombstone().is_err() {
+                    ids.forget(id)
+                } else {
+                    ids.forget_tombstoned(id)
+                }
+            } else {
+                ids.forget(id)
+            }
+        };
+        // After the hold, like every other node removal here.
+        if let Some(key) = key {
+            self.drop_node(key);
+            return true;
+        }
+        false
+    }
+
     /// Throw a staged node away. The mapping never named it, so there is nothing to restore.
     pub fn discard(&self, staged: Staged<'_>) {
         self.drop_node(staged.key);

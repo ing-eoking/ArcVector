@@ -136,6 +136,16 @@ pub fn vget(store: &Store, name: &str, id: &str) -> Result<Reply> {
             )))
         }
         Err(StoreError::ElemGone) => Ok(Reply::NotFound),
+        // The engine described this element in a way that cannot be read. Stop offering the id
+        // — a search would keep returning a row nothing can render — and say so. The Map is
+        // left alone: deleting on a reading we do not trust is the same bad reading twice.
+        Err(StoreError::CorruptElement) => {
+            index.ann.forget_unreadable(id);
+            eprintln!(
+                "ArcVector: element '{id}' of index '{name}' is unreadable; dropped from the graph"
+            );
+            Err(StoreError::CorruptElement.into())
+        }
         // The Map itself is gone, which no read path used to act on.
         Err(StoreError::KeyGone) => {
             map_is_gone(name, stamp);

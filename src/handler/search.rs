@@ -94,6 +94,16 @@ fn similar(
                     map_is_gone(&index.name, stamp);
                     break;
                 }
+                // Unreadable description: stop offering the id and fail the command rather
+                // than quietly shortening the answer. The Map is left alone.
+                Err(StoreError::CorruptElement) => {
+                    index.ann.forget_unreadable(&id);
+                    eprintln!(
+                        "ArcVector: element '{id}' of index '{}' is unreadable; dropped from the graph",
+                        index.name
+                    );
+                    return Err(StoreError::CorruptElement.into());
+                }
                 Err(_) => continue,
             };
             Some(
@@ -170,6 +180,13 @@ pub fn vsim_key(store: &Store, spec: &SimKey) -> Result<Reply> {
     let stored = match store.get_elem(name, key) {
         Ok(v) => v,
         Err(StoreError::ElemGone) => return Ok(Reply::NotFound),
+        Err(StoreError::CorruptElement) => {
+            index.ann.forget_unreadable(key);
+            eprintln!(
+                "ArcVector: element '{key}' of index '{name}' is unreadable; dropped from the graph"
+            );
+            return Err(StoreError::CorruptElement.into());
+        }
         // The Map is gone, so the graph has nothing left to answer with.
         Err(StoreError::KeyGone) => {
             map_is_gone(name, stamp);
