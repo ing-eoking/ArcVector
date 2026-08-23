@@ -293,12 +293,76 @@ pub fn remove_observed(name: &str, observed: &VectorIndex) -> bool {
     }
 }
 
-/// Every registered name, rebuilding ones included.
+/// The `limit` smallest names after `cursor`, wrapping to the smallest of all if that runs out.
 ///
-/// For the sweep, which asks about Maps rather than about what is servable: an index whose Map
-/// went while it was being rebuilt is exactly one worth releasing.
-pub fn names() -> Vec<String> {
-    read().keys().cloned().collect()
+/// This is the sweep's cursor, and it exists here because a `HashMap` has no order to resume
+/// from. Sorting the whole registry to get one would put every name's cost back on the pass that
+/// only wanted a few, so the order is made in one walk of the keys instead: at most `limit`
+/// candidates are kept, and nothing is copied until it earns a place among them. Two of them,
+/// because the wrap needs the smallest names whether or not any name follows the cursor.
+///
+/// A name added behind the cursor waits for the next cycle, which is the wait everything gets.
+/// Empty if the registry is empty, or if the two candidate lists cannot be allocated.
+///
+/// Rebuilding entries are in it. The sweep asks about Maps, not about what is servable, and an
+/// index whose Map went while it was being rebuilt is exactly one worth releasing.
+pub fn names_after(cursor: &str, limit: usize) -> Vec<String> {
+    let reg = read();
+    select_after(reg.keys().map(String::as_str), cursor, limit)
+}
+
+/// [`names_after`] over any keys, in any order.
+fn select_after<'a>(
+    keys: impl Iterator<Item = &'a str>,
+    cursor: &str,
+    limit: usize,
+) -> Vec<String> {
+    let (Ok(mut after), Ok(mut smallest)) = (bounded(limit), bounded(limit)) else {
+        return Vec::new();
+    };
+    if limit == 0 {
+        return Vec::new();
+    }
+    for key in keys {
+        if key > cursor {
+            keep_smallest(&mut after, key, limit);
+        }
+        keep_smallest(&mut smallest, key, limit);
+    }
+
+    // The wrap goes on the end, skipping what the first part already has.
+    let mut batch: Vec<String> = after.iter().map(|k| k.to_string()).collect();
+    for key in smallest {
+        if batch.len() == limit {
+            break;
+        }
+        if !after.contains(&key) {
+            batch.push(key.to_string());
+        }
+    }
+    batch
+}
+
+/// A candidate list that never grows past `limit`, so a big registry cannot make one big.
+fn bounded<'a>(limit: usize) -> Result<Vec<&'a str>, TryReserveError> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(limit)?;
+    Ok(v)
+}
+
+/// Insert `key` into a sorted, bounded list, dropping the largest once it is full.
+fn keep_smallest<'a>(kept: &mut Vec<&'a str>, key: &'a str, limit: usize) {
+    if kept.len() == limit {
+        match kept.last() {
+            // Nothing this list has room for.
+            Some(largest) if key >= *largest => return,
+            _ => {
+                kept.pop();
+            }
+        }
+    }
+    let at = kept.partition_point(|k| *k < key);
+    kept.insert(at, key);
 }
 
 /// Every index that is serving, ordered by name for stable `vlist` output.
@@ -428,5 +492,47 @@ mod tests {
             "the observed index is the live one"
         );
         assert!(get(name).is_none(), "the entry is gone");
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::select_after;
+
+    /// Deliberately unsorted: the point is that the registry's own order does not matter.
+    const NAMES: [&str; 5] = ["d", "a", "e", "c", "b"];
+
+    fn after(cursor: &str, limit: usize) -> Vec<String> {
+        select_after(NAMES.iter().copied(), cursor, limit)
+    }
+
+    #[test]
+    fn a_cycle_walks_every_name_in_order() {
+        assert_eq!(after("", 2), ["a", "b"]);
+        assert_eq!(after("b", 2), ["c", "d"]);
+    }
+
+    #[test]
+    fn a_pass_that_runs_out_wraps_to_the_smallest() {
+        // One name is left after "d", so the pass fills up from the top without repeating it.
+        assert_eq!(after("d", 3), ["e", "a", "b"]);
+    }
+
+    #[test]
+    fn a_registry_smaller_than_the_limit_comes_back_whole() {
+        let mut all = after("c", 8);
+        all.sort();
+        assert_eq!(all, ["a", "b", "c", "d", "e"], "no name is taken twice");
+    }
+
+    #[test]
+    fn a_cursor_past_every_name_wraps_to_the_start() {
+        assert_eq!(after("z", 2), ["a", "b"]);
+    }
+
+    #[test]
+    fn an_empty_registry_gives_nothing() {
+        assert!(select_after(std::iter::empty(), "", 8).is_empty());
+        assert!(after("", 0).is_empty(), "a zero limit asks for nothing");
     }
 }

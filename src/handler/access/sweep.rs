@@ -90,86 +90,48 @@ pub fn maybe(store: &Store) {
     LAST.store(STARTED.elapsed().as_millis() as u64, Ordering::Relaxed);
 }
 
-/// The next `limit` names to probe, in name order, resuming after [`CURSOR`].
+/// The next `limit` names to probe, resuming after [`CURSOR`].
 ///
-/// Sorting is what makes "after" mean anything: the registry is a hash map, so its own order
-/// changes as names come and go and a positional cursor would skip names for good. A name added
-/// behind the cursor waits for the next cycle, which is the same wait everything else gets.
+/// The order is by name because the registry is a hash map and has none of its own — a
+/// positional cursor would skip names for good as entries come and go. [`registry::names_after`]
+/// is where that order gets made, and it makes only this much of it.
 fn due(limit: usize) -> Vec<String> {
     let mut cursor = CURSOR.lock().unwrap_or_else(PoisonError::into_inner);
-    let mut names = registry::names();
-    names.sort_unstable();
-    next_batch(names, &mut cursor, limit)
-}
-
-/// [`due`] without the registry, so the cursor's wrap can be tested. `names` comes sorted.
-fn next_batch(mut names: Vec<String>, cursor: &mut String, limit: usize) -> Vec<String> {
-    let start = names.partition_point(|n| n.as_str() <= cursor.as_str());
-    let mut batch: Vec<String> = names.drain(start..).take(limit).collect();
-    if batch.len() < limit {
-        // The cycle ran out; carry on from the top, skipping what this pass already has.
-        let wrap = limit - batch.len();
-        names.truncate(wrap);
-        batch.append(&mut names);
-    }
-
+    let batch = registry::names_after(&cursor, limit);
     cursor.clear();
-    match batch.last() {
-        // A full pass took everything there was, so the next one starts over.
-        Some(last) if batch.len() == limit => cursor.push_str(last),
-        _ => {}
+    if let Some(last) = resume_from(&batch, limit) {
+        cursor.push_str(last);
     }
     batch
 }
 
+/// Where the pass after this one begins, or `None` to start the cycle over.
+///
+/// A pass that came back short saw every name there was, so there is nothing left to resume
+/// after — and leaving the cursor there would make the next pass wrap for no reason.
+fn resume_from(batch: &[String], limit: usize) -> Option<&str> {
+    match batch.last() {
+        Some(last) if batch.len() == limit => Some(last),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::next_batch;
+    use super::resume_from;
 
-    fn names(all: &[&str]) -> Vec<String> {
-        all.iter().map(|n| n.to_string()).collect()
+    fn batch(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
     }
 
     #[test]
-    fn a_batch_resumes_where_the_last_one_stopped() {
-        let mut cursor = String::new();
-        let all = names(&["a", "b", "c", "d", "e"]);
-
-        assert_eq!(next_batch(all.clone(), &mut cursor, 2), names(&["a", "b"]));
-        assert_eq!(cursor, "b");
-        assert_eq!(next_batch(all.clone(), &mut cursor, 2), names(&["c", "d"]));
-        assert_eq!(cursor, "d");
+    fn a_full_pass_resumes_where_it_stopped() {
+        assert_eq!(resume_from(&batch(&["a", "b"]), 2), Some("b"));
     }
 
     #[test]
-    fn a_short_cycle_wraps_and_a_full_one_carries_the_cursor() {
-        let mut cursor = "d".to_string();
-        let all = names(&["a", "b", "c", "d", "e"]);
-
-        // One name left after the cursor, so the pass fills up from the top.
-        assert_eq!(
-            next_batch(all.clone(), &mut cursor, 3),
-            names(&["e", "a", "b"])
-        );
-        assert_eq!(cursor, "b");
-    }
-
-    #[test]
-    fn a_cycle_shorter_than_the_limit_starts_over() {
-        let mut cursor = "y".to_string();
-        let all = names(&["a", "b"]);
-
-        assert_eq!(next_batch(all, &mut cursor, 8), names(&["a", "b"]));
-        assert_eq!(
-            cursor, "",
-            "nothing was left unprobed, so the next pass begins a cycle"
-        );
-    }
-
-    #[test]
-    fn an_empty_registry_sweeps_nothing() {
-        let mut cursor = "a".to_string();
-        assert!(next_batch(Vec::new(), &mut cursor, 8).is_empty());
-        assert_eq!(cursor, "");
+    fn a_short_pass_starts_the_cycle_over() {
+        assert_eq!(resume_from(&batch(&["a", "b"]), 8), None);
+        assert_eq!(resume_from(&batch(&[]), 8), None);
     }
 }
