@@ -132,8 +132,8 @@ fn check_still_fits(store: &Store, layout: Layout) -> Result<()> {
     )))
 }
 
-/// `vget <index> <id>` — the stored attributes, read from Map by field.
-pub fn vget(store: &Store, name: &str, id: &str) -> Result<Reply> {
+/// `vgetattr <index> <id>` — the stored attributes, read from Map by field.
+pub fn vgetattr(store: &Store, name: &str, id: &str) -> Result<Reply> {
     let index = for_read(store, name)?;
     let stamp = registry::now();
 
@@ -165,6 +165,54 @@ pub fn vget(store: &Store, name: &str, id: &str) -> Result<Reply> {
             Ok(Reply::NotFound)
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+/// `vsetattr <index> <id> <attrlen> <attr JSON>` — replace the attributes, keep the vector.
+///
+/// The graph is not searched, not inserted into, and not rebuilt. It only follows the element:
+/// the engine writes the new value into a **new** element — it writes in place only when
+/// nothing holds a refcount, and the graph holds one on every element it keys a node by — so
+/// the node moves to the new address. Moving it is a `rename`, which is a hash entry rather
+/// than the ~370us HNSW insert a `vadd` pays.
+pub fn vsetattr(store: &Store, name: &str, id: &str, attr: &[u8]) -> Result<Reply> {
+    let index = for_write(store, name)?;
+    let stamp = registry::now();
+    check_attr(attr)?;
+
+    // The current value, and where it lives. Both are needed: the value because everything
+    // outside the ATTR region has to come back byte for byte — the vector, where this build
+    // stores one — and the address because that is the node the graph will have to move.
+    //
+    // The hold is this call's own. It outlives the update, so the outgoing address still means
+    // this element while the graph is told about it.
+    let held = match store.hold_elem(name, id) {
+        Ok(held) => held,
+        Err(StoreError::ElemGone) => return Ok(Reply::NotFound),
+        Err(StoreError::KeyGone) => {
+            map_is_gone(name, stamp);
+            return Ok(Reply::NotFound);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let old = held.addr();
+    let mut value = held.value().to_vec();
+    index.ann.layout.set_attr(&mut value, attr)?;
+
+    match index.ann.update_published(old, || {
+        store.update_elem(name, id, &value)?;
+        // Where it ended up. Reading it back rather than assuming is what makes the node follow
+        // the element the Map actually holds.
+        store.hold_addr(name, id).map(HeldAddr::keep)
+    }) {
+        Ok(()) => Ok(Reply::Stored),
+        Err(PublishError::Store(StoreError::ElemGone)) => Ok(Reply::NotFound),
+        Err(PublishError::Store(StoreError::KeyGone)) => {
+            map_is_gone(name, stamp);
+            Ok(Reply::NotFound)
+        }
+        Err(PublishError::Store(e)) => Err(e.into()),
+        Err(PublishError::Mapping(e)) => Err(e),
     }
 }
 

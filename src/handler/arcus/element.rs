@@ -177,6 +177,31 @@ impl Layout {
         })
     }
 
+    /// Overwrite the ATTR region of a stored value, leaving everything else byte for byte.
+    ///
+    /// The region is a fixed 128 bytes whatever the ATTR is, so the value's length does not
+    /// move — which is what lets `vsetattr` hand the engine the same number of bytes back.
+    /// The whole region is rewritten, not just what `attr` fills: the tail is stored and
+    /// replicated, so leaving the old ATTR's bytes there would ship them.
+    pub fn set_attr(&self, buf: &mut [u8], attr: &[u8]) -> Result<(), CodecError> {
+        if attr.len() > ATTR_BYTES {
+            return Err(CodecError::AttrTooLarge {
+                limit: ATTR_BYTES,
+                got: attr.len(),
+            });
+        }
+        if buf.len() < Self::VECTOR_OFFSET {
+            return Err(CodecError::Truncated {
+                need: Self::VECTOR_OFFSET,
+                got: buf.len(),
+            });
+        }
+        buf[0..HEADER_LEN].copy_from_slice(&(attr.len() as u16).to_le_bytes());
+        buf[ATTR_OFFSET..Self::VECTOR_OFFSET].fill(0);
+        buf[ATTR_OFFSET..ATTR_OFFSET + attr.len()].copy_from_slice(attr);
+        Ok(())
+    }
+
     /// Read only the ATTR region — the hot path used by the search predicate.
     pub fn attr_of<'a>(&self, buf: &'a [u8]) -> Result<&'a [u8], CodecError> {
         let head = parse_header(buf)?;

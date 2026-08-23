@@ -15,7 +15,7 @@ unsafe extern "C" {
 const ITEM_TYPE_MAP: c_int = 3;
 
 /// An element the engine has allocated and we have filled, but that is not part of the Map
-/// yet. Nothing can observe it until [`PendingElem::insert`] — not even a `vget` on the same
+/// yet. Nothing can observe it until [`PendingElem::insert`] — not even a `vgetattr` on the same
 /// id, which reads the Map. Dropping it hands the space back.
 ///
 /// This is what lets a `vadd` do every fallible step before anything becomes visible: the
@@ -394,6 +394,36 @@ impl Store {
         }
     }
 
+    /// Replace one element's value with the same number of bytes.
+    ///
+    /// The engine writes in place only when nothing holds a refcount on the element
+    /// (`do_map_elem_update`), and the graph holds one on every element it keys a node by — so
+    /// in practice this always allocates a new element and unlinks the old. **The address
+    /// changes**, which is why the caller has to move the node. What it does buy is that moving
+    /// a node is a `rename`, not an HNSW insert.
+    pub fn update_elem(&self, key: &str, field: &str, value: &[u8]) -> Result<()> {
+        let Some(update) = self.vtable().map_elem_update else {
+            return Err(StoreError::Unavailable);
+        };
+        let selector = field_t {
+            value: field.as_ptr().cast::<c_char>().cast_mut(),
+            length: field.len(),
+        };
+        // SAFETY: `key`, `selector` and `value` outlive the call.
+        check(unsafe {
+            update(
+                self.handle(),
+                self.cookie,
+                key.as_ptr().cast::<c_void>(),
+                as_int(key.len()),
+                ptr::from_ref(&selector),
+                value.as_ptr().cast::<c_void>(),
+                as_int(value.len()),
+                0,
+            )
+        })
+    }
+
     /// Hand back refcounts the graph was holding.
     pub fn release_held(&self, addrs: &[u64]) {
         if addrs.is_empty() {
@@ -723,6 +753,14 @@ pub struct HeldElem<'a> {
 }
 
 impl HeldElem<'_> {
+    /// Where the element lives, which is the graph's key for it.
+    pub fn addr(&self) -> u64 {
+        match self.elems.as_slice() {
+            Some(items) => items[0] as u64,
+            None => 0,
+        }
+    }
+
     /// The stored bytes, as they were when the hold was taken.
     ///
     /// A description that does not add up reads as no bytes: the caller is a search predicate,

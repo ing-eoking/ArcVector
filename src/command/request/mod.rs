@@ -39,7 +39,8 @@ pub enum Cmd {
     VCreate,
     VAdd,
     VSim,
-    VGet,
+    VGetAttr,
+    VSetAttr,
     VDel,
     VDrop,
     VList,
@@ -48,11 +49,12 @@ pub enum Cmd {
 
 impl Cmd {
     pub fn parse(name: &str) -> Option<Self> {
-        const NAMES: [(&str, Cmd); 8] = [
+        const NAMES: [(&str, Cmd); 9] = [
             ("vcreate", Cmd::VCreate),
             ("vadd", Cmd::VAdd),
             ("vsim", Cmd::VSim),
-            ("vget", Cmd::VGet),
+            ("vgetattr", Cmd::VGetAttr),
+            ("vsetattr", Cmd::VSetAttr),
             ("vdel", Cmd::VDel),
             ("vdrop", Cmd::VDrop),
             ("vlist", Cmd::VList),
@@ -133,9 +135,23 @@ pub struct SimKey<'a> {
 pub enum Line<'a> {
     Create(Create<'a>),
     SimKey(SimKey<'a>),
-    Get { index: &'a str, id: &'a str },
-    Del { index: &'a str, id: &'a str },
-    Drop { index: &'a str },
+    GetAttr {
+        index: &'a str,
+        id: &'a str,
+    },
+    /// The whole ATTR is replaced, so an empty one clears it.
+    SetAttr {
+        index: &'a str,
+        id: &'a str,
+        attr: &'a [u8],
+    },
+    Del {
+        index: &'a str,
+        id: &'a str,
+    },
+    Drop {
+        index: &'a str,
+    },
     List,
     Stats,
 }

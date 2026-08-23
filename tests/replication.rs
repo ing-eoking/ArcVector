@@ -307,7 +307,7 @@ fn a_double_switchover_does_not_leave_a_stale_index() {
         "the Map holds four vectors"
     );
 
-    let by_key = back.cmd_settled(&format!("vget {index} v4"), None);
+    let by_key = back.cmd_settled(&format!("vgetattr {index} v4"), None);
     let by_vector = back.cmd_settled(&format!("vsim VECTOR {index} 4 7 4"), Some("0 1 0 0"));
     assert!(
         by_key.contains("v4"),

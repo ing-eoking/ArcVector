@@ -18,7 +18,7 @@ use std::os::raw::c_void;
 use arcus::{Store, StoreError};
 use index::{vcreate, vdrop, vlist, vstats};
 use search::{vsim_key, vsim_vector};
-use vector::{vadd, vdel, vget};
+use vector::{vadd, vdel, vgetattr, vsetattr};
 
 use crate::command::Request;
 use crate::command::request::{Body, Line};
@@ -54,7 +54,8 @@ pub unsafe fn run(cookie: *const c_void, request: Request) -> Result<Reply> {
         Request::Body(Body::Sim(spec), bytes) => vsim_vector(store, &spec, &bytes),
         Request::Line(Line::Create(spec)) => vcreate(store, &spec),
         Request::Line(Line::SimKey(spec)) => vsim_key(store, &spec),
-        Request::Line(Line::Get { index, id }) => vget(store, index, id),
+        Request::Line(Line::GetAttr { index, id }) => vgetattr(store, index, id),
+        Request::Line(Line::SetAttr { index, id, attr }) => vsetattr(store, index, id, attr),
         Request::Line(Line::Del { index, id }) => vdel(store, index, id),
         Request::Line(Line::Drop { index }) => vdrop(store, index),
         Request::Line(Line::List) => vlist(),

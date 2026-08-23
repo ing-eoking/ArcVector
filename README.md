@@ -197,17 +197,31 @@ VSIM KEY docs 5 v1
   END
 ```
 
-## vget · vdel · vdrop · vlist
+## vgetattr · vsetattr · vdel · vdrop · vlist
 
 | Command | Replies |
 |---|---|
-| `vget <index> <id>` | `VALUE <id> <attrlen>` + attr + `END` · `NOT_FOUND` |
+| `vgetattr <index> <id>` | `VALUE <id> <attrlen>` + attr + `END` · `NOT_FOUND` |
+| `vsetattr <index> <id> <attrlen> <attr JSON>` | `STORED` · `NOT_FOUND` |
 | `vdel <index> <id>` | `DELETED` · `NOT_FOUND` |
 | `vdrop <index>` | `DROPPED` · `NOT_FOUND` |
 | `vlist` | one `INDEX <name> dim=… quant=… metric=… attrbytes=128 count=… maxcount=…` per index, then `END` |
 | `vstats` | module memory, then `END` |
 
-`vget` returns attributes only, not coordinates.
+`vgetattr` returns attributes only, not coordinates.
+
+`vsetattr` replaces the whole attribute region, so `<attrlen> 0` with no JSON clears it. The
+vector is untouched and the search still finds the id at the same coordinates — the graph
+follows the element rather than being rebuilt, which is a key rename rather than the ~370us
+insert a `vadd` pays.
+
+```
+vsetattr docs v1 20 {"cat":"news","n":2}\r\n
+→ STORED
+
+vsetattr docs v1 0\r\n
+→ STORED          # attributes cleared
+```
 
 ## vstats
 
@@ -284,7 +298,7 @@ live; compare it against `vectors` to tell the two apart.
 
 ## Limitations
 
-- `vget` cannot read coordinates back.
+- `vgetattr` cannot read coordinates back, and there is no command that can.
 - Filters support `AND` over top-level fields. No `OR`, no parentheses, no nested
   paths, and no spaces inside a term value.
 - The usearch graph is not serialized. After a restart it is rebuilt from Map on

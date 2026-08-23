@@ -50,7 +50,7 @@ fn a_vector_round_trips_through_the_engine() {
         "STORED\r\n",
     );
 
-    let got = client.send(&format!("vget {ix} v1"));
+    let got = client.send(&format!("vgetattr {ix} v1"));
     assert_reply(
         &got,
         &format!("VALUE v1 {}\r\n{attr}\r\nEND\r\n", attr.len()),
@@ -58,7 +58,7 @@ fn a_vector_round_trips_through_the_engine() {
 
     assert_contains(&client.send("vlist"), "count=1");
     assert_reply(&client.send(&format!("vdel {ix} v1")), "DELETED\r\n");
-    assert_reply(&client.send(&format!("vget {ix} v1")), "NOT_FOUND\r\n");
+    assert_reply(&client.send(&format!("vgetattr {ix} v1")), "NOT_FOUND\r\n");
     client.send(&format!("vdrop {ix}"));
 }
 
@@ -70,8 +70,46 @@ fn attributes_are_optional_and_come_back_empty() {
 
     assert_reply(&client.vadd(&ix, "v1", 2, "0.1 0.2"), "STORED\r\n");
     assert_reply(
-        &client.send(&format!("vget {ix} v1")),
+        &client.send(&format!("vgetattr {ix} v1")),
         "VALUE v1 0\r\n\r\nEND\r\n",
+    );
+    client.send(&format!("vdrop {ix}"));
+}
+
+/// `vsetattr` replaces the attributes and leaves the vector where it was — the search still
+/// finds the id, and at the same coordinates.
+#[test]
+fn set_attr_replaces_the_attributes_and_keeps_the_vector() {
+    session!(_server, client);
+    let ix = index_name("setattr");
+    client.send(&format!("vcreate {ix} 2 METRIC l2"));
+
+    let first = r#"{"cat":"tech"}"#;
+    client.vadd_attr(&ix, "v1", 2, "1.0 0.0", first);
+
+    let second = r#"{"cat":"news","n":2}"#;
+    assert_reply(
+        &client.send(&format!("vsetattr {ix} v1 {} {second}", second.len())),
+        "STORED\r\n",
+    );
+    assert_reply(
+        &client.send(&format!("vgetattr {ix} v1")),
+        &format!("VALUE v1 {}\r\n{second}\r\nEND\r\n", second.len()),
+    );
+
+    // The graph followed the element rather than being rebuilt: same id, same place.
+    assert_contains(&client.vsim(&ix, 1, 2, "1.0 0.0"), "VALUE v1 0");
+
+    // A zero length clears them.
+    assert_reply(&client.send(&format!("vsetattr {ix} v1 0")), "STORED\r\n");
+    assert_reply(
+        &client.send(&format!("vgetattr {ix} v1")),
+        "VALUE v1 0\r\n\r\nEND\r\n",
+    );
+
+    assert_reply(
+        &client.send(&format!("vsetattr {ix} nobody 2 {{}}")),
+        "NOT_FOUND\r\n",
     );
     client.send(&format!("vdrop {ix}"));
 }
@@ -250,7 +288,7 @@ fn a_malformed_attr_is_refused_and_the_connection_survives() {
 fn operating_on_a_missing_index_is_a_client_error() {
     session!(_server, client);
     let ix = index_name("absent");
-    assert_contains(&client.send(&format!("vget {ix} v1")), "CLIENT_ERROR");
+    assert_contains(&client.send(&format!("vgetattr {ix} v1")), "CLIENT_ERROR");
     assert_contains(&client.send(&format!("vdel {ix} v1")), "CLIENT_ERROR");
     assert_contains(&client.send(&format!("VSIM KEY {ix} 1 v1")), "CLIENT_ERROR");
     assert_contains(&client.vadd(&ix, "v1", 2, "0.1 0.2"), "CLIENT_ERROR");
@@ -400,7 +438,7 @@ fn the_metadata_field_is_unreachable_from_the_protocol() {
     );
 
     assert_reply(
-        &client.send(&format!("vget {ix} v1")),
+        &client.send(&format!("vgetattr {ix} v1")),
         "VALUE v1 0\r\n\r\nEND\r\n",
     );
     client.send(&format!("vdrop {ix}"));

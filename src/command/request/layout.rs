@@ -39,11 +39,25 @@ pub(super) mod create {
     pub const TAIL: usize = 3;
 }
 
-/// `vget <index> <id>`, `vdel <index> <id>`
+/// `vgetattr <index> <id>`, `vdel <index> <id>`
 pub(super) mod names {
     pub const INDEX: usize = 1;
     pub const ID: usize = 2;
     pub const TAIL: usize = 3;
+}
+
+/// `vsetattr <index> <id> <attrlen> <attr JSON>`
+///
+/// The length comes before the value, as `vadd`'s does. There is no `ATTR` keyword: nothing
+/// else can follow, so a keyword would only be a word to get wrong.
+pub(super) mod setattr {
+    pub const INDEX: usize = 1;
+    pub const ID: usize = 2;
+    pub const ATTR_LEN: usize = 3;
+    pub const ATTR: usize = 4;
+    /// With an empty ATTR the JSON token is absent, so the line can be either length.
+    pub const TAIL_EMPTY: usize = 4;
+    pub const TAIL: usize = 5;
 }
 
 /// `vdrop <index>`

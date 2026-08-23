@@ -21,10 +21,11 @@ pub fn parse<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
             SimSource::Key => parse_sim_key(tokens).map(|s| Parsed::Line(Line::SimKey(s))),
         },
         Some(Cmd::VCreate) => parse_create(tokens).map(|c| Parsed::Line(Line::Create(c))),
-        Some(Cmd::VGet) => {
+        Some(Cmd::VGetAttr) => {
             let (index, id) = two_names(tokens)?;
-            Ok(Parsed::Line(Line::Get { index, id }))
+            Ok(Parsed::Line(Line::GetAttr { index, id }))
         }
+        Some(Cmd::VSetAttr) => parse_set_attr(tokens),
         Some(Cmd::VDel) => {
             let (index, id) = two_names(tokens)?;
             Ok(Parsed::Line(Line::Del { index, id }))
@@ -188,6 +189,47 @@ fn parse_sim(tokens: &Tokens) -> Result<Sim> {
         filter,
         with_attr,
     })
+}
+
+/// `vsetattr <index> <id> <attrlen> <attr JSON>`
+///
+/// The whole ATTR region is replaced, so `<attrlen> 0` with no JSON clears it.
+fn parse_set_attr<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
+    use layout::setattr as at;
+    let declared: usize = tokens.parse(at::ATTR_LEN, "ATTR length")?;
+    if declared > ATTR_BYTES {
+        return Err(Error::bad_request(format!(
+            "ATTR is {declared} bytes, over the {ATTR_BYTES}-byte limit"
+        )));
+    }
+
+    let attr: &[u8] = if declared == 0 {
+        if tokens.len() != at::TAIL_EMPTY {
+            return Err(malformed());
+        }
+        &[]
+    } else {
+        if tokens.len() != at::TAIL {
+            // One token: a space would split the JSON, as it would in `vadd`.
+            return Err(Error::bad_request(
+                "ATTR JSON must be a single argument with no spaces in it",
+            ));
+        }
+        let json = tokens.text(at::ATTR)?;
+        if json.len() != declared {
+            return Err(Error::bad_request(format!(
+                "declared ATTR length {declared} does not match the {} bytes supplied",
+                json.len()
+            )));
+        }
+        json.as_bytes()
+    };
+
+    Ok(Parsed::Line(Line::SetAttr {
+        index: tokens.text(at::INDEX)?,
+        id: tokens.text(at::ID)?,
+        attr,
+    }))
 }
 
 /// `ATTR <attrlen> <attr JSON>`, starting at token `at`. Optional.
@@ -360,7 +402,7 @@ mod tests {
         assert_eq!(body_len("VSIM VECTOR docs 10 4096 1024"), Some(4096));
         assert_eq!(body_len("VSIM KEY docs 10 v1"), None);
         assert_eq!(body_len("vlist"), None);
-        assert_eq!(body_len("vget docs v1"), None);
+        assert_eq!(body_len("vgetattr docs v1"), None);
         assert_eq!(body_len("nonsense"), None);
     }
 
@@ -653,9 +695,39 @@ mod tests {
     }
 
     #[test]
+    fn set_attr_takes_a_length_and_one_json_token() {
+        tokens!(set = r#"vsetattr docs v1 14 {"cat":"tech"}"#);
+        let Ok(Line::SetAttr { index, id, attr }) = line_of(&set) else {
+            panic!("vsetattr did not parse");
+        };
+        assert_eq!((index, id), ("docs", "v1"));
+        assert_eq!(attr, br#"{"cat":"tech"}"#);
+    }
+
+    /// The whole region is replaced, so a zero length is how a client clears the attributes —
+    /// and then there is no JSON token to give.
+    #[test]
+    fn set_attr_with_zero_length_clears_and_takes_no_json() {
+        tokens!(clear = "vsetattr docs v1 0");
+        let Ok(Line::SetAttr { attr, .. }) = line_of(&clear) else {
+            panic!("clearing did not parse");
+        };
+        assert!(attr.is_empty());
+
+        assert!(err("vsetattr docs v1 0 {}").contains("bad command line format"));
+    }
+
+    #[test]
+    fn set_attr_rejects_a_length_that_does_not_match() {
+        assert!(err(r#"vsetattr docs v1 3 {"cat":"tech"}"#).contains("does not match"));
+        assert!(err(r#"vsetattr docs v1 2 {} extra"#).contains("single argument"));
+        assert!(err("vsetattr docs v1 999").contains("over the"));
+    }
+
+    #[test]
     fn simple_lines_parse_and_reject_wrong_arity() {
-        tokens!(get = "vget docs v1");
-        assert!(matches!(line_of(&get), Ok(Line::Get { .. })));
+        tokens!(get = "vgetattr docs v1");
+        assert!(matches!(line_of(&get), Ok(Line::GetAttr { .. })));
         tokens!(del = "vdel docs v1");
         assert!(matches!(line_of(&del), Ok(Line::Del { .. })));
         tokens!(drop_ = "vdrop docs");
@@ -665,7 +737,7 @@ mod tests {
         tokens!(stats = "vstats");
         assert!(matches!(line_of(&stats), Ok(Line::Stats)));
 
-        assert!(err("vget docs").contains("bad command line format"));
+        assert!(err("vgetattr docs").contains("bad command line format"));
         assert!(err("vdel docs v1 extra").contains("bad command line format"));
         assert!(err("vdrop").contains("bad command line format"));
         assert!(err("vlist extra").contains("bad command line format"));

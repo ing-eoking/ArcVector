@@ -461,6 +461,57 @@ impl AnnIndex {
         Ok(())
     }
 
+    /// Move a node from the element it stood on to the one that replaced it.
+    ///
+    /// For `vsetattr`, which rewrites a value without touching the vector. The engine gives the
+    /// new value a new element — it writes in place only when nothing holds a refcount, and the
+    /// graph holds one — so the node has to follow the address. That move is a `rename`: a hash
+    /// entry, not a graph insert, which is the whole reason this is not a `vadd`.
+    ///
+    /// `write` runs inside the hold and returns where the value ended up. `old` keeps its own
+    /// refcount, the caller's; this hands back only the one the graph had.
+    pub fn update_published<E>(
+        &self,
+        old: u64,
+        write: impl FnOnce() -> std::result::Result<u64, E>,
+    ) -> std::result::Result<(), PublishError<E>> {
+        // `inner` then `held`, as everywhere.
+        let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
+
+        let had_node = held.contains(old);
+        if had_node && let Err(e) = held.reserve() {
+            return Err(PublishError::Mapping(Error::Index(format!(
+                "the held set could not grow: {e}"
+            ))));
+        }
+
+        let new = write().map_err(PublishError::Store)?;
+        if !had_node || new == old {
+            // Either a rebuild has not reached this element, or the engine wrote in place after
+            // all. Nothing for the graph to move.
+            return Ok(());
+        }
+
+        if let Err(e) = index.rename(old, new) {
+            // The value is written and the node still stands on an element the Map has let go.
+            // Take it out rather than leave it answering — a rebuild indexes the new one.
+            if held.take(old) {
+                self.elements.release(&[old]);
+            }
+            drop(held);
+            drop(index);
+            eprintln!("ArcVector: could not move a node to its new element: {e}");
+            self.drop_node(old);
+            return Ok(());
+        }
+        held.take(old);
+        held.publish(new);
+        // The graph's refcount on the outgoing element. The caller's own is its to drop.
+        self.elements.release(&[old]);
+        Ok(())
+    }
+
     /// Drop the node at `addr` without touching the Map.
     ///
     /// For an element the engine describes in a way that cannot be read. The Map is left alone —

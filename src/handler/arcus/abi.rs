@@ -11,12 +11,13 @@ use crate::engine_api::{SERVER_HANDLE_V1, engine_interface_v1};
 ///
 /// No `map_struct_create`: `map_elem_insert` creates the Map from the attributes handed to it,
 /// which is the only way to get a Map and its metadata element without a window.
-const REQUIRED: [&str; 10] = [
+const REQUIRED: [&str; 11] = [
     "remove",
     "map_elem_alloc",
     "map_elem_free",
     "map_elem_release",
     "map_elem_insert",
+    "map_elem_update",
     "map_elem_delete",
     "map_elem_get",
     "getattr",
@@ -31,6 +32,7 @@ fn present(vt: &engine_interface_v1, name: &str) -> bool {
         "map_elem_free" => vt.map_elem_free.is_some(),
         "map_elem_release" => vt.map_elem_release.is_some(),
         "map_elem_insert" => vt.map_elem_insert.is_some(),
+        "map_elem_update" => vt.map_elem_update.is_some(),
         "map_elem_delete" => vt.map_elem_delete.is_some(),
         "map_elem_get" => vt.map_elem_get.is_some(),
         "getattr" => vt.getattr.is_some(),
