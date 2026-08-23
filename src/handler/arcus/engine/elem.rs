@@ -400,8 +400,15 @@ impl Store {
     /// would otherwise be found by is already answered — this skips the hash lookup and the
     /// refcount pair that `map_elem_get` costs, on a path that runs once per visited node.
     ///
-    /// **Only safe while a refcount stands on `addr`.** The graph's held set is what guarantees
-    /// that: the predicate runs with its read lock held and only for keys the set contains.
+    /// Two things have to hold, because this read takes no engine lock.
+    ///
+    /// **The element must not be freed.** The graph's held set guarantees that: the predicate
+    /// runs with its read lock held and only for keys the set contains.
+    ///
+    /// **The element must not change.** A linked element is immutable here — every write that
+    /// changes a value replaces the element instead of editing it, which is why `vsetattr` does
+    /// not use `map_elem_update`. The engine's in-place branch would rewrite these bytes under
+    /// this read, and a client's `mop update` still can; see `미해결.md §2`.
     ///
     /// `None` means the engine described the element in a way that cannot be read, or the ATTR
     /// does not decode — either way the caller has no attributes to judge.
