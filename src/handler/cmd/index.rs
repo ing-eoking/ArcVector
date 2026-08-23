@@ -90,6 +90,8 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
                 eprintln!(
                     "ArcVector: index '{name}' had no Map; released the graph it was built from"
                 );
+                // Not on this connection's clock: the graph may hold millions of refcounts.
+                registry::retire(previous);
             }
             Ok(Reply::Created)
         }

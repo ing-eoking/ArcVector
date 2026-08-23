@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, TryReserveError};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, PoisonError, RwLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, PoisonError, RwLock};
 
 use crate::handler::usearch::AnnIndex;
 
@@ -105,6 +105,71 @@ fn write() -> std::sync::RwLockWriteGuard<'static, HashMap<String, Arc<VectorInd
     INDICES.write().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Graphs on their way out, dropped somewhere other than the thread that evicted them.
+///
+/// Dropping a `VectorIndex` is not cheap: the last `Arc` runs `AnnIndex::drop`, which hands back
+/// a refcount per vector — `map_elem_release` takes the engine's cache lock every hundred — and
+/// then destroys the HNSW index. On a two-million-vector graph that is a long time to spend on
+/// a connection that asked for something else, and longer still to spend holding the registry's
+/// write lock, which every command's name lookup needs.
+///
+/// So an evicted entry is handed here instead. The thread needs no connection: releasing
+/// refcounts and destroying a graph are calls that ignore the cookie.
+struct Reaper {
+    queue: Mutex<Vec<Arc<VectorIndex>>>,
+    wake: Condvar,
+}
+
+static REAPER: LazyLock<Reaper> = LazyLock::new(|| {
+    std::thread::Builder::new()
+        .name("arcvector-reap".to_owned())
+        .spawn(run_reaper)
+        .expect("spawn the reaper thread");
+    Reaper {
+        queue: Mutex::new(Vec::new()),
+        wake: Condvar::new(),
+    }
+});
+
+fn run_reaper() {
+    loop {
+        let evicted = {
+            let mut queue = REAPER.queue.lock().unwrap_or_else(PoisonError::into_inner);
+            loop {
+                if let Some(index) = queue.pop() {
+                    break index;
+                }
+                queue = REAPER
+                    .wake
+                    .wait(queue)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        };
+        // Outside the queue lock, because this is the expensive part.
+        drop(evicted);
+    }
+}
+
+/// Hand an entry that has left the registry to the reaper. **Call with no registry guard held.**
+///
+/// If it is not the last `Arc` this only moves a reference — whichever command still holds one
+/// pays for the teardown when it finishes, and that thread was using the index anyway. What
+/// this covers is the case the sweep creates: nobody is using it, so the eviction itself would
+/// otherwise pay.
+pub(in crate::handler) fn retire(evicted: Option<Arc<VectorIndex>>) {
+    let Some(index) = evicted else { return };
+    let mut queue = REAPER.queue.lock().unwrap_or_else(PoisonError::into_inner);
+    if queue.try_reserve(1).is_err() {
+        // Nowhere to put it. Tearing it down here costs this thread the time, which still beats
+        // leaking the graph.
+        drop(queue);
+        drop(index);
+        return;
+    }
+    queue.push(index);
+    REAPER.wake.notify_one();
+}
+
 /// Look a name up, releasing the registry lock immediately.
 pub fn get(name: &str) -> Option<Arc<VectorIndex>> {
     read().get(name).cloned()
@@ -157,7 +222,9 @@ pub fn unput(ours: &VectorIndex, previous: Option<Arc<VectorIndex>>) {
             }
         }
         None => {
-            reg.remove(name);
+            let evicted = reg.remove(name);
+            drop(reg);
+            retire(evicted);
         }
     }
 }
@@ -174,7 +241,9 @@ pub fn remove_if_stale(name: &str, stamp: u64) -> bool {
             if at == 0 || at >= stamp {
                 return false;
             }
-            reg.remove(name);
+            let evicted = reg.remove(name);
+            drop(reg);
+            retire(evicted);
             true
         }
         None => false,
@@ -197,7 +266,11 @@ pub fn insert_or_get(index: VectorIndex) -> Result<(Arc<VectorIndex>, bool), Try
 }
 
 pub fn remove(name: &str) -> bool {
-    write().remove(name).is_some()
+    // The guard is a temporary and goes at the semicolon; the entry outlives it.
+    let evicted = write().remove(name);
+    let had = evicted.is_some();
+    retire(evicted);
+    had
 }
 
 /// Remove `name` only while it still holds `observed`.
@@ -211,7 +284,9 @@ pub fn remove_observed(name: &str, observed: &VectorIndex) -> bool {
     let mut reg = write();
     match reg.get(name) {
         Some(current) if std::ptr::eq(Arc::as_ptr(current), observed) => {
-            reg.remove(name);
+            let evicted = reg.remove(name);
+            drop(reg);
+            retire(evicted);
             true
         }
         _ => false,

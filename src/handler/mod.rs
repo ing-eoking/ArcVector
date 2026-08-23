@@ -55,8 +55,10 @@ pub unsafe fn run(cookie: *const c_void, request: Request) -> Result<Reply> {
         Request::Line(Line::Stats) => vstats(),
     };
 
-    // After the answer, so the sweep is never part of a command's latency, and on this thread
-    // because it has the cookie an engine read may be handed — see `sweep`.
+    // After the answer is decided, and on this thread because probing takes the cookie an
+    // engine read may be handed. The answer has not gone out yet, so what happens here is on
+    // this connection's clock: `sweep` bounds it, and hands the expensive part to a thread of
+    // its own.
     access::sweep::maybe(store);
     reply
 }
