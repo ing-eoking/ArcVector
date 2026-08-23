@@ -26,6 +26,14 @@ const ITEM_TYPE_MAP: c_int = 3;
 /// It is also the point of no return: `do_map_elem_link` emits `CLOG_MAP_ELEM_INSERT`, which
 /// is what carries the write to replicas and the persistence log. Allocating logs nothing, so
 /// everything that can fail belongs on this side of it.
+/// What one `map_elem_insert` did.
+struct Published {
+    /// The Map was not there and this call made it.
+    created: bool,
+    /// The field was taken and this element took its place.
+    replaced: bool,
+}
+
 #[must_use = "an uninserted element is invisible; insert it or drop it"]
 pub struct PendingElem<'a> {
     store: &'a Store,
@@ -73,8 +81,13 @@ impl PendingElem<'_> {
 
     /// Publish the element into a Map that already exists, replacing whatever was under the
     /// same field. On failure `Drop` hands the space back.
-    pub fn insert(self) -> Result<()> {
-        self.publish(ptr::null_mut(), true).map(|_| ())
+    /// Reports whether it **replaced** one that was already there.
+    ///
+    /// `false` means the field was free and this became a new element, count and all. A writer
+    /// that meant to replace has to look at that: an upsert brings back an element something
+    /// else deleted while the value was being prepared.
+    pub fn insert(self) -> Result<bool> {
+        self.publish(ptr::null_mut(), true).map(|p| p.replaced)
     }
 
     /// Publish the element, creating the Map with `attr` when it is not there. Reports
@@ -90,11 +103,12 @@ impl PendingElem<'_> {
     /// caller has to take it back out — see `vcreate`.
     pub fn insert_creating(self, mut attr: item_attr) -> Result<bool> {
         self.publish(ptr::from_mut(&mut attr), false)
+            .map(|p| p.created)
     }
 
     /// `attr` non-null lets the engine create the Map; null requires it to exist. Reports
     /// whether the Map was created by this call.
-    fn publish(mut self, attr: *mut item_attr, replace_if_exist: bool) -> Result<bool> {
+    fn publish(mut self, attr: *mut item_attr, replace_if_exist: bool) -> Result<Published> {
         let Some(insert) = self.store.vtable().map_elem_insert else {
             return Err(StoreError::Unavailable);
         };
@@ -121,7 +135,7 @@ impl PendingElem<'_> {
         check(code)?;
         // The engine owns it now; keep `Drop` from freeing it.
         self.item = ptr::null_mut();
-        Ok(created)
+        Ok(Published { created, replaced })
     }
 }
 
@@ -211,7 +225,7 @@ impl Store {
 
     /// Allocate and insert in one step, for writes with nothing to undo.
     pub fn put_elem(&self, key: &str, field: &str, value: &[u8]) -> Result<()> {
-        self.alloc_elem(key, field, value)?.insert()
+        self.alloc_elem(key, field, value)?.insert().map(|_| ())
     }
 
     pub fn delete_elem(&self, key: &str, field: &str) -> Result<()> {

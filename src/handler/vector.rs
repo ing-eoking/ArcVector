@@ -80,7 +80,9 @@ pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
         // Reading it back rather than trusting `pending.addr()` is what makes the key the
         // element the Map actually holds, whatever landed in between.
         || {
-            pending.insert()?;
+            // Replacing or landing on a free field are both this command's business, so what
+            // `insert` reports about which one happened is not.
+            let _replaced = pending.insert()?;
             store.hold_addr(name, id).map(HeldAddr::keep)
         },
     ) {
@@ -206,7 +208,14 @@ pub fn vsetattr(store: &Store, name: &str, id: &str, attr: &[u8]) -> Result<Repl
                 .map_err(|_| StoreError::CorruptElement)?;
             let pending = store.alloc_elem(name, id, &value)?;
             let addr = pending.addr();
-            pending.insert()?;
+            if !pending.insert()? {
+                // The field was free, so this became a *new* element rather than taking one's
+                // place — something deleted it while the value was being prepared, and an
+                // upsert would bring it back from the dead. Take it out and answer as the read
+                // would have.
+                let _ = store.delete_elem(name, id);
+                return Err(StoreError::ElemGone);
+            }
             // The refcount the graph takes over. Read back rather than assumed, so the node
             // follows the element the Map actually holds.
             let held = store.hold_addr(name, id)?;
