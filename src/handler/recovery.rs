@@ -101,7 +101,6 @@ fn run_builder() {
 }
 
 fn refill(store: &Store, index: &VectorIndex, held: &mut HeldMap) -> Result<usize> {
-    let mut kept: Vec<u64> = Vec::new();
     index.ann.reserve(held.len())?;
 
     let layout = index.ann.layout;
@@ -122,11 +121,8 @@ fn refill(store: &Store, index: &VectorIndex, held: &mut HeldMap) -> Result<usiz
             .add_unless_known(addr, || Ok(Some(vector.clone())))?;
         if replayed {
             added += 1;
-            kept.push(addr);
+            held.keep(addr);
         }
-    }
-    for addr in kept {
-        held.keep(addr);
     }
     Ok(added)
 }

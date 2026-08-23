@@ -31,6 +31,7 @@ fn similar(
     out: &mut String,
 ) -> Result<()> {
     let layout = index.ann.layout;
+    let k = k.min((index.maxcount as usize).max(1));
 
     let stamp = crate::handler::registry::now();
 
@@ -63,7 +64,7 @@ fn similar(
 
     let named = index.ann.search(query, k, accept)?;
 
-    let mut rendered = Vec::with_capacity(k);
+    let mut rendered = Vec::with_capacity(named.len().min(k));
     for (key, id, distance) in named {
         if rendered.len() == k {
             break;

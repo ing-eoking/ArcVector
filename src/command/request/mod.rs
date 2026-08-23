@@ -11,6 +11,8 @@ use crate::{ATTR_BYTES, Metric};
 
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
 
+pub const MAX_RESULTS: usize = i32::MAX as usize;
+
 #[derive(Debug)]
 pub enum Parsed<'a> {
     Line(Line<'a>),

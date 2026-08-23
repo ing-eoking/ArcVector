@@ -371,12 +371,12 @@ impl AnnIndex {
 
     pub fn forget_unreadable(&self, addr: u64) -> bool {
         let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
-        let was_held = if self.rebuilding.load(Ordering::Acquire) {
-            let _ = held.reserve_tombstone();
-            held.take_tombstoned(addr)
-        } else {
-            held.take(addr)
-        };
+        let was_held =
+            if self.rebuilding.load(Ordering::Acquire) && held.reserve_tombstone().is_ok() {
+                held.take_tombstoned(addr)
+            } else {
+                held.take(addr)
+            };
         if was_held {
             self.elements.release(&[addr]);
         }

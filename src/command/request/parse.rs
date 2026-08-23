@@ -148,8 +148,10 @@ fn parse_sim_key<'a>(tokens: &Tokens<'a>) -> Result<SimKey<'a>> {
 
 fn result_count(tokens: &Tokens, at: usize) -> Result<usize> {
     let k: usize = tokens.parse(at, "result count")?;
-    if k == 0 {
-        return Err(Error::bad_request("result count must be at least 1"));
+    if k == 0 || k > MAX_RESULTS {
+        return Err(Error::bad_request(format!(
+            "result count must be between 1 and {MAX_RESULTS}"
+        )));
     }
     Ok(k)
 }
@@ -590,6 +592,17 @@ mod tests {
         assert!(err("VSIM ID docs 5 v1").contains("expected VECTOR or KEY"));
         assert!(err("VSIM KEY docs 0 v1").contains("result count"));
         assert!(err("VSIM VECTOR docs 0 4096 1024").contains("result count"));
+    }
+
+    #[test]
+    fn a_result_count_past_the_ceiling_is_refused_before_anything_is_sized_by_it() {
+        let over = MAX_RESULTS + 1;
+        assert!(err(&format!("VSIM KEY docs {over} v1")).contains("result count"));
+        assert!(err(&format!("VSIM VECTOR docs {over} 4096 1024")).contains("result count"));
+
+        assert!(on_line(&format!("VSIM KEY docs {MAX_RESULTS} v1"), |t| {
+            matches!(parse(t), Ok(Parsed::Line(_)))
+        }));
     }
 
     fn filter_of(line: &str) -> Result<Option<Filter>> {
