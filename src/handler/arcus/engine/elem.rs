@@ -53,6 +53,14 @@ impl Drop for PendingElem<'_> {
 }
 
 impl PendingElem<'_> {
+    /// Where this element lives, which is the graph's key for it once it is linked.
+    ///
+    /// `map_elem_insert` links *this* allocation — a replace hands the engine the new element
+    /// and unlinks the old one — so the address is known before the write and does not move.
+    pub fn addr(&self) -> u64 {
+        self.item as u64
+    }
+
     /// The reserved value bytes, to be filled before `insert`.
     ///
     /// Nothing can read them: the element is not part of the Map until `insert`, so this is
@@ -350,6 +358,79 @@ impl Store {
             .map_err(|_| StoreError::CorruptElement)
     }
 
+    /// Take a refcount on one element and report where it lives.
+    ///
+    /// The address is the graph's key for that element. The refcount is what makes it stay one:
+    /// the engine frees an element only once no refcount stands, so an unlinked one keeps its
+    /// address instead of handing it to whatever the slab allocates next.
+    pub fn hold_addr(&self, key: &str, field: &str) -> Result<HeldAddr<'_>> {
+        let elems = self.fetch(key, Some(field))?;
+        let addr = match elems.as_slice() {
+            Some(items) => items[0] as u64,
+            None => return Err(StoreError::ElemGone),
+        };
+        // The refcount moves to the returned guard.
+        std::mem::forget(elems);
+        Ok(HeldAddr { store: self, addr })
+    }
+
+    /// Read one element and delete it in the same call, keeping the refcount.
+    ///
+    /// The hold outlives the unlink, which is what lets the caller still use the address to
+    /// find the node — and stops the engine handing that address to another element before it
+    /// has.
+    pub fn take_addr(&self, key: &str, field: &str) -> Result<Option<HeldAddr<'_>>> {
+        match self.fetch_with(key, Some(field), true) {
+            Ok(elems) => {
+                let addr = match elems.as_slice() {
+                    Some(items) => items[0] as u64,
+                    None => return Ok(None),
+                };
+                std::mem::forget(elems);
+                Ok(Some(HeldAddr { store: self, addr }))
+            }
+            Err(StoreError::ElemGone) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Hand back refcounts the graph was holding.
+    pub fn release_held(&self, addrs: &[u64]) {
+        if addrs.is_empty() {
+            return;
+        }
+        let Some(release) = self.vtable().map_elem_release else {
+            return;
+        };
+        let mut array: Vec<*mut eitem> = addrs.iter().map(|a| *a as *mut eitem).collect();
+        // SAFETY: each address still carries a refcount this store took, and release ignores
+        // the cookie and locks the engine's cache itself.
+        unsafe {
+            release(
+                self.handle(),
+                self.cookie,
+                array.as_mut_ptr(),
+                as_int(array.len()),
+            );
+        }
+    }
+
+    /// The field bytes of the element at `addr` — its id.
+    ///
+    /// Only safe while a refcount stands on it; the graph's held set is what guarantees that.
+    pub fn id_at(&self, addr: u64) -> Option<std::sync::Arc<str>> {
+        let elems = Elems {
+            store: self,
+            array: ptr::null_mut(),
+            count: 0,
+        };
+        let view = elems.view(addr as *mut eitem).ok()?;
+        std::mem::forget(elems);
+        Some(std::sync::Arc::from(
+            String::from_utf8_lossy(view.0).as_ref(),
+        ))
+    }
+
     /// Take and keep the engine's hold on every element of a Map.
     ///
     /// For a refill: the fetch happens here, on a thread with a connection, and the result goes
@@ -363,6 +444,7 @@ impl Store {
                 return Ok(HeldMap {
                     array: ptr::null_mut(),
                     count: 0,
+                    kept: std::collections::HashSet::new(),
                 });
             }
             Err(e) => return Err(e),
@@ -370,6 +452,7 @@ impl Store {
         let held = HeldMap {
             array: elems.array,
             count: elems.count,
+            kept: std::collections::HashSet::new(),
         };
         // Ownership of the array and the refcounts moves to `held`.
         std::mem::forget(elems);
@@ -505,6 +588,10 @@ impl Drop for Elems<'_> {
 pub struct HeldMap {
     array: *mut *mut eitem,
     count: usize,
+    /// Addresses whose refcount has been handed to the graph. A refill keys its nodes by these,
+    /// so the hold has to outlive the snapshot — releasing one here would let the engine free
+    /// an element the graph is still pointing at.
+    kept: std::collections::HashSet<u64>,
 }
 
 // SAFETY: the array and the elements are plain engine memory with no thread affinity, and the
@@ -512,11 +599,12 @@ pub struct HeldMap {
 unsafe impl Send for HeldMap {}
 
 impl HeldMap {
-    /// Read every element as `(field, value)`, skipping any the engine cannot describe.
+    /// Read every element as `(address, field, value)`, skipping any the engine cannot
+    /// describe. The address is the graph's key for that element.
     ///
     /// Needs a `Store` only for the engine handle; the cookie is unused on this path, so a
     /// detached one is what the rebuild thread passes.
-    pub fn read(&self, store: &Store) -> Vec<(Vec<u8>, Vec<u8>)> {
+    pub fn read(&self, store: &Store) -> Vec<(u64, Vec<u8>, Vec<u8>)> {
         let Some(items) = self.as_slice() else {
             return Vec::new();
         };
@@ -527,12 +615,24 @@ impl HeldMap {
         };
         let views = items
             .iter()
-            .filter_map(|item| elems.view(*item).ok())
-            .map(|(field, value)| (field.to_vec(), value.to_vec()))
+            .filter_map(|item| elems.view(*item).ok().map(|v| (*item as u64, v)))
+            .map(|(addr, (field, value))| (addr, field.to_vec(), value.to_vec()))
             .collect();
         // The hold belongs to `self`, not to the borrowed view.
         std::mem::forget(elems);
         views
+    }
+
+    /// Hand this element's refcount to the graph, so the snapshot does not release it.
+    ///
+    /// Reports whether it could be recorded. A refusal releases nothing early — it leaks one
+    /// refcount rather than freeing an element the graph still points at.
+    pub fn keep(&mut self, addr: u64) -> bool {
+        if self.kept.try_reserve(1).is_err() {
+            return false;
+        }
+        self.kept.insert(addr);
+        true
     }
 
     /// How many elements the snapshot holds — what a refill reserves capacity for.
@@ -561,20 +661,59 @@ impl Drop for HeldMap {
         let Some(store) = Store::detached() else {
             return;
         };
-        if let Some(release) = store.vtable().map_elem_release {
-            // SAFETY: each entry still carries `map_elem_get`'s refcount, and release ignores
-            // the cookie — see the type's documentation.
-            unsafe {
-                release(
-                    store.handle(),
-                    store.cookie,
-                    self.array,
-                    self.count as c_int,
-                );
+        // Compact in place so the ones the graph took over sit past what is released. The
+        // array is ours to rearrange — this type frees it below.
+        let mut releasing = 0usize;
+        if self.count > 0 {
+            // SAFETY: `count` entries at `array`, allocated by the engine for this result.
+            let items = unsafe { std::slice::from_raw_parts_mut(self.array, self.count) };
+            for i in 0..items.len() {
+                if !self.kept.contains(&(items[i] as u64)) {
+                    items.swap(releasing, i);
+                    releasing += 1;
+                }
             }
+        }
+        if releasing > 0
+            && let Some(release) = store.vtable().map_elem_release
+        {
+            // SAFETY: each of these still carries `map_elem_get`'s refcount, and release
+            // ignores the cookie — see the type's documentation.
+            unsafe { release(store.handle(), store.cookie, self.array, releasing as c_int) };
         }
         // SAFETY: the engine allocated it for this result.
         unsafe { free(self.array.cast::<c_void>()) };
+    }
+}
+
+/// A refcount on one element, and the address it keeps valid.
+///
+/// The graph keys nodes by element address, so it has to keep the element from being freed and
+/// handed to a different one. This is that refcount, made explicit: while it stands the address
+/// means what it meant.
+#[must_use = "dropping this releases the address the graph is keyed by"]
+pub struct HeldAddr<'a> {
+    store: &'a Store,
+    addr: u64,
+}
+
+impl HeldAddr<'_> {
+    pub fn addr(&self) -> u64 {
+        self.addr
+    }
+
+    /// Hand the refcount to the graph. Nothing is released; the caller becomes responsible for
+    /// it through [`Store::release_held`].
+    pub fn keep(self) -> u64 {
+        let addr = self.addr;
+        std::mem::forget(self);
+        addr
+    }
+}
+
+impl Drop for HeldAddr<'_> {
+    fn drop(&mut self) {
+        self.store.release_held(&[self.addr]);
     }
 }
 

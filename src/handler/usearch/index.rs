@@ -12,7 +12,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 // `::` because this module shares a name with the crate it wraps.
 use ::usearch::{Index, IndexOptions, ScalarKind, b1x8, f16};
 
-use super::idmap::{IdMap, generation_of, key_of, slot_of};
+use super::held::{self, Elements, HeldSet};
 use super::metric::Metric;
 use crate::error::Error;
 use crate::handler::arcus::element::Layout;
@@ -106,6 +106,24 @@ impl Drop for Staged<'_> {
     }
 }
 
+impl Drop for AnnIndex {
+    fn drop(&mut self) {
+        // Every element this graph pinned goes back. Nothing else will do it: the entry that
+        // owned this index is already out of the registry by the time the last `Arc` falls, so
+        // there is no caller left to ask. Skipped without it, an expired index would keep its
+        // elements allocated for the life of the process while the engine's accounting says
+        // they are free.
+        let outgoing = self
+            .held
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take_all();
+        if !outgoing.is_empty() {
+            self.elements.release(&outgoing);
+        }
+    }
+}
+
 /// Why a published write did not go through.
 ///
 /// Two failures with nothing in common: the caller's own write refused, and the mapping unable
@@ -143,39 +161,6 @@ impl Drop for InFlight<'_> {
     }
 }
 
-/// Slots handed back, and the ones that can never come back on their own.
-///
-/// Kept out of `ids` so minting a key does not take the mapping lock: a stage would then queue
-/// behind every search's translation for no reason.
-#[derive(Default)]
-struct Keys {
-    /// Complete keys, generation already advanced. FIFO, so a slot is not handed straight back
-    /// to the write that released it — that spreads the generation advance across slots and
-    /// pushes exhaustion out by the number of live slots.
-    free: std::collections::VecDeque<u64>,
-    /// Slots whose generation reached `u32::MAX`. Handing one out again would let a key from
-    /// before it retired answer, so it waits for a moment with no search in flight.
-    retired: Vec<u32>,
-    next_slot: u32,
-}
-
-/// Counts one search from before it captures keys to after it has translated them.
-#[must_use = "the count only covers the search while this is alive"]
-struct Searching<'a>(&'a AtomicUsize);
-
-impl<'a> Searching<'a> {
-    fn new(count: &'a AtomicUsize) -> Self {
-        count.fetch_add(1, Ordering::Release);
-        Searching(count)
-    }
-}
-
-impl Drop for Searching<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Release);
-    }
-}
-
 pub struct AnnIndex {
     pub layout: Layout,
     pub metric: Metric,
@@ -183,21 +168,18 @@ pub struct AnnIndex {
     /// Write-locked only to grow capacity; every other operation reads.
     inner: RwLock<Index>,
     reserved: AtomicUsize,
-    ids: RwLock<IdMap>,
-    /// Keys are minted here, not under `ids`: a fresh key needs no agreement with the
-    /// mapping, only distinctness.
-    keys: std::sync::Mutex<Keys>,
-    /// Searches between capturing keys and translating them. A retired slot cannot be revived
-    /// while this is non-zero, because such a search may hold a key the revival would make
-    /// answerable again.
-    ///
-    /// One counter for the index rather than per worker: a search costs ~65us, so even heavily
-    /// contended this pair of atomics is well under a percent of it.
-    searching: AtomicUsize,
-    /// Bumped by `clear`. A search that captured keys before a wipe must not translate them
-    /// afterwards — the slots are handed out again from zero, so an old key would match a new
-    /// id. Same idea as `Staged`'s owner token, for readers.
+    /// The elements this graph holds a refcount on, addressed by the usearch key that *is*
+    /// their address. See [`HeldSet`].
+    held: RwLock<HeldSet>,
+    /// Bumped by `clear`. A search that captured keys before a wipe must not dereference them
+    /// afterwards — the holds are on their way out and the addresses can be handed to different
+    /// elements. Same idea as `Staged`'s owner token, for readers.
     epoch: AtomicU64,
+    /// Serial for staged nodes' placeholder keys. Never reused, never an address.
+    next_placeholder: AtomicU64,
+    /// The store the graph's keys are addresses into. Held for the index's lifetime because
+    /// [`Drop`] needs it: every refcount this graph took has to go back when it does.
+    elements: Arc<dyn Elements>,
     /// Staged nodes not yet published or discarded. A search asks for this many results
     /// beyond `k`, because each one can take a slot it will then be dropped from.
     in_flight: AtomicUsize,
@@ -212,6 +194,7 @@ impl AnnIndex {
         connectivity: usize,
         expansion_add: usize,
         expansion_search: usize,
+        elements: Arc<dyn Elements>,
     ) -> Result<Self> {
         Self::with_threads(
             layout,
@@ -220,6 +203,7 @@ impl AnnIndex {
             expansion_add,
             expansion_search,
             THREAD_SLOTS,
+            elements,
         )
     }
 
@@ -231,6 +215,7 @@ impl AnnIndex {
         expansion_add: usize,
         expansion_search: usize,
         threads: usize,
+        elements: Arc<dyn Elements>,
     ) -> Result<Self> {
         metric.check_quant(layout.quant)?;
 
@@ -256,35 +241,30 @@ impl AnnIndex {
             inner: RwLock::new(index),
             reserved: AtomicUsize::new(MIN_CAPACITY),
             in_flight: AtomicUsize::new(0),
-            keys: std::sync::Mutex::new(Keys::default()),
-            searching: AtomicUsize::new(0),
+            next_placeholder: AtomicU64::new(0),
+            elements,
             epoch: AtomicU64::new(0),
-            ids: RwLock::new(IdMap::default()),
+            held: RwLock::new(HeldSet::default()),
             rebuilding: AtomicBool::new(false),
         })
     }
 
     /// How many vectors are live. Not the number ever added.
     pub fn len(&self) -> usize {
-        self.ids().len()
+        self.held().len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// The id a usearch key stands for, or `None` if it has been removed.
-    pub fn id_of(&self, key: u64) -> Option<Arc<str>> {
-        self.ids().id_of(key).map(Arc::clone)
+    fn held(&self) -> std::sync::RwLockReadGuard<'_, HeldSet> {
+        self.held.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn ids(&self) -> std::sync::RwLockReadGuard<'_, IdMap> {
-        self.ids.read().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Module memory held by the key mapping, which arcus cannot see.
+    /// Module memory the held set costs, which arcus cannot see.
     pub fn id_map_bytes(&self) -> usize {
-        self.ids().bytes()
+        self.held().bytes()
     }
 
     /// Measured, not estimated, and chunked far ahead of the data (see [`Self::used_bytes`]).
@@ -343,9 +323,12 @@ impl AnnIndex {
         self.ensure_capacity(self.live() + THREAD_SLOTS)?;
 
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
-        // No mapping lock: minting a key coordinates with nothing, so concurrent stages do
-        // not queue behind each other and searches never wait on one.
-        let key = self.mint()?;
+        // A placeholder, not the element's address. The address is known already — the caller
+        // allocated the element — but a node keyed by it would be *nameable*: the field bytes
+        // are in that allocation, so a search could dereference them and answer with an id
+        // whose element is not linked yet, for a write that can still fail. The tag keeps the
+        // node invisible until `insert_published` renames it, which is after the link.
+        let key = held::STAGED_TAG | self.next_placeholder.fetch_add(1, Ordering::Relaxed);
 
         // Counted in before the node exists, so the count is never behind the graph.
         let staged = Staged::new(key, owner, &self.in_flight);
@@ -356,112 +339,151 @@ impl AnnIndex {
         Ok(staged)
     }
 
-    /// The two registrations of an insert, under one hold on the mapping.
+    /// The two registrations of an insert, under one hold on the held set.
     ///
     /// This is the only place either store becomes visible, and the element write runs *inside*
-    /// the hold on purpose: a reader translates keys under the same lock, so it sees the state
-    /// before the mapping was touched or after the element was linked, never between. Without
+    /// the hold on purpose: a lookup dereferences under the same lock, so it sees the state
+    /// before the graph was touched or after the element was linked, never between. Without
     /// that, a plain `vsim` — which reads no element at all — would answer with an id whose
     /// element is not in the Map yet, for a write that can still fail.
     ///
     /// Holding it across the engine call costs less than it looks: `map_elem_insert` takes the
-    /// engine's cache lock, so the writes queueing here were queueing anyway. It also replaces
-    /// the per-id lock this used to need — an exclusive hold orders same-id writes by itself.
-    /// Nothing but the element write is inside: the node this write displaces comes from the
-    /// mapping, so learning it costs a hash lookup rather than an engine read.
+    /// engine's cache lock, so the writes queueing here were queueing anyway. It also orders
+    /// same-id writes by itself, which is what a per-id lock used to do.
+    ///
+    /// `displaced` finds the element this write replaces — the graph cannot say, because it
+    /// knows an outgoing element only by its address, and only the Map can name one. It runs
+    /// **inside the hold**, which is what serializes it against the link: read outside, two
+    /// writes to one id would both see the same outgoing address, and only the first would
+    /// retire it — leaving the second's predecessor held forever, with a node still answering.
+    ///
+    /// Whatever it returns comes with a refcount of its own, and this call hands that back.
     ///
     /// A takeover since the stage emptied the graph, so the node is gone and must not be
     /// named. The element is still written: a rebuild reads the Map, so the write survives
     /// there and the refill indexes it.
-    pub fn insert_published<T, E>(
+    pub fn insert_published<E>(
         &self,
-        id: &str,
         staged: Staged<'_>,
         owner: u64,
-        store: impl FnOnce() -> std::result::Result<T, E>,
-    ) -> std::result::Result<T, PublishError<E>> {
-        // Never taken while `inner` is held, so the order cannot invert against `clear`. Node
-        // removals below happen after the guard is released for the same reason.
-        let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
-        // A write already holds the mapping exclusively, which is where retired slots can be
-        // put back without racing a translation.
-        self.reclaim_retired(&mut ids);
+        displaced: impl FnOnce() -> Option<u64>,
+        link: impl FnOnce() -> std::result::Result<u64, E>,
+    ) -> std::result::Result<(), PublishError<E>> {
+        // `inner` first and `held` second, everywhere. `clear` takes `inner`'s write lock and
+        // then this one, so a call that took them the other way round — and this one needs both,
+        // because naming a published node is a `rename` on the graph — would deadlock against it.
+        let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
         let live = staged.owner == owner;
-        // The room for the binding comes before the binding, and before the element write it
-        // gates. A std collection that cannot grow aborts instead of returning, so the growth
-        // has to be asked for where the answer can still be a reply. Nothing is written yet,
-        // so the only thing to unwind is this call's own node.
-        if live && let Err(e) = ids.reserve_binding(id, staged.key) {
-            drop(ids);
+
+        // The room comes before the element write it gates. A std collection that cannot grow
+        // aborts instead of returning, so the growth has to be asked for where the answer can
+        // still be a reply. Nothing is written yet, so the only thing to unwind is this call's
+        // own node.
+        if live && let Err(e) = held.reserve() {
+            drop(held);
+            drop(index);
             let key = staged.key;
             drop(staged);
             self.drop_node(key);
             return Err(PublishError::Mapping(Error::Index(format!(
-                "the id mapping could not grow: {e}"
+                "the held set could not grow: {e}"
             ))));
         }
-        let displaced = if live { ids.bind(id, staged.key) } else { None };
 
-        match store() {
-            Ok(value) => {
-                drop(ids);
-                // Whichever node is now unreachable: the one this write replaced, or its own
-                // if a takeover means nothing will name it.
-                match (live, displaced) {
-                    (true, Some(key)) => self.drop_node(key),
-                    (false, _) => self.drop_node(staged.key),
-                    (true, None) => {}
-                }
-                Ok(value)
-            }
+        let displaced = displaced();
+        let written = link();
+        let key = staged.key;
+        drop(staged);
+
+        let addr = match written {
+            Ok(addr) => addr,
             Err(e) => {
-                // The element was never written, so nothing left this node and the mapping has
-                // to read as it did before. Neither restore can allocate: `bind` here only
-                // overwrites an id `by_id` already holds, into a slot that already exists.
-                if live {
-                    match displaced {
-                        Some(key) => {
-                            ids.bind(id, key);
-                        }
-                        None => {
-                            ids.forget(id);
-                        }
-                    }
+                // The element was never written, so nothing left this node and the graph has to
+                // read as it did before. The node still carries its placeholder, so nothing
+                // could have named it in the meantime.
+                if let Some(old) = displaced {
+                    self.elements.release(&[old]);
                 }
-                drop(ids);
-                self.drop_node(staged.key);
-                Err(PublishError::Store(e))
+                drop(held);
+                drop(index);
+                self.drop_node(key);
+                return Err(PublishError::Store(e));
             }
+        };
+
+        // A takeover since the stage emptied the graph, so this node is gone and must not be
+        // named. The element is still written — a rebuild reads the Map, so the write survives
+        // there — but the refcount `link` took is nobody's to keep.
+        if !live {
+            let mut back = vec![addr];
+            back.extend(displaced);
+            self.elements.release(&back);
+            drop(held);
+            drop(index);
+            self.drop_node(key);
+            return Ok(());
         }
+
+        // The link happened, so the address is an element in the Map and the node may answer
+        // under it. `rename` moves the key without touching the graph — the address is fresh,
+        // so nothing can already hold it.
+        let renamed = index.rename(key, addr);
+        if let Err(e) = renamed {
+            // The element is written and the node cannot be named for it. Leave the Map alone —
+            // a rebuild indexes it — and take the node out rather than leave one answering
+            // under a placeholder.
+            let mut back = vec![addr];
+            back.extend(displaced);
+            self.elements.release(&back);
+            drop(held);
+            drop(index);
+            eprintln!("ArcVector: could not name a published node: {e}");
+            self.drop_node(key);
+            return Ok(());
+        }
+        held.publish(addr);
+
+        // The element this write replaced is now unreachable. Two refcounts may stand on it —
+        // the one `displaced` took to name it, and the graph's, if the graph had it — and both
+        // go back before the lock does, which is what keeps a lookup from reading an address on
+        // its way out. See `HeldSet::take`.
+        let retired = displaced.is_some_and(|old| held.take(old));
+        if let Some(old) = displaced {
+            let back = if retired { vec![old, old] } else { vec![old] };
+            self.elements.release(&back);
+        }
+        drop(held);
+        drop(index);
+        if retired && let Some(old) = displaced {
+            self.drop_node(old);
+        }
+        Ok(())
     }
 
-    /// Drop `id` from the graph without touching the Map.
+    /// Drop the node at `addr` without touching the Map.
     ///
     /// For an element the engine describes in a way that cannot be read. The Map is left alone —
     /// deleting on a description we do not trust would be acting on the same bad reading — but
-    /// the graph must stop offering the id, or every search returns a row that cannot render.
+    /// the graph must stop offering it, or every search returns a row that cannot render.
     ///
-    /// Reports whether the mapping had a key for it.
-    pub fn forget_unreadable(&self, id: &str) -> bool {
-        let key = {
-            let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
-            if self.rebuilding.load(Ordering::Acquire) {
-                // A refill must not put it back.
-                if ids.reserve_tombstone().is_err() {
-                    ids.forget(id)
-                } else {
-                    ids.forget_tombstoned(id)
-                }
-            } else {
-                ids.forget(id)
-            }
+    /// Reports whether this graph held it.
+    pub fn forget_unreadable(&self, addr: u64) -> bool {
+        let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
+        let was_held = if self.rebuilding.load(Ordering::Acquire) {
+            // A refill must not put it back. A refusal to make room is not worth failing over
+            // here: the worst of it is that the refill re-adds an element nobody can read.
+            let _ = held.reserve_tombstone();
+            held.take_tombstoned(addr)
+        } else {
+            held.take(addr)
         };
-        // After the hold, like every other node removal here.
-        if let Some(key) = key {
-            self.drop_node(key);
-            return true;
+        if was_held {
+            self.elements.release(&[addr]);
         }
-        false
+        drop(held);
+        self.drop_node(addr);
+        was_held
     }
 
     /// Throw a staged node away. The mapping never named it, so there is nothing to restore.
@@ -469,89 +491,30 @@ impl AnnIndex {
         self.drop_node(staged.key);
     }
 
-    /// Mint a key nothing has held before.
+    /// Detach a node from the graph. The refcount is the caller's to hand back.
     ///
-    /// A recycled slot comes back with its generation advanced, so the key is new even though
-    /// the position is not. Running out is an error rather than a wrap: reviving a slot early
-    /// would let a key a search is still holding answer for a different id.
-    fn mint(&self) -> Result<u64> {
-        let mut keys = self.keys.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(key) = keys.free.pop_front() {
-            return Ok(key);
-        }
-        let slot = keys.next_slot;
-        keys.next_slot = slot.checked_add(1).ok_or_else(|| {
-            Error::Index(format!(
-                "index is out of graph slots ({} retired and waiting for a quiet moment)",
-                keys.retired.len()
-            ))
-        })?;
-        Ok(key_of(slot, 0))
-    }
-
-    /// Detach a node nothing maps to any more, and hand its slot back.
-    ///
-    /// A failure to remove leaks a node no id names, which every reader already drops, so
-    /// there is nothing for a caller to do about it. The slot goes back either way: the key
-    /// that named it is dead whether or not the node went.
+    /// A failure to remove leaks a node nothing holds, which every lookup already drops, so
+    /// there is nothing for a caller to do about it.
     fn drop_node(&self, key: u64) {
-        {
-            let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
-            let _ = index.remove(key);
-        }
-        let mut keys = self.keys.lock().unwrap_or_else(PoisonError::into_inner);
-        match generation_of(key).checked_add(1) {
-            Some(next) => keys.free.push_back(key_of(slot_of(key) as u32, next)),
-            // Its last generation is spent. Reviving it needs a moment with no search holding
-            // keys, which `reclaim_retired` waits for.
-            None => keys.retired.push(slot_of(key) as u32),
-        }
+        let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        let _ = index.remove(key);
     }
 
-    /// Put retired slots back in service, if no search could be holding one of their old keys.
+    /// Add the element at `addr` unless a rebuild has a reason to leave it alone.
     ///
-    /// Called by writes, which already hold `ids` exclusively. A search raises `searching`
-    /// before it captures any key and lowers it after translating, so zero here means no key
-    /// is in flight. On a permanently busy index this never fires — and that is survivable,
-    /// because a slot retires at worst once a day under the most concentrated write load
-    /// there is, so the slot space outlasts the process by a wide margin.
-    fn reclaim_retired(&self, ids: &mut IdMap) {
-        if self.searching.load(Ordering::Acquire) != 0 {
-            return;
-        }
-        let mut keys = self.keys.lock().unwrap_or_else(PoisonError::into_inner);
-        if keys.retired.is_empty() {
-            return;
-        }
-        // Re-check under the lock that raised it, so a search that started meanwhile is seen.
-        if self.searching.load(Ordering::Acquire) != 0 {
-            return;
-        }
-        let reviving: Vec<u32> = keys.retired.drain(..).collect();
-        for slot in reviving {
-            ids.revive(slot);
-            keys.free.push_back(key_of(slot, 0));
-        }
-    }
-
-    /// Add `id` only if a rebuild has no reason to leave it alone.
-    ///
-    /// `vector` runs inside the hold: the refill's read of the stored element and its claim on
-    /// the mapping have to be one step, or a live write that lands between them is replayed
-    /// over. `None` means the element went away since the refill listed it.
-    ///
-    /// The key is minted here. Nothing stored says what a rebuilt node should be called, so a
-    /// refill names its nodes afresh; only the ids have to come back.
+    /// `vector` runs inside the hold: the refill's decision and its claim on the address are
+    /// one step, so a live write and a replay of the same element cannot interleave. The
+    /// refcount on the snapshot element belongs to the caller until this returns `true`, at
+    /// which point the graph has taken it over.
     pub fn add_unless_known(
         &self,
-        id: &str,
+        addr: u64,
         vector: impl FnOnce() -> Result<Option<Vec<u8>>>,
     ) -> Result<bool> {
-        // `inner` before `ids`, the order `clear` takes them in.
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
-        let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
+        let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
 
-        if ids.is_known(id) {
+        if held.is_known(addr) {
             return Ok(false);
         }
         let Some(vector) = vector()? else {
@@ -564,18 +527,10 @@ impl AnnIndex {
                 self.layout.vector_bytes()
             )));
         }
-        // `is_known` just said no, so the mapping is this call's to undo. The name goes on
-        // before the insert here — unlike an insert's stage — because the refill has to hold
-        // the `is_known` verdict and the claim on `id` under one lock.
-        let key = self.mint()?;
-        // Before the binding and before the node, so a refusal costs this call and nothing else.
-        ids.reserve_binding(id, key)
-            .map_err(|e| Error::Index(format!("the id mapping could not grow: {e}")))?;
-        ids.bind(id, key);
-        if let Err(e) = self.typed_add(&index, key, &vector) {
-            ids.forget(id);
-            return Err(e);
-        }
+        held.reserve()
+            .map_err(|e| Error::Index(format!("the held set could not grow: {e}")))?;
+        self.typed_add(&index, addr, &vector)?;
+        held.publish(addr);
         Ok(true)
     }
 
@@ -591,10 +546,7 @@ impl AnnIndex {
     }
 
     fn live(&self) -> usize {
-        self.ids
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .len()
+        self.held().len()
     }
 
     fn typed_add(&self, index: &Index, key: u64, vector: &[u8]) -> Result<()> {
@@ -607,18 +559,20 @@ impl AnnIndex {
         .map_err(usearch_err)
     }
 
-    /// The stored vector for `id`, read back out of the graph.
+    /// The stored vector for the element at `addr`, read back out of the graph.
     ///
     /// usearch keeps the vectors it was given, in the quantization the index was built with —
     /// the same bytes the Map used to carry. That copy is why a build without recovery does not
     /// store a second one, and this is what `vsim KEY` reads its query from.
     ///
-    /// `None` means nothing names `id`.
-    pub fn vector_of(&self, id: &str) -> Result<Option<Vec<u8>>> {
-        let Some(key) = self.ids().key_of(id) else {
-            return Ok(None);
-        };
+    /// `None` means the graph has no node for that element.
+    pub fn vector_of(&self, addr: u64) -> Result<Option<Vec<u8>>> {
+        // `inner` before `held`, as everywhere — see `insert_published`.
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        if !self.held().contains(addr) {
+            return Ok(None);
+        }
+        let key = addr;
         let dim = self.layout.dim;
         // Read in the index's own scalar type, so nothing is converted and the bytes come back
         // exactly as `Quant::encode` would have written them.
@@ -657,7 +611,7 @@ impl AnnIndex {
         };
         if bytes.len() != self.layout.vector_bytes() {
             return Err(Error::Index(format!(
-                "the graph returned {} bytes for '{id}', expected {}",
+                "the graph returned {} bytes for {addr:#x}, expected {}",
                 bytes.len(),
                 self.layout.vector_bytes()
             )));
@@ -673,19 +627,20 @@ impl AnnIndex {
     pub fn begin_rebuild(&self) -> Result<()> {
         // Recording deletes starts before the graph is emptied, so a racing delete is still remembered.
         self.rebuilding.store(true, Ordering::Release);
-        self.clear()
+        self.clear_with()
     }
 
     /// Stop recording deletes and drop what was recorded.
     pub fn end_rebuild(&self) {
-        let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
+        let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
         self.rebuilding.store(false, Ordering::Release);
-        ids.tombstones.clear();
+        held.forget_tombstones();
     }
 
-    pub fn clear(&self) -> Result<()> {
+    /// Throw away every member and hand back every refcount.
+    pub fn clear_with(&self) -> Result<()> {
         let index = self.inner.write().unwrap_or_else(PoisonError::into_inner);
-        let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
+        let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
         index.reset().map_err(usearch_err)?;
         // `reset` deallocates the thread contexts along with the members, so put the floor
         // back under both: an `AnnIndex` is never without a context for a search to take.
@@ -695,86 +650,107 @@ impl AnnIndex {
         self.reserved.store(MIN_CAPACITY, Ordering::Release);
         // Anything staged against the graph this emptied must not be named afterwards. The
         // caller changes the index's owner before getting here, which is what says so.
-        *ids = IdMap::default();
-        // Slots start over too, so the array does not carry a dead prefix the size of every
-        // key the old graph ever used. That makes old keys answerable again, which is what the
-        // epoch closes: a search that captured keys before this point discards them.
-        *self.keys.lock().unwrap_or_else(PoisonError::into_inner) = Keys::default();
+        //
+        // Every refcount goes back before the lock does. Those addresses can then be handed to
+        // different elements, and a search that captured one before this point would read the
+        // wrong id from it — the epoch is what makes it discard them instead.
+        let outgoing = held.take_all();
+        if !outgoing.is_empty() {
+            self.elements.release(&outgoing);
+        }
         self.epoch.fetch_add(1, Ordering::Release);
-        drop(ids);
+        drop(held);
         Ok(())
     }
 
-    /// The two removals of a delete, under one hold on the mapping.
+    /// The two removals of a delete, under one hold on the held set.
     ///
-    /// `take` unlinks the element and reports whether there was one — the engine first, always,
-    /// because that is the copy replicas and the persistence log follow. Under the same hold as
-    /// the mapping removal, a reader cannot see the element gone while the mapping still names
-    /// the node, nor the reverse.
+    /// `take` unlinks the element and reports **where it was** — the engine first, always,
+    /// because that is the copy replicas and the persistence log follow, and because the
+    /// address it hands back is the graph's key for that element. Under the same hold as the
+    /// graph removal, a lookup cannot see the element gone while the node still answers for it,
+    /// nor the reverse.
     ///
-    /// The count is raised for the whole call: a search that resolved this id just before the
-    /// hold renders after it, finds nothing to read, and drops the row.
+    /// The count is raised for the whole call: a search that read this key just before the hold
+    /// resolves after it, finds nothing holding the address, and drops the row.
     ///
-    /// `None` means there was no element. `Some(named)` also says whether the mapping had a key
-    /// for it — a rebuild that has not reached this id yet leaves it unnamed.
+    /// `None` means there was no element. `Some(had_node)` also says whether the graph had one
+    /// — a rebuild that has not reached this element yet leaves it out.
     pub fn remove_published<E>(
         &self,
-        id: &str,
-        take: impl FnOnce() -> std::result::Result<bool, E>,
+        take: impl FnOnce() -> std::result::Result<Option<u64>, E>,
     ) -> std::result::Result<Option<bool>, PublishError<E>> {
         let _slack = InFlight::new(&self.in_flight);
-        let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
+        let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
 
-        // While rebuilding, a deleted id is remembered so the refill cannot replay it — and
-        // the room for that has to be taken *before* the element goes. Once the engine has
+        // While rebuilding, a deleted element is remembered so the refill cannot replay it —
+        // and the room for that has to be taken *before* the element goes. Once the engine has
         // deleted it there is no failure left to report: the delete is already on its way to
         // the replicas, and refusing here would answer for a state that no longer exists.
         let tombstone = self.rebuilding.load(Ordering::Acquire);
-        if tombstone && let Err(e) = ids.reserve_tombstone() {
+        if tombstone && let Err(e) = held.reserve_tombstone() {
             return Err(PublishError::Mapping(Error::Index(format!(
-                "the id mapping could not grow: {e}"
+                "the held set could not grow: {e}"
             ))));
         }
 
-        if !take().map_err(PublishError::Store)? {
+        let Some(addr) = take().map_err(PublishError::Store)? else {
             return Ok(None);
-        }
-
-        let key = if tombstone {
-            ids.forget_tombstoned(id)
-        } else {
-            ids.forget(id)
         };
-        drop(ids);
 
-        // After the hold, and unchecked: it leaves a node no id names, which every reader
-        // already drops.
-        if let Some(key) = key {
-            self.drop_node(key);
+        // `take` left the caller holding a refcount of its own on the unlinked element, so the
+        // address stays valid whether or not the graph had it.
+        let had_node = if tombstone {
+            held.take_tombstoned(addr)
+        } else {
+            held.take(addr)
+        };
+        if had_node {
+            self.elements.release(&[addr]);
         }
-        Ok(Some(key.is_some()))
+        drop(held);
+
+        // After the hold, and unchecked: it leaves a node nothing holds, which every lookup
+        // already drops.
+        if had_node {
+            self.drop_node(addr);
+        }
+        Ok(Some(had_node))
     }
 
     /// Translate search hits under one hold, so no write's two steps are seen half-done.
     ///
     /// Keys the mapping does not name are dropped: a node staged by a `vadd` that has not
-    /// reached [`Self::insert_published`] yet, one whose element a `vdel` just took, or one
-    /// whose slot has since been recycled — the generation in the key is what tells those
-    /// apart from a live node.
+    /// reached [`Self::insert_published`] yet — it still carries its placeholder tag — or one
+    /// whose element a `vdel` just took, which the held set no longer has.
     ///
-    /// `entered` is the epoch the search started in. A `clear` between then and now handed the
-    /// slots out again from zero, so these keys describe a graph that no longer exists.
+    /// **The read lock is what makes the dereference safe.** A release takes the write lock, so
+    /// an address checked here cannot be handed back before it is read.
+    ///
+    /// `entered` is the epoch the search started in. A `clear` between then and now handed every
+    /// address back, and the allocator may have given one to a different element since — these
+    /// keys describe a graph that no longer exists.
     fn resolve(&self, hits: &[(u64, f32)], entered: u64) -> Vec<(u64, Arc<str>, f32)> {
-        let ids = self.ids();
+        let held = self.held();
         if self.epoch.load(Ordering::Acquire) != entered {
             return Vec::new();
         }
         hits.iter()
             .filter_map(|(key, distance)| {
-                let id = ids.id_of(*key)?;
-                Some((*key, Arc::clone(id), *distance))
+                let id = self.name(&held, *key)?;
+                Some((*key, id, *distance))
             })
             .collect()
+    }
+
+    /// The id a key stands for, or `None` if nothing can answer for it.
+    ///
+    /// The caller holds the read lock, which is the safety condition for the dereference.
+    fn name(&self, held: &HeldSet, key: u64) -> Option<Arc<str>> {
+        if held::is_staged(key) || !held.contains(key) {
+            return None;
+        }
+        self.elements.id_at(key)
     }
 
     /// k-NN search. `accept` is called once per visited graph node and must be
@@ -826,10 +802,8 @@ impl AnnIndex {
     /// the `k`th distance while an unnameable node sits inside it — otherwise a real
     /// neighbour is cut from the candidates before it can be considered.
     ///
-    /// Capturing the keys and translating them is one call on purpose. A caller that did the
-    /// two halves itself would have to raise `searching` before the first and lower it after
-    /// the second, and getting that wrong lets a retired slot come back under a key this
-    /// search is still holding.
+    /// Capturing the keys and turning them into ids is one call on purpose. The second half
+    /// dereferences element addresses, and only this side knows the lock that makes that safe.
     pub fn search(
         &self,
         query: &[u8],
@@ -844,9 +818,6 @@ impl AnnIndex {
             )));
         }
 
-        // Raised before any key is captured and lowered after they are all translated, which
-        // is what lets a retired slot be revived only when no key is in flight.
-        let _searching = Searching::new(&self.searching);
         let entered = self.epoch.load(Ordering::Acquire);
 
         // One extra per write in flight. `Relaxed` because the count carries no ordering:
@@ -863,10 +834,13 @@ impl AnnIndex {
                 // No callback: usearch takes its `is_dummy` path, which still excludes what it
                 // removed itself, so nothing on this side is consulted per node.
                 None => self.unfiltered(&index, query, k),
-                Some(matches) => self.matches(&index, query, k, |key| match self.id_of(key) {
-                    Some(id) => matches(key, &id),
-                    None => false,
-                }),
+                Some(matches) => {
+                    let held = self.held();
+                    self.matches(&index, query, k, |key| match self.name(&held, key) {
+                        Some(id) => matches(key, &id),
+                        None => false,
+                    })
+                }
             }?
         };
 
@@ -903,18 +877,119 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// The production insert with a stubbed element write: the mapping writes, the ordering
-    /// and the lock are all real, only the engine call is absent.
-    fn publish(idx: &AnnIndex, id: &str, staged: Staged<'_>, owner: u64) {
-        let done: std::result::Result<(), PublishError<()>> =
-            idx.insert_published(id, staged, owner, || Ok(()));
+    /// Stands in for the Map: hands out addresses, remembers what each one is named, and
+    /// forgets an address when its refcount comes back.
+    ///
+    /// Addresses are never reused, which is the one way it is kinder than a slab — the tests
+    /// that care about reuse are the ones that check an address is released, not that the next
+    /// allocation collides with it.
+    ///
+    /// Keyed by index as well as id, because the tests share one of these and run in parallel:
+    /// two of them writing `"a"` are two different Maps, as they would be in a server.
+    struct FakeStore {
+        by_addr: RwLock<std::collections::HashMap<u64, Arc<str>>>,
+        by_id: RwLock<std::collections::HashMap<(usize, Arc<str>), u64>>,
+        next: AtomicU64,
+        released: AtomicUsize,
+    }
+
+    static FAKE: std::sync::LazyLock<Arc<FakeStore>> = std::sync::LazyLock::new(|| {
+        Arc::new(FakeStore {
+            by_addr: RwLock::new(std::collections::HashMap::new()),
+            by_id: RwLock::new(std::collections::HashMap::new()),
+            // Away from zero and from the staged tag, like a real heap address.
+            next: AtomicU64::new(0x7f00_0000_0000),
+            released: AtomicUsize::new(0),
+        })
+    });
+
+    impl FakeStore {
+        /// Link a new element for `id`, returning where it lives.
+        fn link(&self, idx: &AnnIndex, id: &str) -> u64 {
+            let addr = self.next.fetch_add(64, Ordering::Relaxed);
+            let id: Arc<str> = Arc::from(id);
+            self.by_addr.write().unwrap().insert(addr, Arc::clone(&id));
+            self.by_id.write().unwrap().insert((map_of(idx), id), addr);
+            addr
+        }
+
+        fn addr_of(&self, idx: &AnnIndex, id: &str) -> Option<u64> {
+            self.by_id
+                .read()
+                .unwrap()
+                .get(&(map_of(idx), Arc::from(id)))
+                .copied()
+        }
+
+        /// Unlink `id`'s element, keeping the address readable — the engine does the same
+        /// while a refcount stands.
+        fn unlink(&self, idx: &AnnIndex, id: &str) -> Option<u64> {
+            self.by_id
+                .write()
+                .unwrap()
+                .remove(&(map_of(idx), Arc::from(id)))
+        }
+
+        /// Every id this index's Map still holds.
+        fn ids_of(&self, idx: &AnnIndex) -> std::collections::HashSet<String> {
+            let map = map_of(idx);
+            self.by_id
+                .read()
+                .unwrap()
+                .keys()
+                .filter(|(m, _)| *m == map)
+                .map(|(_, id)| id.to_string())
+                .collect()
+        }
+    }
+
+    /// Which Map an index's elements belong to. The index's own address does as well as
+    /// anything: it outlives every element the test gives it.
+    fn map_of(idx: &AnnIndex) -> usize {
+        std::ptr::from_ref(idx) as usize
+    }
+
+    impl Elements for FakeStore {
+        fn id_at(&self, addr: u64) -> Option<Arc<str>> {
+            self.by_addr.read().unwrap().get(&addr).cloned()
+        }
+
+        /// A released address is one the engine may hand to a different element, so it stops
+        /// answering here. A dereference after this is the bug the refcount exists to prevent.
+        fn release(&self, addrs: &[u64]) {
+            let mut by_addr = self.by_addr.write().unwrap();
+            for addr in addrs {
+                by_addr.remove(addr);
+                self.released.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The production insert with a stubbed element write: the graph writes, the ordering and
+    /// the lock are all real, only the engine call is absent.
+    fn publish(idx: &AnnIndex, id: &str, staged: Staged<'_>, owner: u64) -> u64 {
+        // One cell, because the address is chosen inside the hold — the same place production
+        // reads it — and the test still needs it afterwards.
+        let linked = std::sync::Mutex::new(0u64);
+        let done: std::result::Result<(), PublishError<()>> = idx.insert_published(
+            staged,
+            owner,
+            || FAKE.addr_of(idx, id),
+            || {
+                let addr = FAKE.link(idx, id);
+                *linked.lock().unwrap() = addr;
+                Ok(addr)
+            },
+        );
         assert!(done.is_ok(), "publish failed");
+        *linked.lock().unwrap()
     }
 
     /// Likewise for the delete, with the element already known to be there.
     fn remove(idx: &AnnIndex, id: &str) -> bool {
+        let addr = FAKE.unlink(idx, id);
         let removed: std::result::Result<Option<bool>, PublishError<()>> =
-            idx.remove_published(id, || Ok(true));
+            idx.remove_published(|| Ok(addr));
         let Ok(removed) = removed else {
             panic!("remove failed");
         };
@@ -937,10 +1012,10 @@ mod tests {
             let stored: Vec<u8> = (0..layout.vector_bytes()).map(|i| (i as u8) | 1).collect();
 
             let staged = idx.stage(&stored, OWNER).expect("stage");
-            publish(&idx, "v1", staged, OWNER);
+            let addr = publish(&idx, "v1", staged, OWNER);
 
             assert_eq!(
-                idx.vector_of("v1").expect("read back"),
+                idx.vector_of(addr).expect("read back"),
                 Some(stored.clone()),
                 "{quant:?} did not round-trip through the graph"
             );
@@ -948,13 +1023,22 @@ mod tests {
     }
 
     #[test]
-    fn an_unnamed_id_has_no_vector() {
+    fn an_address_the_graph_does_not_hold_has_no_vector() {
         let idx = build(4, Quant::F32, Metric::L2, 2);
-        assert_eq!(idx.vector_of("nobody").expect("read back"), None);
+        assert_eq!(idx.vector_of(0x7fff_0000_0000).expect("read back"), None);
     }
 
     fn build(dim: usize, quant: Quant, metric: Metric, threads: usize) -> AnnIndex {
-        AnnIndex::with_threads(Layout::new(dim, quant), metric, 0, 0, 0, threads).unwrap()
+        AnnIndex::with_threads(
+            Layout::new(dim, quant),
+            metric,
+            0,
+            0,
+            0,
+            threads,
+            Arc::clone(&FAKE) as Arc<dyn Elements>,
+        )
+        .unwrap()
     }
 
     /// Leave usearch with no thread contexts, which is what an over-subscribed worker pool
@@ -964,44 +1048,51 @@ mod tests {
         idx.inner.write().unwrap().reset().unwrap();
     }
 
-    /// Every name must point at a node the graph actually holds.
+    /// Every held address must be a node the graph actually holds, and must still name
+    /// something — a released address answers nothing.
     ///
-    /// Only checkable at rest. `clear` takes `inner`'s write lock and `publish` takes `ids`',
-    /// so they do not exclude each other: even with the generation check, a `clear` can land
-    /// between the check and the `bind`. Correct code violates this *during* a rebuild and
-    /// satisfies it once the writers stop.
+    /// Only checkable at rest. `clear` takes `inner`'s write lock and `publish` takes the held
+    /// set's, so they do not exclude each other. Correct code violates this *during* a rebuild
+    /// and satisfies it once the writers stop.
     fn assert_names_resolve_to_nodes(idx: &AnnIndex, note: &str) {
         let index = idx.inner.read().unwrap();
-        for (key, id) in idx.ids().iter() {
+        for addr in idx.held().live_addrs() {
             assert!(
-                index.contains(key),
-                "{note}: {id} names key {key}, which the graph does not have"
+                index.contains(addr),
+                "{note}: the set holds {addr:#x}, which the graph does not have"
+            );
+            assert!(
+                FAKE.id_at(addr).is_some(),
+                "{note}: {addr:#x} is held but its element is gone"
             );
         }
     }
 
-    /// No two keys may name the same id. That is what a bijection means now that only one
-    /// direction is kept: a second key naming an id is a second hit for it in every search.
+    /// No two addresses may name the same id. A second one is a second hit for that id in
+    /// every search, and means an overwrite failed to retire what it displaced.
     fn assert_one_key_per_id(idx: &AnnIndex, note: &str) {
-        let ids = idx.ids();
-        let mut seen: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
-        for (key, id) in ids.iter() {
-            if let Some(other) = seen.insert(id, key) {
-                panic!("{note}: {id} is named by both {other} and {key}");
+        let live = idx.held().live_addrs();
+        let mut seen: std::collections::HashMap<Arc<str>, u64> = std::collections::HashMap::new();
+        for addr in &live {
+            let Some(id) = FAKE.id_at(*addr) else {
+                continue;
+            };
+            if let Some(other) = seen.insert(id.clone(), *addr) {
+                panic!("{note}: {id} is named by both {other:#x} and {addr:#x}");
             }
         }
-        assert_eq!(seen.len(), ids.len());
+        assert_eq!(seen.len(), live.len());
     }
 
     /// Stands in for `VectorIndex`'s token: the same value means no takeover happened.
     const OWNER: u64 = 7;
 
-    /// A settled write, returning the key the mapping now holds for this id.
+    /// A settled write, returning the address the graph now keys this id by.
     fn add(idx: &AnnIndex, id: &str, coords: &[f32]) -> u64 {
         put(idx, id, coords)
     }
 
-    /// A write, whether or not the id is already there — the mapping finds what it displaces.
+    /// A write, whether or not the id is already there — `publish` finds what it displaces.
     fn put(idx: &AnnIndex, id: &str, coords: &[f32]) -> u64 {
         let staged = idx
             .stage(
@@ -1009,9 +1100,7 @@ mod tests {
                 OWNER,
             )
             .unwrap();
-        let key = staged.key();
-        publish(idx, id, staged, OWNER);
-        key
+        publish(idx, id, staged, OWNER)
     }
 
     fn search(idx: &AnnIndex, coords: &[f32], k: usize) -> Vec<String> {
@@ -1068,14 +1157,22 @@ mod tests {
 
     #[test]
     fn readding_an_id_moves_it_to_a_fresh_key() {
-        // The old node has to stay put until the element links, so the new vector cannot
-        // share its key. Nothing outside the graph names keys, so only `len` has to hold.
+        // An overwrite links a new element, so the node moves to that address and the old one
+        // is retired — the graph must not be left holding both.
         let idx = build(4, Quant::F32, Metric::L2, 2);
         let first = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
 
         let second = put(&idx, "a", &[0.0, 1.0, 0.0, 0.0]);
         assert_ne!(second, first);
-        assert_eq!(idx.id_of(first), None, "the displaced key names nothing");
+        assert!(
+            !idx.held().contains(first),
+            "the displaced address is not held any more"
+        );
+        assert_eq!(
+            FAKE.id_at(first),
+            None,
+            "and its refcount went back, so it answers nothing"
+        );
         assert_eq!(idx.len(), 1, "an update must not grow the index");
         assert_eq!(
             search(&idx, &[0.0, 1.0, 0.0, 0.0], 5),
@@ -1099,33 +1196,10 @@ mod tests {
 
         assert_eq!(idx.len(), 0);
         assert_eq!(
-            idx.keys.lock().unwrap().next_slot,
-            5,
-            "slots come back, so 1000 writes need only the peak live count"
-        );
-        assert!(
-            idx.keys.lock().unwrap().retired.is_empty(),
-            "no slot came close to spending its generations"
-        );
-        assert_eq!(
             idx.reserved.load(Ordering::Acquire),
             MIN_CAPACITY,
             "the reservation grew with keys rather than with members"
         );
-    }
-
-    #[test]
-    fn a_sparse_key_is_fine_for_usearch() {
-        // usearch reserves for a member count, not a key range, so a recycled slot arriving
-        // with a fresh generation is a key it has never seen and does not have to have room for.
-        let idx = build(4, Quant::F32, Metric::L2, 2);
-        for i in 0..50 {
-            add(&idx, &format!("v{i}"), &[i as f32, 1.0, 2.0, 3.0]);
-            remove(&idx, &format!("v{i}"));
-        }
-        add(&idx, "last", &[1.0, 1.0, 2.0, 3.0]);
-        assert_eq!(idx.len(), 1);
-        assert_eq!(search(&idx, &[1.0, 1.0, 2.0, 3.0], 1), vec!["last"]);
     }
 
     #[test]
@@ -1140,7 +1214,7 @@ mod tests {
             "a second remove of the same key names nothing"
         );
         assert_eq!(idx.len(), 1);
-        assert_eq!(idx.id_of(a), None);
+        assert!(!idx.held().contains(a));
 
         let hits = search(&idx, &[1.0, 0.0, 0.0, 0.0], 10);
         assert_eq!(hits, vec!["b"]);
@@ -1164,8 +1238,9 @@ mod tests {
         exhaust_contexts(&idx);
 
         let v = crate::handler::quant::encode(&[0.0, 1.0], Quant::F32);
-        assert!(idx.add_unless_known("b", || Ok(Some(v.to_vec()))).is_err());
-        assert_eq!(idx.id_of(42), None);
+        let addr = FAKE.link(&idx, "b");
+        assert!(idx.add_unless_known(addr, || Ok(Some(v.to_vec()))).is_err());
+        assert!(!idx.held().contains(addr));
         assert_eq!(idx.len(), 0);
     }
 
@@ -1250,11 +1325,8 @@ mod tests {
         let v = crate::handler::quant::encode(&[0.0, 1.0], Quant::F32);
         idx.discard(idx.stage(&v, OWNER).unwrap());
 
-        assert_eq!(
-            idx.id_of(key).as_deref(),
-            Some("a"),
-            "the mapping was never moved"
-        );
+        assert!(idx.held().contains(key), "the graph never moved");
+        assert_eq!(FAKE.id_at(key).as_deref(), Some("a"));
         assert_eq!(idx.len(), 1);
         assert_eq!(search(&idx, &[1.0, 0.0], 5), vec!["a"]);
     }
@@ -1263,8 +1335,8 @@ mod tests {
     fn a_takeover_inside_the_staging_window_voids_the_stage() {
         // `take_over` sets the index's owner to REBUILDING and then empties the graph, so a
         // publish carrying the older token is naming a node that is no longer there. The wipe
-        // also restarts the slots, so the owner token is the only thing standing between the
-        // stale publish and a key that now belongs to somebody else.
+        // also hands every address back, so the owner token is what stops a stale publish from
+        // keying a node by an element the engine may have given to somebody else.
         const TAKEOVER: u64 = 0;
         let idx = build(2, Quant::F32, Metric::Cos, 4);
         add(&idx, "a", &[1.0, 0.0]);
@@ -1277,15 +1349,12 @@ mod tests {
         publish(&idx, "b", staged, TAKEOVER);
         assert_eq!(idx.len(), 0, "the stage did not survive the takeover");
 
-        // The wipe hands slots out from zero again, so the next key may well be numerically
-        // smaller. What must hold is that the abandoned key names nothing.
         let abandoned = staged_key;
         let again = idx.stage(&v, TAKEOVER).unwrap();
         publish(&idx, "b", again, TAKEOVER);
-        assert_eq!(
-            idx.id_of(abandoned),
-            None,
-            "the key staged against the wiped graph still names nothing"
+        assert!(
+            !idx.held().contains(abandoned),
+            "the node staged against the wiped graph is held by nothing"
         );
         assert_eq!(idx.len(), 1);
         assert_eq!(search(&idx, &[0.0, 1.0], 5), vec!["b"]);
@@ -1339,7 +1408,7 @@ mod tests {
         let idx = build(2, Quant::F32, Metric::Cos, 2);
         add(&idx, "a", &[1.0, 0.0]);
 
-        idx.clear().unwrap();
+        idx.clear_with().unwrap();
         // What a refill over a vectorless Map asks for: nothing.
         idx.reserve(0).unwrap();
 
@@ -1404,7 +1473,6 @@ mod tests {
 
     /// Stands in for the Map: which ids have an element. No keys in here, because a stored
     /// element does not carry one either — the mapping owns both directions.
-    type Elements = std::sync::Mutex<std::collections::HashSet<String>>;
 
     #[test]
     fn concurrent_writers_deleters_and_searchers_keep_the_mapping_consistent() {
@@ -1415,11 +1483,10 @@ mod tests {
         const IDS: usize = 24;
         let dim = 8;
         let idx = Arc::new(build(dim, Quant::F32, Metric::L2, 16));
-        let elements: Arc<Elements> = Arc::new(std::sync::Mutex::new(Default::default()));
         for i in 0..IDS {
             let id = format!("id{i}");
+            // `add` links the element through the store, so the Map records it too.
             add(&idx, &id, &[i as f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
-            elements.lock().unwrap().insert(id);
         }
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -1434,7 +1501,6 @@ mod tests {
         // Writers: stage, then publish or discard — a vadd whose insert did or did not land.
         for t in 0..4 {
             let idx = Arc::clone(&idx);
-            let elements = Arc::clone(&elements);
             let discarded = Arc::clone(&discarded);
             handles.push(std::thread::spawn(move || {
                 for i in 0..250 {
@@ -1449,14 +1515,15 @@ mod tests {
                         discarded.lock().unwrap().insert(key);
                         idx.discard(staged);
                     } else {
-                        // The element is read and written inside the call, which is what the
-                        // engine does: both live under the same hold on the mapping, and a
-                        // test that touched `elements` outside it would be racing on its own.
-                        let done: std::result::Result<(), PublishError<()>> =
-                            idx.insert_published(&id, staged, OWNER, || {
-                                elements.lock().unwrap().insert(id.clone());
-                                Ok(())
-                            });
+                        // The Map is read and written inside the call, which is what the
+                        // engine does: both live under the same hold, and a test that touched
+                        // the store outside it would be racing on its own.
+                        let done: std::result::Result<(), PublishError<()>> = idx.insert_published(
+                            staged,
+                            OWNER,
+                            || FAKE.addr_of(&idx, &id),
+                            || Ok(FAKE.link(&idx, &id)),
+                        );
                         done.unwrap();
                     }
                 }
@@ -1466,14 +1533,13 @@ mod tests {
         // Deleters: the vdel that lands inside somebody's staging window.
         for t in 4..6 {
             let idx = Arc::clone(&idx);
-            let elements = Arc::clone(&elements);
             handles.push(std::thread::spawn(move || {
                 for i in 0..250 {
                     let id = format!("id{}", choice(t, i, IDS));
-                    // `vdel` takes the element and the key in it in one engine call, inside
-                    // the same hold that removes the name.
+                    // `vdel` unlinks the element and learns its address in one engine call,
+                    // inside the same hold that takes the node out.
                     let removed: std::result::Result<Option<bool>, PublishError<()>> =
-                        idx.remove_published(&id, || Ok(elements.lock().unwrap().remove(&id)));
+                        idx.remove_published(|| Ok(FAKE.unlink(&idx, &id)));
                     removed.unwrap();
                 }
             }));
@@ -1519,17 +1585,22 @@ mod tests {
             0,
             "a discarded key resolved to an id, so the caller would have rendered it"
         );
-        // And it stays that way at rest: nothing a discard threw away can be named.
+        // And it stays that way at rest: nothing a discard threw away is held.
         for key in discarded.lock().unwrap().iter() {
-            assert_eq!(idx.id_of(*key), None, "discarded key {key} is named");
+            assert!(!idx.held().contains(*key), "discarded key {key} is held");
         }
-        // Every element the Map still holds is named, and nothing else is.
-        let live = elements.lock().unwrap().clone();
-        let named: std::collections::HashSet<String> =
-            idx.ids().iter().map(|(_, id)| id.to_string()).collect();
+        // Every element the Map still holds has a node, and nothing else does.
+        let live = FAKE.ids_of(&idx);
+        let named: std::collections::HashSet<String> = idx
+            .held()
+            .live_addrs()
+            .into_iter()
+            .filter_map(|a| FAKE.id_at(a))
+            .map(|id| id.to_string())
+            .collect();
         assert_eq!(
             named, live,
-            "the mapping and the Map disagree on which ids exist"
+            "the graph and the Map disagree on which ids exist"
         );
     }
 
@@ -1540,17 +1611,15 @@ mod tests {
         const IDS: usize = 16;
         let dim = 8;
         let idx = Arc::new(build(dim, Quant::F32, Metric::L2, 16));
-        let elements: Arc<Elements> = Arc::new(std::sync::Mutex::new(Default::default()));
         for i in 0..IDS {
             let id = format!("id{i}");
+            // `add` links the element through the store, so the Map records it too.
             add(&idx, &id, &[i as f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
-            elements.lock().unwrap().insert(id);
         }
 
         let mut handles = Vec::new();
         for t in 0..4 {
             let idx = Arc::clone(&idx);
-            let elements = Arc::clone(&elements);
             handles.push(std::thread::spawn(move || {
                 for i in 0..200 {
                     let id = format!("id{}", choice(t, i, IDS));
@@ -1558,12 +1627,13 @@ mod tests {
                     let v = crate::handler::quant::encode(&coords, Quant::F32);
                     // A stage can fail once `clear` has dropped the reservation to the floor.
                     if let Ok(staged) = idx.stage(&v, OWNER) {
-                        // Both element accesses inside the call, as the engine does them.
-                        let done: std::result::Result<(), PublishError<()>> =
-                            idx.insert_published(&id, staged, OWNER, || {
-                                elements.lock().unwrap().insert(id.clone());
-                                Ok(())
-                            });
+                        // Both Map accesses inside the call, as the engine does them.
+                        let done: std::result::Result<(), PublishError<()>> = idx.insert_published(
+                            staged,
+                            OWNER,
+                            || FAKE.addr_of(&idx, &id),
+                            || Ok(FAKE.link(&idx, &id)),
+                        );
                         done.unwrap();
                     }
                 }
@@ -1624,9 +1694,10 @@ mod tests {
                             OWNER,
                         )
                         .unwrap();
-                    let key = staged.key();
-                    publish(&idx, &id, staged, OWNER);
-                    keys.lock().unwrap().push((id, key));
+                    // The published key is the element's address, not the placeholder the
+                    // stage carried — `publish` renames it once the element is linked.
+                    let addr = publish(&idx, &id, staged, OWNER);
+                    keys.lock().unwrap().push((id, addr));
                     let q =
                         crate::handler::quant::encode(&[t as f32, i as f32, 0.0, 0.0], Quant::F32);
                     let _ = idx.search(&q, 3, None).unwrap();
@@ -1640,7 +1711,8 @@ mod tests {
         assert_eq!(idx.len(), 800);
         assert_one_key_per_id(&idx, "after concurrent adds and searches");
         for (id, key) in keys.lock().unwrap().iter() {
-            assert_eq!(idx.id_of(*key).as_deref(), Some(id.as_str()));
+            assert_eq!(FAKE.id_at(*key).as_deref(), Some(id.as_str()));
+            assert!(idx.held().contains(*key));
         }
     }
 
@@ -1731,91 +1803,45 @@ mod tests {
         );
     }
 
-    /// A slot whose generations are spent waits, and a later write puts it back.
-    ///
-    /// Reaching `u32::MAX` for real takes about 4.3 billion reuses of one slot, so the retired
-    /// slot is planted rather than earned; what is under test is the handover, not the counter.
-    #[test]
-    fn a_retired_slot_comes_back_when_no_search_is_in_flight() {
-        let idx = build(4, Quant::F32, Metric::L2, 2);
-        add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
-
-        idx.keys.lock().unwrap().retired.push(9);
-        assert!(idx.keys.lock().unwrap().free.is_empty());
-
-        // A write holds the mapping, which is where the handover happens.
-        add(&idx, "b", &[0.0, 1.0, 0.0, 0.0]);
-        let keys = idx.keys.lock().unwrap();
-        assert!(
-            keys.retired.is_empty(),
-            "the slot was taken off the retired list"
-        );
-        assert!(
-            keys.free.contains(&key_of(9, 0)),
-            "and offered again at generation zero"
-        );
-    }
-
-    #[test]
-    fn a_retired_slot_stays_put_while_a_search_holds_keys() {
-        let idx = build(4, Quant::F32, Metric::L2, 2);
-        add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
-        idx.keys.lock().unwrap().retired.push(9);
-
-        // Stand in for a search between capturing keys and translating them.
-        let searching = Searching::new(&idx.searching);
-        add(&idx, "b", &[0.0, 1.0, 0.0, 0.0]);
-        assert_eq!(
-            idx.keys.lock().unwrap().retired,
-            vec![9],
-            "a key in flight could still be one this slot answered"
-        );
-
-        drop(searching);
-        add(&idx, "c", &[0.0, 0.0, 1.0, 0.0]);
-        assert!(
-            idx.keys.lock().unwrap().retired.is_empty(),
-            "and it comes back once nothing is holding keys"
-        );
-    }
-
-    /// Slots are handed back, so a long churn does not walk the slot space forward.
-    #[test]
-    fn a_released_slot_is_offered_again_with_a_fresh_generation() {
-        let idx = build(4, Quant::F32, Metric::L2, 2);
-        let first = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
-        assert!(remove(&idx, "a"));
-
-        let second = add(&idx, "b", &[0.0, 1.0, 0.0, 0.0]);
-        assert_eq!(
-            slot_of(second),
-            slot_of(first),
-            "the slot came back rather than the space growing"
-        );
-        assert_ne!(second, first, "but not as the same key");
-        assert_eq!(idx.id_of(first), None, "so the old key names nothing");
-        assert_eq!(idx.id_of(second).as_deref(), Some("b"));
-    }
-
-    /// A wipe restarts the slots, and the epoch is what keeps a search from translating keys
-    /// it captured against the graph that is gone.
+    /// A wipe hands every address back, and the engine may give one to a different element.
+    /// The epoch is what keeps a search from dereferencing keys it captured before that.
     #[test]
     fn keys_captured_before_a_wipe_are_discarded() {
         let idx = build(4, Quant::F32, Metric::L2, 2);
         let key = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
         let entered = idx.epoch.load(Ordering::Acquire);
 
-        idx.clear().unwrap();
-        add(&idx, "b", &[1.0, 0.0, 0.0, 0.0]);
+        idx.clear_with().unwrap();
         assert_eq!(
-            slot_of(add(&idx, "c", &[0.0, 1.0, 0.0, 0.0])),
-            1,
-            "slots start over after a wipe"
+            FAKE.id_at(key),
+            None,
+            "the wipe handed the address back, so it names nothing"
         );
+        add(&idx, "b", &[1.0, 0.0, 0.0, 0.0]);
 
         assert!(
             idx.resolve(&[(key, 0.0)], entered).is_empty(),
-            "a search that captured keys before the wipe translates none of them"
+            "a search that captured keys before the wipe resolves none of them"
         );
+    }
+
+    /// The tag is what makes a staged node unreadable, not the held set — its address is a
+    /// real element the caller allocated, and its field bytes are already written.
+    #[test]
+    fn a_staged_key_is_never_dereferenced() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let v = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], Quant::F32);
+        let staged = idx.stage(&v, OWNER).unwrap();
+
+        assert!(
+            held::is_staged(staged.key()),
+            "a staged node carries the tag"
+        );
+        assert!(
+            idx.resolve(&[(staged.key(), 0.0)], idx.epoch.load(Ordering::Acquire))
+                .is_empty(),
+            "and resolves to nothing, without the store being asked"
+        );
+        idx.discard(staged);
     }
 }

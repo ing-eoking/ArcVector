@@ -30,6 +30,7 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         spec.connectivity,
         spec.expansion_add,
         spec.expansion_search,
+        std::sync::Arc::new(engine::DetachedElements),
     )?;
 
     let held = map_size_for(store, spec.maxcount);

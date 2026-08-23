@@ -98,7 +98,7 @@ pub fn ensure_builder() {
 
 fn run_builder() {
     loop {
-        let (name, held) = BUILDER.take();
+        let (name, mut held) = BUILDER.take();
         let Some(index) = get(&name) else { continue };
         // Only for the engine handle. Every call this thread makes from here — `get_elem_info`
         // and, when `held` drops, `map_elem_release` — ignores the cookie, which is why a
@@ -106,7 +106,7 @@ fn run_builder() {
         let Some(store) = Store::detached() else {
             continue;
         };
-        match refill(&store, &index, &held) {
+        match refill(&store, &index, &mut held) {
             Ok(count) => {
                 index.mark_refilled();
                 eprintln!("ArcVector: refilled index '{name}' from {count} element(s)");
@@ -129,29 +129,35 @@ fn run_builder() {
 /// replayed. `add_unless_known` decides under the mapping's write lock, the same one a `vadd`
 /// holds across both of its registrations and a `vdel` across its tombstone, so any id the live
 /// path has touched is already known here and skipped.
-fn refill(store: &Store, index: &VectorIndex, held: &HeldMap) -> Result<usize> {
+fn refill(store: &Store, index: &VectorIndex, held: &mut HeldMap) -> Result<usize> {
+    let mut kept: Vec<u64> = Vec::new();
     index.ann.reserve(held.len())?;
 
     let layout = index.ann.layout;
     let mut added = 0usize;
-    for (field, value) in held.read(store) {
-        let Ok(field) = std::str::from_utf8(&field) else {
-            continue;
-        };
-        let field = field.to_owned();
-        if field == META_FIELD {
+    for (addr, field, value) in held.read(store) {
+        if field == META_FIELD.as_bytes() {
             continue;
         }
-        let element = layout
-            .decode(&value)
-            .map_err(|e| Error::bad_request(format!("{e} in element '{field}'")))?;
+        let element = layout.decode(&value).map_err(|e| {
+            Error::bad_request(format!(
+                "{e} in element {}",
+                String::from_utf8_lossy(&field)
+            ))
+        })?;
         let vector = element.vector.to_vec();
         let replayed = index
             .ann
-            .add_unless_known(&field, || Ok(Some(vector.clone())))?;
+            .add_unless_known(addr, || Ok(Some(vector.clone())))?;
         if replayed {
+            // The graph now keys a node by this address, so its refcount has to outlive the
+            // snapshot. `keep` is what stops the release below from freeing it.
             added += 1;
+            kept.push(addr);
         }
+    }
+    for addr in kept {
+        held.keep(addr);
     }
     Ok(added)
 }

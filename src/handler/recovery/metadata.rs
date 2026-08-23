@@ -13,6 +13,7 @@ pub fn build_ann(meta: &MetaRecord, layout: Layout) -> Result<AnnIndex> {
         meta.connectivity,
         meta.expansion_add,
         meta.expansion_search,
+        std::sync::Arc::new(crate::handler::arcus::engine::DetachedElements),
     )
 }
 

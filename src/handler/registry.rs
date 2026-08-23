@@ -245,8 +245,15 @@ mod tests {
     use crate::handler::usearch::Metric;
 
     fn index(name: &str) -> VectorIndex {
-        let ann = AnnIndex::new(Layout::new(4, Quant::F32), Metric::L2, 0, 0, 0)
-            .expect("build the graph");
+        let ann = AnnIndex::new(
+            Layout::new(4, Quant::F32),
+            Metric::L2,
+            0,
+            0,
+            0,
+            Arc::new(crate::handler::arcus::engine::DetachedElements),
+        )
+        .expect("build the graph");
         VectorIndex::new(name.to_owned(), ann, 8, 1)
     }
 

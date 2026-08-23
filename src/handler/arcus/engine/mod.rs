@@ -4,7 +4,7 @@ mod elem;
 mod error;
 mod map;
 
-pub use elem::{HeldElem, HeldMap, PendingElem};
+pub use elem::{HeldAddr, HeldElem, HeldMap, PendingElem};
 pub use error::StoreError;
 pub use map::{FORMAT_VERSION, INDEX_FLAGS, MapProbe, index_attr};
 
@@ -107,5 +107,25 @@ impl Store {
 
     pub fn max_map_size(&self) -> u32 {
         self.config_u32(c"max_map_size", DEFAULT_MAX_MAP_SIZE)
+    }
+}
+
+/// The store as a long-lived index sees it: no connection, and none needed.
+///
+/// A graph outlives every connection that touches it, so it cannot hold a `Store` — that one
+/// carries a cookie. It does not need to. The two calls it makes, `get_elem_info` and
+/// `map_elem_release`, ignore both the handle's cookie and, in the release's case, take the
+/// engine's cache lock themselves. See `docs/내부구조.md` §7.5.
+pub struct DetachedElements;
+
+impl crate::handler::usearch::Elements for DetachedElements {
+    fn id_at(&self, addr: u64) -> Option<std::sync::Arc<str>> {
+        Store::detached()?.id_at(addr)
+    }
+
+    fn release(&self, addrs: &[u64]) {
+        if let Some(store) = Store::detached() {
+            store.release_held(addrs);
+        }
     }
 }

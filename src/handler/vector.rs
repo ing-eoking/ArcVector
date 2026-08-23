@@ -3,6 +3,7 @@ use super::coords::coords;
 use crate::command::request::Add;
 use crate::error::{Error, Reply, Result};
 use crate::handler::arcus::element::Layout;
+use crate::handler::arcus::engine::HeldAddr;
 use crate::handler::arcus::engine::{Store, StoreError};
 use crate::handler::quant;
 use crate::handler::registry;
@@ -69,10 +70,20 @@ pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
     // That call is the step which leaves this node: `CLOG_MAP_ELEM_INSERT` is emitted from
     // `do_map_elem_link`, so replicas and the persistence log learn of the write there and
     // nowhere earlier — reserving logs nothing. Everything fallible is already done.
-    match index
-        .ann
-        .insert_published(id, staged, index.owner(), || pending.insert())
-    {
+    match index.ann.insert_published(
+        staged,
+        index.owner(),
+        // Read inside the hold, so two writes to one id cannot both see the same outgoing
+        // element. The refcount comes along and `insert_published` hands it back.
+        || store.hold_addr(name, id).ok().map(HeldAddr::keep),
+        // The link, then the refcount that keeps the address the graph is about to key by.
+        // Reading it back rather than trusting `pending.addr()` is what makes the key the
+        // element the Map actually holds, whatever landed in between.
+        || {
+            pending.insert()?;
+            store.hold_addr(name, id).map(HeldAddr::keep)
+        },
+    ) {
         Ok(()) => Ok(Reply::Stored),
         Err(PublishError::Store(e)) => store_failed(name, stamp, e),
         // The mapping refused to grow. Nothing was written and nothing is left over, so this
@@ -140,7 +151,9 @@ pub fn vget(store: &Store, name: &str, id: &str) -> Result<Reply> {
         // — a search would keep returning a row nothing can render — and say so. The Map is
         // left alone: deleting on a reading we do not trust is the same bad reading twice.
         Err(StoreError::CorruptElement) => {
-            index.ann.forget_unreadable(id);
+            if let Ok(held) = store.hold_addr(name, id) {
+                index.ann.forget_unreadable(held.addr());
+            }
             eprintln!(
                 "ArcVector: element '{id}' of index '{name}' is unreadable; dropped from the graph"
             );
@@ -164,17 +177,24 @@ pub fn vdel(store: &Store, name: &str, id: &str) -> Result<Reply> {
     // delete that only reached the graph would come back. Under the mapping's hold, so no
     // reader sees one store without the other.
     let mut map_gone = false;
+    // The hold outlives the unlink, so the address still means this element while the graph is
+    // asked about it. It is released when `taken` drops, after the graph has let go of its own.
+    let mut taken = None;
     let removed = index
         .ann
-        .remove_published(id, || match store.take_elem(name, id) {
-            Ok(_) => Ok(true),
-            Err(StoreError::ElemGone) => Ok(false),
+        .remove_published(|| match store.take_addr(name, id) {
+            Ok(held) => {
+                let addr = held.as_ref().map(HeldAddr::addr);
+                taken = held;
+                Ok(addr)
+            }
             Err(StoreError::KeyGone) => {
                 map_gone = true;
-                Ok(false)
+                Ok(None)
             }
             Err(e) => Err(e),
         });
+    drop(taken);
 
     // Outside the hold: releasing the registry entry drops the graph, and the mapping lock is
     // inside it.

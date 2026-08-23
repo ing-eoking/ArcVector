@@ -97,7 +97,7 @@ fn similar(
                 // Unreadable description: stop offering the id and fail the command rather
                 // than quietly shortening the answer. The Map is left alone.
                 Err(StoreError::CorruptElement) => {
-                    index.ann.forget_unreadable(&id);
+                    index.ann.forget_unreadable(key);
                     eprintln!(
                         "ArcVector: element '{id}' of index '{}' is unreadable; dropped from the graph",
                         index.name
@@ -172,23 +172,25 @@ pub fn vsim_key(store: &Store, spec: &SimKey) -> Result<Reply> {
     let index = for_read(store, name)?;
     let stamp = crate::handler::registry::now();
 
+    // The graph is keyed by element address, so the id becomes one here before the graph is
+    // asked anything. The Map is the authority on whether the id exists at all.
+    let held = match store.hold_addr(name, key) {
+        Ok(held) => held,
+        Err(StoreError::ElemGone) => return Ok(Reply::NotFound),
+        Err(StoreError::KeyGone) => {
+            map_is_gone(name, stamp);
+            return Ok(Reply::NotFound);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
     // The query comes out of the graph, not the Map. usearch holds the vector in the index's
     // own quantization — the same bytes a stored element carries — so this reads what the Map
     // would have said, and it is the only copy a build without recovery keeps.
-    let Some(query) = index.ann.vector_of(key)? else {
-        // Nothing names the id. The Map is the authority on whether it exists at all, so ask it
-        // rather than answering out of the graph's silence.
-        return match store.get_elem(name, key) {
-            // The element is there and its node is not: a write that has not published yet, or
-            // a rebuild that has not reached this id. Neither is "no such vector".
-            Ok(_) => Err(Error::Unreadable),
-            Err(StoreError::ElemGone) => Ok(Reply::NotFound),
-            Err(StoreError::KeyGone) => {
-                map_is_gone(name, stamp);
-                Ok(Reply::NotFound)
-            }
-            Err(e) => Err(e.into()),
-        };
+    let Some(query) = index.ann.vector_of(held.addr())? else {
+        // The element is there and its node is not: a write that has not published yet, or a
+        // rebuild that has not reached it. Neither is "no such vector".
+        return Err(Error::Unreadable);
     };
 
     let mut out = String::new();
