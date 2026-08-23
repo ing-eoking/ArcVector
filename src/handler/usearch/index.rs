@@ -898,13 +898,17 @@ impl AnnIndex {
                 // No callback: usearch takes its `is_dummy` path, which still excludes what it
                 // removed itself, so nothing on this side is consulted per node.
                 None => self.unfiltered(&index, query, k),
-                Some(matches) => {
+                // The read lock is taken **per node**, not for the search. It has to be held
+                // across the clause too — the predicate dereferences the element behind the
+                // key — but holding it for the whole search stops every write for that long:
+                // measured at `publish` p50 0.5 → 83us under four searchers.
+                Some(matches) => self.matches(&index, query, k, |key| {
                     let held = self.held();
-                    self.matches(&index, query, k, |key| match self.name(&held, key) {
+                    match self.name(&held, key) {
                         Some(id) => matches(key, &id),
                         None => false,
-                    })
-                }
+                    }
+                }),
             }?
         };
 
