@@ -61,7 +61,8 @@ struct Sweeper {
 
 #[derive(Default)]
 struct State {
-    /// Put up by the thread, taken one at a time by connections.
+    /// Put up by the thread, taken one at a time by connections. Coldest last, because that is
+    /// the end [`take_offer`] pops.
     offered: Vec<Probe>,
     /// Handed back by connections: probed, and the Map was gone.
     gone: Vec<Probe>,
@@ -69,7 +70,9 @@ struct State {
     retired: Vec<Arc<VectorIndex>>,
 }
 
-/// `offered.len()`, so a command that has nothing to do finds out in one relaxed load.
+/// `offered.len()`, so a command with nothing to do finds out in one relaxed load and never
+/// reaches for the lock. Only ever written under it, so the two cannot disagree for long, and a
+/// command that misreads it either takes the lock for nothing or waits one more command.
 static OFFERED: AtomicUsize = AtomicUsize::new(0);
 
 static SWEEPER: LazyLock<Sweeper> = LazyLock::new(|| {
@@ -103,6 +106,12 @@ pub fn maybe(store: &Store) {
     }
 }
 
+/// Take one offered name, or `None` if another connection took the last of them.
+///
+/// The pop is what makes a name one connection's to probe: the lock is held across taking it and
+/// updating [`OFFERED`], so two connections cannot come away with the same one. It is a short
+/// lock and a rare one — a round is ten names a second, and every other command turns back at
+/// the atomic above.
 fn take_offer() -> Option<Probe> {
     let mut state = state();
     let probe = state.offered.pop();
@@ -195,12 +204,15 @@ fn offer_round() {
     let stamp = registry::now();
     let round: Vec<Probe> = registry::coldest(BATCH)
         .into_iter()
+        .rev()
         .map(|name| Probe { name, stamp })
         .collect();
     if round.is_empty() {
         return;
     }
 
+    // Nothing was offered when this round was chosen and only connections take from it, so
+    // there is nothing here to overwrite.
     let mut state = state();
     state.offered = round;
     OFFERED.store(state.offered.len(), Ordering::Relaxed);
