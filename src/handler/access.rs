@@ -14,10 +14,16 @@ use crate::handler::registry::{self, VectorIndex};
 
 #[cfg(recovery)]
 pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
-    let (meta, layout) = usable_metadata(store, name)?;
+    // One lookup, and it comes first — not because it decides anything, but because it is the
+    // note of which entry this call may end up releasing. See `map_is_gone`. Deciding is the
+    // metadata's job, below.
+    let held = registry::get(name);
+    let (meta, layout) = usable_metadata(store, name, held.as_deref())?;
 
-    let (index, fresh) = match registry::get(name) {
+    let (index, fresh) = match held {
         Some(index) => (index, false),
+        // Registered while the metadata was being read, if anyone did: `empty_graph` inserts
+        // through `insert_or_get`, so the winner is whichever landed first and `fresh` follows.
         None => empty_graph(store, name, &meta, layout)?,
     };
 
@@ -39,8 +45,16 @@ pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
 /// ours, and the registry cannot see any of that. The metadata read is what does.
 #[cfg(not(recovery))]
 pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
-    let (meta, _) = usable_metadata(store, name)?;
-    let index = registry::get(name).ok_or(Error::NoSuchIndex)?;
+    // First, and once: this is the note of what a release below may take, and it is also the
+    // index this call resolves to. What it is *not* is the judgement — that is the metadata's,
+    // on the next line. See `map_is_gone` for why the note has to precede the read.
+    let held = registry::get(name);
+    let (meta, _) = usable_metadata(store, name, held.as_deref())?;
+
+    // The metadata read said this name is an index, so a missing entry means the graph went
+    // without the Map going with it. Nothing here can rebuild one, and the Map is not ours to
+    // delete over it — that is `vdrop`'s call, and this build tells the client as much.
+    let index = held.ok_or(Error::NoSuchIndex)?;
     if meta.owner != index.owner() {
         // Identity, not name: see `map_is_gone`.
         // Nothing in this build can produce a second index at one name — no transfer, no
@@ -56,21 +70,25 @@ pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
 
 /// The metadata element, or the reason there is none — and, where the reason is definitive,
 /// the release of a graph that has nothing left to serve.
-fn usable_metadata(store: &Store, name: &str) -> Result<(MetaRecord, Layout)> {
-    // Read before the metadata, because that is what the verdict below will be about. An entry
-    // that appears after this describes a Map this read never saw, and is not ours to judge.
-    let observed = registry::get(name);
+///
+/// `held` is what the registry had before this read: the only entry a verdict from it may
+/// release. One that appears afterwards describes a Map this read never saw.
+fn usable_metadata(
+    store: &Store,
+    name: &str,
+    held: Option<&VectorIndex>,
+) -> Result<(MetaRecord, Layout)> {
     match read_metadata(store, name) {
         MetaState::Usable(meta, layout) => Ok((meta, layout)),
         // Expired, evicted, or dropped by another node.
         MetaState::NoMap => {
-            if let Some(index) = &observed {
+            if let Some(index) = held {
                 map_is_gone(name, index);
             }
             Err(Error::NoSuchIndex)
         }
         MetaState::Damaged(why) => {
-            discard_damaged(store, name, &why, observed.as_deref());
+            discard_damaged(store, name, &why, held);
             Err(Error::NoSuchIndex)
         }
         // Proves nothing about the name, so nothing is released on it — and the client hears
