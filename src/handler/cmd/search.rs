@@ -6,22 +6,18 @@ use crate::command::filter::Filter;
 use crate::command::request::{Sim, SimKey};
 use crate::error::{Error, Reply, Result};
 use crate::handler::access::{for_read, map_is_gone};
-use crate::handler::arcus::element::Layout;
-use crate::handler::arcus::engine::{HeldElem, Store, StoreError};
+use crate::handler::arcus::engine::{Store, StoreError};
 use crate::handler::quant;
 use crate::handler::registry::VectorIndex;
 use crate::handler::usearch::Accept;
 
-/// The attributes of a held element, if the `FILTER` held this key.
-fn held_attr(
-    held: &RefCell<Vec<(u64, HeldElem<'_>)>>,
-    key: u64,
-    layout: &Layout,
-) -> Option<String> {
-    let held = held.borrow();
-    let (_, elem) = held.iter().find(|(k, _)| *k == key)?;
-    let attr = layout.attr_of(elem.value()).ok()?;
-    Some(String::from_utf8_lossy(attr).into_owned())
+/// What the `FILTER` read for this key, if it read one.
+fn judged_attr(judged: &RefCell<Vec<(u64, String)>>, key: u64) -> Option<String> {
+    let judged = judged.borrow();
+    judged
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, a)| a.clone())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -40,31 +36,39 @@ fn similar(
     // reach anything registered since.
     let stamp = crate::handler::registry::now();
 
-    // Elements the FILTER read, kept by the engine's own hold rather than copied. A hit that
-    // is in here needs no second lookup to render, and what the reply carries is the same
-    // bytes the filter judged — reading twice could have straddled a write.
-    let held: RefCell<Vec<(u64, HeldElem<'_>)>> = RefCell::new(Vec::new());
-    let by_attr = |key: u64, id: &str| -> bool {
+    // What the FILTER read, for the hits that pass it. Copied rather than held: the ATTR is at
+    // most `ATTR_BYTES`, so keeping the bytes costs less than keeping the element they came
+    // from — no engine call inside the graph's read lock, and no refcount standing for the
+    // length of the search. A hit that is in here renders without a second read, and what the
+    // reply carries is the same bytes the filter judged.
+    //
+    // Local to this query, and `RefCell` because usearch's predicate is `Fn`.
+    let judged: RefCell<Vec<(u64, String)>> = RefCell::new(Vec::new());
+    let by_attr = |key: u64| -> bool {
         let Some(filter) = filter else {
             return true;
         };
         // The key is the element's address, so the attributes are one dereference away — no
         // hash lookup, no refcount pair, on the path that runs once per visited node. Safe
         // because the graph checked the address and holds its read lock for this call.
-        let Some(passes) = store.with_attr_at(key, layout, |attr| filter.matches(attr)) else {
+        let Some(passed) = store.with_attr_at(key, layout, |attr| {
+            filter
+                .matches(attr)
+                .then(|| String::from_utf8_lossy(attr).into_owned())
+        }) else {
             // Unreadable mid-search: no longer a candidate.
             return false;
         };
-        if !passes {
-            return false;
-        }
-        // Only what survived is held, and only so the reply carries the bytes the filter
-        // judged — reading twice could straddle a write. That is `k` lookups rather than one
-        // per visited node.
-        let Ok(elem) = store.hold_elem(&index.name, id) else {
+        let Some(attr) = passed else {
             return false;
         };
-        held.borrow_mut().push((key, elem));
+        let mut judged = judged.borrow_mut();
+        // A candidate that cannot be recorded is dropped rather than answered without the
+        // bytes it was judged on — and the daemon does not fall over a search it declined.
+        if judged.try_reserve(1).is_err() {
+            return false;
+        }
+        judged.push((key, attr));
         true
     };
 
@@ -88,11 +92,13 @@ fn similar(
         // `FILTER` still catches that, because it could not have read it either.
         let attr = if !with_attr {
             None
-        } else if let Some(attr) = held_attr(&held, key, &layout) {
-            // The FILTER already holds this element; read it again from the hold.
+        } else if let Some(attr) = judged_attr(&judged, key) {
+            // The FILTER already read this element; answer with the bytes it judged.
             Some(attr)
         } else {
-            let stored = match store.get_elem(&index.name, &id) {
+            // The ATTR only, as `vgetattr` answers it — the rest of the stored value is a
+            // length header and, where this build keeps one, the vector.
+            let stored = match store.get_attr(&index.name, &id, layout) {
                 Ok(stored) => stored,
                 // Every remaining hit would fail the same way, and the graph should not
                 // outlive the Map it was built from.

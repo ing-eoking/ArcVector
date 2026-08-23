@@ -47,9 +47,13 @@ const MIN_CAPACITY: usize = 1024;
 /// stripe-lock table as `ceil2(threads * connectivity_max * 4)` cache lines.
 const THREAD_SLOTS: usize = 64;
 
-/// A `FILTER` clause: asked of every node a search visits, with the node's key and the id
-/// naming it. The key comes along so a caller can keep what it read against it.
-pub type Accept<'a> = &'a dyn Fn(u64, &str) -> bool;
+/// A `FILTER` clause: asked of every node a search visits, with the node's key.
+///
+/// The key is all it gets, and that is the point. The key **is** the element's address, so a
+/// clause reads what it needs straight out of it; asking for the id as well would mean naming
+/// every visited node — an allocation apiece — to answer a question the id has no part in.
+/// Naming happens once the hits are known.
+pub type Accept<'a> = &'a dyn Fn(u64) -> bool;
 
 /// A node in the graph that nothing names yet.
 ///
@@ -811,10 +815,18 @@ impl AnnIndex {
     ///
     /// The caller holds the read lock, which is the safety condition for the dereference.
     fn name(&self, held: &HeldSet, key: u64) -> Option<Arc<str>> {
-        if held::is_staged(key) || !held.contains(key) {
+        if !Self::is_named(held, key) {
             return None;
         }
         self.elements.id_at(key)
+    }
+
+    /// Whether this key stands for something — without building the id it stands for.
+    ///
+    /// What a search's per-node path needs. A bit test and a set lookup, no dereference and no
+    /// allocation; [`name`](Self::name) is for the hits that survive.
+    fn is_named(held: &HeldSet, key: u64) -> bool {
+        !held::is_staged(key) && held.contains(key)
     }
 
     /// k-NN search. `accept` is called once per visited graph node and must be
@@ -846,9 +858,9 @@ impl AnnIndex {
         .map_err(usearch_err)
     }
 
-    /// k-NN search, returning what each hit is named. `accept` is the `FILTER` clause, called once per visited node with the
-    /// key and the id naming it; `None` means there is no clause and usearch runs with no
-    /// callback at all. The key comes along so a caller can keep what it read against it.
+    /// k-NN search, returning what each hit is named. `accept` is the `FILTER` clause, called
+    /// once per visited node with that node's key; `None` means there is no clause and usearch
+    /// runs with no callback at all.
     ///
     /// Nothing else is checked per node. A staged node — in the graph, named by nothing —
     /// needs no check of its own: a `FILTER` cannot read the element it does not have yet and
@@ -902,12 +914,13 @@ impl AnnIndex {
                 // across the clause too — the predicate dereferences the element behind the
                 // key — but holding it for the whole search stops every write for that long:
                 // measured at `publish` p50 0.5 → 83us under four searchers.
+                //
+                // Nothing is named here. `is_named` answers the only question this path has —
+                // does the key stand for a linked element — and the clause reads that element
+                // itself. Naming every visited node cost an allocation each.
                 Some(matches) => self.matches(&index, query, k, |key| {
                     let held = self.held();
-                    match self.name(&held, key) {
-                        Some(id) => matches(key, &id),
-                        None => false,
-                    }
+                    Self::is_named(&held, key) && matches(key)
                 }),
             }?
         };
@@ -1211,13 +1224,15 @@ mod tests {
     }
 
     #[test]
-    fn the_predicate_sees_the_id_and_excludes_what_it_rejects() {
+    fn the_predicate_excludes_what_it_rejects() {
         let idx = build(4, Quant::F32, Metric::L2, 2);
         add(&idx, "keep", &[1.0, 0.0, 0.0, 0.0]);
         add(&idx, "skip", &[1.0, 0.0, 0.0, 0.0]);
 
         let q = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], Quant::F32);
-        let keep = |_key: u64, id: &str| id == "keep";
+        // The clause gets a key, not an id — naming it is the caller's business, and here that
+        // is what the assertion is about.
+        let keep = |key: u64| FAKE.id_at(key).is_some_and(|id| &*id == "keep");
         let hits = idx.search(&q, 10, Some(&keep as Accept)).unwrap();
         let ids: Vec<String> = hits.iter().map(|(_, id, _)| id.to_string()).collect();
         assert_eq!(ids, vec!["keep"]);

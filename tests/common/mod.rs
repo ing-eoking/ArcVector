@@ -294,6 +294,29 @@ impl Client {
         )
     }
 
+    /// `WITHATTR`, with an optional `FILTER` — the two render hits by different routes.
+    pub fn vsim_withattr(
+        &mut self,
+        index: &str,
+        k: usize,
+        dim: usize,
+        coords: &str,
+        terms: &[&str],
+    ) -> String {
+        let filter = if terms.is_empty() {
+            String::new()
+        } else {
+            format!(" FILTER {} {}", terms.len(), terms.join(" "))
+        };
+        self.send_body(
+            &format!(
+                "VSIM VECTOR {index} {k} {} {dim}{filter} WITHATTR",
+                coords.len()
+            ),
+            coords,
+        )
+    }
+
     /// A wrong body length leaves surplus bytes that memcached answers as one more command.
     pub fn drain(&mut self) {
         let previous = self.stream.read_timeout().ok().flatten();

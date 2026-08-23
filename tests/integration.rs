@@ -176,6 +176,29 @@ fn a_filter_restricts_results_by_attribute() {
     client.send(&format!("vdrop {ix}"));
 }
 
+/// The two render paths must agree. A hit the `FILTER` read is answered from what the filter
+/// judged; one it did not is read back here — and that read used to hand over the whole stored
+/// value, header and vector included, instead of the ATTR.
+#[test]
+fn withattr_answers_the_attributes_by_either_route() {
+    session!(_server, client);
+    let ix = index_name("withattr");
+    client.send(&format!("vcreate {ix} 2 METRIC l2"));
+
+    let attr = r#"{"score":900}"#;
+    client.vadd_attr(&ix, "one", 2, "0.1 0.2", attr);
+
+    // No FILTER: the hit is read back at render time.
+    let plain = client.vsim_withattr(&ix, 5, 2, "0.1 0.2", &[]);
+    assert_contains(&plain, &format!("VALUE one 0 {}\r\n{attr}", attr.len()));
+
+    // With FILTER: the hit carries the bytes the filter judged.
+    let filtered = client.vsim_withattr(&ix, 5, 2, "0.1 0.2", &["score>500"]);
+    assert_contains(&filtered, &format!("VALUE one 0 {}\r\n{attr}", attr.len()));
+
+    client.send(&format!("vdrop {ix}"));
+}
+
 #[test]
 fn search_by_key_uses_the_stored_vector() {
     session!(_server, client);
