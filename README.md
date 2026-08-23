@@ -9,7 +9,8 @@ eviction, TTL and replication; the ANN graph is a
 [usearch](https://github.com/unum-cloud/usearch) index kept alongside as a cache.
 
 내부 구조·빌드·복구 로직은 [docs/내부구조.md](docs/내부구조.md), 알면서 안 고친 것들은
-[docs/미해결.md](docs/미해결.md)에 있다.
+[docs/미해결.md](docs/미해결.md)에 있다. 코드를 읽으며 검토할 때는
+[docs/코드리뷰.md](docs/코드리뷰.md) — 절마다 소스 조각 하나와 확인 항목이 붙어 있다.
 
 ---
 
