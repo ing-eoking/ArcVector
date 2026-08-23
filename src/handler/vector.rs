@@ -183,9 +183,8 @@ pub fn vsetattr(store: &Store, name: &str, id: &str, attr: &[u8]) -> Result<Repl
 
     let mut gone = false;
     let settled = index.ann.update_published(
-        // Where the element is and what it holds. The hold is this closure's own and drops
-        // before it returns, so the only refcount left is the graph's — which the graph gives
-        // up next, and that is what lets the engine write in place.
+        // Where the element is and what it holds. Everything outside the ATTR region has to
+        // come back byte for byte — the vector, where this build stores one.
         || {
             let held = match store.hold_elem(name, id) {
                 Ok(held) => held,
@@ -197,17 +196,22 @@ pub fn vsetattr(store: &Store, name: &str, id: &str, attr: &[u8]) -> Result<Repl
             };
             Some((held.addr(), held.value().to_vec()))
         },
-        // The ATTR region is a fixed 128 bytes, so the value going back is exactly as long as
-        // the one that came out — which, with no refcount standing, is the condition for the
-        // engine's in-place `memcpy`. The address does not move and the node does not either.
+        // A replace, not an edit: the engine links this allocation and unlinks the old one, so
+        // the address is ours to know rather than something to go looking for afterwards.
         |mut value| {
-            let outcome = layout
+            // The stored bytes carry the engine's terminator; the body is what gets handed back.
+            value.truncate(layout.element_len().min(value.len()));
+            layout
                 .set_attr(&mut value, attr)
-                .map_err(|_| StoreError::CorruptElement)
-                .and_then(|()| store.update_elem(name, id, &value));
-            // Held again whether or not that worked: the graph is keyed by this element and has
-            // let go of it.
-            (outcome, store.hold_addr(name, id).ok().map(HeldAddr::keep))
+                .map_err(|_| StoreError::CorruptElement)?;
+            let pending = store.alloc_elem(name, id, &value)?;
+            let addr = pending.addr();
+            pending.insert()?;
+            // The refcount the graph takes over. Read back rather than assumed, so the node
+            // follows the element the Map actually holds.
+            let held = store.hold_addr(name, id)?;
+            debug_assert_eq!(held.addr(), addr, "the engine linked a different element");
+            Ok(held.keep())
         },
     );
 

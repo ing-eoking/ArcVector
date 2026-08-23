@@ -394,36 +394,6 @@ impl Store {
         }
     }
 
-    /// Replace one element's value with the same number of bytes.
-    ///
-    /// The engine writes in place only when nothing holds a refcount on the element
-    /// (`do_map_elem_update`), and the graph holds one on every element it keys a node by — so
-    /// in practice this always allocates a new element and unlinks the old. **The address
-    /// changes**, which is why the caller has to move the node. What it does buy is that moving
-    /// a node is a `rename`, not an HNSW insert.
-    pub fn update_elem(&self, key: &str, field: &str, value: &[u8]) -> Result<()> {
-        let Some(update) = self.vtable().map_elem_update else {
-            return Err(StoreError::Unavailable);
-        };
-        let selector = field_t {
-            value: field.as_ptr().cast::<c_char>().cast_mut(),
-            length: field.len(),
-        };
-        // SAFETY: `key`, `selector` and `value` outlive the call.
-        check(unsafe {
-            update(
-                self.handle(),
-                self.cookie,
-                key.as_ptr().cast::<c_void>(),
-                as_int(key.len()),
-                ptr::from_ref(&selector),
-                value.as_ptr().cast::<c_void>(),
-                as_int(value.len()),
-                0,
-            )
-        })
-    }
-
     /// Read the ATTR of the element at `addr` without looking it up.
     ///
     /// The search predicate's read. A node's key *is* its element's address, so the field it
