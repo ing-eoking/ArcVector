@@ -1,9 +1,9 @@
 use std::fmt::Write as _;
 
-#[cfg(recovery)]
-use super::access::resolve;
 use crate::command::request::Create;
 use crate::error::{Error, Reply, Result};
+#[cfg(recovery)]
+use crate::handler::access::resolve;
 use crate::handler::arcus::element::{self, Layout, MetaRecord};
 use crate::handler::arcus::engine::{self, Store, StoreError};
 use crate::handler::quant::Quant;

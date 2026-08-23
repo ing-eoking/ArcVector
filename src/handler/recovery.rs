@@ -2,16 +2,13 @@
 
 use std::sync::{Condvar, LazyLock, Mutex, PoisonError};
 
-pub mod metadata;
-
-use metadata::stamp;
-
-use crate::handler::meta::{MetaState, read_metadata};
+use crate::handler::access::meta::{MetaState, read_metadata};
 
 use super::registry::{REBUILDING, VectorIndex, get, remove};
 use crate::error::{Error, Result};
-use crate::handler::arcus::element::{META_FIELD, mint_owner};
+use crate::handler::arcus::element::{Layout, META_FIELD, MetaRecord, mint_owner};
 use crate::handler::arcus::engine::{HeldMap, Store};
+use crate::handler::usearch::{AnnIndex, Metric};
 
 /// Empty a graph this node was not serving and queue its refill.
 pub fn take_over(store: &Store, index: &VectorIndex) -> Result<()> {
@@ -178,5 +175,32 @@ pub fn claim_refilled(store: &Store, index: &VectorIndex) -> Result<()> {
         "ArcVector: index '{}' is serving again, owner={owner:016x}",
         index.name
     );
+    Ok(())
+}
+
+/// Build the empty graph an adoption starts from, out of what the metadata recorded.
+pub fn build_ann(meta: &MetaRecord, layout: Layout) -> Result<AnnIndex> {
+    let metric = Metric::parse(&meta.metric)
+        .ok_or_else(|| Error::bad_request(format!("unknown metric '{}'", meta.metric)))?;
+    AnnIndex::new(
+        layout,
+        metric,
+        meta.connectivity,
+        meta.expansion_add,
+        meta.expansion_search,
+        std::sync::Arc::new(crate::handler::arcus::engine::DetachedElements),
+    )
+}
+
+/// Write `owner` into the Map's metadata element, keeping everything else.
+pub(super) fn stamp(store: &Store, name: &str, owner: u64) -> Result<()> {
+    let (meta, layout) = match read_metadata(store, name) {
+        MetaState::Usable(meta, layout) => (meta, layout),
+        MetaState::NoMap => return Err(Error::NoSuchIndex),
+        MetaState::Damaged(why) => return Err(Error::bad_request(why)),
+        MetaState::Unknown(e) => return Err(e.into()),
+    };
+    let claimed = MetaRecord { owner, ..meta };
+    store.put_elem(name, META_FIELD, &claimed.encode(layout))?;
     Ok(())
 }

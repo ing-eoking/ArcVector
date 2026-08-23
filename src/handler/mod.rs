@@ -6,19 +6,12 @@ pub mod registry;
 pub mod usearch;
 
 mod access;
-mod coords;
-mod index;
-mod meta;
-mod search;
-mod sweep;
-mod vector;
+mod cmd;
 
 use std::os::raw::c_void;
 
 use arcus::{Store, StoreError};
-use index::{vcreate, vdrop, vlist, vstats};
-use search::{vsim_key, vsim_vector};
-use vector::{vadd, vdel, vgetattr, vsetattr};
+use cmd::{vadd, vcreate, vdel, vdrop, vgetattr, vlist, vsetattr, vsim_key, vsim_vector, vstats};
 
 use crate::command::Request;
 use crate::command::request::{Body, Line};
@@ -64,6 +57,6 @@ pub unsafe fn run(cookie: *const c_void, request: Request) -> Result<Reply> {
 
     // After the answer, so the sweep is never part of a command's latency, and on this thread
     // because it has the cookie an engine read may be handed — see `sweep`.
-    sweep::maybe(store);
+    access::sweep::maybe(store);
     reply
 }

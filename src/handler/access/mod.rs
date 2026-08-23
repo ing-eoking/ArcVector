@@ -1,4 +1,15 @@
-//! Every command starts with the Map's metadata element; with `cfg(recovery)` its `owner` token also decides whether this node's graph is the one to serve.
+//! Which graph serves a name, and for how long.
+//!
+//! Three questions, one subject. [`resolve`] answers "is this name still our index, and which
+//! graph should serve it" for every command. [`meta`] is the only thing that can answer the
+//! first half — the metadata element. [`sweep`] asks the same question about names **no command
+//! is asking about**, so an expired index does not keep its graph for the life of the process.
+
+//! Every command starts with the metadata element; with `cfg(recovery)` its `owner` token also
+//! decides whether this node's graph is the one to serve.
+
+pub mod meta;
+pub mod sweep;
 
 use std::sync::Arc;
 
@@ -7,10 +18,10 @@ use crate::handler::arcus::element::{Layout, MetaRecord};
 use crate::handler::arcus::engine::Store;
 #[cfg(recovery)]
 use crate::handler::arcus::engine::StoreError;
-use crate::handler::meta::{MetaState, read_metadata};
 #[cfg(recovery)]
 use crate::handler::recovery;
 use crate::handler::registry::{self, VectorIndex};
+use meta::{MetaState, read_metadata};
 
 #[cfg(recovery)]
 pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
@@ -157,7 +168,7 @@ fn empty_graph(
     layout: Layout,
 ) -> Result<(Arc<VectorIndex>, bool)> {
     let probe = store.probe_map(name)?;
-    let ann = recovery::metadata::build_ann(meta, layout)?;
+    let ann = recovery::build_ann(meta, layout)?;
     // Nothing to undo if the registry cannot take it: the Map is not ours to remove — we are
     // adopting one that was already there — and the graph goes out of scope unregistered.
     registry::insert_or_get(VectorIndex::new(
