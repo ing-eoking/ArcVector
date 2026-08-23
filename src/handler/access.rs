@@ -42,12 +42,13 @@ pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
     let (meta, _) = usable_metadata(store, name)?;
     let index = registry::get(name).ok_or(Error::NoSuchIndex)?;
     if meta.owner != index.owner() {
+        // Identity, not name: see `map_is_gone`.
         // Nothing in this build can produce a second index at one name — no transfer, no
         // restore, and `vcreate` releases a stale graph before it registers. So this is the
         // branch that should never run, kept because the guarantee it rests on is a build
         // configuration rather than anything the code enforces. There is nothing to rebuild
         // from, so let the graph go and answer as if the name were free.
-        registry::remove(name);
+        registry::remove_observed(name, &index);
         return Err(Error::NoSuchIndex);
     }
     Ok(index)
@@ -56,15 +57,20 @@ pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
 /// The metadata element, or the reason there is none — and, where the reason is definitive,
 /// the release of a graph that has nothing left to serve.
 fn usable_metadata(store: &Store, name: &str) -> Result<(MetaRecord, Layout)> {
+    // Read before the metadata, because that is what the verdict below will be about. An entry
+    // that appears after this describes a Map this read never saw, and is not ours to judge.
+    let observed = registry::get(name);
     match read_metadata(store, name) {
         MetaState::Usable(meta, layout) => Ok((meta, layout)),
         // Expired, evicted, or dropped by another node.
         MetaState::NoMap => {
-            map_is_gone(name);
+            if let Some(index) = &observed {
+                map_is_gone(name, index);
+            }
             Err(Error::NoSuchIndex)
         }
         MetaState::Damaged(why) => {
-            discard_damaged(store, name, &why);
+            discard_damaged(store, name, &why, observed.as_deref());
             Err(Error::NoSuchIndex)
         }
         // Proves nothing about the name, so nothing is released on it — and the client hears
@@ -78,16 +84,20 @@ fn usable_metadata(store: &Store, name: &str) -> Result<(MetaRecord, Layout)> {
 ///
 /// The Map is there — `NoMap` was already ruled out — so the question is only whose it is.
 #[cfg(recovery)]
-fn discard_damaged(store: &Store, name: &str, why: &str) {
+fn discard_damaged(store: &Store, name: &str, why: &str, observed: Option<&VectorIndex>) {
     match store.probe_map(name) {
         // Gone between the metadata read and this probe. Nothing to delete.
-        Err(StoreError::KeyGone) => map_is_gone(name),
+        Err(StoreError::KeyGone) => {
+            if let Some(index) = observed {
+                map_is_gone(name, index);
+            }
+        }
         // Any other engine trouble proves nothing about whether the Map is there.
         Err(_) => {}
         // Somebody else's Map is none of our business — but the graph under that name is
         // ours, and it has nothing left to serve.
         Ok(probe) if !probe.looks_like_index() => {
-            if registry::remove(name) {
+            if observed.is_some_and(|index| registry::remove_observed(name, index)) {
                 eprintln!(
                     "ArcVector: '{name}' is not our Map ({why}); releasing the graph that used to be there"
                 );
@@ -104,7 +114,9 @@ fn discard_damaged(store: &Store, name: &str, why: &str) {
                  which cannot become an index again without it"
             );
             let _ = store.drop_map(name);
-            registry::remove(name);
+            if let Some(index) = observed {
+                registry::remove_observed(name, index);
+            }
         }
     }
 }
@@ -112,8 +124,8 @@ fn discard_damaged(store: &Store, name: &str, why: &str) {
 /// A Map that is not an index. Never deleted here: no build deletes a Map it did not make, and
 /// this one cannot even tell whether it made it — that is what the metadata would have said.
 #[cfg(not(recovery))]
-fn discard_damaged(_store: &Store, name: &str, why: &str) {
-    if registry::remove(name) {
+fn discard_damaged(_store: &Store, name: &str, why: &str, observed: Option<&VectorIndex>) {
+    if observed.is_some_and(|index| registry::remove_observed(name, index)) {
         eprintln!(
             "ArcVector: '{name}' is no longer our Map ({why}); releasing the graph it was built from"
         );
@@ -168,8 +180,13 @@ pub(super) fn for_write(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
 /// whose insert reports it created the Map. No build pays an extra probe to find this out, and
 /// nothing here runs on a guess: a probe that merely failed could have failed for a transient
 /// reason, and releasing the graph on that would throw away a working index.
-pub(super) fn map_is_gone(name: &str) {
-    if registry::remove(name) {
+///
+/// `observed` is the entry the caller was working with, and the only one this releases. The
+/// verdict was reached before the lock, so by now the name can hold an index some `vcreate`
+/// registered in between — one built for a Map that exists. Releasing by name would take that
+/// one out, leaving a Map nothing serves and, in a build that cannot rebuild, no way back.
+pub(super) fn map_is_gone(name: &str, observed: &VectorIndex) {
+    if registry::remove_observed(name, observed) {
         eprintln!("ArcVector: index '{name}' has no Map; releasing the graph it was built from");
     }
 }

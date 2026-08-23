@@ -42,6 +42,10 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         expansion_search: spec.expansion_search,
         owner,
     };
+    // Read before the insert, because that is what a release below can be about: an entry
+    // registered after this point was built from the Map this call is about to make, and is
+    // the opposite of stale.
+    let stale = registry::get(name);
     // One engine call settles the name. Nothing probes it first: a probe answers about a
     // moment that has already passed, and every case it could report comes back from this
     // call anyway — decided under the engine's own cache lock, so there is no window between
@@ -79,11 +83,13 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         return already_there(store, name);
     }
 
-    // The name was free until this call, so any registry entry under it is a graph whose Map
-    // expired or was evicted. Release it here, or the insert below finds it and answers
-    // `EXISTS` — that reply would leave the fresh empty Map paired with the stale graph, and
-    // in a build that cannot rebuild, nothing would ever notice.
-    super::access::map_is_gone(name);
+    // The name was free until this call, so the entry read above is a graph whose Map expired
+    // or was evicted. Release it here, or the insert below finds it and answers `EXISTS` —
+    // that reply would leave the fresh empty Map paired with the stale graph, and in a build
+    // that cannot rebuild, nothing would ever notice.
+    if let Some(index) = &stale {
+        super::access::map_is_gone(name, index);
+    }
 
     let index = VectorIndex::new(name.to_owned(), ann, maxcount, owner);
     let (_, inserted) = match registry::insert_or_get(index) {

@@ -99,6 +99,24 @@ pub fn remove(name: &str) -> bool {
     write().remove(name).is_some()
 }
 
+/// Remove `name` only while it still holds `observed`.
+///
+/// Releasing a graph is always decided on something read earlier — a metadata read, an engine
+/// call's `KeyGone` — and by the time the decision arrives the name can hold a different index
+/// entirely. Matching on identity is what keeps a stale verdict from taking out a live entry:
+/// `vcreate` registering between the read and the release is exactly that case, and by name
+/// alone the new index would be dropped with the Map it was just built for still in place.
+pub fn remove_observed(name: &str, observed: &VectorIndex) -> bool {
+    let mut reg = write();
+    match reg.get(name) {
+        Some(current) if std::ptr::eq(Arc::as_ptr(current), observed) => {
+            reg.remove(name);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Every index that is serving, ordered by name for stable `vlist` output.
 pub fn snapshot() -> Vec<Arc<VectorIndex>> {
     let mut all: Vec<Arc<VectorIndex>> = read()
@@ -108,4 +126,55 @@ pub fn snapshot() -> Vec<Arc<VectorIndex>> {
         .collect();
     all.sort_by(|a, b| a.name.cmp(&b.name));
     all
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handler::arcus::element::Layout;
+    use crate::handler::quant::Quant;
+    use crate::handler::usearch::Metric;
+
+    fn index(name: &str) -> VectorIndex {
+        let ann = AnnIndex::new(Layout::new(4, Quant::F32), Metric::L2, 0, 0, 0)
+            .expect("build the graph");
+        VectorIndex::new(name.to_owned(), ann, 8, 1)
+    }
+
+    /// The race this guards: a command reads the Map, finds it gone, and only reaches the
+    /// registry after a `vcreate` has put a live index under the same name. By name alone the
+    /// release takes out the new one, leaving a Map nothing serves.
+    #[test]
+    fn a_stale_release_leaves_a_newly_registered_index_alone() {
+        let name = "registry-test-stale-release";
+        let (observed, _) = insert_or_get(index(name)).expect("register the first");
+
+        // The first index goes, a second takes the name — what `vcreate` does.
+        assert!(remove(name));
+        let (current, inserted) = insert_or_get(index(name)).expect("register the second");
+        assert!(inserted, "the name was free");
+
+        // The release finally arrives, carrying a verdict about the index that is already gone.
+        assert!(
+            !remove_observed(name, &observed),
+            "a stale release must report that it removed nothing"
+        );
+        assert!(
+            get(name).is_some_and(|live| Arc::ptr_eq(&live, &current)),
+            "the live index must survive a release meant for its predecessor"
+        );
+        remove(name);
+    }
+
+    #[test]
+    fn a_release_for_the_live_index_removes_it() {
+        let name = "registry-test-live-release";
+        let (live, _) = insert_or_get(index(name)).expect("register");
+
+        assert!(
+            remove_observed(name, &live),
+            "the observed index is the live one"
+        );
+        assert!(get(name).is_none(), "the entry is gone");
+    }
 }

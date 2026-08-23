@@ -88,7 +88,7 @@ fn similar(
                 // Every remaining hit would fail the same way, and the graph should not
                 // outlive the Map it was built from.
                 Err(StoreError::KeyGone) => {
-                    map_is_gone(&index.name);
+                    map_is_gone(&index.name, index);
                     break;
                 }
                 Err(_) => continue,
@@ -168,7 +168,7 @@ pub fn vsim_key(store: &Store, spec: &SimKey) -> Result<Reply> {
         Err(StoreError::ElemGone) => return Ok(Reply::NotFound),
         // The Map is gone, so the graph has nothing left to answer with.
         Err(StoreError::KeyGone) => {
-            map_is_gone(name);
+            map_is_gone(name, &index);
             return Ok(Reply::NotFound);
         }
         Err(e) => return Err(e.into()),

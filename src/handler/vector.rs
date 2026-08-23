@@ -5,6 +5,7 @@ use crate::error::{Error, Reply, Result};
 use crate::handler::arcus::element::Layout;
 use crate::handler::arcus::engine::{Store, StoreError};
 use crate::handler::quant;
+use crate::handler::registry::VectorIndex;
 use crate::handler::usearch::PublishError;
 
 /// `vadd <index> <id> <veclen> <dim> [ATTR <attrlen> <attr JSON>]`
@@ -45,7 +46,7 @@ pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
     // call — no node to unwind.
     let mut pending = match store.reserve_elem(name, id, layout.element_len()) {
         Ok(pending) => pending,
-        Err(e) => return store_failed(name, e),
+        Err(e) => return store_failed(name, &index, e),
     };
 
     // ② ③ ④ Mint the key, count the write in flight, insert the node. Nothing names it yet,
@@ -70,7 +71,7 @@ pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
         .insert_published(id, staged, index.owner(), || pending.insert())
     {
         Ok(()) => Ok(Reply::Stored),
-        Err(PublishError::Store(e)) => store_failed(name, e),
+        Err(PublishError::Store(e)) => store_failed(name, &index, e),
         // The mapping refused to grow. Nothing was written and nothing is left over, so this
         // is a reply like any other — the daemon does not fall over a write it declined.
         Err(PublishError::Mapping(e)) => Err(e),
@@ -78,11 +79,13 @@ pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
 }
 
 /// How a failed Map write answers: a full index and an evicted one are replies, not errors.
-fn store_failed(name: &str, e: StoreError) -> Result<Reply> {
+///
+/// `index` is the entry this write was working with, and the only one an eviction releases.
+fn store_failed(name: &str, index: &VectorIndex, e: StoreError) -> Result<Reply> {
     match e {
         StoreError::Overflow => Ok(Reply::Overflowed),
         StoreError::KeyGone => {
-            map_is_gone(name);
+            map_is_gone(name, index);
             Err(Error::IndexEvicted)
         }
         e => Err(e.into()),
@@ -130,7 +133,7 @@ pub fn vget(store: &Store, name: &str, id: &str) -> Result<Reply> {
         Err(StoreError::ElemGone) => Ok(Reply::NotFound),
         // The Map itself is gone, which no read path used to act on.
         Err(StoreError::KeyGone) => {
-            map_is_gone(name);
+            map_is_gone(name, &index);
             Ok(Reply::NotFound)
         }
         Err(e) => Err(e.into()),
@@ -160,7 +163,7 @@ pub fn vdel(store: &Store, name: &str, id: &str) -> Result<Reply> {
     // Outside the hold: releasing the registry entry drops the graph, and the mapping lock is
     // inside it.
     if map_gone {
-        map_is_gone(name);
+        map_is_gone(name, &index);
     }
     match removed {
         Ok(Some(_)) => Ok(Reply::Deleted),
