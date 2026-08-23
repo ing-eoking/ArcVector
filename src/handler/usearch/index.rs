@@ -449,7 +449,8 @@ impl AnnIndex {
 
     pub fn vector_of(&self, addr: u64) -> Result<Option<Vec<u8>>> {
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
-        if !self.held().contains(addr) {
+        let held = self.held();
+        if !held.contains(addr) {
             return Ok(None);
         }
         let key = addr;
