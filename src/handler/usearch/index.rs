@@ -454,15 +454,14 @@ impl AnnIndex {
             return;
         }
         let after = crate::server::coarse_now() + 1;
+        let done = self.oldest_reader();
 
-        if self.oldest_reader() >= after {
+        if done >= after && self.queued.load(Ordering::Relaxed) == 0 {
             self.elements.release(addrs);
-            if self.queued.load(Ordering::Relaxed) > 0 {
-                self.reclaim();
-            }
             return;
         }
 
+        let mut ready: Vec<u64> = Vec::new();
         {
             let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
             if retired.try_reserve(addrs.len()).is_err() {
@@ -471,9 +470,12 @@ impl AnnIndex {
                 return;
             }
             retired.extend(addrs.iter().map(|addr| (*addr, after)));
+            take_ready(&mut retired, done, &mut ready);
             self.queued.store(retired.len(), Ordering::Relaxed);
         }
-        self.reclaim();
+        if !ready.is_empty() {
+            self.elements.release(&ready);
+        }
     }
 
     fn drain_then_release(&self, addrs: &[u64], after: u64) {
@@ -502,14 +504,12 @@ impl AnnIndex {
         let mut ready: Vec<u64> = Vec::new();
         {
             let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
-            let cut = retired.partition_point(|(_, after)| *after <= done);
-            if cut == 0 || ready.try_reserve(cut).is_err() {
-                return;
-            }
-            ready.extend(retired.drain(..cut).map(|(addr, _)| addr));
+            take_ready(&mut retired, done, &mut ready);
             self.queued.store(retired.len(), Ordering::Relaxed);
         }
-        self.elements.release(&ready);
+        if !ready.is_empty() {
+            self.elements.release(&ready);
+        }
     }
 
     fn drop_node(&self, key: u64) -> bool {
@@ -793,6 +793,14 @@ impl AnnIndex {
         let hits: Vec<(u64, f32)> = matches.keys.into_iter().zip(matches.distances).collect();
         Ok(self.resolve(&hits, entered))
     }
+}
+
+fn take_ready(retired: &mut Vec<(u64, u64)>, done: u64, ready: &mut Vec<u64>) {
+    let cut = retired.partition_point(|(_, after)| *after <= done);
+    if cut == 0 || ready.try_reserve(cut).is_err() {
+        return;
+    }
+    ready.extend(retired.drain(..cut).map(|(addr, _)| addr));
 }
 
 fn to_f32(bytes: &[u8]) -> Vec<f32> {
