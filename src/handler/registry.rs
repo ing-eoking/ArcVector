@@ -2,8 +2,9 @@
 
 use std::collections::{HashMap, TryReserveError};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
+use crate::handler::access::sweep;
 use crate::handler::usearch::AnnIndex;
 
 /// `owner` while a rebuild is in flight: claimed by nobody.
@@ -36,6 +37,12 @@ pub struct VectorIndex {
     /// Map and is right about what it saw — the entry has to say "not yet" itself, because
     /// nothing outside it can tell that verdict from a true one.
     published: AtomicU64,
+    /// The [`ACCESS_TICK`] reading when a command last looked this name up.
+    ///
+    /// What the sweep orders by. An index a command touched a second ago is one whose Map was
+    /// there a second ago, so looking at the coldest first is looking where something is
+    /// actually likely to be gone.
+    last_access: AtomicU64,
     /// Set by the rebuild thread when the graph is complete.
     #[cfg(recovery)]
     pub(super) refilled: std::sync::atomic::AtomicBool,
@@ -49,6 +56,7 @@ impl VectorIndex {
             maxcount,
             owner: AtomicU64::new(owner),
             published: AtomicU64::new(0),
+            last_access: AtomicU64::new(0),
             #[cfg(recovery)]
             refilled: std::sync::atomic::AtomicBool::new(false),
         }
@@ -66,6 +74,21 @@ impl VectorIndex {
     pub fn publish(&self) {
         self.published
             .store(CLOCK.fetch_add(1, Ordering::AcqRel), Ordering::Release);
+    }
+
+    /// Record that a command looked this name up.
+    ///
+    /// On the path of every command, so it reads before it writes: within one tick the value is
+    /// already right, and the entry's cache line stays clean for everyone else on it.
+    fn touch(&self) {
+        let now = ACCESS_TICK.load(Ordering::Relaxed);
+        if self.last_access.load(Ordering::Relaxed) != now {
+            self.last_access.store(now, Ordering::Relaxed);
+        }
+    }
+
+    fn accessed_at(&self) -> u64 {
+        self.last_access.load(Ordering::Relaxed)
     }
 
     /// `0` while the Map this entry describes has not been written yet.
@@ -94,6 +117,17 @@ impl VectorIndex {
     }
 }
 
+/// Coarse time for [`VectorIndex::touch`], ticked by the sweeper.
+///
+/// A real clock read on every command would cost more than this is worth, and the sweep only
+/// needs to know which names are colder than which. One tick of resolution is plenty.
+static ACCESS_TICK: AtomicU64 = AtomicU64::new(1);
+
+/// Advance [`ACCESS_TICK`]. The sweeper's thread calls this, once per tick.
+pub(in crate::handler) fn tick() {
+    ACCESS_TICK.fetch_add(1, Ordering::Relaxed);
+}
+
 static INDICES: LazyLock<RwLock<HashMap<String, Arc<VectorIndex>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
@@ -105,74 +139,13 @@ fn write() -> std::sync::RwLockWriteGuard<'static, HashMap<String, Arc<VectorInd
     INDICES.write().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Graphs on their way out, dropped somewhere other than the thread that evicted them.
-///
-/// Dropping a `VectorIndex` is not cheap: the last `Arc` runs `AnnIndex::drop`, which hands back
-/// a refcount per vector — `map_elem_release` takes the engine's cache lock every hundred — and
-/// then destroys the HNSW index. On a two-million-vector graph that is a long time to spend on
-/// a connection that asked for something else, and longer still to spend holding the registry's
-/// write lock, which every command's name lookup needs.
-///
-/// So an evicted entry is handed here instead. The thread needs no connection: releasing
-/// refcounts and destroying a graph are calls that ignore the cookie.
-struct Reaper {
-    queue: Mutex<Vec<Arc<VectorIndex>>>,
-    wake: Condvar,
-}
-
-static REAPER: LazyLock<Reaper> = LazyLock::new(|| {
-    std::thread::Builder::new()
-        .name("arcvector-reap".to_owned())
-        .spawn(run_reaper)
-        .expect("spawn the reaper thread");
-    Reaper {
-        queue: Mutex::new(Vec::new()),
-        wake: Condvar::new(),
-    }
-});
-
-fn run_reaper() {
-    loop {
-        let evicted = {
-            let mut queue = REAPER.queue.lock().unwrap_or_else(PoisonError::into_inner);
-            loop {
-                if let Some(index) = queue.pop() {
-                    break index;
-                }
-                queue = REAPER
-                    .wake
-                    .wait(queue)
-                    .unwrap_or_else(PoisonError::into_inner);
-            }
-        };
-        // Outside the queue lock, because this is the expensive part.
-        drop(evicted);
-    }
-}
-
-/// Hand an entry that has left the registry to the reaper. **Call with no registry guard held.**
-///
-/// If it is not the last `Arc` this only moves a reference — whichever command still holds one
-/// pays for the teardown when it finishes, and that thread was using the index anyway. What
-/// this covers is the case the sweep creates: nobody is using it, so the eviction itself would
-/// otherwise pay.
-pub(in crate::handler) fn retire(evicted: Option<Arc<VectorIndex>>) {
-    let Some(index) = evicted else { return };
-    let mut queue = REAPER.queue.lock().unwrap_or_else(PoisonError::into_inner);
-    if queue.try_reserve(1).is_err() {
-        // Nowhere to put it. Tearing it down here costs this thread the time, which still beats
-        // leaking the graph.
-        drop(queue);
-        drop(index);
-        return;
-    }
-    queue.push(index);
-    REAPER.wake.notify_one();
-}
-
 /// Look a name up, releasing the registry lock immediately.
 pub fn get(name: &str) -> Option<Arc<VectorIndex>> {
-    read().get(name).cloned()
+    let index = read().get(name).cloned();
+    if let Some(index) = &index {
+        index.touch();
+    }
+    index
 }
 
 pub fn contains(name: &str) -> bool {
@@ -224,7 +197,7 @@ pub fn unput(ours: &VectorIndex, previous: Option<Arc<VectorIndex>>) {
         None => {
             let evicted = reg.remove(name);
             drop(reg);
-            retire(evicted);
+            sweep::retire(evicted);
         }
     }
 }
@@ -243,7 +216,7 @@ pub fn remove_if_stale(name: &str, stamp: u64) -> bool {
             }
             let evicted = reg.remove(name);
             drop(reg);
-            retire(evicted);
+            sweep::retire(evicted);
             true
         }
         None => false,
@@ -269,7 +242,7 @@ pub fn remove(name: &str) -> bool {
     // The guard is a temporary and goes at the semicolon; the entry outlives it.
     let evicted = write().remove(name);
     let had = evicted.is_some();
-    retire(evicted);
+    sweep::retire(evicted);
     had
 }
 
@@ -286,40 +259,46 @@ pub fn remove_observed(name: &str, observed: &VectorIndex) -> bool {
         Some(current) if std::ptr::eq(Arc::as_ptr(current), observed) => {
             let evicted = reg.remove(name);
             drop(reg);
-            retire(evicted);
+            sweep::retire(evicted);
             true
         }
         _ => false,
     }
 }
 
-/// The smallest name after `cursor`, wrapping to the smallest of all when none follows it.
+/// The `limit` names a command has gone longest without looking up, coldest first.
 ///
-/// This is the sweep's cursor, and it exists because a `HashMap` has no order to resume from.
-/// Making one would mean copying and sorting every name for the sake of the one the pass wants,
-/// so the pass takes one name and keeps two `&str` while it walks the keys. Nothing is copied
-/// but the answer.
+/// The sweep's worklist. Choosing it means reading every entry, which is exactly why a
+/// connection does not do it — the sweeper's thread calls this and hands a connection only the
+/// `getattr` that needs a cookie.
 ///
-/// A name added behind the cursor waits for the next cycle, which is the wait everything gets.
+/// Unpublished entries are left out: a `vcreate` mid-flight has no Map yet on purpose, and
+/// [`remove_if_stale`] would spare it anyway, so probing it only wastes a slot.
 ///
-/// Rebuilding entries are in it. The sweep asks about Maps, not about what is servable, and an
-/// index whose Map went while it was being rebuilt is exactly one worth releasing.
-pub fn name_after(cursor: &str) -> Option<String> {
-    next_after(read().keys().map(String::as_str), cursor)
+/// Rebuilding ones are in. The sweep asks about Maps, not about what is servable, and an index
+/// whose Map went while it was being rebuilt is exactly one worth releasing.
+pub(in crate::handler) fn coldest(limit: usize) -> Vec<String> {
+    let reg = read();
+    coldest_of(
+        reg.iter()
+            .filter(|(_, index)| index.published_at() != 0)
+            .map(|(name, index)| (index.accessed_at(), name.as_str())),
+        limit,
+    )
 }
 
-/// [`name_after`] over any keys, in any order.
-fn next_after<'a>(keys: impl Iterator<Item = &'a str>, cursor: &str) -> Option<String> {
-    let (mut after, mut smallest) = (None, None);
-    for key in keys {
-        if key > cursor && after.is_none_or(|best| key < best) {
-            after = Some(key);
+/// [`coldest`] over any entries. Empty if the scratch list cannot be allocated.
+fn coldest_of<'a>(entries: impl Iterator<Item = (u64, &'a str)>, limit: usize) -> Vec<String> {
+    let mut all: Vec<(u64, &str)> = Vec::new();
+    for entry in entries {
+        if all.try_reserve(1).is_err() {
+            return Vec::new();
         }
-        if smallest.is_none_or(|best| key < best) {
-            smallest = Some(key);
-        }
+        all.push(entry);
     }
-    after.or(smallest).map(str::to_string)
+    all.sort_unstable();
+    all.truncate(limit);
+    all.into_iter().map(|(_, name)| name.to_string()).collect()
 }
 
 /// Every index that is serving, ordered by name for stable `vlist` output.
@@ -453,35 +432,29 @@ mod tests {
 }
 
 #[cfg(test)]
-mod cursor_tests {
-    use super::next_after;
+mod coldest_tests {
+    use super::coldest_of;
 
-    /// Deliberately unsorted: the point is that the registry's own order does not matter.
-    const NAMES: [&str; 3] = ["c", "a", "b"];
+    /// `(마지막 접근, 이름)`, deliberately unordered.
+    const ENTRIES: [(u64, &str); 4] = [(30, "warm"), (10, "cold"), (40, "hot"), (20, "cool")];
 
-    fn after(cursor: &str) -> Option<String> {
-        next_after(NAMES.iter().copied(), cursor)
+    fn coldest(limit: usize) -> Vec<String> {
+        coldest_of(ENTRIES.iter().copied(), limit)
     }
 
     #[test]
-    fn a_cycle_walks_every_name_in_order() {
-        assert_eq!(after("").as_deref(), Some("a"));
-        assert_eq!(after("a").as_deref(), Some("b"));
-        assert_eq!(after("b").as_deref(), Some("c"));
+    fn the_longest_untouched_names_come_first() {
+        assert_eq!(coldest(2), ["cold", "cool"]);
     }
 
     #[test]
-    fn the_last_name_wraps_to_the_first() {
-        assert_eq!(after("c").as_deref(), Some("a"));
-        assert_eq!(
-            after("z").as_deref(),
-            Some("a"),
-            "a name dropped since last pass"
-        );
+    fn a_registry_smaller_than_the_batch_comes_back_whole() {
+        assert_eq!(coldest(8), ["cold", "cool", "warm", "hot"]);
     }
 
     #[test]
     fn an_empty_registry_gives_nothing() {
-        assert_eq!(next_after(std::iter::empty(), ""), None);
+        assert!(coldest_of(std::iter::empty(), 8).is_empty());
+        assert!(coldest(0).is_empty(), "a zero batch asks for nothing");
     }
 }

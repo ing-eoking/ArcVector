@@ -55,10 +55,9 @@ pub unsafe fn run(cookie: *const c_void, request: Request) -> Result<Reply> {
         Request::Line(Line::Stats) => vstats(),
     };
 
-    // After the answer is decided, and on this thread because probing takes the cookie an
-    // engine read may be handed. The answer has not gone out yet, so what happens here is on
-    // this connection's clock: `sweep` bounds it, and hands the expensive part to a thread of
-    // its own.
+    // The answer is decided but not sent, so this is still on the connection's clock — and it
+    // is one `getattr`, on a name the sweeper's thread picked. Choosing and tearing down happen
+    // over there; the cookie is the only reason a connection is involved at all.
     access::sweep::maybe(store);
     reply
 }

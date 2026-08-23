@@ -4,6 +4,7 @@ use crate::command::request::Create;
 use crate::error::{Error, Reply, Result};
 #[cfg(recovery)]
 use crate::handler::access::resolve;
+use crate::handler::access::sweep;
 use crate::handler::arcus::element::{self, Layout, MetaRecord};
 use crate::handler::arcus::engine::{self, Store, StoreError};
 use crate::handler::quant::Quant;
@@ -91,7 +92,7 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
                     "ArcVector: index '{name}' had no Map; released the graph it was built from"
                 );
                 // Not on this connection's clock: the graph may hold millions of refcounts.
-                registry::retire(previous);
+                sweep::retire(previous);
             }
             Ok(Reply::Created)
         }
