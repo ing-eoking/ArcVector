@@ -132,6 +132,15 @@ pub fn vsetattr(store: &Store, name: &str, id: &str, attr: &[u8]) -> Result<Repl
     check_attr(attr)?;
     let layout = index.ann.layout;
 
+    let mut pending = match store.reserve_elem(name, id, layout.element_len()) {
+        Ok(pending) => pending,
+        Err(StoreError::KeyGone) => {
+            map_is_gone(name, stamp);
+            return Ok(Reply::NotFound);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
     let mut gone = false;
     let settled = index.ann.update_published(
         || {
@@ -145,12 +154,16 @@ pub fn vsetattr(store: &Store, name: &str, id: &str, attr: &[u8]) -> Result<Repl
             };
             Some((held.addr(), held.value().to_vec()))
         },
-        |mut value| {
-            value.truncate(layout.element_len().min(value.len()));
+        |value| {
+            if value.len() < layout.element_len() {
+                return Err(StoreError::CorruptElement);
+            }
+            let body = pending.value_mut();
+            let kept = body.len();
+            body.copy_from_slice(&value[..kept]);
             layout
-                .set_attr(&mut value, attr)
+                .set_attr(body, attr)
                 .map_err(|_| StoreError::CorruptElement)?;
-            let pending = store.alloc_elem(name, id, &value)?;
             let addr = pending.addr();
             if !pending.insert()? {
                 let _ = store.delete_elem(name, id);
