@@ -478,13 +478,20 @@ impl AnnIndex {
     ///   not the write succeeded** — the graph has let go by then, and something has to hold the
     ///   element it is still keyed by. `None` means there is no element left to hold.
     ///
-    /// Normally the address comes back unchanged and nothing moves. It is handled if it does
-    /// change — a `rename`, which is a hash entry rather than a graph insert.
+    /// Normally the address comes back unchanged and nothing moves. It does change when
+    /// something else holds a refcount at the same moment — a `FILTER` carrying this element to
+    /// its render is the one that happens — and then the engine allocates instead, and the node
+    /// follows with a `rename`. That is a hash entry rather than a graph insert, and the search
+    /// keeps rendering the bytes it judged, from the element it is holding.
+    ///
+    /// The count is raised for the whole call, as a delete's is: a search that read this key
+    /// before the move resolves after it, finds the old address unheld, and drops the row.
     pub fn update_published<E>(
         &self,
         locate: impl FnOnce() -> Option<(u64, Vec<u8>)>,
         write: impl FnOnce(Vec<u8>) -> (std::result::Result<(), E>, Option<u64>),
     ) -> std::result::Result<Option<()>, PublishError<E>> {
+        let _slack = InFlight::new(&self.in_flight);
         // `inner` then `held`, as everywhere.
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
@@ -1946,6 +1953,25 @@ mod tests {
             vec![addr],
             "the node stands on the same element it started on"
         );
+        assert_eq!(search(&idx, &[1.0, 0.0, 0.0, 0.0], 5), vec!["v1"]);
+    }
+
+    /// A `FILTER` carrying an element to its render holds a refcount on it, so an update in that
+    /// moment cannot write in place. It still lands, and the node follows.
+    #[test]
+    fn an_update_under_a_reader_moves_instead_of_writing_in_place() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let old = add(&idx, "v1", &[1.0, 0.0, 0.0, 0.0]);
+
+        // What the engine does when a refcount stands: a new element rather than a memcpy.
+        let settled: std::result::Result<Option<()>, PublishError<()>> = idx.update_published(
+            || Some((old, vec![0u8; 8])),
+            |_| (Ok(()), Some(FAKE.link(&idx, "v1"))),
+        );
+        assert!(settled.is_ok());
+
+        assert!(!idx.held().contains(old), "the old element was let go");
+        assert_eq!(idx.len(), 1, "and the node moved rather than doubling");
         assert_eq!(search(&idx, &[1.0, 0.0, 0.0, 0.0], 5), vec!["v1"]);
     }
 
