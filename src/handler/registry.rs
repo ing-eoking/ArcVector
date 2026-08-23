@@ -218,6 +218,14 @@ pub fn remove_observed(name: &str, observed: &VectorIndex) -> bool {
     }
 }
 
+/// Every registered name, rebuilding ones included.
+///
+/// For the sweep, which asks about Maps rather than about what is servable: an index whose Map
+/// went while it was being rebuilt is exactly one worth releasing.
+pub fn names() -> Vec<String> {
+    read().keys().cloned().collect()
+}
+
 /// Every index that is serving, ordered by name for stable `vlist` output.
 pub fn snapshot() -> Vec<Arc<VectorIndex>> {
     let mut all: Vec<Arc<VectorIndex>> = read()

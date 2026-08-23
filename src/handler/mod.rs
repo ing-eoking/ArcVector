@@ -10,6 +10,7 @@ mod coords;
 mod index;
 mod meta;
 mod search;
+mod sweep;
 mod vector;
 
 use std::os::raw::c_void;
@@ -48,7 +49,7 @@ pub unsafe fn run(cookie: *const c_void, request: Request) -> Result<Reply> {
 
     let store = &unsafe { store_for(cookie) }?;
 
-    match request {
+    let reply = match request {
         Request::Body(Body::Add(spec), bytes) => vadd(store, &spec, &bytes),
         Request::Body(Body::Sim(spec), bytes) => vsim_vector(store, &spec, &bytes),
         Request::Line(Line::Create(spec)) => vcreate(store, &spec),
@@ -58,5 +59,10 @@ pub unsafe fn run(cookie: *const c_void, request: Request) -> Result<Reply> {
         Request::Line(Line::Drop { index }) => vdrop(store, index),
         Request::Line(Line::List) => vlist(),
         Request::Line(Line::Stats) => vstats(),
-    }
+    };
+
+    // After the answer, so the sweep is never part of a command's latency, and on this thread
+    // because it has the cookie an engine read may be handed — see `sweep`.
+    sweep::maybe(store);
+    reply
 }
