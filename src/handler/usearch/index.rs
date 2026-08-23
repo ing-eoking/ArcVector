@@ -106,6 +106,22 @@ impl Drop for Staged<'_> {
     }
 }
 
+/// Why a published write did not go through.
+///
+/// Two failures with nothing in common: the caller's own write refused, and the mapping unable
+/// to take the binding that write needs. Keeping them apart is what lets `vadd` turn a full
+/// index into `OVERFLOWED` while an allocation refusal answers `SERVER_ERROR` — and both are
+/// replies, so neither ends the process.
+///
+/// Either way the mapping and the graph read as they did before the call.
+#[derive(Debug)]
+pub enum PublishError<E> {
+    /// The element write refused. Whatever it means is the caller's to say.
+    Store(E),
+    /// The mapping could not grow. Nothing was written.
+    Mapping(Error),
+}
+
 /// One write counted in flight without a node staged for it.
 ///
 /// A delete needs this: between the moment a search resolved a key and the moment it renders
@@ -363,7 +379,7 @@ impl AnnIndex {
         staged: Staged<'_>,
         owner: u64,
         store: impl FnOnce() -> std::result::Result<T, E>,
-    ) -> std::result::Result<T, E> {
+    ) -> std::result::Result<T, PublishError<E>> {
         // Never taken while `inner` is held, so the order cannot invert against `clear`. Node
         // removals below happen after the guard is released for the same reason.
         let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
@@ -371,6 +387,19 @@ impl AnnIndex {
         // put back without racing a translation.
         self.reclaim_retired(&mut ids);
         let live = staged.owner == owner;
+        // The room for the binding comes before the binding, and before the element write it
+        // gates. A std collection that cannot grow aborts instead of returning, so the growth
+        // has to be asked for where the answer can still be a reply. Nothing is written yet,
+        // so the only thing to unwind is this call's own node.
+        if live && let Err(e) = ids.reserve_binding(id, staged.key) {
+            drop(ids);
+            let key = staged.key;
+            drop(staged);
+            self.drop_node(key);
+            return Err(PublishError::Mapping(Error::Index(format!(
+                "the id mapping could not grow: {e}"
+            ))));
+        }
         let displaced = if live { ids.bind(id, staged.key) } else { None };
 
         match store() {
@@ -387,7 +416,8 @@ impl AnnIndex {
             }
             Err(e) => {
                 // The element was never written, so nothing left this node and the mapping has
-                // to read as it did before.
+                // to read as it did before. Neither restore can allocate: `bind` here only
+                // overwrites an id `by_id` already holds, into a slot that already exists.
                 if live {
                     match displaced {
                         Some(key) => {
@@ -400,7 +430,7 @@ impl AnnIndex {
                 }
                 drop(ids);
                 self.drop_node(staged.key);
-                Err(e)
+                Err(PublishError::Store(e))
             }
         }
     }
@@ -509,6 +539,9 @@ impl AnnIndex {
         // before the insert here — unlike an insert's stage — because the refill has to hold
         // the `is_known` verdict and the claim on `id` under one lock.
         let key = self.mint()?;
+        // Before the binding and before the node, so a refusal costs this call and nothing else.
+        ids.reserve_binding(id, key)
+            .map_err(|e| Error::Index(format!("the id mapping could not grow: {e}")))?;
         ids.bind(id, key);
         if let Err(e) = self.typed_add(&index, key, &vector) {
             ids.forget(id);
@@ -601,16 +634,26 @@ impl AnnIndex {
         &self,
         id: &str,
         take: impl FnOnce() -> std::result::Result<bool, E>,
-    ) -> std::result::Result<Option<bool>, E> {
+    ) -> std::result::Result<Option<bool>, PublishError<E>> {
         let _slack = InFlight::new(&self.in_flight);
         let mut ids = self.ids.write().unwrap_or_else(PoisonError::into_inner);
 
-        if !take()? {
+        // While rebuilding, a deleted id is remembered so the refill cannot replay it — and
+        // the room for that has to be taken *before* the element goes. Once the engine has
+        // deleted it there is no failure left to report: the delete is already on its way to
+        // the replicas, and refusing here would answer for a state that no longer exists.
+        let tombstone = self.rebuilding.load(Ordering::Acquire);
+        if tombstone && let Err(e) = ids.reserve_tombstone() {
+            return Err(PublishError::Mapping(Error::Index(format!(
+                "the id mapping could not grow: {e}"
+            ))));
+        }
+
+        if !take().map_err(PublishError::Store)? {
             return Ok(None);
         }
 
-        // While rebuilding, a deleted id is remembered so the refill cannot replay it.
-        let key = if self.rebuilding.load(Ordering::Acquire) {
+        let key = if tombstone {
             ids.forget_tombstoned(id)
         } else {
             ids.forget(id)
@@ -776,14 +819,19 @@ mod tests {
     /// The production insert with a stubbed element write: the mapping writes, the ordering
     /// and the lock are all real, only the engine call is absent.
     fn publish(idx: &AnnIndex, id: &str, staged: Staged<'_>, owner: u64) {
-        let done: std::result::Result<(), ()> = idx.insert_published(id, staged, owner, || Ok(()));
-        done.unwrap();
+        let done: std::result::Result<(), PublishError<()>> =
+            idx.insert_published(id, staged, owner, || Ok(()));
+        assert!(done.is_ok(), "publish failed");
     }
 
     /// Likewise for the delete, with the element already known to be there.
     fn remove(idx: &AnnIndex, id: &str) -> bool {
-        let removed: std::result::Result<Option<bool>, ()> = idx.remove_published(id, || Ok(true));
-        removed.unwrap().unwrap_or(false)
+        let removed: std::result::Result<Option<bool>, PublishError<()>> =
+            idx.remove_published(id, || Ok(true));
+        let Ok(removed) = removed else {
+            panic!("remove failed");
+        };
+        removed.unwrap_or(false)
     }
 
     fn build(dim: usize, quant: Quant, metric: Metric, threads: usize) -> AnnIndex {
@@ -1285,7 +1333,7 @@ mod tests {
                         // The element is read and written inside the call, which is what the
                         // engine does: both live under the same hold on the mapping, and a
                         // test that touched `elements` outside it would be racing on its own.
-                        let done: std::result::Result<(), ()> =
+                        let done: std::result::Result<(), PublishError<()>> =
                             idx.insert_published(&id, staged, OWNER, || {
                                 elements.lock().unwrap().insert(id.clone());
                                 Ok(())
@@ -1305,7 +1353,7 @@ mod tests {
                     let id = format!("id{}", choice(t, i, IDS));
                     // `vdel` takes the element and the key in it in one engine call, inside
                     // the same hold that removes the name.
-                    let removed: std::result::Result<Option<bool>, ()> =
+                    let removed: std::result::Result<Option<bool>, PublishError<()>> =
                         idx.remove_published(&id, || Ok(elements.lock().unwrap().remove(&id)));
                     removed.unwrap();
                 }
@@ -1392,7 +1440,7 @@ mod tests {
                     // A stage can fail once `clear` has dropped the reservation to the floor.
                     if let Ok(staged) = idx.stage(&v, OWNER) {
                         // Both element accesses inside the call, as the engine does them.
-                        let done: std::result::Result<(), ()> =
+                        let done: std::result::Result<(), PublishError<()>> =
                             idx.insert_published(&id, staged, OWNER, || {
                                 elements.lock().unwrap().insert(id.clone());
                                 Ok(())

@@ -5,6 +5,7 @@ use crate::error::{Error, Reply, Result};
 use crate::handler::arcus::element::Layout;
 use crate::handler::arcus::engine::{Store, StoreError};
 use crate::handler::quant;
+use crate::handler::usearch::PublishError;
 
 /// `vadd <index> <id> <veclen> <dim> [ATTR <attrlen> <attr JSON>]`
 pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
@@ -64,11 +65,16 @@ pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
     // That call is the step which leaves this node: `CLOG_MAP_ELEM_INSERT` is emitted from
     // `do_map_elem_link`, so replicas and the persistence log learn of the write there and
     // nowhere earlier — reserving logs nothing. Everything fallible is already done.
-    index
+    match index
         .ann
         .insert_published(id, staged, index.owner(), || pending.insert())
-        .map(|()| Reply::Stored)
-        .or_else(|e| store_failed(name, e))
+    {
+        Ok(()) => Ok(Reply::Stored),
+        Err(PublishError::Store(e)) => store_failed(name, e),
+        // The mapping refused to grow. Nothing was written and nothing is left over, so this
+        // is a reply like any other — the daemon does not fall over a write it declined.
+        Err(PublishError::Mapping(e)) => Err(e),
+    }
 }
 
 /// How a failed Map write answers: a full index and an evicted one are replies, not errors.
@@ -159,6 +165,8 @@ pub fn vdel(store: &Store, name: &str, id: &str) -> Result<Reply> {
     match removed {
         Ok(Some(_)) => Ok(Reply::Deleted),
         Ok(None) => Ok(Reply::NotFound),
-        Err(e) => Err(e.into()),
+        Err(PublishError::Store(e)) => Err(e.into()),
+        // Refused before the element was touched, so the delete simply did not happen.
+        Err(PublishError::Mapping(e)) => Err(e),
     }
 }

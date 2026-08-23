@@ -86,7 +86,20 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
     super::access::map_is_gone(name);
 
     let index = VectorIndex::new(name.to_owned(), ann, maxcount, owner);
-    let (_, inserted) = registry::insert_or_get(index);
+    let (_, inserted) = match registry::insert_or_get(index) {
+        Ok(pair) => pair,
+        // The Map exists and nothing serves it. This is the one place in `vcreate` with
+        // something to undo: the insert above is what created it, so taking it back leaves the
+        // name as free as we found it. `vdrop` is otherwise the only path that deletes a Map,
+        // and this stays inside that rule — we are deleting the Map we made, in the call that
+        // made it, having never answered for it.
+        Err(e) => {
+            let _ = store.drop_map(name);
+            return Err(Error::Index(format!(
+                "the index registry could not grow: {e}"
+            )));
+        }
+    };
     Ok(if inserted {
         Reply::Created
     } else {

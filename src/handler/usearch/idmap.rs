@@ -12,7 +12,7 @@
 //! never is. Without it a stale key captured before a delete would resolve to whatever took
 //! the slot next, which is a wrong id in a reply rather than a missing row.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, TryReserveError};
 use std::sync::Arc;
 
 /// Bits of the key that name the slot; the rest is the generation.
@@ -48,20 +48,54 @@ pub(super) struct IdMap {
 }
 
 impl IdMap {
+    /// Make room for one more binding, so [`Self::bind`] cannot allocate.
+    ///
+    /// Both reservations happen before either collection is touched, so a failure leaves the
+    /// map exactly as it was — there is nothing for the caller to undo.
+    pub(super) fn reserve_binding(&mut self, id: &str, key: u64) -> Result<(), TryReserveError> {
+        let grow = (slot_of(key) + 1).saturating_sub(self.slots.len());
+        if grow > 0 {
+            self.slots.try_reserve(grow)?;
+        }
+        if !self.by_id.contains_key(id) {
+            self.by_id.try_reserve(1)?;
+        }
+        Ok(())
+    }
+
+    /// Make room to remember one deletion, so [`Self::forget_tombstoned`] cannot allocate.
+    pub(super) fn reserve_tombstone(&mut self) -> Result<(), TryReserveError> {
+        self.tombstones.try_reserve(1)
+    }
+
     /// Name `key` as `id`, and report the key `id` named before — whose node nothing can
     /// reach now, so the caller detaches it and hands the slot back.
     ///
     /// No winner is decided here. Every caller holds this map's write lock across the element
     /// write too, so writes to one id arrive in one order.
+    ///
+    /// **Call [`Self::reserve_binding`] first, under the same hold.** The `resize` and the
+    /// `insert` below allocate on their own, and a std collection that cannot allocate aborts
+    /// the process rather than returning. With the room already taken they cannot reach that
+    /// path. Restoring a binding needs no reservation: the id is still in `by_id` and its slot
+    /// is still sized, so the same two calls touch nothing that could grow.
     pub(super) fn bind(&mut self, id: &str, key: u64) -> Option<u64> {
         let slot = slot_of(key);
         if slot >= self.slots.len() {
+            debug_assert!(
+                self.slots.capacity() > slot,
+                "bind without reserve_binding: the resize below can abort"
+            );
             self.slots.resize(slot + 1, Slot::default());
         }
 
         let displaced = match self.by_id.get_mut(id) {
             Some(held) => Some(std::mem::replace(held, key)),
             None => {
+                debug_assert!(
+                    self.by_id.capacity() > self.by_id.len(),
+                    "bind without reserve_binding: the insert below can abort"
+                );
                 let text: Arc<str> = Arc::from(id);
                 self.id_bytes += id.len();
                 self.by_id.insert(Arc::clone(&text), key);
@@ -95,6 +129,9 @@ impl IdMap {
     }
 
     /// Forget `id`, but remember that it was deleted so a refill cannot replay it.
+    ///
+    /// **Call [`Self::reserve_tombstone`] first**, and before the engine delete this pairs
+    /// with — by the time the element is gone there is no failure left to report.
     pub(super) fn forget_tombstoned(&mut self, id: &str) -> Option<u64> {
         let key = self.forget(id);
         self.tombstones.insert(Arc::from(id));
@@ -150,17 +187,76 @@ impl IdMap {
 mod tests {
     use super::*;
 
+    /// `bind` under its contract: the room first, as every production caller takes it.
+    fn bind(ids: &mut IdMap, id: &str, key: u64) -> Option<u64> {
+        ids.reserve_binding(id, key).expect("reserve");
+        ids.bind(id, key)
+    }
+
+    #[test]
+    fn a_reserved_binding_does_not_allocate() {
+        let mut ids = IdMap::default();
+        ids.reserve_binding("v1", key_of(3, 0)).expect("reserve");
+        let (slots, map) = (ids.slots.capacity(), ids.by_id.capacity());
+
+        ids.bind("v1", key_of(3, 0));
+
+        assert_eq!(
+            ids.slots.capacity(),
+            slots,
+            "the slots grew after reserving"
+        );
+        assert_eq!(ids.by_id.capacity(), map, "the id map grew after reserving");
+    }
+
+    /// What makes the publish rollback infallible: it restores an id the map still holds into
+    /// a slot that already exists, so there is nothing left to allocate and nothing to reserve.
+    #[test]
+    fn restoring_a_displaced_binding_allocates_nothing() {
+        let mut ids = IdMap::default();
+        bind(&mut ids, "v1", key_of(0, 0));
+        let displaced = bind(&mut ids, "v1", key_of(1, 0)).expect("the first key is displaced");
+        let (slots, map) = (ids.slots.capacity(), ids.by_id.capacity());
+
+        // The rollback path, called exactly as `insert_published` calls it — unreserved.
+        ids.bind("v1", displaced);
+
+        assert_eq!(ids.slots.capacity(), slots, "the slots grew on rollback");
+        assert_eq!(ids.by_id.capacity(), map, "the id map grew on rollback");
+        assert_eq!(
+            ids.by_id.get("v1").copied(),
+            Some(displaced),
+            "the restored binding is the one that was displaced"
+        );
+    }
+
+    #[test]
+    fn a_reserved_tombstone_does_not_allocate() {
+        let mut ids = IdMap::default();
+        bind(&mut ids, "v1", key_of(0, 0));
+        ids.reserve_tombstone().expect("reserve");
+        let tombstones = ids.tombstones.capacity();
+
+        ids.forget_tombstoned("v1");
+
+        assert_eq!(
+            ids.tombstones.capacity(),
+            tombstones,
+            "the tombstones grew after reserving"
+        );
+    }
+
     #[test]
     fn binding_a_replacement_reports_the_displaced_key_and_counts_the_text_once() {
         let mut ids = IdMap::default();
         assert_eq!(
-            ids.bind("v1", key_of(0, 0)),
+            bind(&mut ids, "v1", key_of(0, 0)),
             None,
             "a new id displaces nothing"
         );
         let after_first = ids.bytes();
 
-        let displaced = ids.bind("v1", key_of(1, 0));
+        let displaced = bind(&mut ids, "v1", key_of(1, 0));
         assert_eq!(displaced, Some(key_of(0, 0)), "the key v1 used to name");
         assert_eq!(ids.len(), 1);
         assert_eq!(ids.id_of(key_of(1, 0)).map(|s| &**s), Some("v1"));
@@ -171,11 +267,11 @@ mod tests {
     #[test]
     fn a_recycled_slot_does_not_answer_the_key_it_answered_before() {
         let mut ids = IdMap::default();
-        ids.bind("v1", key_of(7, 0));
+        bind(&mut ids, "v1", key_of(7, 0));
         ids.forget("v1");
 
         // The slot comes back with its generation advanced, as `drop_node` hands it back.
-        ids.bind("v9", key_of(7, 1));
+        bind(&mut ids, "v9", key_of(7, 1));
 
         assert_eq!(ids.id_of(key_of(7, 1)).map(|s| &**s), Some("v9"));
         assert_eq!(
@@ -188,7 +284,7 @@ mod tests {
     #[test]
     fn forgetting_reports_the_key_and_releases_the_text() {
         let mut ids = IdMap::default();
-        ids.bind("v1", key_of(3, 5));
+        bind(&mut ids, "v1", key_of(3, 5));
         assert_eq!(ids.forget("v1"), Some(key_of(3, 5)));
         assert_eq!(ids.id_of(key_of(3, 5)), None);
         assert_eq!(ids.bytes(), ids.slots.capacity() * size_of::<Slot>());
@@ -198,7 +294,7 @@ mod tests {
     #[test]
     fn a_tombstone_outlives_the_binding() {
         let mut ids = IdMap::default();
-        ids.bind("v1", key_of(2, 0));
+        bind(&mut ids, "v1", key_of(2, 0));
         assert_eq!(ids.forget_tombstoned("v1"), Some(key_of(2, 0)));
 
         assert_eq!(ids.len(), 0);
@@ -211,7 +307,7 @@ mod tests {
         ids.forget_tombstoned("v1");
         assert!(ids.is_known("v1"));
 
-        ids.bind("v1", key_of(4, 0));
+        bind(&mut ids, "v1", key_of(4, 0));
         assert_eq!(ids.forget("v1"), Some(key_of(4, 0)));
         assert!(!ids.is_known("v1"), "the delete was undone by a live write");
     }
@@ -219,11 +315,11 @@ mod tests {
     #[test]
     fn reviving_a_slot_returns_it_to_generation_zero() {
         let mut ids = IdMap::default();
-        ids.bind("v1", key_of(6, u32::MAX));
+        bind(&mut ids, "v1", key_of(6, u32::MAX));
         ids.forget("v1");
         ids.revive(6);
 
-        ids.bind("v9", key_of(6, 0));
+        bind(&mut ids, "v9", key_of(6, 0));
         assert_eq!(ids.id_of(key_of(6, 0)).map(|s| &**s), Some("v9"));
         assert_eq!(
             ids.id_of(key_of(6, u32::MAX)),
@@ -253,7 +349,7 @@ mod tests {
         let mut slots = IdMap::default();
         let mut hashed: HashMap<u64, Arc<str>> = HashMap::new();
         for (i, id) in ids.iter().enumerate() {
-            slots.bind(id, key_of(i as u32, 0));
+            bind(&mut slots, id, key_of(i as u32, 0));
             hashed.insert(key_of(i as u32, 0), Arc::from(id.as_str()));
         }
 

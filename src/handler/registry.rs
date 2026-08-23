@@ -1,6 +1,6 @@
 //! An entry pairs the Map with the graph built from it and the `owner` token it was built under; [`super::recovery`] judges that token.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, TryReserveError};
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
 use crate::handler::usearch::AnnIndex;
@@ -79,14 +79,20 @@ pub fn contains(name: &str) -> bool {
 }
 
 /// Register `index` unless the name is taken, returning whichever ends up live.
-pub fn insert_or_get(index: VectorIndex) -> (Arc<VectorIndex>, bool) {
+///
+/// The room comes first. `entry` grows the map on its own, and a std collection that cannot
+/// grow aborts the process instead of returning — the one failure a daemon must never take.
+/// Asking for the room up front turns it into a value the caller can answer with, and leaves
+/// the registry untouched when the answer is no.
+pub fn insert_or_get(index: VectorIndex) -> Result<(Arc<VectorIndex>, bool), TryReserveError> {
     let mut reg = write();
+    reg.try_reserve(1)?;
     let mut inserted = false;
     let entry = reg.entry(index.name.clone()).or_insert_with(|| {
         inserted = true;
         Arc::new(index)
     });
-    (Arc::clone(entry), inserted)
+    Ok((Arc::clone(entry), inserted))
 }
 
 pub fn remove(name: &str) -> bool {

@@ -129,12 +129,15 @@ fn empty_graph(
 ) -> Result<(Arc<VectorIndex>, bool)> {
     let probe = store.probe_map(name)?;
     let ann = recovery::metadata::build_ann(meta, layout)?;
-    Ok(registry::insert_or_get(VectorIndex::new(
+    // Nothing to undo if the registry cannot take it: the Map is not ours to remove — we are
+    // adopting one that was already there — and the graph goes out of scope unregistered.
+    registry::insert_or_get(VectorIndex::new(
         name.to_owned(),
         ann,
         probe.maxcount.saturating_sub(1),
         registry::REBUILDING,
-    )))
+    ))
+    .map_err(|e| Error::Index(format!("the index registry could not grow: {e}")))
 }
 
 pub(super) fn for_read(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
