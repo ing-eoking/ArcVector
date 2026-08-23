@@ -900,6 +900,50 @@ mod tests {
     }
 
     #[test]
+    fn usearch_removes_a_node_while_our_callback_is_still_inside_it() {
+        let idx = Arc::new(build(4, Quant::F32, Metric::L2, 4));
+        add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
+        add(&idx, "b", &[0.9, 0.1, 0.0, 0.0]);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<u64>();
+        let (removed_tx, removed_rx) = std::sync::mpsc::channel::<usize>();
+
+        let other = Arc::clone(&idx);
+        let remover = std::thread::spawn(move || {
+            let key = entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the callback never said which node it was inside");
+            let index = other.inner.read().unwrap_or_else(PoisonError::into_inner);
+            let removed = index.remove(key).expect("remove");
+            removed_tx.send(removed).unwrap();
+        });
+
+        let query = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], Quant::F32);
+        let reported = std::cell::Cell::new(false);
+        let witnessed = std::cell::Cell::new(0usize);
+        let probe = |key: u64| {
+            if !reported.replace(true) {
+                entered_tx.send(key).unwrap();
+                witnessed.set(
+                    removed_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("the node was not removed while the callback was inside it"),
+                );
+            }
+            true
+        };
+        let _ = idx.search(&query, 2, Some(&probe as Accept)).unwrap();
+        remover.join().unwrap();
+
+        assert_eq!(
+            witnessed.get(),
+            1,
+            "usearch took the node out with the callback for that same node still running, \
+             which is why the held set is read-locked across the dereference"
+        );
+    }
+
+    #[test]
     fn the_predicate_excludes_what_it_rejects() {
         let idx = build(4, Quant::F32, Metric::L2, 2);
         add(&idx, "keep", &[1.0, 0.0, 0.0, 0.0]);
