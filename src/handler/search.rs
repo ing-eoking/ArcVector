@@ -48,16 +48,22 @@ fn similar(
         let Some(filter) = filter else {
             return true;
         };
-        let Ok(elem) = store.hold_elem(&index.name, id) else {
-            // Evicted or vanished mid-search: no longer a candidate.
+        // The key is the element's address, so the attributes are one dereference away — no
+        // hash lookup, no refcount pair, on the path that runs once per visited node. Safe
+        // because the graph checked the address and holds its read lock for this call.
+        let Some(passes) = store.with_attr_at(key, layout, |attr| filter.matches(attr)) else {
+            // Unreadable mid-search: no longer a candidate.
             return false;
         };
-        let Ok(attr) = layout.attr_of(elem.value()) else {
-            return false;
-        };
-        if !filter.matches(attr) {
+        if !passes {
             return false;
         }
+        // Only what survived is held, and only so the reply carries the bytes the filter
+        // judged — reading twice could straddle a write. That is `k` lookups rather than one
+        // per visited node.
+        let Ok(elem) = store.hold_elem(&index.name, id) else {
+            return false;
+        };
         held.borrow_mut().push((key, elem));
         true
     };

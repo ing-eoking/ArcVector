@@ -424,6 +424,34 @@ impl Store {
         })
     }
 
+    /// Read the ATTR of the element at `addr` without looking it up.
+    ///
+    /// The search predicate's read. A node's key *is* its element's address, so the field it
+    /// would otherwise be found by is already answered — this skips the hash lookup and the
+    /// refcount pair that `map_elem_get` costs, on a path that runs once per visited node.
+    ///
+    /// **Only safe while a refcount stands on `addr`.** The graph's held set is what guarantees
+    /// that: the predicate runs with its read lock held and only for keys the set contains.
+    ///
+    /// `None` means the engine described the element in a way that cannot be read, or the ATTR
+    /// does not decode — either way the caller has no attributes to judge.
+    pub fn with_attr_at<T>(
+        &self,
+        addr: u64,
+        layout: Layout,
+        f: impl FnOnce(&[u8]) -> T,
+    ) -> Option<T> {
+        let elems = Elems {
+            store: self,
+            array: ptr::null_mut(),
+            count: 0,
+        };
+        let value = elems.view(addr as *mut eitem).ok()?.1;
+        // The view borrows nothing this owns; there is no hold to release.
+        std::mem::forget(elems);
+        Some(f(layout.attr_of(value).ok()?))
+    }
+
     /// Hand back refcounts the graph was holding.
     pub fn release_held(&self, addrs: &[u64]) {
         if addrs.is_empty() {
