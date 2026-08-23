@@ -211,9 +211,10 @@ VSIM KEY docs 5 v1
 `vgetattr` returns attributes only, not coordinates.
 
 `vsetattr` replaces the whole attribute region, so `<attrlen> 0` with no JSON clears it. The
-vector is untouched and the search still finds the id at the same coordinates — the graph
-follows the element rather than being rebuilt, which is a key rename rather than the ~370us
-insert a `vadd` pays.
+vector is untouched and the search still finds the id at the same coordinates. **The graph is
+not touched at all**: the region is a fixed width, so the value going back is exactly as long
+as the one that came out, and the engine writes it in place — no allocation, no relink, and
+none of the ~370us HNSW insert a `vadd` pays.
 
 ```
 vsetattr docs v1 20 {"cat":"news","n":2}\r\n

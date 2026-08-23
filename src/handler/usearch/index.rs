@@ -461,55 +461,85 @@ impl AnnIndex {
         Ok(())
     }
 
-    /// Move a node from the element it stood on to the one that replaced it.
+    /// Rewrite one element's value without moving its node — if the engine will let it.
     ///
-    /// For `vsetattr`, which rewrites a value without touching the vector. The engine gives the
-    /// new value a new element — it writes in place only when nothing holds a refcount, and the
-    /// graph holds one — so the node has to follow the address. That move is a `rename`: a hash
-    /// entry, not a graph insert, which is the whole reason this is not a `vadd`.
+    /// For `vsetattr`. The engine writes in place only when **nothing holds a refcount** on the
+    /// element (`do_map_elem_update`), and the graph holds one on every element it keys a node
+    /// by. So the graph gives its own up across the write and takes one back afterwards. That
+    /// is safe because a release frees an element only once it is *unlinked* — this one is
+    /// linked, so it stays exactly where it is, and the value goes in with a `memcpy`.
     ///
-    /// `write` runs inside the hold and returns where the value ended up. `old` keeps its own
-    /// refcount, the caller's; this hands back only the one the graph had.
+    /// Both closures run inside the hold, which is what serializes this against writes to the
+    /// same id.
+    ///
+    /// - `locate` reports where the element is now and what it holds. Any refcount it takes is
+    ///   its own to drop before returning.
+    /// - `write` puts the new value in and reports the address to hold afterwards, **whether or
+    ///   not the write succeeded** — the graph has let go by then, and something has to hold the
+    ///   element it is still keyed by. `None` means there is no element left to hold.
+    ///
+    /// Normally the address comes back unchanged and nothing moves. It is handled if it does
+    /// change — a `rename`, which is a hash entry rather than a graph insert.
     pub fn update_published<E>(
         &self,
-        old: u64,
-        write: impl FnOnce() -> std::result::Result<u64, E>,
-    ) -> std::result::Result<(), PublishError<E>> {
+        locate: impl FnOnce() -> Option<(u64, Vec<u8>)>,
+        write: impl FnOnce(Vec<u8>) -> (std::result::Result<(), E>, Option<u64>),
+    ) -> std::result::Result<Option<()>, PublishError<E>> {
         // `inner` then `held`, as everywhere.
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
 
-        let had_node = held.contains(old);
-        if had_node && let Err(e) = held.reserve() {
+        let Some((old, value)) = locate() else {
+            return Ok(None);
+        };
+        // Room for the address that comes back, taken before anything is written.
+        if let Err(e) = held.reserve() {
             return Err(PublishError::Mapping(Error::Index(format!(
                 "the held set could not grow: {e}"
             ))));
         }
 
-        let new = write().map_err(PublishError::Store)?;
-        if !had_node || new == old {
-            // Either a rebuild has not reached this element, or the engine wrote in place after
-            // all. Nothing for the graph to move.
-            return Ok(());
+        // The graph lets go so the engine can write in place. The element is linked, so this
+        // does not free it — only an unlinked element with no refcount is freed.
+        let had_node = held.take(old);
+        if had_node {
+            self.elements.release(&[old]);
         }
 
-        if let Err(e) = index.rename(old, new) {
-            // The value is written and the node still stands on an element the Map has let go.
-            // Take it out rather than leave it answering — a rebuild indexes the new one.
-            if held.take(old) {
-                self.elements.release(&[old]);
+        let (outcome, now) = write(value);
+
+        // Whatever `write` reports is what the graph holds from here, even on failure: the
+        // element is still there and the node is still keyed by it.
+        match now {
+            Some(new) => {
+                if had_node {
+                    if new != old
+                        && let Err(e) = index.rename(old, new)
+                    {
+                        self.elements.release(&[new]);
+                        drop(held);
+                        drop(index);
+                        eprintln!("ArcVector: could not move a node to its new element: {e}");
+                        self.drop_node(old);
+                        return outcome.map(Some).map_err(PublishError::Store);
+                    }
+                    held.publish(new);
+                } else {
+                    // No node stands on it — a rebuild has not reached this element. Nothing to
+                    // hold it for.
+                    self.elements.release(&[new]);
+                }
             }
-            drop(held);
-            drop(index);
-            eprintln!("ArcVector: could not move a node to its new element: {e}");
-            self.drop_node(old);
-            return Ok(());
+            // The element is gone. Nothing to hold, and the node has nothing to stand on.
+            None if had_node => {
+                drop(held);
+                drop(index);
+                self.drop_node(old);
+                return outcome.map(Some).map_err(PublishError::Store);
+            }
+            None => {}
         }
-        held.take(old);
-        held.publish(new);
-        // The graph's refcount on the outgoing element. The caller's own is its to drop.
-        self.elements.release(&[old]);
-        Ok(())
+        outcome.map(Some).map_err(PublishError::Store)
     }
 
     /// Drop the node at `addr` without touching the Map.
@@ -958,6 +988,15 @@ mod tests {
         /// Link a new element for `id`, returning where it lives.
         fn link(&self, idx: &AnnIndex, id: &str) -> u64 {
             let addr = self.next.fetch_add(64, Ordering::Relaxed);
+            let id: Arc<str> = Arc::from(id);
+            self.by_addr.write().unwrap().insert(addr, Arc::clone(&id));
+            self.by_id.write().unwrap().insert((map_of(idx), id), addr);
+            addr
+        }
+
+        /// Put an element back at the address it already had — what an in-place write leaves
+        /// behind. The engine keeps a linked element where it is, so the address still means it.
+        fn relink(&self, idx: &AnnIndex, id: &str, addr: u64) -> u64 {
             let id: Arc<str> = Arc::from(id);
             self.by_addr.write().unwrap().insert(addr, Arc::clone(&id));
             self.by_id.write().unwrap().insert((map_of(idx), id), addr);
@@ -1874,6 +1913,58 @@ mod tests {
             idx.resolve(&[(key, 0.0)], entered).is_empty(),
             "a search that captured keys before the wipe resolves none of them"
         );
+    }
+
+    /// What `vsetattr` rests on: the graph lets go across the write, so the engine can keep the
+    /// element where it is, and the node never moves.
+    #[test]
+    fn an_update_that_stays_put_leaves_the_node_alone() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let addr = add(&idx, "v1", &[1.0, 0.0, 0.0, 0.0]);
+
+        let mut released_while_writing = None;
+        let settled: std::result::Result<Option<()>, PublishError<()>> = idx.update_published(
+            || Some((addr, vec![0u8; 8])),
+            |_| {
+                // The engine's in-place branch needs no refcount standing. This is the moment
+                // it would look at, and the graph must have let go by now.
+                released_while_writing = Some(FAKE.id_at(addr).is_none());
+                // Same element, same address — what a fixed-width value gets back.
+                (Ok(()), Some(FAKE.relink(&idx, "v1", addr)))
+            },
+        );
+
+        assert!(settled.is_ok(), "the update went through");
+        assert_eq!(
+            released_while_writing,
+            Some(true),
+            "the graph still held the element while the engine was writing it"
+        );
+        assert_eq!(idx.len(), 1, "one node, not two");
+        assert_eq!(
+            idx.held().live_addrs(),
+            vec![addr],
+            "the node stands on the same element it started on"
+        );
+        assert_eq!(search(&idx, &[1.0, 0.0, 0.0, 0.0], 5), vec!["v1"]);
+    }
+
+    /// And if it does move, the node follows rather than being left on the old element.
+    #[test]
+    fn an_update_that_moves_the_element_moves_the_node() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let old = add(&idx, "v1", &[1.0, 0.0, 0.0, 0.0]);
+
+        let settled: std::result::Result<Option<()>, PublishError<()>> = idx.update_published(
+            || Some((old, vec![0u8; 8])),
+            |_| (Ok(()), Some(FAKE.link(&idx, "v1"))),
+        );
+        assert!(settled.is_ok());
+
+        let live = idx.held().live_addrs();
+        assert_eq!(live.len(), 1, "the old address was let go");
+        assert_ne!(live[0], old, "and the node stands on the new one");
+        assert_eq!(search(&idx, &[1.0, 0.0, 0.0, 0.0], 5), vec!["v1"]);
     }
 
     /// The tag is what makes a staged node unreadable, not the held set — its address is a

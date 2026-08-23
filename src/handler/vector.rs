@@ -179,33 +179,45 @@ pub fn vsetattr(store: &Store, name: &str, id: &str, attr: &[u8]) -> Result<Repl
     let index = for_write(store, name)?;
     let stamp = registry::now();
     check_attr(attr)?;
+    let layout = index.ann.layout;
 
-    // The current value, and where it lives. Both are needed: the value because everything
-    // outside the ATTR region has to come back byte for byte — the vector, where this build
-    // stores one — and the address because that is the node the graph will have to move.
-    //
-    // The hold is this call's own. It outlives the update, so the outgoing address still means
-    // this element while the graph is told about it.
-    let held = match store.hold_elem(name, id) {
-        Ok(held) => held,
-        Err(StoreError::ElemGone) => return Ok(Reply::NotFound),
-        Err(StoreError::KeyGone) => {
-            map_is_gone(name, stamp);
-            return Ok(Reply::NotFound);
-        }
-        Err(e) => return Err(e.into()),
-    };
-    let old = held.addr();
-    let mut value = held.value().to_vec();
-    index.ann.layout.set_attr(&mut value, attr)?;
+    let mut gone = false;
+    let settled = index.ann.update_published(
+        // Where the element is and what it holds. The hold is this closure's own and drops
+        // before it returns, so the only refcount left is the graph's — which the graph gives
+        // up next, and that is what lets the engine write in place.
+        || {
+            let held = match store.hold_elem(name, id) {
+                Ok(held) => held,
+                Err(StoreError::KeyGone) => {
+                    gone = true;
+                    return None;
+                }
+                Err(_) => return None,
+            };
+            Some((held.addr(), held.value().to_vec()))
+        },
+        // The ATTR region is a fixed 128 bytes, so the value going back is exactly as long as
+        // the one that came out — which, with no refcount standing, is the condition for the
+        // engine's in-place `memcpy`. The address does not move and the node does not either.
+        |mut value| {
+            let outcome = layout
+                .set_attr(&mut value, attr)
+                .map_err(|_| StoreError::CorruptElement)
+                .and_then(|()| store.update_elem(name, id, &value));
+            // Held again whether or not that worked: the graph is keyed by this element and has
+            // let go of it.
+            (outcome, store.hold_addr(name, id).ok().map(HeldAddr::keep))
+        },
+    );
 
-    match index.ann.update_published(old, || {
-        store.update_elem(name, id, &value)?;
-        // Where it ended up. Reading it back rather than assuming is what makes the node follow
-        // the element the Map actually holds.
-        store.hold_addr(name, id).map(HeldAddr::keep)
-    }) {
-        Ok(()) => Ok(Reply::Stored),
+    if gone {
+        map_is_gone(name, stamp);
+        return Ok(Reply::NotFound);
+    }
+    match settled {
+        Ok(Some(())) => Ok(Reply::Stored),
+        Ok(None) => Ok(Reply::NotFound),
         Err(PublishError::Store(StoreError::ElemGone)) => Ok(Reply::NotFound),
         Err(PublishError::Store(StoreError::KeyGone)) => {
             map_is_gone(name, stamp);
