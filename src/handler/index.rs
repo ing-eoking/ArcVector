@@ -49,16 +49,17 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
     // can fail goes in front of it, the registry's own growth included. Answering for a Map
     // already made and then failing would leave only a delete to take it back.
     //
-    // The hold is what makes the two one step. Registered without the Map, the name describes
-    // an index whose Map is not there, and a command arriving in that gap releases the entry —
-    // correctly, on what it can see. Every lookup takes this lock, so no one sees between them.
-    let mut reg = registry::hold();
-    if let Err(e) = reg.reserve() {
-        return Err(Error::Index(format!(
-            "the index registry could not grow: {e}"
-        )));
-    }
-    let previous = reg.put(index);
+    // The entry lands unpublished, which is what makes the gap safe without holding a lock
+    // across the engine call. A command that reads the metadata in here finds no Map and is
+    // right about what it saw — so the entry says "not yet" itself, and nothing releases it.
+    let (registered, previous) = match registry::put(index) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return Err(Error::Index(format!(
+                "the index registry could not grow: {e}"
+            )));
+        }
+    };
 
     // One engine call settles the name. Nothing probes it first: a probe answers about a
     // moment that has already passed, and every case it could report comes back from this
@@ -78,11 +79,12 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         .and_then(|pending| pending.insert_creating(engine::index_attr(Some(held), spec.exptime)));
 
     match settled {
-        // Ours, both of them. Whatever the name held before is a graph whose Map had expired
-        // or been evicted — `put` already displaced it, and dropping it here frees the usearch
-        // graph and the mapping with it.
+        // Ours, both of them. Publishing is the last step and the only one that cannot fail:
+        // from here the entry answers, and a release may take it. Whatever the name held before
+        // is a graph whose Map had expired or been evicted, and dropping it here frees the
+        // usearch graph and the id mapping with it.
         Ok(true) => {
-            drop(reg);
+            registered.publish();
             if previous.is_some() {
                 eprintln!(
                     "ArcVector: index '{name}' had no Map; released the graph it was built from"
@@ -90,20 +92,18 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
             }
             Ok(Reply::Created)
         }
-        // Not ours. Put the registry back the way it was — allocation-free, so this cannot
-        // fail — and take the element back out of a Map we did not make: a plain `mop` Map, or
-        // one a replication transfer is still filling. The Map is as we found it, since
-        // `delete_elem` passes `drop_if_empty` false and emptying it does not drop it.
+        // Not ours. Put the registry back — only if the name still holds this call's entry,
+        // since a racing `vcreate` displacing it owns what it put — and take the element back
+        // out of a Map we did not make: a plain `mop` Map, or one a replication transfer is
+        // still filling. The Map is as we found it, since `delete_elem` passes `drop_if_empty`
+        // false and emptying it does not drop it.
         Ok(false) => {
-            reg.restore(name, previous);
+            registry::unput(&registered, previous);
             let _ = store.delete_elem(name, element::META_FIELD);
-            drop(reg);
             already_there(store, name)
         }
         Err(e) => {
-            reg.restore(name, previous);
-            // Before `already_there`, which resolves the name and would take this lock again.
-            drop(reg);
+            registry::unput(&registered, previous);
             match e {
                 StoreError::ElemExists => already_there(store, name),
                 StoreError::BadType => Err(Error::bad_request(format!(

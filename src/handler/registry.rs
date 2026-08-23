@@ -1,19 +1,41 @@
 //! An entry pairs the Map with the graph built from it and the `owner` token it was built under; [`super::recovery`] judges that token.
 
 use std::collections::{HashMap, TryReserveError};
-use std::sync::{Arc, LazyLock, PoisonError, RwLock, RwLockWriteGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
 use crate::handler::usearch::AnnIndex;
 
 /// `owner` while a rebuild is in flight: claimed by nobody.
 pub const REBUILDING: u64 = 0;
 
+/// Ticks once per publish, and orders publishes against the reads that judge them.
+///
+/// A release is always decided on something read earlier — a metadata read, an engine call's
+/// `KeyGone` — and by the time it reaches the registry the name can hold an index registered
+/// since, for a Map that exists. [`now`] taken before the read says what "already there" means
+/// for that verdict, and [`remove_if_stale`] refuses anything newer.
+static CLOCK: AtomicU64 = AtomicU64::new(1);
+
+/// The reading a verdict carries. One atomic load — not a lookup, and it takes no lock, which
+/// is what lets the metadata read stay first.
+pub fn now() -> u64 {
+    CLOCK.load(Ordering::Acquire)
+}
+
 pub struct VectorIndex {
     pub name: String,
     pub ann: AnnIndex,
     /// Element-count limit for vectors, already excluding the metadata element.
     pub maxcount: u32,
-    owner: std::sync::atomic::AtomicU64,
+    owner: AtomicU64,
+    /// When this entry became answerable, and `0` until then.
+    ///
+    /// `vcreate` registers before it writes to the engine, so for a moment the name holds an
+    /// index whose Map does not exist yet. A command reading the metadata right then finds no
+    /// Map and is right about what it saw — the entry has to say "not yet" itself, because
+    /// nothing outside it can tell that verdict from a true one.
+    published: AtomicU64,
     /// Set by the rebuild thread when the graph is complete.
     #[cfg(recovery)]
     pub(super) refilled: std::sync::atomic::AtomicBool,
@@ -25,14 +47,30 @@ impl VectorIndex {
             name,
             ann,
             maxcount,
-            owner: std::sync::atomic::AtomicU64::new(owner),
+            owner: AtomicU64::new(owner),
+            published: AtomicU64::new(0),
             #[cfg(recovery)]
             refilled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     pub fn owner(&self) -> u64 {
-        self.owner.load(std::sync::atomic::Ordering::Acquire)
+        self.owner.load(Ordering::Acquire)
+    }
+
+    /// Mark the entry answerable: its Map exists now.
+    ///
+    /// Stamped with the clock *before* the tick, so a verdict that read the same value was
+    /// reached no later than this publish and leaves the entry alone. Only a verdict taken
+    /// after it — which reads a higher value — can release it.
+    pub fn publish(&self) {
+        self.published
+            .store(CLOCK.fetch_add(1, Ordering::AcqRel), Ordering::Release);
+    }
+
+    /// `0` while the Map this entry describes has not been written yet.
+    fn published_at(&self) -> u64 {
+        self.published.load(Ordering::Acquire)
     }
 
     pub fn is_rebuilding(&self) -> bool {
@@ -42,19 +80,17 @@ impl VectorIndex {
     /// Whether the graph is full again and only the token write is outstanding.
     #[cfg(recovery)]
     pub fn is_refilled(&self) -> bool {
-        self.refilled.load(std::sync::atomic::Ordering::Acquire)
+        self.refilled.load(Ordering::Acquire)
     }
 
     #[cfg(recovery)]
     pub(super) fn mark_refilled(&self) {
-        self.refilled
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.refilled.store(true, Ordering::Release);
     }
 
     #[cfg(recovery)]
     pub(super) fn set_owner(&self, owner: u64) {
-        self.owner
-            .store(owner, std::sync::atomic::Ordering::Release);
+        self.owner.store(owner, Ordering::Release);
     }
 }
 
@@ -78,66 +114,83 @@ pub fn contains(name: &str) -> bool {
     read().contains_key(name)
 }
 
-/// The registry held across the engine write that makes a Map.
+/// Claim `name` for an index whose Map does not exist yet.
 ///
-/// `vcreate` registers first and writes to the engine last, which is the module's rule
-/// everywhere: the engine write emits `CLOG_MAP_ELEM_INSERT` and is what carries the write off
-/// this node, so everything that can fail belongs in front of it. Registering is one of those
-/// things — the map has to grow — and doing it after would mean answering for a Map already
-/// made, with only a delete to take it back.
+/// `vcreate` registers first and writes to the engine last, which is the rule everywhere here:
+/// the engine write emits `CLOG_MAP_ELEM_INSERT` and is what carries the create off this node,
+/// so everything that can fail belongs in front of it. Growing this map is one of those things.
 ///
-/// The hold is what makes the pair atomic. Without it the name is registered while its Map does
-/// not exist yet, and a command arriving there reads no Map and releases the entry — correctly,
-/// on what it can see. Every lookup goes through this lock, so no one sees between the two.
-pub struct Held(RwLockWriteGuard<'static, HashMap<String, Arc<VectorIndex>>>);
-
-/// Take the registry for a create. Nothing else may take an engine lock and then this one.
-pub fn hold() -> Held {
-    Held(write())
+/// The entry lands unpublished, and nothing releases an unpublished entry — that is what covers
+/// the stretch where the name is claimed and the Map is not there yet, with no lock held across
+/// the engine call. Call [`VectorIndex::publish`] once the Map exists, or [`unput`] if it never
+/// does.
+///
+/// Returns the registered index and whatever the name held before.
+pub fn put(
+    index: VectorIndex,
+) -> Result<(Arc<VectorIndex>, Option<Arc<VectorIndex>>), TryReserveError> {
+    let mut reg = write();
+    reg.try_reserve(1)?;
+    let index = Arc::new(index);
+    let previous = reg.insert(index.name.clone(), Arc::clone(&index));
+    Ok((index, previous))
 }
 
-impl Held {
-    /// Room for one entry, taken before anything is written anywhere.
-    pub fn reserve(&mut self) -> Result<(), TryReserveError> {
-        self.0.try_reserve(1)
+/// Undo a [`put`] whose Map never got written, restoring what the name held before.
+///
+/// Only while the name still holds `ours`: a second `vcreate` racing on the same name displaces
+/// it, and that one's entry is not this call's to take back. Allocation-free either way — the
+/// key is already in the map.
+pub fn unput(ours: &VectorIndex, previous: Option<Arc<VectorIndex>>) {
+    let mut reg = write();
+    let name = ours.name.as_str();
+    if !reg
+        .get(name)
+        .is_some_and(|c| std::ptr::eq(Arc::as_ptr(c), ours))
+    {
+        return;
     }
-
-    /// Register `index`, handing back whatever the name held before.
-    ///
-    /// Call [`Self::reserve`] first: the insert grows the map on its own, and a std collection
-    /// that cannot grow aborts. The key clone is a single small allocation and has no fallible
-    /// form on stable — see `미해결.md §7`.
-    pub fn put(&mut self, index: VectorIndex) -> Option<Arc<VectorIndex>> {
-        self.0.insert(index.name.clone(), Arc::new(index))
-    }
-
-    /// Undo a [`Self::put`], allocation-free: the key is already in the map either way.
-    pub fn restore(&mut self, name: &str, previous: Option<Arc<VectorIndex>>) {
-        match previous {
-            Some(index) => {
-                if let Some(slot) = self.0.get_mut(name) {
-                    *slot = index;
-                }
-            }
-            None => {
-                self.0.remove(name);
+    match previous {
+        Some(index) => {
+            if let Some(slot) = reg.get_mut(name) {
+                *slot = index;
             }
         }
+        None => {
+            reg.remove(name);
+        }
+    }
+}
+
+/// Release `name` if what it holds was already answerable when `stamp` was taken.
+///
+/// Two entries are spared. One published after `stamp` belongs to a Map the verdict never
+/// looked at. One not published at all is a `vcreate` mid-flight, and its Map is on its way.
+pub fn remove_if_stale(name: &str, stamp: u64) -> bool {
+    let mut reg = write();
+    match reg.get(name) {
+        Some(current) => {
+            let at = current.published_at();
+            if at == 0 || at >= stamp {
+                return false;
+            }
+            reg.remove(name);
+            true
+        }
+        None => false,
     }
 }
 
 /// Register `index` unless the name is taken, returning whichever ends up live.
 ///
-/// The room comes first. `entry` grows the map on its own, and a std collection that cannot
-/// grow aborts the process instead of returning — the one failure a daemon must never take.
-/// Asking for the room up front turns it into a value the caller can answer with, and leaves
-/// the registry untouched when the answer is no.
+/// For adoptions, where the Map is already there: the entry is published as it goes in.
 pub fn insert_or_get(index: VectorIndex) -> Result<(Arc<VectorIndex>, bool), TryReserveError> {
     let mut reg = write();
     reg.try_reserve(1)?;
     let mut inserted = false;
     let entry = reg.entry(index.name.clone()).or_insert_with(|| {
         inserted = true;
+        index.publish();
         Arc::new(index)
     });
     Ok((Arc::clone(entry), inserted))
@@ -187,6 +240,67 @@ mod tests {
         let ann = AnnIndex::new(Layout::new(4, Quant::F32), Metric::L2, 0, 0, 0)
             .expect("build the graph");
         VectorIndex::new(name.to_owned(), ann, 8, 1)
+    }
+
+    /// The race the clock guards: a command reads the Map, finds it gone, and only reaches the
+    /// registry after a `vcreate` has put a live index under the same name. Without the stamp
+    /// the release takes out the new one, leaving a Map nothing serves.
+    #[test]
+    fn a_verdict_older_than_the_entry_releases_nothing() {
+        let name = "registry-test-late-verdict";
+        let stamp = now();
+
+        // The create lands after the verdict was reached.
+        let (registered, _) = put(index(name)).expect("claim the name");
+        registered.publish();
+
+        assert!(
+            !remove_if_stale(name, stamp),
+            "a verdict from before the entry existed must release nothing"
+        );
+        assert!(get(name).is_some(), "the new index survives");
+        remove(name);
+    }
+
+    /// `vcreate` claims the name before it writes the Map, so for a moment the entry describes
+    /// an index with no Map. A command reading the metadata right then is right about what it
+    /// saw, and must still leave the entry alone.
+    #[test]
+    fn an_unpublished_entry_is_never_released() {
+        let name = "registry-test-unpublished";
+        let (registered, _) = put(index(name)).expect("claim the name");
+
+        assert!(
+            !remove_if_stale(name, now()),
+            "an entry whose Map is still being written must survive any verdict"
+        );
+
+        registered.publish();
+        assert!(
+            remove_if_stale(name, now()),
+            "once published it is releasable like any other"
+        );
+    }
+
+    /// A racing `vcreate` displaced this call's entry, so the undo is not its to make.
+    #[test]
+    fn unput_leaves_a_displacing_entry_alone() {
+        let name = "registry-test-unput-displaced";
+        let (mine, _) = put(index(name)).expect("claim the name");
+        let (theirs, displaced) = put(index(name)).expect("displace it");
+        assert!(
+            displaced.is_some_and(|d| Arc::ptr_eq(&d, &mine)),
+            "the second put displaces the first"
+        );
+
+        unput(&mine, None);
+
+        assert!(
+            get(name).is_some_and(|live| Arc::ptr_eq(&live, &theirs)),
+            "undoing the displaced entry must not remove the one that displaced it"
+        );
+        unput(&theirs, None);
+        assert!(get(name).is_none(), "the owner of the entry can undo it");
     }
 
     /// The race this guards: a command reads the Map, finds it gone, and only reaches the

@@ -36,6 +36,9 @@ fn similar(
     out: &mut String,
 ) -> Result<()> {
     let layout = index.ann.layout;
+    // After `for_read`, so this search's entry is already published and a release below cannot
+    // reach anything registered since.
+    let stamp = crate::handler::registry::now();
 
     // Elements the FILTER read, kept by the engine's own hold rather than copied. A hit that
     // is in here needs no second lookup to render, and what the reply carries is the same
@@ -88,7 +91,7 @@ fn similar(
                 // Every remaining hit would fail the same way, and the graph should not
                 // outlive the Map it was built from.
                 Err(StoreError::KeyGone) => {
-                    map_is_gone(&index.name, index);
+                    map_is_gone(&index.name, stamp);
                     break;
                 }
                 Err(_) => continue,
@@ -162,13 +165,14 @@ pub fn vsim_key(store: &Store, spec: &SimKey) -> Result<Reply> {
     let (k, with_attr, filter) = (*k, *with_attr, filter.as_ref());
 
     let index = for_read(store, name)?;
+    let stamp = crate::handler::registry::now();
 
     let stored = match store.get_elem(name, key) {
         Ok(v) => v,
         Err(StoreError::ElemGone) => return Ok(Reply::NotFound),
         // The Map is gone, so the graph has nothing left to answer with.
         Err(StoreError::KeyGone) => {
-            map_is_gone(name, &index);
+            map_is_gone(name, stamp);
             return Ok(Reply::NotFound);
         }
         Err(e) => return Err(e.into()),
