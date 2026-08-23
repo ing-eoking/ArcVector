@@ -587,36 +587,44 @@ impl AnnIndex {
 
     pub fn vector_of(&self, addr: u64) -> Result<Option<Vec<u8>>> {
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
-        let held = self.held();
-        if !held.contains(addr) {
-            return Ok(None);
-        }
         let key = addr;
         let dim = self.layout.dim;
 
         let bytes = match self.layout.quant {
             Quant::F32 => {
                 let mut out = vec![0f32; dim];
-                index.get(key, &mut out).map_err(usearch_err)?;
+                if index.get(key, &mut out).map_err(usearch_err)? == 0 {
+                    return Ok(None);
+                }
                 out.iter().flat_map(|v| v.to_le_bytes()).collect()
             }
             Quant::F16 => {
                 let mut out = vec![0i16; dim];
-                index
+                if index
                     .get(key, f16::from_mut_i16s(&mut out))
-                    .map_err(usearch_err)?;
+                    .map_err(usearch_err)?
+                    == 0
+                {
+                    return Ok(None);
+                }
                 out.iter().flat_map(|v| v.to_le_bytes()).collect()
             }
             Quant::I8 => {
                 let mut out = vec![0i8; dim];
-                index.get(key, &mut out).map_err(usearch_err)?;
+                if index.get(key, &mut out).map_err(usearch_err)? == 0 {
+                    return Ok(None);
+                }
                 out.iter().map(|v| *v as u8).collect()
             }
             Quant::B1 => {
                 let mut out = vec![0u8; dim];
-                index
+                if index
                     .get(key, b1x8::from_mut_u8s(&mut out))
-                    .map_err(usearch_err)?;
+                    .map_err(usearch_err)?
+                    == 0
+                {
+                    return Ok(None);
+                }
                 out.truncate(self.layout.vector_bytes());
                 out
             }

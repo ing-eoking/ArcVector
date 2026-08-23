@@ -19,6 +19,7 @@ impl HeldSet {
         self.live.len()
     }
 
+    #[cfg(test)]
     pub(super) fn contains(&self, addr: u64) -> bool {
         self.live.contains(&addr)
     }
