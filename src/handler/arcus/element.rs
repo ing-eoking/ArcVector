@@ -66,13 +66,35 @@ impl Layout {
     /// Bytes the engine appends to every collection element for the terminator.
     pub const STORED_TERMINATOR: usize = 2;
 
+    /// What a stored element holds.
+    ///
+    /// The vector is in it only where something reads it back: a rebuild from Map. usearch
+    /// already holds one copy, and outside a recovery build nothing ever asks the Map for it —
+    /// `vsim KEY` takes its query straight from the graph. At 768 dimensions the vector is
+    /// 3072 of the element's 3204 bytes, so leaving it out is most of what an element costs.
+    #[cfg(recovery)]
     pub const fn element_len(&self) -> usize {
         Self::VECTOR_OFFSET + self.vector_bytes()
     }
 
-    /// What the engine allocates, and what must fit `max_element_bytes`.
+    #[cfg(not(recovery))]
+    pub const fn element_len(&self) -> usize {
+        Self::VECTOR_OFFSET
+    }
+
+    /// What the engine allocates.
     pub const fn stored_len(&self) -> usize {
         self.element_len() + Self::STORED_TERMINATOR
+    }
+
+    /// What an element would take with the vector in it, whatever this build stores.
+    ///
+    /// The dimension limit is measured against this in every build. It could be relaxed where
+    /// the vector is left out, but then the same server would accept a dimension on one build
+    /// and refuse it on another, and an index would stop being describable independently of how
+    /// the module was compiled.
+    pub const fn full_stored_len(&self) -> usize {
+        Self::VECTOR_OFFSET + self.vector_bytes() + Self::STORED_TERMINATOR
     }
 
     /// Largest dimension whose element fits `budget`. Zero if not even one does.
@@ -133,6 +155,7 @@ impl Layout {
         // is whatever the slab held, and those bytes are stored and replicated.
         buf[ATTR_OFFSET..Self::VECTOR_OFFSET].fill(0);
         buf[ATTR_OFFSET..ATTR_OFFSET + attr.len()].copy_from_slice(attr);
+        #[cfg(recovery)]
         buf[Self::VECTOR_OFFSET..].copy_from_slice(vector);
         Ok(())
     }
@@ -149,6 +172,7 @@ impl Layout {
         }
         Ok(Element {
             attr: &buf[ATTR_OFFSET..ATTR_OFFSET + head.attr_len],
+            #[cfg(recovery)]
             vector: &buf[Self::VECTOR_OFFSET..need],
         })
     }
@@ -269,6 +293,9 @@ impl MetaRecord {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Element<'a> {
     pub attr: &'a [u8],
+    /// Only where a rebuild reads it back. Gated rather than left empty, so a build that does
+    /// not store the vector cannot compile a reader for one.
+    #[cfg(recovery)]
     pub vector: &'a [u8],
 }
 
@@ -313,7 +340,12 @@ mod tests {
         for dim in [1usize, 128, 4096] {
             for q in [Quant::F32, Quant::F16, Quant::I8, Quant::B1] {
                 let l = Layout::new(dim, q);
+                #[cfg(recovery)]
                 assert_eq!(l.element_len(), 130 + l.vector_bytes());
+                // Without a rebuild to feed, the vector is not stored — see `element_len`.
+                #[cfg(not(recovery))]
+                assert_eq!(l.element_len(), 130);
+                assert_eq!(l.full_stored_len(), 132 + l.vector_bytes());
             }
         }
     }
@@ -343,9 +375,12 @@ mod tests {
 
         let from_bare = l.decode(&bare).expect("old shape decodes");
         let from_terminated = l.decode(&terminated).expect("new shape decodes");
-        assert_eq!(from_bare.vector, from_terminated.vector);
         assert_eq!(from_bare.attr, from_terminated.attr);
-        assert_eq!(from_bare.vector, &vector[..]);
+        #[cfg(recovery)]
+        {
+            assert_eq!(from_bare.vector, from_terminated.vector);
+            assert_eq!(from_bare.vector, &vector[..]);
+        }
 
         assert!(matches!(
             l.decode(&bare[..bare.len() - 1]),
@@ -361,11 +396,14 @@ mod tests {
 
         let buf = l.encode(&vector, attr).unwrap();
         assert_eq!(buf.len(), l.element_len());
-        assert_eq!(buf.len(), 130 + 4);
 
         let e = l.decode(&buf).unwrap();
         assert_eq!(e.attr, attr);
-        assert_eq!(e.vector, &vector[..]);
+        #[cfg(recovery)]
+        {
+            assert_eq!(buf.len(), 130 + 4);
+            assert_eq!(e.vector, &vector[..]);
+        }
     }
 
     #[test]
@@ -408,6 +446,7 @@ mod tests {
         let attr = vec![b'x'; ATTR_BYTES];
         let buf = l.encode(&[1, 2, 3, 4], &attr).unwrap();
         assert_eq!(l.decode(&buf).unwrap().attr, &attr[..]);
+        #[cfg(recovery)]
         assert_eq!(l.decode(&buf).unwrap().vector, &[1, 2, 3, 4]);
     }
 
@@ -484,6 +523,9 @@ mod tests {
         let good = l.encode(&[0, 0, 0, 0], b"{}").unwrap();
         let short = &good[..Layout::VECTOR_OFFSET];
         assert_eq!(l.attr_of(short).unwrap(), b"{}");
+        // Only where a vector is stored is this a truncation at all; without one the element
+        // ends at the ATTR region and there is no tail to lose.
+        #[cfg(recovery)]
         assert!(l.decode(short).is_err());
     }
 
@@ -497,9 +539,11 @@ mod tests {
         assert_eq!(Layout::max_dim_for(Quant::B1, limit), 130_016);
 
         for q in [Quant::F32, Quant::F16, Quant::I8, Quant::B1] {
+            // `max_dim_for` is the dimension cap, and that is measured with the vector in the
+            // element whatever this build stores — see `full_stored_len`.
             let d = Layout::max_dim_for(q, limit);
-            assert!(Layout::new(d, q).stored_len() <= limit, "{q:?}");
-            assert!(Layout::new(d + 1, q).stored_len() > limit, "{q:?}");
+            assert!(Layout::new(d, q).full_stored_len() <= limit, "{q:?}");
+            assert!(Layout::new(d + 1, q).full_stored_len() > limit, "{q:?}");
         }
     }
 

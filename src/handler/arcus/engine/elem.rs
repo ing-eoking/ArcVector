@@ -337,6 +337,19 @@ impl Store {
         self.with_elems(key, Some(field), |elems| elems[0].1.to_vec())
     }
 
+    /// Read one element's ATTR region, copying only that.
+    ///
+    /// `get_elem` copies the whole stored value, which where the vector is in it means copying
+    /// kilobytes to hand back tens of bytes. The hold keeps the engine from reclaiming the
+    /// element while `attr_of` slices it, so the copy is exactly the answer.
+    pub fn get_attr(&self, key: &str, field: &str, layout: Layout) -> Result<Vec<u8>> {
+        let held = self.hold_elem(key, field)?;
+        layout
+            .attr_of(held.value())
+            .map(<[u8]>::to_vec)
+            .map_err(|_| StoreError::CorruptElement)
+    }
+
     /// Read every element — used to rebuild the usearch index from Map.
     pub fn get_all(&self, key: &str) -> Result<Vec<(String, Vec<u8>)>> {
         let all = self.with_elems(key, None, |elems| {

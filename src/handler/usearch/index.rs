@@ -607,6 +607,64 @@ impl AnnIndex {
         .map_err(usearch_err)
     }
 
+    /// The stored vector for `id`, read back out of the graph.
+    ///
+    /// usearch keeps the vectors it was given, in the quantization the index was built with —
+    /// the same bytes the Map used to carry. That copy is why a build without recovery does not
+    /// store a second one, and this is what `vsim KEY` reads its query from.
+    ///
+    /// `None` means nothing names `id`.
+    pub fn vector_of(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        let Some(key) = self.ids().key_of(id) else {
+            return Ok(None);
+        };
+        let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        let dim = self.layout.dim;
+        // Read in the index's own scalar type, so nothing is converted and the bytes come back
+        // exactly as `Quant::encode` would have written them.
+        let bytes = match self.layout.quant {
+            Quant::F32 => {
+                let mut out = vec![0f32; dim];
+                index.get(key, &mut out).map_err(usearch_err)?;
+                out.iter().flat_map(|v| v.to_le_bytes()).collect()
+            }
+            Quant::F16 => {
+                // `f16` is a transparent newtype over `i16`, so the buffer is the plain one.
+                let mut out = vec![0i16; dim];
+                index
+                    .get(key, f16::from_mut_i16s(&mut out))
+                    .map_err(usearch_err)?;
+                out.iter().flat_map(|v| v.to_le_bytes()).collect()
+            }
+            Quant::I8 => {
+                let mut out = vec![0i8; dim];
+                index.get(key, &mut out).map_err(usearch_err)?;
+                out.iter().map(|v| *v as u8).collect()
+            }
+            Quant::B1 => {
+                // Transparent over `u8`, and the packed bytes are the stored form — but the
+                // binding measures this buffer against `dimensions()`, which for a binary index
+                // counts bits, and refuses anything that is not a multiple of it. So ask for
+                // `dim` bytes, which is always at least the `dim / 8` it writes, and keep that
+                // many. `add` has no such check, which is why only the read side pays it.
+                let mut out = vec![0u8; dim];
+                index
+                    .get(key, b1x8::from_mut_u8s(&mut out))
+                    .map_err(usearch_err)?;
+                out.truncate(self.layout.vector_bytes());
+                out
+            }
+        };
+        if bytes.len() != self.layout.vector_bytes() {
+            return Err(Error::Index(format!(
+                "the graph returned {} bytes for '{id}', expected {}",
+                bytes.len(),
+                self.layout.vector_bytes()
+            )));
+        }
+        Ok(Some(bytes))
+    }
+
     pub fn reserve(&self, count: usize) -> Result<()> {
         self.ensure_capacity(count)
     }
@@ -861,6 +919,38 @@ mod tests {
             panic!("remove failed");
         };
         removed.unwrap_or(false)
+    }
+
+    /// The claim a build without recovery rests on: usearch gives back exactly the bytes the
+    /// Map used to store, for every quantization, so `vsim KEY` needs no second copy.
+    #[test]
+    fn a_stored_vector_reads_back_byte_for_byte() {
+        for (quant, metric, dim) in [
+            (Quant::F32, Metric::L2, 4usize),
+            (Quant::F16, Metric::L2, 4),
+            (Quant::I8, Metric::Cos, 4),
+            (Quant::B1, Metric::Hamming, 16),
+        ] {
+            let idx = build(dim, quant, metric, 2);
+            let layout = Layout::new(dim, quant);
+            // Distinct, non-zero bytes, so a wrong length or a swapped pair would show.
+            let stored: Vec<u8> = (0..layout.vector_bytes()).map(|i| (i as u8) | 1).collect();
+
+            let staged = idx.stage(&stored, OWNER).expect("stage");
+            publish(&idx, "v1", staged, OWNER);
+
+            assert_eq!(
+                idx.vector_of("v1").expect("read back"),
+                Some(stored.clone()),
+                "{quant:?} did not round-trip through the graph"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unnamed_id_has_no_vector() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        assert_eq!(idx.vector_of("nobody").expect("read back"), None);
     }
 
     fn build(dim: usize, quant: Quant, metric: Metric, threads: usize) -> AnnIndex {

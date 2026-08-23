@@ -126,10 +126,10 @@ pub fn vget(store: &Store, name: &str, id: &str) -> Result<Reply> {
     let index = for_read(store, name)?;
     let stamp = registry::now();
 
-    match store.get_elem(name, id) {
-        Ok(stored) => {
-            let element = index.ann.layout.decode(&stored)?;
-            let json = String::from_utf8_lossy(element.attr);
+    // Only the ATTR is answered, so only the ATTR is copied.
+    match store.get_attr(name, id, index.ann.layout) {
+        Ok(attr) => {
+            let json = String::from_utf8_lossy(&attr);
             Ok(Reply::Body(format!(
                 "VALUE {id} {}\r\n{json}\r\nEND\r\n",
                 json.len()

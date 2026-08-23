@@ -106,12 +106,7 @@ fn similar(
                 }
                 Err(_) => continue,
             };
-            Some(
-                layout
-                    .decode(&stored)
-                    .map(|e| String::from_utf8_lossy(e.attr).into_owned())
-                    .unwrap_or_default(),
-            )
+            Some(String::from_utf8_lossy(&stored).into_owned())
         };
         rendered.push((id.to_owned(), distance, attr));
     }
@@ -177,24 +172,24 @@ pub fn vsim_key(store: &Store, spec: &SimKey) -> Result<Reply> {
     let index = for_read(store, name)?;
     let stamp = crate::handler::registry::now();
 
-    let stored = match store.get_elem(name, key) {
-        Ok(v) => v,
-        Err(StoreError::ElemGone) => return Ok(Reply::NotFound),
-        Err(StoreError::CorruptElement) => {
-            index.ann.forget_unreadable(key);
-            eprintln!(
-                "ArcVector: element '{key}' of index '{name}' is unreadable; dropped from the graph"
-            );
-            return Err(StoreError::CorruptElement.into());
-        }
-        // The Map is gone, so the graph has nothing left to answer with.
-        Err(StoreError::KeyGone) => {
-            map_is_gone(name, stamp);
-            return Ok(Reply::NotFound);
-        }
-        Err(e) => return Err(e.into()),
+    // The query comes out of the graph, not the Map. usearch holds the vector in the index's
+    // own quantization — the same bytes a stored element carries — so this reads what the Map
+    // would have said, and it is the only copy a build without recovery keeps.
+    let Some(query) = index.ann.vector_of(key)? else {
+        // Nothing names the id. The Map is the authority on whether it exists at all, so ask it
+        // rather than answering out of the graph's silence.
+        return match store.get_elem(name, key) {
+            // The element is there and its node is not: a write that has not published yet, or
+            // a rebuild that has not reached this id. Neither is "no such vector".
+            Ok(_) => Err(Error::Unreadable),
+            Err(StoreError::ElemGone) => Ok(Reply::NotFound),
+            Err(StoreError::KeyGone) => {
+                map_is_gone(name, stamp);
+                Ok(Reply::NotFound)
+            }
+            Err(e) => Err(e.into()),
+        };
     };
-    let query = index.ann.layout.decode(&stored)?.vector.to_vec();
 
     let mut out = String::new();
     similar(store, &index, &query, k, filter, with_attr, 0, &mut out)?;

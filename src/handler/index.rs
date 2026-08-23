@@ -136,13 +136,15 @@ fn already_there(store: &Store, name: &str) -> Result<Reply> {
 
 fn check_dimension_fits(store: &Store, layout: Layout, quant: Quant) -> Result<()> {
     let limit = store.max_element_bytes() as usize;
-    if layout.stored_len() <= limit {
+    // Measured with the vector in the element even where this build leaves it out, so the
+    // dimension a server accepts does not depend on how the module was compiled.
+    if layout.full_stored_len() <= limit {
         return Ok(());
     }
     Err(Error::bad_request(format!(
         "element would be {} bytes, over max_element_bytes {limit} \
          (max dimension is {} for quant {quant})",
-        layout.stored_len(),
+        layout.full_stored_len(),
         Layout::max_dim_for(quant, limit),
     )))
 }

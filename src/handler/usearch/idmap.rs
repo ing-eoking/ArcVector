@@ -150,6 +150,11 @@ impl IdMap {
 
     /// Whether a rebuild should leave this id alone: the graph already holds it, or it was
     /// deleted since the rebuild began.
+    /// The key `id` names, if anything does.
+    pub(super) fn key_of(&self, id: &str) -> Option<u64> {
+        self.by_id.get(id).copied()
+    }
+
     pub(super) fn is_known(&self, id: &str) -> bool {
         self.by_id.contains_key(id) || self.tombstones.contains(id)
     }
