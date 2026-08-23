@@ -62,19 +62,42 @@ impl Drop for Staged<'_> {
     }
 }
 
+const READER_SLOTS: usize = 128;
+
+const NO_READER: u64 = u64::MAX;
+
 #[must_use = "the search is only counted while this is alive"]
-struct Searching<'a>(&'a AnnIndex);
+struct Searching<'a> {
+    index: &'a AnnIndex,
+    slot: Option<usize>,
+}
 
 impl<'a> Searching<'a> {
     fn new(index: &'a AnnIndex) -> Self {
-        index.entered.fetch_add(1, Ordering::AcqRel);
-        Searching(index)
+        let ticket = index.next_ticket.fetch_add(1, Ordering::AcqRel);
+        let start = (ticket % READER_SLOTS as u64) as usize;
+        let slot = (0..READER_SLOTS)
+            .map(|step| (start + step) % READER_SLOTS)
+            .find(|slot| {
+                index.readers[*slot]
+                    .compare_exchange(NO_READER, ticket, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            });
+        if slot.is_none() {
+            index.unslotted.fetch_add(1, Ordering::AcqRel);
+        }
+        Searching { index, slot }
     }
 }
 
 impl Drop for Searching<'_> {
     fn drop(&mut self) {
-        self.0.exited.fetch_add(1, Ordering::AcqRel);
+        match self.slot {
+            Some(slot) => self.index.readers[slot].store(NO_READER, Ordering::Release),
+            None => {
+                self.index.unslotted.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
     }
 }
 
@@ -134,8 +157,9 @@ pub struct AnnIndex {
 
     rebuilding: AtomicBool,
 
-    entered: AtomicU64,
-    exited: AtomicU64,
+    next_ticket: AtomicU64,
+    readers: [AtomicU64; READER_SLOTS],
+    unslotted: AtomicUsize,
     retired: std::sync::Mutex<Vec<(u64, u64)>>,
 }
 
@@ -197,8 +221,9 @@ impl AnnIndex {
             epoch: AtomicU64::new(0),
             held: RwLock::new(HeldSet::default()),
             rebuilding: AtomicBool::new(false),
-            entered: AtomicU64::new(0),
-            exited: AtomicU64::new(0),
+            next_ticket: AtomicU64::new(0),
+            readers: std::array::from_fn(|_| AtomicU64::new(NO_READER)),
+            unslotted: AtomicUsize::new(0),
             retired: std::sync::Mutex::new(Vec::new()),
         })
     }
@@ -420,7 +445,7 @@ impl AnnIndex {
         if addrs.is_empty() {
             return;
         }
-        let after = self.entered.load(Ordering::Acquire);
+        let after = self.next_ticket.load(Ordering::Acquire);
         {
             let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
             if retired.try_reserve(addrs.len()).is_err() {
@@ -434,14 +459,25 @@ impl AnnIndex {
     }
 
     fn drain_then_release(&self, addrs: &[u64], after: u64) {
-        while self.exited.load(Ordering::Acquire) < after {
+        while self.oldest_reader() < after {
             std::thread::yield_now();
         }
         self.elements.release(addrs);
     }
 
+    fn oldest_reader(&self) -> u64 {
+        if self.unslotted.load(Ordering::Acquire) > 0 {
+            return 0;
+        }
+        self.readers
+            .iter()
+            .map(|cell| cell.load(Ordering::Acquire))
+            .min()
+            .unwrap_or(NO_READER)
+    }
+
     pub fn reclaim(&self) {
-        let done = self.exited.load(Ordering::Acquire);
+        let done = self.oldest_reader();
         let mut ready: Vec<u64> = Vec::new();
         {
             let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
@@ -955,6 +991,36 @@ mod tests {
             let hits = search(&idx, &[1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0], 1);
             assert_eq!(hits, vec!["x"], "quant {q:?}");
         }
+    }
+
+    /// Searches do not finish in the order they started. A counter of how many have ended
+    /// cannot say the early ones are among them, so the floor is the oldest ticket still out.
+    #[test]
+    fn a_later_search_finishing_does_not_free_what_an_earlier_one_may_hold() {
+        let idx = build(4, Quant::F32, Metric::L2, 4);
+        let addr = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
+
+        let first = Searching::new(&idx);
+        let second = Searching::new(&idx);
+
+        let taken: std::result::Result<Option<bool>, PublishError<()>> =
+            idx.remove_published(|| Ok(Some(addr)));
+        assert_eq!(taken.unwrap(), Some(true));
+
+        drop(second);
+        drop(Searching::new(&idx));
+        idx.reclaim();
+        assert!(
+            FAKE.id_at(addr).is_some(),
+            "two searches ended, but the one that started first is still running"
+        );
+
+        drop(first);
+        idx.reclaim();
+        assert!(
+            FAKE.id_at(addr).is_none(),
+            "nothing is reading it any more, so it should have gone back"
+        );
     }
 
     #[test]
