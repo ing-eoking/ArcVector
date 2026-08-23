@@ -262,8 +262,8 @@ impl AnnIndex {
         self.held.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Module memory the held set costs, which arcus cannot see.
-    pub fn id_map_bytes(&self) -> usize {
+    /// Module memory the held-address set costs, which arcus cannot see.
+    pub fn addr_set_bytes(&self) -> usize {
         self.held().bytes()
     }
 
@@ -1671,7 +1671,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_adds_and_searches_do_not_corrupt_the_id_map() {
+    fn concurrent_adds_and_searches_keep_every_address_named() {
         // 8 searchers plus the one add that holds the mapping lock: 9 entrants, 16 contexts.
         let idx = Arc::new(build(4, Quant::F32, Metric::L2, 16));
         // Ids are unique per thread here, so nothing displaces anything and the keys can be

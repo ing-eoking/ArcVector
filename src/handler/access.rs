@@ -186,8 +186,8 @@ pub(super) fn for_write(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
 
 /// The Map is gone, so the graph built from it has nothing left to serve.
 ///
-/// Dropping the registry entry drops the last `Arc`, and with it usearch's graph and the id
-/// mapping. A command already holding one frees it when it finishes.
+/// Dropping the registry entry drops the last `Arc`, and with it usearch's graph and the refcounts it
+/// holds. A command already holding one frees it when it finishes.
 ///
 /// Not gated on `recovery`: a Map can expire or be evicted in any build, and the graph must not
 /// outlive it.
