@@ -410,6 +410,20 @@ impl AnnIndex {
         }
     }
 
+    pub fn reconcile<E>(
+        &self,
+        stored: impl FnOnce() -> std::result::Result<usize, E>,
+    ) -> std::result::Result<Option<(usize, usize)>, E> {
+        if self.rebuilding.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let held = self.held.write().unwrap_or_else(PoisonError::into_inner);
+        let in_map = stored()?;
+        let named = held.len();
+        drop(held);
+        Ok((in_map != named).then_some((in_map, named)))
+    }
+
     pub fn unclaimed(&self, addr: u64) {
         self.elements.release(&[addr]);
     }
@@ -1780,6 +1794,31 @@ mod tests {
         idx.end_rebuild();
         assert_eq!(search(&idx, &coords, 1), vec!["k"]);
         assert_one_key_per_id(&idx, "after completing an update during a rebuild");
+    }
+
+    #[test]
+    fn a_graph_that_names_what_the_map_holds_reconciles() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        put(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
+        put(&idx, "b", &[0.0, 1.0, 0.0, 0.0]);
+
+        let same: std::result::Result<_, ()> = idx.reconcile(|| Ok(2));
+        assert_eq!(same, Ok(None), "two named, two stored");
+
+        let off: std::result::Result<_, ()> = idx.reconcile(|| Ok(3));
+        assert_eq!(off, Ok(Some((3, 2))), "the Map holds one the graph lost");
+    }
+
+    #[test]
+    fn a_rebuilding_graph_is_not_reconciled() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        put(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
+        idx.begin_rebuild().expect("begin");
+
+        let counted: std::result::Result<_, ()> = idx.reconcile(|| {
+            panic!("a half-built graph must not be compared against the Map");
+        });
+        assert_eq!(counted, Ok(None));
     }
 
     #[test]

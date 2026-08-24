@@ -51,8 +51,30 @@ pub fn maybe(store: &Store) {
         return;
     }
     let Some(probe) = take_offer() else { return };
-    if matches!(store.probe_map(&probe.name), Err(StoreError::KeyGone)) {
-        hand_back(probe);
+    let Some(index) = registry::get(&probe.name) else {
+        return;
+    };
+    if index.is_rebuilding() {
+        return;
+    }
+
+    let name = &probe.name;
+    let counted = index.ann.reconcile(|| {
+        store
+            .probe_map(name)
+            .map(|map| map.count.saturating_sub(1) as usize)
+    });
+    match counted {
+        Ok(None) => {}
+        Ok(Some((in_map, named))) => {
+            eprintln!(
+                "ArcVector: index '{name}' names {named} element(s) but its Map holds {in_map}; \
+                 dropping the graph so the next read rebuilds it"
+            );
+            registry::remove_observed(name, &index);
+        }
+        Err(StoreError::KeyGone) => hand_back(probe),
+        Err(_) => {}
     }
 }
 
