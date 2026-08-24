@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 use crate::handler::access::sweep;
 use crate::handler::usearch::AnnIndex;
 
-pub const REBUILDING: u64 = 0;
+pub const REBUILDING: u64 = crate::handler::owner::NOBODY;
 
 static CLOCK: AtomicU64 = AtomicU64::new(1);
 

@@ -34,7 +34,7 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
 
     let held = map_size_for(store, spec.maxcount);
     let maxcount = held - 1;
-    let owner = element::mint_owner();
+    let owner = crate::handler::owner::mint();
     let meta = MetaRecord {
         metric: metric.as_str().to_owned(),
         connectivity: spec.connectivity,

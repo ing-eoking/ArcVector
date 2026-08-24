@@ -4,8 +4,9 @@ use crate::handler::access::meta::{MetaState, read_metadata};
 
 use super::registry::{REBUILDING, VectorIndex, get, remove};
 use crate::error::{Error, Result};
-use crate::handler::arcus::element::{Layout, META_FIELD, MetaRecord, mint_owner};
+use crate::handler::arcus::element::{Layout, META_FIELD, MetaRecord};
 use crate::handler::arcus::engine::{HeldMap, Store};
+use crate::handler::owner;
 use crate::handler::usearch::{AnnIndex, Metric};
 
 pub fn take_over(store: &Store, index: &VectorIndex) -> Result<()> {
@@ -147,7 +148,7 @@ pub fn claim_refilled(store: &Store, index: &VectorIndex) -> Result<()> {
             return Err(e.into());
         }
     }
-    let owner = mint_owner();
+    let owner = owner::mint();
     if let Err(e) = stamp(store, &index.name, owner) {
         index.mark_refilled();
         return Err(e);

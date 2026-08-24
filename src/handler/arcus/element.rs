@@ -208,13 +208,6 @@ pub struct MetaRecord {
     pub owner: u64,
 }
 
-pub fn mint_owner() -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u64(0x4156_0000_0000_0001);
-    h.finish()
-}
-
 impl MetaRecord {
     pub fn encode(&self, layout: Layout) -> Vec<u8> {
         format!(
