@@ -62,6 +62,9 @@ impl Drop for Staged<'_> {
     }
 }
 
+#[cfg(test)]
+static NEXT_IDENTITY: AtomicUsize = AtomicUsize::new(1);
+
 const READER_SLOTS: usize = 128;
 
 const NO_READER: u64 = u64::MAX;
@@ -163,6 +166,9 @@ pub struct AnnIndex {
 
     rebuilding: AtomicBool,
 
+    #[cfg(test)]
+    identity: usize,
+
     readers: [AtomicU64; READER_SLOTS],
     stuck: std::sync::Mutex<Vec<u64>>,
     unslotted: AtomicUsize,
@@ -228,6 +234,8 @@ impl AnnIndex {
             epoch: AtomicU64::new(0),
             held: RwLock::new(HeldSet::default()),
             rebuilding: AtomicBool::new(false),
+            #[cfg(test)]
+            identity: NEXT_IDENTITY.fetch_add(1, Ordering::Relaxed),
             readers: std::array::from_fn(|_| AtomicU64::new(NO_READER)),
             stuck: std::sync::Mutex::new(Vec::new()),
             unslotted: AtomicUsize::new(0),
@@ -883,7 +891,7 @@ mod tests {
     }
 
     fn map_of(idx: &AnnIndex) -> usize {
-        std::ptr::from_ref(idx) as usize
+        idx.identity
     }
 
     impl Elements for FakeStore {
