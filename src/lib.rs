@@ -14,6 +14,7 @@ pub mod engine_api {
 pub mod command;
 pub mod error;
 pub mod handler;
+pub mod owner;
 pub mod server;
 
 pub use handler::arcus::element::ATTR_BYTES;
@@ -99,6 +100,7 @@ pub extern "C" fn memcached_extensions_initialize(
         return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
     };
     server::set_api(get_api);
+    eprintln!("ArcVector: owner {}", owner::install());
 
     unsafe {
         let server = get_api();

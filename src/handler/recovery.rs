@@ -2,22 +2,24 @@ use std::sync::{Condvar, LazyLock, Mutex, PoisonError};
 
 use crate::handler::access::meta::{MetaState, read_metadata};
 
-use super::registry::{REBUILDING, VectorIndex, get, remove};
+use super::registry::{VectorIndex, get, remove};
 use crate::error::{Error, Result};
 use crate::handler::arcus::element::{Layout, META_FIELD, MetaRecord};
 use crate::handler::arcus::engine::{HeldMap, Store};
-use crate::handler::owner;
 use crate::handler::usearch::{AnnIndex, Metric};
+use crate::owner;
 
 pub fn take_over(store: &Store, index: &VectorIndex) -> Result<()> {
-    let previous = index.owner();
+    let was_ours = !index.is_rebuilding();
     index
         .refilled
         .store(false, std::sync::atomic::Ordering::Release);
-    index.set_owner(REBUILDING);
+    index.mark_rebuilding();
 
-    if let Err(e) = stamp(store, &index.name, REBUILDING) {
-        index.set_owner(previous);
+    if let Err(e) = stamp(store, &index.name, owner::NOBODY) {
+        if was_ours {
+            index.mark_ours();
+        }
         return Err(e);
     }
 
@@ -134,7 +136,7 @@ pub fn claim_refilled(store: &Store, index: &VectorIndex) -> Result<()> {
         return Ok(());
     }
     match read_metadata(store, &index.name) {
-        MetaState::Usable(meta, _) if meta.owner == REBUILDING => {}
+        MetaState::Usable(meta, _) if meta.owner == owner::NOBODY => {}
         MetaState::Usable(..) | MetaState::NoMap => {
             index.mark_refilled();
             return Err(Error::NoSuchIndex);
@@ -148,15 +150,15 @@ pub fn claim_refilled(store: &Store, index: &VectorIndex) -> Result<()> {
             return Err(e.into());
         }
     }
-    let owner = owner::mint();
-    if let Err(e) = stamp(store, &index.name, owner) {
+    let token = owner::ours();
+    if let Err(e) = stamp(store, &index.name, token) {
         index.mark_refilled();
         return Err(e);
     }
     index.ann.end_rebuild();
-    index.set_owner(owner);
+    index.mark_ours();
     eprintln!(
-        "ArcVector: index '{}' is serving again, owner={owner:016x}",
+        "ArcVector: index '{}' is serving again, owner={token}",
         index.name
     );
     Ok(())
@@ -175,14 +177,17 @@ pub fn build_ann(meta: &MetaRecord, layout: Layout) -> Result<AnnIndex> {
     )
 }
 
-pub(super) fn stamp(store: &Store, name: &str, owner: u64) -> Result<()> {
+pub(super) fn stamp(store: &Store, name: &str, owner: &str) -> Result<()> {
     let (meta, layout) = match read_metadata(store, name) {
         MetaState::Usable(meta, layout) => (meta, layout),
         MetaState::NoMap => return Err(Error::NoSuchIndex),
         MetaState::Damaged(why) => return Err(Error::bad_request(why)),
         MetaState::Unknown(e) => return Err(e.into()),
     };
-    let claimed = MetaRecord { owner, ..meta };
+    let claimed = MetaRecord {
+        owner: owner.to_owned(),
+        ..meta
+    };
     store.put_elem(name, META_FIELD, &claimed.encode(layout))?;
     Ok(())
 }

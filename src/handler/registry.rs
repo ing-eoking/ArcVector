@@ -1,13 +1,11 @@
 use std::collections::{HashMap, TryReserveError};
 #[cfg(recovery)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
 use crate::handler::access::sweep;
 use crate::handler::usearch::AnnIndex;
-
-pub const REBUILDING: u64 = crate::handler::owner::NOBODY;
 
 static CLOCK: AtomicU64 = AtomicU64::new(1);
 
@@ -30,7 +28,7 @@ pub struct VectorIndex {
     pub ann: AnnIndex,
 
     pub maxcount: u32,
-    owner: AtomicU64,
+    stamped: AtomicBool,
 
     published: AtomicU64,
 
@@ -47,12 +45,20 @@ pub struct VectorIndex {
 }
 
 impl VectorIndex {
-    pub fn new(name: String, ann: AnnIndex, maxcount: u32, owner: u64) -> Self {
+    pub fn ours(name: String, ann: AnnIndex, maxcount: u32) -> Self {
+        Self::new(name, ann, maxcount, true)
+    }
+
+    pub fn rebuilding(name: String, ann: AnnIndex, maxcount: u32) -> Self {
+        Self::new(name, ann, maxcount, false)
+    }
+
+    fn new(name: String, ann: AnnIndex, maxcount: u32, stamped: bool) -> Self {
         Self {
             name,
             ann,
             maxcount,
-            owner: AtomicU64::new(owner),
+            stamped: AtomicBool::new(stamped),
             published: AtomicU64::new(0),
             last_access: AtomicU64::new(0),
             #[cfg(recovery)]
@@ -66,8 +72,12 @@ impl VectorIndex {
         }
     }
 
-    pub fn owner(&self) -> u64 {
-        self.owner.load(Ordering::Acquire)
+    pub fn stamped_as(&self) -> &'static str {
+        if self.stamped.load(Ordering::Acquire) {
+            crate::owner::ours()
+        } else {
+            crate::owner::NOBODY
+        }
     }
 
     pub fn publish(&self) {
@@ -91,7 +101,7 @@ impl VectorIndex {
     }
 
     pub fn is_rebuilding(&self) -> bool {
-        self.owner() == REBUILDING
+        !self.stamped.load(Ordering::Acquire)
     }
 
     #[cfg(recovery)]
@@ -156,8 +166,13 @@ impl VectorIndex {
     }
 
     #[cfg(recovery)]
-    pub(super) fn set_owner(&self, owner: u64) {
-        self.owner.store(owner, Ordering::Release);
+    pub(super) fn mark_ours(&self) {
+        self.stamped.store(true, Ordering::Release);
+    }
+
+    #[cfg(recovery)]
+    pub(super) fn mark_rebuilding(&self) {
+        self.stamped.store(false, Ordering::Release);
     }
 }
 
@@ -326,7 +341,7 @@ mod tests {
             Arc::new(crate::handler::arcus::engine::DetachedElements),
         )
         .expect("build the graph");
-        VectorIndex::new(name.to_owned(), ann, 8, 1)
+        VectorIndex::ours(name.to_owned(), ann, 8)
     }
 
     #[test]
@@ -467,7 +482,7 @@ mod refill_wait_tests {
             Arc::new(NoElements),
         )
         .expect("build a graph");
-        Arc::new(VectorIndex::new(name.to_owned(), ann, 10, REBUILDING))
+        Arc::new(VectorIndex::rebuilding(name.to_owned(), ann, 10))
     }
 
     #[test]

@@ -24,7 +24,7 @@ pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
         None => empty_graph(store, name, &meta, layout)?,
     };
 
-    if fresh || meta.owner != index.owner() {
+    if fresh || meta.owner != index.stamped_as() {
         recovery::ensure_builder();
         recovery::take_over(store, &index)?;
         return Ok(index);
@@ -49,7 +49,7 @@ pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
         let _ = store.drop_map(name);
         return Err(Error::NoSuchIndex);
     };
-    if meta.owner != index.owner() {
+    if meta.owner != index.stamped_as() {
         registry::remove_observed(name, &index);
         return Err(Error::NoSuchIndex);
     }
@@ -121,11 +121,10 @@ fn empty_graph(
     let probe = store.probe_map(name)?;
     let ann = recovery::build_ann(meta, layout)?;
 
-    registry::insert_or_get(VectorIndex::new(
+    registry::insert_or_get(VectorIndex::rebuilding(
         name.to_owned(),
         ann,
         probe.maxcount.saturating_sub(1),
-        registry::REBUILDING,
     ))
     .map_err(|e| Error::Index(format!("the index registry could not grow: {e}")))
 }

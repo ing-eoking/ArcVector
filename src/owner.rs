@@ -1,24 +1,25 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::Hasher;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const NOBODY: u64 = 0;
+pub const NOBODY: &str = "-";
 
-pub fn mint() -> u64 {
-    static OWNER: OnceLock<u64> = OnceLock::new();
-    *OWNER.get_or_init(|| {
-        let mut h = DefaultHasher::new();
-        match node_address() {
-            Some(mac) => h.write(&mac),
-            None => h.write_u64(unpredictable()),
-        }
-        h.write_u32(std::process::id());
-        h.write_u128(started());
-        match h.finish() {
-            NOBODY => NOBODY + 1,
-            token => token,
-        }
+static OURS: OnceLock<String> = OnceLock::new();
+
+pub fn install() -> &'static str {
+    ours()
+}
+
+pub fn ours() -> &'static str {
+    OURS.get_or_init(|| {
+        let node = match node_address() {
+            Some(mac) => mac.iter().fold(String::new(), |mut out, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{byte:02x}");
+                out
+            }),
+            None => format!("{:016x}", unpredictable()),
+        };
+        format!("{node}/{}/{}", std::process::id(), started())
     })
 }
 
@@ -32,7 +33,7 @@ fn started() -> u128 {
 }
 
 fn unpredictable() -> u64 {
-    use std::hash::BuildHasher;
+    use std::hash::{BuildHasher, Hasher};
     std::collections::hash_map::RandomState::new()
         .build_hasher()
         .finish()
@@ -205,7 +206,7 @@ fn parse_address(text: &str) -> Option<[u8; 6]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NOBODY, mint, parse_address};
+    use super::{NOBODY, ours, parse_address};
 
     #[test]
     fn an_address_reads_back_as_six_bytes() {
@@ -262,8 +263,16 @@ mod tests {
 
     #[test]
     fn the_token_is_one_value_for_the_life_of_the_process() {
-        let first = mint();
-        assert_eq!(first, mint());
-        assert_ne!(first, NOBODY, "zero is the token for nobody");
+        let first = ours();
+        assert_eq!(first, ours());
+        assert_ne!(first, NOBODY);
+        let parts: Vec<_> = first.split('/').collect();
+        assert_eq!(parts.len(), 3, "node, pid, start: {first}");
+        assert_eq!(
+            parts[1],
+            std::process::id().to_string(),
+            "the middle part is this process"
+        );
+        assert!(!parts[0].is_empty() && !parts[2].is_empty());
     }
 }

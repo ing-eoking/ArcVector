@@ -34,15 +34,15 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
 
     let held = map_size_for(store, spec.maxcount);
     let maxcount = held - 1;
-    let owner = crate::handler::owner::mint();
+    let owner = crate::owner::ours();
     let meta = MetaRecord {
         metric: metric.as_str().to_owned(),
         connectivity: spec.connectivity,
         expansion_add: spec.expansion_add,
         expansion_search: spec.expansion_search,
-        owner,
+        owner: owner.to_owned(),
     };
-    let index = VectorIndex::new(name.to_owned(), ann, maxcount, owner);
+    let index = VectorIndex::ours(name.to_owned(), ann, maxcount);
 
     let (registered, previous) = match registry::put(index) {
         Ok(pair) => pair,

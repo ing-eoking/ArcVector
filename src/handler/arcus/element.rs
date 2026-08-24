@@ -205,20 +205,20 @@ pub struct MetaRecord {
     pub expansion_add: usize,
     pub expansion_search: usize,
 
-    pub owner: u64,
+    pub owner: String,
 }
 
 impl MetaRecord {
     pub fn encode(&self, layout: Layout) -> Vec<u8> {
         format!(
-            r#"{{"dim":{},"quant":"{}","metric":"{}","m":{},"efc":{},"efs":{},"owner":"{:016x}"}}"#,
+            r#"{{"dim":{},"quant":"{}","metric":"{}","m":{},"efc":{},"efs":{},"owner":{}}}"#,
             layout.dim,
             layout.quant,
             self.metric,
             self.connectivity,
             self.expansion_add,
             self.expansion_search,
-            self.owner,
+            serde_json::Value::from(self.owner.as_str()),
         )
         .into_bytes()
     }
@@ -237,8 +237,9 @@ impl MetaRecord {
         let owner = json
             .get("owner")
             .and_then(serde_json::Value::as_str)
-            .and_then(|s| u64::from_str_radix(s, 16).ok())
-            .ok_or_else(|| miss("owner"))?;
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| miss("owner"))?
+            .to_owned();
 
         Ok((
             Self {
@@ -260,10 +261,6 @@ impl MetaRecord {
                     .ok_or_else(|| miss("quant"))?,
             ),
         ))
-    }
-
-    pub fn owner_of(buf: &[u8]) -> Result<u64, CodecError> {
-        Self::decode(buf).map(|(meta, _)| meta.owner)
     }
 }
 
@@ -441,7 +438,7 @@ mod tests {
             connectivity: u32::MAX as usize,
             expansion_add: u32::MAX as usize,
             expansion_search: u32::MAX as usize,
-            owner: u64::MAX,
+            owner: "ffee/1/2".to_owned(),
         };
         let encoded = meta.encode(layout);
         let (back, back_layout) = MetaRecord::decode(&encoded).unwrap();
