@@ -288,6 +288,49 @@ def main(out):
           "    Self::VECTOR_OFFSET",
           "}"])
 
+    # ---------------------------------------------------------------- AV META
+    s = page(prs, "AV META — 이름이 우리 인덱스인지 답하는 유일한 것",
+             eyebrow="메타데이터",
+             kicker="같은 Map 안의 예약된 원소 하나. 모든 명령의 첫 걸음이 이걸 읽는 것이다.")
+    y = BODY_TOP + Inches(0.1)
+    y = code(s, MARGIN, y, BODY_W,
+             ['field  "AV META"',
+              'value  {"dim":768,"quant":"f32","metric":"cos","m":16,'
+              '"efc":128,"efs":64,"owner":"a3f1…"}']) + Inches(0.34)
+
+    text(s, MARGIN, y, Inches(6.1), Inches(2.1),
+         [[("값이 통째로 JSON이다.", {"bold": True}),
+           (" 헤더가 없으니 고정 오프셋도 ATTR 상한도 없다. 벡터 원소와 같은 Map에 살지만 "
+            "배치를 공유하지 않는다.", {})],
+          [("getattr로는 대신 못 한다.", {"bold": True}),
+           (" 아이템 플래그는 mop create로 아무나 설정할 수 있어 평범한 Map이 우리 태그를 "
+            "달 수 있고, owner에 대해서는 아무 말도 못 한다.", {})],
+          [("이 원소가 없는 Map은 인덱스가 아니다.", {}),
+           (" 그래서 Map을 만드는 map_elem_insert 하나가 이것도 같이 넣는다 — 둘 사이에 창이 "
+            "없다. 자리 하나를 먹으므로 Map은 maxcount + 1로 만들어진다.", {})]],
+         size=14.5, spacing=1.4)
+
+    x = MARGIN + Inches(6.7)
+    text(s, x, y - Inches(0.05), BODY_W - Inches(6.7), Inches(0.3),
+         "읽으면 넷 중 하나다", size=15, bold=True)
+    states = [("Usable", "메타데이터를 읽었다 → owner 판정으로", ARCUS),
+              ("NoMap", "Map이 없다 → 그래프를 놓고 NOT_FOUND", FAIL),
+              ("Damaged", "우리 Map이 아니다 → 그래프를 놓는다", FAIL),
+              ("Unknown", "엔진이 답을 못 했다 → 아무것도 놓지 않는다", MUTED)]
+    yy = y + Inches(0.42)
+    for name, what, col in states:
+        text(s, x, yy, Inches(1.5), Inches(0.3), name, size=13, font=MONO, bold=True, color=col)
+        text(s, x + Inches(1.6), yy, BODY_W - Inches(8.3), Inches(0.56), what,
+             size=13, color=INK, spacing=1.3)
+        rule(s, yy + Inches(0.62), color=SOFT, x=x, w=BODY_W - Inches(6.7))
+        yy += Inches(0.82)
+
+    text(s, MARGIN, H - Inches(1.62), Inches(6.1), Inches(1.0),
+         [[("Unknown을 NOT_FOUND로 뭉개지 않는 것이 중요하다.", {"bold": True}),
+           (" 엔진이 한 번 딸꾹질할 때마다 멀쩡한 인덱스가 없다고 답하게 되고, "
+            "ABI 불일치도 같은 말로 나가 버린다.", {})]],
+         size=14.5, spacing=1.4)
+
     # ---------------------------------------------------------------- 4
     s = page(prs, "키는 원소의 주소다", eyebrow="I2",
              kicker="key → id 가 해시 조회가 아니라 역참조다. 원소가 자기 필드 바이트를 들고 있고, 그게 id다.")
