@@ -141,28 +141,20 @@ const WAITING_WORKERS: usize = 1;
 pub(super) fn for_read(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
     let index = resolve(store, name)?;
     #[cfg(recovery)]
-    settled(store, &index)?;
+    if index.is_rebuilding() {
+        if index.rebuild_size() > SMALL_REBUILD
+            || !index.await_refill(REBUILD_WAIT_CAP, WAITING_WORKERS)
+        {
+            return Err(Error::Unreadable);
+        }
+
+        recovery::claim_refilled(store, &index)?;
+    }
     Ok(index)
 }
 
 pub(super) fn for_write(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
-    let index = resolve(store, name)?;
-    #[cfg(recovery)]
-    settled(store, &index)?;
-    Ok(index)
-}
-
-#[cfg(recovery)]
-fn settled(store: &Store, index: &Arc<VectorIndex>) -> Result<()> {
-    if !index.is_rebuilding() {
-        return Ok(());
-    }
-    if index.rebuild_size() > SMALL_REBUILD
-        || !index.await_refill(REBUILD_WAIT_CAP, WAITING_WORKERS)
-    {
-        return Err(Error::Rebuilding);
-    }
-    recovery::claim_refilled(store, index)
+    resolve(store, name)
 }
 
 pub(super) fn map_is_gone(name: &str, stamp: u64) {

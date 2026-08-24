@@ -49,6 +49,14 @@ impl HeldSet {
         self.live.remove(&addr)
     }
 
+    pub(super) fn give_up(&mut self, addr: u64, tombstone: bool) -> bool {
+        if tombstone {
+            self.take_tombstoned(addr)
+        } else {
+            self.take(addr)
+        }
+    }
+
     pub(super) fn take_tombstoned(&mut self, addr: u64) -> bool {
         let held = self.take(addr);
         self.tombstones.insert(addr);

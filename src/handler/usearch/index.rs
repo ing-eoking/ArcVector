@@ -324,17 +324,21 @@ impl AnnIndex {
     ) -> std::result::Result<(), PublishError<E>> {
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
+        let live = staged.at_epoch == self.epoch.load(Ordering::Acquire);
+        let tombstone = self.rebuilding.load(Ordering::Acquire);
 
-        if let Err(e) = self.writable(staged.at_epoch) {
+        if tombstone && let Err(e) = held.reserve_tombstone() {
             drop(held);
             drop(index);
             let key = staged.key;
             drop(staged);
             let _ = self.drop_node(key);
-            return Err(PublishError::Mapping(e));
+            return Err(PublishError::Mapping(Error::Index(format!(
+                "the held set could not grow: {e}"
+            ))));
         }
 
-        if let Err(e) = held.reserve() {
+        if live && let Err(e) = held.reserve() {
             drop(held);
             drop(index);
             let key = staged.key;
@@ -363,10 +367,20 @@ impl AnnIndex {
             }
         };
 
+        if !live {
+            self.elements.release(&[addr]);
+            let taken = displaced.is_some_and(|old| held.give_up(old, tombstone));
+            drop(held);
+            drop(index);
+            let _ = self.drop_node(key);
+            self.drop_displaced(displaced, taken);
+            return Ok(());
+        }
+
         let renamed = index.rename(key, addr);
         if let Err(e) = renamed {
             self.elements.release(&[addr]);
-            let taken = displaced.is_some_and(|old| held.take(old));
+            let taken = displaced.is_some_and(|old| held.give_up(old, tombstone));
             drop(held);
             drop(index);
             eprintln!("ArcVector: could not name a published node: {e}");
@@ -376,18 +390,10 @@ impl AnnIndex {
         }
         held.publish(addr);
 
-        let taken = displaced.is_some_and(|old| held.take(old));
+        let taken = displaced.is_some_and(|old| held.give_up(old, tombstone));
         drop(held);
         drop(index);
         self.drop_displaced(displaced, taken);
-        Ok(())
-    }
-
-    fn writable(&self, at_epoch: u64) -> Result<()> {
-        if self.rebuilding.load(Ordering::Acquire) || at_epoch != self.epoch.load(Ordering::Acquire)
-        {
-            return Err(Error::Rebuilding);
-        }
         Ok(())
     }
 
@@ -411,10 +417,6 @@ impl AnnIndex {
 
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
-
-        if self.rebuilding.load(Ordering::Acquire) {
-            return Err(PublishError::Mapping(Error::Rebuilding));
-        }
 
         let Some((old, value)) = locate() else {
             return Ok(None);
@@ -452,12 +454,8 @@ impl AnnIndex {
 
     pub fn forget_unreadable(&self, addr: u64) -> bool {
         let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
-        let was_held =
-            if self.rebuilding.load(Ordering::Acquire) && held.reserve_tombstone().is_ok() {
-                held.take_tombstoned(addr)
-            } else {
-                held.take(addr)
-            };
+        let tombstone = self.rebuilding.load(Ordering::Acquire) && held.reserve_tombstone().is_ok();
+        let was_held = held.give_up(addr, tombstone);
         drop(held);
         if self.unlink_node(addr) && was_held {
             self.retire(&[addr]);
@@ -715,15 +713,18 @@ impl AnnIndex {
         let _slack = InFlight::new(&self.in_flight);
         let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
 
-        if self.rebuilding.load(Ordering::Acquire) {
-            return Err(PublishError::Mapping(Error::Rebuilding));
+        let tombstone = self.rebuilding.load(Ordering::Acquire);
+        if tombstone && let Err(e) = held.reserve_tombstone() {
+            return Err(PublishError::Mapping(Error::Index(format!(
+                "the held set could not grow: {e}"
+            ))));
         }
 
         let Some(addr) = take().map_err(PublishError::Store)? else {
             return Ok(None);
         };
 
-        let had_node = held.take(addr);
+        let had_node = held.give_up(addr, tombstone);
         drop(held);
 
         if had_node && self.unlink_node(addr) {
@@ -926,27 +927,6 @@ mod tests {
         );
         assert!(done.is_ok(), "publish failed");
         *linked.lock().unwrap()
-    }
-
-    fn refused(idx: &AnnIndex, id: &str, staged: Staged<'_>) -> Error {
-        let mut linked = false;
-        let done: std::result::Result<(), PublishError<()>> = idx.insert_published(
-            staged,
-            || FAKE.addr_of(idx, id),
-            || {
-                linked = true;
-                Ok(FAKE.link(idx, id))
-            },
-        );
-        assert!(
-            !linked,
-            "the store was written by a publish that was refused"
-        );
-        match done {
-            Err(PublishError::Mapping(e)) => e,
-            Err(PublishError::Store(())) => panic!("the store closure ran"),
-            Ok(()) => panic!("the publish was accepted"),
-        }
     }
 
     fn remove(idx: &AnnIndex, id: &str) -> bool {
@@ -1443,7 +1423,7 @@ mod tests {
         idx.begin_rebuild().unwrap();
         idx.end_rebuild();
 
-        assert!(matches!(refused(&idx, "b", staged), Error::Rebuilding));
+        publish(&idx, "b", staged);
         assert_eq!(
             idx.len(),
             0,
@@ -1462,11 +1442,10 @@ mod tests {
         let staged_key = staged.key();
         idx.begin_rebuild().unwrap();
 
-        assert!(matches!(refused(&idx, "b", staged), Error::Rebuilding));
+        publish(&idx, "b", staged);
         assert_eq!(idx.len(), 0, "the stage did not survive the takeover");
 
         let abandoned = staged_key;
-        idx.end_rebuild();
         let again = idx.stage(&v).unwrap();
         publish(&idx, "b", again);
         assert!(
@@ -1686,7 +1665,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_publish_is_refused_before_it_reaches_the_store() {
+    fn a_stale_publish_lets_go_of_the_address_it_displaced() {
         let idx = build(4, Quant::F32, Metric::L2, 2);
         let coords = [1.0, 2.0, 3.0, 4.0];
         let v = crate::handler::quant::encode(&coords, Quant::F32);
@@ -1698,38 +1677,43 @@ mod tests {
         let live = put(&idx, "k", &coords);
         assert!(idx.held().live_addrs().contains(&live));
 
-        assert!(matches!(refused(&idx, "k", stale), Error::Rebuilding));
+        let done: std::result::Result<(), PublishError<()>> = idx.insert_published(
+            stale,
+            || FAKE.addr_of(&idx, "k"),
+            || Ok(FAKE.link(&idx, "k")),
+        );
+        done.expect("the stale publish reports success");
 
         assert!(
-            idx.held().live_addrs().contains(&live),
-            "the refused publish took the live address with it"
+            !idx.held().live_addrs().contains(&live),
+            "the address the stale writer displaced is still held"
         );
-        assert_eq!(FAKE.addr_of(&idx, "k"), Some(live), "the store was rewound");
-        assert_one_key_per_id(&idx, "after a refused publish");
+        assert_one_key_per_id(&idx, "after a stale publish");
     }
 
     #[test]
-    fn a_write_is_refused_while_the_index_rebuilds() {
+    fn an_overwrite_during_a_rebuild_does_not_let_the_old_element_come_back() {
         let idx = build(4, Quant::F32, Metric::L2, 2);
-        let coords = [1.0, 2.0, 3.0, 4.0];
-        let live = put(&idx, "k", &coords);
+        let was = [1.0, 0.0, 0.0, 0.0];
+        let old = put(&idx, "k", &was);
 
         idx.begin_rebuild().expect("begin");
-        let v = crate::handler::quant::encode(&coords, Quant::F32);
-        let staged = idx.stage(&v).expect("stage during the rebuild");
-        assert!(matches!(refused(&idx, "k", staged), Error::Rebuilding));
 
-        let removed: std::result::Result<Option<bool>, PublishError<()>> =
-            idx.remove_published(|| Ok(Some(live)));
+        let new = put(&idx, "k", &[0.0, 1.0, 0.0, 0.0]);
+        assert_ne!(old, new);
+
+        let replayed = idx
+            .add_unless_known(old, || {
+                Ok(Some(crate::handler::quant::encode(&was, Quant::F32)))
+            })
+            .expect("replay the snapshot");
         assert!(
-            matches!(removed, Err(PublishError::Mapping(Error::Rebuilding))),
-            "a delete during a rebuild must be refused too"
+            !replayed,
+            "the rebuild put back the element the overwrite displaced"
         );
-        assert_eq!(
-            FAKE.addr_of(&idx, "k"),
-            Some(live),
-            "the refused delete unlinked the element anyway"
-        );
+
+        idx.end_rebuild();
+        assert_one_key_per_id(&idx, "after an overwrite during a rebuild");
     }
 
     #[test]
@@ -1758,9 +1742,7 @@ mod tests {
                             || FAKE.addr_of(&idx, &id),
                             || Ok(FAKE.link(&idx, &id)),
                         );
-                        if let Err(PublishError::Mapping(e)) = done {
-                            assert!(matches!(e, Error::Rebuilding), "unexpected: {e}");
-                        }
+                        done.unwrap();
                     }
                 }
             }));

@@ -27,7 +27,6 @@ pub enum Error {
     IndexEvicted,
 
     Unreadable,
-    Rebuilding,
     Codec(CodecError),
     Filter(ParseError),
     Store(StoreError),
@@ -52,7 +51,7 @@ impl Error {
                 _ => Blame::Server,
             },
 
-            Self::Unreadable | Self::Rebuilding => Blame::Server,
+            Self::Unreadable => Blame::Server,
             Self::Store(_) | Self::Index(_) => Blame::Server,
         }
     }
@@ -65,7 +64,6 @@ impl fmt::Display for Error {
             Self::NoSuchIndex => f.write_str("index not found"),
             Self::IndexEvicted => f.write_str("index was evicted"),
             Self::Unreadable => f.write_str("index is unreadable while it rebuilds from Map"),
-            Self::Rebuilding => f.write_str("index is rebuilding from Map; retry"),
             Self::Codec(e) => write!(f, "{e}"),
             Self::Filter(e) => write!(f, "{e}"),
             Self::Store(e) => write!(f, "{e}"),
