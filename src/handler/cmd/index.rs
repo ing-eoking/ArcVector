@@ -42,7 +42,7 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         expansion_search: spec.expansion_search,
         owner: owner.to_owned(),
     };
-    let index = VectorIndex::ours(name.to_owned(), ann, maxcount);
+    let index = VectorIndex::building(name.to_owned(), ann, maxcount);
 
     let (registered, previous) = match registry::put(index) {
         Ok(pair) => pair,
@@ -60,6 +60,7 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
     match settled {
         Ok(true) => {
             registered.publish();
+            registered.mark_ours();
             if previous.is_some() {
                 eprintln!(
                     "ArcVector: index '{name}' had no Map; released the graph it was built from"

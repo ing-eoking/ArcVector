@@ -15,6 +15,8 @@ pub const COLD: u8 = 2;
 
 pub const FILLING: u8 = 3;
 
+pub const BUILDING: u8 = 4;
+
 static CLOCK: AtomicU64 = AtomicU64::new(1);
 
 pub fn now() -> u64 {
@@ -59,6 +61,10 @@ impl VectorIndex {
 
     pub fn rebuilding(name: String, ann: AnnIndex, maxcount: u32) -> Self {
         Self::new(name, ann, maxcount, COLD)
+    }
+
+    pub fn building(name: String, ann: AnnIndex, maxcount: u32) -> Self {
+        Self::new(name, ann, maxcount, BUILDING)
     }
 
     fn new(name: String, ann: AnnIndex, maxcount: u32, state: u8) -> Self {
@@ -177,8 +183,7 @@ impl VectorIndex {
         self.is_refilled()
     }
 
-    #[cfg(recovery)]
-    pub(super) fn mark_ours(&self) {
+    pub(in crate::handler) fn mark_ours(&self) {
         self.state.store(SERVING, Ordering::Release);
     }
 
@@ -189,7 +194,7 @@ impl VectorIndex {
             .is_ok()
     }
 
-    #[cfg(recovery)]
+    #[cfg_attr(not(recovery), expect(dead_code))]
     pub(super) fn mark_state(&self, now: u8) {
         self.state.store(now, Ordering::Release);
     }
@@ -255,8 +260,7 @@ pub fn remove_if_stale(name: &str, stamp: u64) -> bool {
     let mut reg = write();
     match reg.get(name) {
         Some(current) => {
-            let at = current.published_at();
-            if at == 0 || at >= stamp {
+            if current.state() == BUILDING || current.published_at() >= stamp {
                 return false;
             }
             let evicted = reg.remove(name);
@@ -314,7 +318,7 @@ pub(in crate::handler) fn coldest(limit: usize) -> Vec<String> {
     let reg = read();
     coldest_of(
         reg.iter()
-            .filter(|(_, index)| index.published_at() != 0)
+            .filter(|(_, index)| index.state() != BUILDING)
             .map(|(name, index)| (index.accessed_at(), name.as_str())),
         limit,
     )
@@ -363,6 +367,12 @@ mod tests {
         VectorIndex::ours(name.to_owned(), ann, 8)
     }
 
+    fn building(name: &str) -> VectorIndex {
+        let made = index(name);
+        made.mark_state(BUILDING);
+        made
+    }
+
     #[test]
     fn a_verdict_older_than_the_entry_releases_nothing() {
         let name = "registry-test-late-verdict";
@@ -380,19 +390,24 @@ mod tests {
     }
 
     #[test]
-    fn an_unpublished_entry_is_never_released() {
+    fn an_entry_still_being_built_is_never_released() {
         let name = "registry-test-unpublished";
-        let (registered, _) = put(index(name)).expect("claim the name");
+        let (registered, _) = put(building(name)).expect("claim the name");
 
         assert!(
             !remove_if_stale(name, now()),
             "an entry whose Map is still being written must survive any verdict"
         );
+        assert!(
+            !coldest(10).contains(&name.to_owned()),
+            "and it is not offered for sweeping either"
+        );
 
         registered.publish();
+        registered.mark_ours();
         assert!(
             remove_if_stale(name, now()),
-            "once published it is releasable like any other"
+            "once it stands on its Map it is releasable like any other"
         );
     }
 

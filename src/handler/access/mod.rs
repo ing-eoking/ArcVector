@@ -19,6 +19,7 @@ pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
     let (meta, layout) = usable_metadata(store, name, stamp)?;
 
     let (index, fresh) = match registry::get(name) {
+        Some(index) if index.state() == registry::BUILDING => return Err(Error::NoSuchIndex),
         Some(index) => (index, false),
 
         None => empty_graph(store, name, &meta, layout)?,
@@ -41,7 +42,7 @@ pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
     let stamp = registry::now();
     let (meta, _) = usable_metadata(store, name, stamp)?;
 
-    let Some(index) = registry::get(name) else {
+    let Some(index) = registry::get(name).filter(|i| i.state() != registry::BUILDING) else {
         eprintln!(
             "ArcVector: '{name}' has an index Map with no graph, which this build cannot \
              rebuild; deleting the Map so the name can be used again"
