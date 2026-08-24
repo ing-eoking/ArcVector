@@ -26,11 +26,11 @@ pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
 
     if fresh || meta.owner != index.stamped_as() {
         recovery::ensure_builder();
-        recovery::take_over(store, &index)?;
+        recovery::drain(store, &index)?;
         return Ok(index);
     }
 
-    if index.is_rebuilding() && index.is_refilled() {
+    if index.state() == registry::FILLING && index.is_refilled() {
         recovery::claim_refilled(store, &index)?;
     }
     Ok(index)
@@ -141,20 +141,32 @@ const WAITING_WORKERS: usize = 1;
 pub(super) fn for_read(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
     let index = resolve(store, name)?;
     #[cfg(recovery)]
-    if index.is_rebuilding() {
-        if index.rebuild_size() > SMALL_REBUILD
-            || !index.await_refill(REBUILD_WAIT_CAP, WAITING_WORKERS)
-        {
-            return Err(Error::Unreadable);
+    {
+        if index.state() == registry::DRAINING {
+            return Err(Error::Rebuilding);
         }
-
-        recovery::claim_refilled(store, &index)?;
+        if index.state() == registry::COLD {
+            recovery::fill(store, &index)?;
+        }
+        if index.state() == registry::FILLING {
+            if index.rebuild_size() > SMALL_REBUILD
+                || !index.await_refill(REBUILD_WAIT_CAP, WAITING_WORKERS)
+            {
+                return Err(Error::Unreadable);
+            }
+            recovery::claim_refilled(store, &index)?;
+        }
     }
     Ok(index)
 }
 
 pub(super) fn for_write(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
-    resolve(store, name)
+    let index = resolve(store, name)?;
+    #[cfg(recovery)]
+    if index.state() == registry::DRAINING {
+        return Err(Error::Rebuilding);
+    }
+    Ok(index)
 }
 
 pub(super) fn map_is_gone(name: &str, stamp: u64) {

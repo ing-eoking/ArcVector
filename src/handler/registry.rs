@@ -1,11 +1,19 @@
 use std::collections::{HashMap, TryReserveError};
 #[cfg(recovery)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
 use crate::handler::access::sweep;
 use crate::handler::usearch::AnnIndex;
+
+pub const SERVING: u8 = 0;
+
+pub const DRAINING: u8 = 1;
+
+pub const COLD: u8 = 2;
+
+pub const FILLING: u8 = 3;
 
 static CLOCK: AtomicU64 = AtomicU64::new(1);
 
@@ -28,7 +36,7 @@ pub struct VectorIndex {
     pub ann: AnnIndex,
 
     pub maxcount: u32,
-    stamped: AtomicBool,
+    state: AtomicU8,
 
     published: AtomicU64,
 
@@ -46,19 +54,19 @@ pub struct VectorIndex {
 
 impl VectorIndex {
     pub fn ours(name: String, ann: AnnIndex, maxcount: u32) -> Self {
-        Self::new(name, ann, maxcount, true)
+        Self::new(name, ann, maxcount, SERVING)
     }
 
     pub fn rebuilding(name: String, ann: AnnIndex, maxcount: u32) -> Self {
-        Self::new(name, ann, maxcount, false)
+        Self::new(name, ann, maxcount, COLD)
     }
 
-    fn new(name: String, ann: AnnIndex, maxcount: u32, stamped: bool) -> Self {
+    fn new(name: String, ann: AnnIndex, maxcount: u32, state: u8) -> Self {
         Self {
             name,
             ann,
             maxcount,
-            stamped: AtomicBool::new(stamped),
+            state: AtomicU8::new(state),
             published: AtomicU64::new(0),
             last_access: AtomicU64::new(0),
             #[cfg(recovery)]
@@ -72,8 +80,12 @@ impl VectorIndex {
         }
     }
 
+    pub fn state(&self) -> u8 {
+        self.state.load(Ordering::Acquire)
+    }
+
     pub fn stamped_as(&self) -> &'static str {
-        if self.stamped.load(Ordering::Acquire) {
+        if self.state() == SERVING {
             crate::owner::ours()
         } else {
             crate::owner::NOBODY
@@ -101,7 +113,7 @@ impl VectorIndex {
     }
 
     pub fn is_rebuilding(&self) -> bool {
-        !self.stamped.load(Ordering::Acquire)
+        self.state() != SERVING
     }
 
     #[cfg(recovery)]
@@ -167,12 +179,19 @@ impl VectorIndex {
 
     #[cfg(recovery)]
     pub(super) fn mark_ours(&self) {
-        self.stamped.store(true, Ordering::Release);
+        self.state.store(SERVING, Ordering::Release);
     }
 
     #[cfg(recovery)]
-    pub(super) fn mark_rebuilding(&self) {
-        self.stamped.store(false, Ordering::Release);
+    pub(super) fn enter(&self, was: u8, now: u8) -> bool {
+        self.state
+            .compare_exchange(was, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    #[cfg(recovery)]
+    pub(super) fn mark_state(&self, now: u8) {
+        self.state.store(now, Ordering::Release);
     }
 }
 

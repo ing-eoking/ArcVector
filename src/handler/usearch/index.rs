@@ -728,6 +728,15 @@ impl AnnIndex {
         self.clear_with()
     }
 
+    pub fn drop_all(&self) -> Result<()> {
+        self.rebuilding.store(false, Ordering::Release);
+        self.clear_with()
+    }
+
+    pub fn begin_fill(&self) {
+        self.rebuilding.store(true, Ordering::Release);
+    }
+
     pub fn end_rebuild(&self) {
         let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
         self.rebuilding.store(false, Ordering::Release);
@@ -1819,6 +1828,42 @@ mod tests {
             panic!("a half-built graph must not be compared against the Map");
         });
         assert_eq!(counted, Ok(None));
+    }
+
+    #[test]
+    fn dropping_a_graph_empties_it_and_asks_for_no_tombstones() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let old = put(&idx, "k", &[1.0, 0.0, 0.0, 0.0]);
+
+        idx.drop_all().expect("drop the graph");
+        assert!(idx.is_empty(), "the drained graph still names something");
+
+        let new = put(&idx, "k", &[0.0, 1.0, 0.0, 0.0]);
+        assert_ne!(new, old);
+        let v = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], Quant::F32);
+        assert!(
+            idx.add_unless_known(old, || Ok(Some(v)))
+                .expect("a drained graph takes any address"),
+            "a drop must not leave tombstones behind"
+        );
+    }
+
+    #[test]
+    fn a_fill_asks_for_tombstones_without_touching_the_graph() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let old = put(&idx, "k", &[1.0, 0.0, 0.0, 0.0]);
+
+        idx.begin_fill();
+        assert_eq!(idx.len(), 1, "beginning a fill must not wipe the graph");
+
+        put(&idx, "k", &[0.0, 1.0, 0.0, 0.0]);
+        let v = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], Quant::F32);
+        assert!(
+            !idx.add_unless_known(old, || Ok(Some(v)))
+                .expect("replay the snapshot"),
+            "the address the overwrite displaced was not tombstoned"
+        );
+        idx.end_rebuild();
     }
 
     #[test]

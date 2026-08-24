@@ -1,43 +1,115 @@
-use std::sync::{Condvar, LazyLock, Mutex, PoisonError};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Condvar, LazyLock, Mutex, PoisonError};
 
 use crate::handler::access::meta::{MetaState, read_metadata};
 
-use super::registry::{VectorIndex, get, remove};
+use super::registry::{COLD, DRAINING, FILLING, VectorIndex, get, remove};
 use crate::error::{Error, Result};
 use crate::handler::arcus::element::{Layout, META_FIELD, MetaRecord};
 use crate::handler::arcus::engine::{HeldMap, Store};
 use crate::handler::usearch::{AnnIndex, Metric};
 use crate::owner;
 
-pub fn take_over(store: &Store, index: &VectorIndex) -> Result<()> {
-    let was_ours = !index.is_rebuilding();
-    index
-        .refilled
-        .store(false, std::sync::atomic::Ordering::Release);
-    index.mark_rebuilding();
+pub fn drain(store: &Store, index: &Arc<VectorIndex>) -> Result<()> {
+    let was = index.state();
+    if was == DRAINING {
+        return Ok(());
+    }
+    index.mark_state(DRAINING);
+    index.refilled.store(false, Ordering::Release);
 
     if let Err(e) = stamp(store, &index.name, owner::NOBODY) {
-        if was_ours {
-            index.mark_ours();
-        }
+        index.mark_state(was);
         return Err(e);
     }
 
-    if let Err(e) = index.ann.begin_rebuild() {
-        remove(&index.name);
-        return Err(e);
+    if index.ann.is_empty() {
+        index.mark_state(COLD);
+        return Ok(());
     }
+    DRAINER.enqueue(Arc::clone(index));
+    Ok(())
+}
+
+pub fn fill(store: &Store, index: &Arc<VectorIndex>) -> Result<()> {
+    if !index.enter(COLD, FILLING) {
+        return Ok(());
+    }
+    index.refilled.store(false, Ordering::Release);
+    index.ann.begin_fill();
 
     let held = match store.hold_all(&index.name) {
         Ok(held) => held,
         Err(e) => {
-            remove(&index.name);
+            index.ann.end_rebuild();
+            index.mark_state(COLD);
             return Err(e.into());
         }
     };
     index.set_rebuild_size(held.len());
     BUILDER.enqueue(&index.name, held);
     Ok(())
+}
+
+struct Drainer {
+    queue: Mutex<Vec<Arc<VectorIndex>>>,
+    wake: Condvar,
+}
+
+impl Drainer {
+    fn enqueue(&self, index: Arc<VectorIndex>) {
+        let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        if queue.try_reserve(1).is_err() {
+            drop(queue);
+            finish_drain(&index);
+            return;
+        }
+        queue.push(index);
+        self.wake.notify_one();
+    }
+
+    fn take(&self) -> Arc<VectorIndex> {
+        let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if let Some(index) = queue.pop() {
+                return index;
+            }
+            queue = self
+                .wake
+                .wait(queue)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+static DRAINER: LazyLock<Drainer> = LazyLock::new(|| {
+    std::thread::Builder::new()
+        .name("arcvector-drain".to_owned())
+        .spawn(run_drainer)
+        .expect("spawn the drain thread");
+    Drainer {
+        queue: Mutex::new(Vec::new()),
+        wake: Condvar::new(),
+    }
+});
+
+fn run_drainer() {
+    loop {
+        let index = DRAINER.take();
+        finish_drain(&index);
+    }
+}
+
+fn finish_drain(index: &VectorIndex) {
+    if let Err(e) = index.ann.drop_all() {
+        eprintln!(
+            "ArcVector: could not empty the graph of '{}' ({e}); dropping the index",
+            index.name
+        );
+        remove(&index.name);
+        return;
+    }
+    index.mark_state(COLD);
 }
 
 struct Builder {
@@ -81,6 +153,7 @@ static BUILDER: LazyLock<Builder> = LazyLock::new(|| {
 
 pub fn ensure_builder() {
     LazyLock::force(&BUILDER);
+    LazyLock::force(&DRAINER);
 }
 
 fn run_builder() {
@@ -113,6 +186,9 @@ fn refill(store: &Store, index: &VectorIndex, held: &mut HeldMap) -> Result<usiz
         if field == META_FIELD.as_bytes() {
             continue;
         }
+        if index.state() != FILLING {
+            return Ok(added);
+        }
         let element = layout.decode(&value).map_err(|e| {
             Error::bad_request(format!(
                 "{e} in element {}",
@@ -132,7 +208,7 @@ fn refill(store: &Store, index: &VectorIndex, held: &mut HeldMap) -> Result<usiz
 }
 
 pub fn claim_refilled(store: &Store, index: &VectorIndex) -> Result<()> {
-    if !index.take_refilled() {
+    if index.state() != FILLING || !index.take_refilled() {
         return Ok(());
     }
     match read_metadata(store, &index.name) {
