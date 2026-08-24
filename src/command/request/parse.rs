@@ -656,6 +656,12 @@ mod tests {
         let only = trailing_of("VSIM KEY docs 5 v1 WITHATTR").unwrap();
         assert!(only.filter.is_none() && only.with_attr);
 
+        let reversed = trailing_of("VSIM KEY docs 5 v1 WITHATTR FILTER 1 cat=tech").unwrap();
+        assert!(
+            reversed.with_attr && reversed.filter.is_some(),
+            "either order is accepted"
+        );
+
         let both = trailing_of("VSIM KEY docs 5 v1 FILTER 1 cat=tech WITHATTR").unwrap();
         assert!(both.filter.is_some() && both.with_attr);
 

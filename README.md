@@ -153,10 +153,10 @@ anything.
 ## VSIM
 
 ```
-VSIM VECTOR <index> <num> <bytes> <dim> [FILTER <n> <term>...]
+VSIM VECTOR <index> <num> <bytes> <dim> [FILTER <n> <term>...] [WITHATTR]
 <coordinates>
 
-VSIM KEY <index> <num> <key> [FILTER <n> <term>...]
+VSIM KEY <index> <num> <key> [FILTER <n> <term>...] [WITHATTR]
 ```
 
 `<num>` is how many neighbours to return.
@@ -166,15 +166,27 @@ VSIM KEY <index> <num> <key> [FILTER <n> <term>...]
 - **KEY** searches with a vector already in the index. No body, and no
   re-encoding — the stored bytes are already quantized.
 
-**Reply**, one group per query:
+`FILTER` and `WITHATTR` are both optional and may come in either order.
+
+**Reply**, one group per query. `WITHATTR` is what decides the `VALUE` line:
 
 ```
-QUERY <query_no> <count>
+QUERY <query_no> <count>          without WITHATTR
+VALUE <id> <distance>
+...
+END
+
+QUERY <query_no> <count>          with WITHATTR
 VALUE <id> <distance> <attrlen>
 <attr JSON>
 ...
 END
 ```
+
+Without `WITHATTR` a hit costs no engine read at all — the reply is built from the
+graph alone. The trade is that the fastest path (no `FILTER`, no `WITHATTR`) can
+return the id of an element deleted between the search and the reply; anything
+that reads the element catches that.
 
 `FILTER <n> <term>...` takes a **term count**, then that many terms. Each term is
 a single token, so it must not contain spaces; terms are combined with `AND`.
@@ -182,7 +194,7 @@ Operators are `=` `!=` `<` `<=` `>` `>=`, over top-level JSON fields only. A
 condition on an absent field is **always false**, `!=` included.
 
 ```
-VSIM VECTOR docs 10 15 2 FILTER 2 abc>12 def=abc
+VSIM VECTOR docs 10 15 2 FILTER 2 abc>12 def=abc WITHATTR
 0.1 0.2 0.3 0.4
 → QUERY 0 10
   VALUE v1 0.12 23
@@ -194,6 +206,8 @@ VSIM VECTOR docs 10 15 2 FILTER 2 abc>12 def=abc
 
 VSIM KEY docs 5 v1
 → QUERY 0 5
+  VALUE v1 0
+  VALUE v7 0.08
   ...
   END
 ```
