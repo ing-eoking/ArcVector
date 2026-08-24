@@ -128,14 +128,29 @@ fn refill(store: &Store, index: &VectorIndex, held: &mut HeldMap) -> Result<usiz
 }
 
 pub fn claim_refilled(store: &Store, index: &VectorIndex) -> Result<()> {
+    if !index.take_refilled() {
+        return Ok(());
+    }
     match read_metadata(store, &index.name) {
         MetaState::Usable(meta, _) if meta.owner == REBUILDING => {}
-        MetaState::Usable(..) | MetaState::NoMap => return Err(Error::NoSuchIndex),
-        MetaState::Damaged(why) => return Err(Error::bad_request(why)),
-        MetaState::Unknown(e) => return Err(e.into()),
+        MetaState::Usable(..) | MetaState::NoMap => {
+            index.mark_refilled();
+            return Err(Error::NoSuchIndex);
+        }
+        MetaState::Damaged(why) => {
+            index.mark_refilled();
+            return Err(Error::bad_request(why));
+        }
+        MetaState::Unknown(e) => {
+            index.mark_refilled();
+            return Err(e.into());
+        }
     }
     let owner = mint_owner();
-    stamp(store, &index.name, owner)?;
+    if let Err(e) = stamp(store, &index.name, owner) {
+        index.mark_refilled();
+        return Err(e);
+    }
     index.ann.end_rebuild();
     index.set_owner(owner);
     eprintln!(

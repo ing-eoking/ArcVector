@@ -1,4 +1,6 @@
 use std::collections::{HashMap, TryReserveError};
+#[cfg(recovery)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
@@ -11,6 +13,16 @@ static CLOCK: AtomicU64 = AtomicU64::new(1);
 
 pub fn now() -> u64 {
     CLOCK.load(Ordering::Acquire)
+}
+
+#[cfg(recovery)]
+struct Seat<'a>(&'a AtomicUsize);
+
+#[cfg(recovery)]
+impl Drop for Seat<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub struct VectorIndex {
@@ -26,6 +38,10 @@ pub struct VectorIndex {
 
     #[cfg(recovery)]
     pub(super) refilled: std::sync::atomic::AtomicBool,
+    #[cfg(recovery)]
+    done: (std::sync::Mutex<()>, std::sync::Condvar),
+    #[cfg(recovery)]
+    waiting: AtomicUsize,
 }
 
 impl VectorIndex {
@@ -39,6 +55,10 @@ impl VectorIndex {
             last_access: AtomicU64::new(0),
             #[cfg(recovery)]
             refilled: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(recovery)]
+            done: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
+            #[cfg(recovery)]
+            waiting: AtomicUsize::new(0),
         }
     }
 
@@ -76,8 +96,49 @@ impl VectorIndex {
     }
 
     #[cfg(recovery)]
+    pub(super) fn take_refilled(&self) -> bool {
+        self.refilled.swap(false, Ordering::AcqRel)
+    }
+
+    #[cfg(recovery)]
     pub(super) fn mark_refilled(&self) {
+        let _held = self.done.0.lock().unwrap_or_else(PoisonError::into_inner);
         self.refilled.store(true, Ordering::Release);
+        self.done.1.notify_all();
+    }
+
+    #[cfg(recovery)]
+    pub fn await_refill(&self, limit: std::time::Duration, seats: usize) -> bool {
+        if self.is_refilled() {
+            return true;
+        }
+        if self
+            .waiting
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < seats).then_some(n + 1)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        let seated = Seat(&self.waiting);
+
+        let deadline = std::time::Instant::now() + limit;
+        let mut held = self.done.0.lock().unwrap_or_else(PoisonError::into_inner);
+        while !self.is_refilled() {
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            held = self
+                .done
+                .1
+                .wait_timeout(held, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        drop(held);
+        drop(seated);
+        self.is_refilled()
     }
 
     #[cfg(recovery)]
@@ -364,5 +425,95 @@ mod coldest_tests {
     fn an_empty_registry_gives_nothing() {
         assert!(coldest_of(std::iter::empty(), 8).is_empty());
         assert!(coldest(0).is_empty(), "a zero batch asks for nothing");
+    }
+}
+
+#[cfg(all(test, recovery))]
+mod refill_wait_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
+
+    struct NoElements;
+
+    impl crate::handler::usearch::Elements for NoElements {
+        fn id_at(&self, _addr: u64) -> Option<Arc<str>> {
+            None
+        }
+        fn release(&self, _addrs: &[u64]) {}
+    }
+
+    fn rebuilding(name: &str) -> Arc<VectorIndex> {
+        let ann = crate::handler::usearch::AnnIndex::new(
+            crate::handler::arcus::element::Layout::new(4, crate::handler::quant::Quant::F32),
+            crate::handler::usearch::Metric::L2,
+            16,
+            64,
+            64,
+            Arc::new(NoElements),
+        )
+        .expect("build a graph");
+        Arc::new(VectorIndex::new(name.to_owned(), ann, 10, REBUILDING))
+    }
+
+    #[test]
+    fn a_read_gives_up_when_the_refill_takes_too_long() {
+        let index = rebuilding("slow");
+        let began = Instant::now();
+        assert!(!index.await_refill(Duration::from_millis(60), 1));
+        assert!(began.elapsed() >= Duration::from_millis(55), "it waited");
+        assert!(began.elapsed() < Duration::from_secs(2), "and gave up");
+    }
+
+    #[test]
+    fn a_read_wakes_as_soon_as_the_refill_lands() {
+        let index = rebuilding("quick");
+        let other = Arc::clone(&index);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            other.mark_refilled();
+        });
+
+        let began = Instant::now();
+        assert!(index.await_refill(Duration::from_secs(5), 1));
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "it woke on the signal rather than on the timeout"
+        );
+    }
+
+    #[test]
+    fn only_as_many_workers_wait_as_there_are_seats() {
+        let index = rebuilding("seats");
+        let seated = Arc::new(AtomicUsize::new(0));
+
+        let holder = Arc::clone(&index);
+        let counted = Arc::clone(&seated);
+        let sleeper = std::thread::spawn(move || {
+            counted.fetch_add(1, Ordering::Release);
+            holder.await_refill(Duration::from_millis(400), 1)
+        });
+        while seated.load(Ordering::Acquire) == 0 {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(40));
+
+        let began = Instant::now();
+        assert!(!index.await_refill(Duration::from_millis(400), 1));
+        assert!(
+            began.elapsed() < Duration::from_millis(30),
+            "the seat was taken, so it came back at once instead of sleeping"
+        );
+
+        index.mark_refilled();
+        assert!(sleeper.join().unwrap());
+    }
+
+    #[test]
+    fn the_finished_refill_is_claimed_once() {
+        let index = rebuilding("once");
+        index.mark_refilled();
+        assert!(index.take_refilled());
+        assert!(!index.take_refilled(), "the loser must not claim it again");
     }
 }

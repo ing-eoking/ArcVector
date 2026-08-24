@@ -130,11 +130,21 @@ fn empty_graph(
     .map_err(|e| Error::Index(format!("the index registry could not grow: {e}")))
 }
 
+#[cfg(recovery)]
+const WAIT_FOR_REBUILD: std::time::Duration = std::time::Duration::from_millis(120);
+
+#[cfg(recovery)]
+const WAITING_WORKERS: usize = 1;
+
 pub(super) fn for_read(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
     let index = resolve(store, name)?;
     #[cfg(recovery)]
     if index.is_rebuilding() {
-        return Err(Error::Unreadable);
+        if !index.await_refill(WAIT_FOR_REBUILD, WAITING_WORKERS) {
+            return Err(Error::Unreadable);
+        }
+
+        recovery::claim_refilled(store, &index)?;
     }
     Ok(index)
 }
