@@ -356,41 +356,44 @@ impl AnnIndex {
         };
 
         if !live {
-            let mut back = vec![addr];
-            back.extend(displaced);
-            self.elements.release(&back);
+            self.elements.release(&[addr]);
+            let taken = displaced.is_some_and(|old| held.take(old));
             drop(held);
             drop(index);
             let _ = self.drop_node(key);
+            self.drop_displaced(displaced, taken);
             return Ok(());
         }
 
         let renamed = index.rename(key, addr);
         if let Err(e) = renamed {
-            let mut back = vec![addr];
-            back.extend(displaced);
-            self.elements.release(&back);
+            self.elements.release(&[addr]);
+            let taken = displaced.is_some_and(|old| held.take(old));
             drop(held);
             drop(index);
             eprintln!("ArcVector: could not name a published node: {e}");
             let _ = self.drop_node(key);
+            self.drop_displaced(displaced, taken);
             return Ok(());
         }
         held.publish(addr);
 
-        let unlinked = displaced.is_some_and(|old| held.take(old));
+        let taken = displaced.is_some_and(|old| held.take(old));
         drop(held);
         drop(index);
-        if let Some(old) = displaced {
-            if !unlinked {
-                self.retire(&[old]);
-            } else if self.unlink_node(old) {
-                self.retire(&[old, old]);
-            } else {
-                self.retire(&[old]);
-            }
-        }
+        self.drop_displaced(displaced, taken);
         Ok(())
+    }
+
+    fn drop_displaced(&self, displaced: Option<u64>, taken: bool) {
+        let Some(old) = displaced else {
+            return;
+        };
+        if taken && self.unlink_node(old) {
+            self.retire(&[old, old]);
+        } else {
+            self.retire(&[old]);
+        }
     }
 
     pub fn update_published<E>(
@@ -1655,6 +1658,33 @@ mod tests {
             named, live,
             "the graph and the Map disagree on which ids exist"
         );
+    }
+
+    #[test]
+    fn a_stale_publish_lets_go_of_the_address_it_displaced() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let coords = [1.0, 2.0, 3.0, 4.0];
+        let v = crate::handler::quant::encode(&coords, Quant::F32);
+        let stale = idx.stage(&v).expect("stage before the rebuild");
+
+        idx.begin_rebuild().expect("begin");
+        idx.end_rebuild();
+
+        let live = put(&idx, "k", &coords);
+        assert!(idx.held().live_addrs().contains(&live));
+
+        let done: std::result::Result<(), PublishError<()>> = idx.insert_published(
+            stale,
+            || FAKE.addr_of(&idx, "k"),
+            || Ok(FAKE.link(&idx, "k")),
+        );
+        done.expect("the stale publish reports success");
+
+        assert!(
+            !idx.held().live_addrs().contains(&live),
+            "the address the stale writer displaced is still held"
+        );
+        assert_one_key_per_id(&idx, "after a stale publish");
     }
 
     #[test]
