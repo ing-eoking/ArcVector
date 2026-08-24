@@ -42,6 +42,8 @@ pub struct VectorIndex {
     done: (std::sync::Mutex<()>, std::sync::Condvar),
     #[cfg(recovery)]
     waiting: AtomicUsize,
+    #[cfg(recovery)]
+    rebuild_size: AtomicUsize,
 }
 
 impl VectorIndex {
@@ -59,6 +61,8 @@ impl VectorIndex {
             done: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
             #[cfg(recovery)]
             waiting: AtomicUsize::new(0),
+            #[cfg(recovery)]
+            rebuild_size: AtomicUsize::new(0),
         }
     }
 
@@ -93,6 +97,16 @@ impl VectorIndex {
     #[cfg(recovery)]
     pub fn is_refilled(&self) -> bool {
         self.refilled.load(Ordering::Acquire)
+    }
+
+    #[cfg(recovery)]
+    pub(super) fn set_rebuild_size(&self, elements: usize) {
+        self.rebuild_size.store(elements, Ordering::Release);
+    }
+
+    #[cfg(recovery)]
+    pub fn rebuild_size(&self) -> usize {
+        self.rebuild_size.load(Ordering::Acquire)
     }
 
     #[cfg(recovery)]
@@ -507,6 +521,15 @@ mod refill_wait_tests {
 
         index.mark_refilled();
         assert!(sleeper.join().unwrap());
+    }
+
+    #[test]
+    fn the_size_to_rebuild_is_what_the_snapshot_held() {
+        let index = rebuilding("sized");
+        assert_eq!(index.rebuild_size(), 0, "nothing queued yet");
+
+        index.set_rebuild_size(4096);
+        assert_eq!(index.rebuild_size(), 4096);
     }
 
     #[test]

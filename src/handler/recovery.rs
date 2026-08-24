@@ -32,6 +32,7 @@ pub fn take_over(store: &Store, index: &VectorIndex) -> Result<()> {
             return Err(e.into());
         }
     };
+    index.set_rebuild_size(held.len());
     BUILDER.enqueue(&index.name, held);
     Ok(())
 }

@@ -131,7 +131,10 @@ fn empty_graph(
 }
 
 #[cfg(recovery)]
-const WAIT_FOR_REBUILD: std::time::Duration = std::time::Duration::from_millis(1);
+const SMALL_REBUILD: usize = 256;
+
+#[cfg(recovery)]
+const REBUILD_WAIT_CAP: std::time::Duration = std::time::Duration::from_millis(200);
 
 #[cfg(recovery)]
 const WAITING_WORKERS: usize = 1;
@@ -140,7 +143,9 @@ pub(super) fn for_read(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
     let index = resolve(store, name)?;
     #[cfg(recovery)]
     if index.is_rebuilding() {
-        if !index.await_refill(WAIT_FOR_REBUILD, WAITING_WORKERS) {
+        if index.rebuild_size() > SMALL_REBUILD
+            || !index.await_refill(REBUILD_WAIT_CAP, WAITING_WORKERS)
+        {
             return Err(Error::Unreadable);
         }
 
