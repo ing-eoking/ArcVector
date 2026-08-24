@@ -131,7 +131,7 @@ fn empty_graph(
 }
 
 #[cfg(recovery)]
-const WAIT_FOR_REBUILD: std::time::Duration = std::time::Duration::from_millis(120);
+const WAIT_FOR_REBUILD: std::time::Duration = std::time::Duration::from_millis(1);
 
 #[cfg(recovery)]
 const WAITING_WORKERS: usize = 1;
