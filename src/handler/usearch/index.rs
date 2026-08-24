@@ -34,7 +34,7 @@ pub type Accept<'a> = &'a dyn Fn(u64) -> bool;
 pub struct Staged<'a> {
     key: u64,
 
-    owner: u64,
+    at_epoch: u64,
 
     in_flight: &'a AtomicUsize,
 }
@@ -46,11 +46,11 @@ impl Staged<'_> {
 }
 
 impl<'a> Staged<'a> {
-    fn new(key: u64, owner: u64, in_flight: &'a AtomicUsize) -> Self {
+    fn new(key: u64, at_epoch: u64, in_flight: &'a AtomicUsize) -> Self {
         in_flight.fetch_add(1, Ordering::Relaxed);
         Staged {
             key,
-            owner,
+            at_epoch,
             in_flight,
         }
     }
@@ -301,7 +301,7 @@ impl AnnIndex {
         Ok(())
     }
 
-    pub fn stage(&self, vector: &[u8], owner: u64) -> Result<Staged<'_>> {
+    pub fn stage(&self, vector: &[u8]) -> Result<Staged<'_>> {
         self.check_vector(vector)?;
 
         self.ensure_capacity(self.live() + THREAD_SLOTS)?;
@@ -310,7 +310,7 @@ impl AnnIndex {
 
         let key = held::STAGED_TAG | self.next_placeholder.fetch_add(1, Ordering::Relaxed);
 
-        let staged = Staged::new(key, owner, &self.in_flight);
+        let staged = Staged::new(key, self.epoch.load(Ordering::Acquire), &self.in_flight);
 
         self.typed_add(&index, key, vector)?;
         Ok(staged)
@@ -319,13 +319,12 @@ impl AnnIndex {
     pub fn insert_published<E>(
         &self,
         staged: Staged<'_>,
-        owner: u64,
         displaced: impl FnOnce() -> Option<u64>,
         link: impl FnOnce() -> std::result::Result<u64, E>,
     ) -> std::result::Result<(), PublishError<E>> {
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
-        let live = staged.owner == owner;
+        let live = staged.at_epoch == self.epoch.load(Ordering::Acquire);
 
         if live && let Err(e) = held.reserve() {
             drop(held);
@@ -908,11 +907,10 @@ mod tests {
         }
     }
 
-    fn publish(idx: &AnnIndex, id: &str, staged: Staged<'_>, owner: u64) -> u64 {
+    fn publish(idx: &AnnIndex, id: &str, staged: Staged<'_>) -> u64 {
         let linked = std::sync::Mutex::new(0u64);
         let done: std::result::Result<(), PublishError<()>> = idx.insert_published(
             staged,
-            owner,
             || FAKE.addr_of(idx, id),
             || {
                 let addr = FAKE.link(idx, id);
@@ -947,8 +945,8 @@ mod tests {
 
             let stored: Vec<u8> = (0..layout.vector_bytes()).map(|i| (i as u8) | 1).collect();
 
-            let staged = idx.stage(&stored, OWNER).expect("stage");
-            let addr = publish(&idx, "v1", staged, OWNER);
+            let staged = idx.stage(&stored).expect("stage");
+            let addr = publish(&idx, "v1", staged);
 
             assert_eq!(
                 idx.vector_of(addr).expect("read back"),
@@ -1009,20 +1007,15 @@ mod tests {
         assert_eq!(seen.len(), live.len());
     }
 
-    const OWNER: u64 = 7;
-
     fn add(idx: &AnnIndex, id: &str, coords: &[f32]) -> u64 {
         put(idx, id, coords)
     }
 
     fn put(idx: &AnnIndex, id: &str, coords: &[f32]) -> u64 {
         let staged = idx
-            .stage(
-                &crate::handler::quant::encode(coords, idx.layout.quant),
-                OWNER,
-            )
+            .stage(&crate::handler::quant::encode(coords, idx.layout.quant))
             .unwrap();
-        publish(idx, id, staged, OWNER)
+        publish(idx, id, staged)
     }
 
     fn search(idx: &AnnIndex, coords: &[f32], k: usize) -> Vec<String> {
@@ -1064,11 +1057,6 @@ mod tests {
         }
     }
 
-    /// Searches do not finish in the order they started. A counter of how many have ended
-    /// cannot say the early ones are among them, so the floor is the oldest ticket still out.
-    /// `index.remove` can fail — usearch grows a free list to record the slot, and that
-    /// allocation can refuse. The address is then still a live node, so its refcount stays put
-    /// and the removal is tried again later rather than left as a hole.
     #[test]
     fn a_node_that_would_not_come_out_is_taken_out_on_a_later_pass() {
         let idx = build(4, Quant::F32, Metric::L2, 2);
@@ -1080,7 +1068,6 @@ mod tests {
         idx.reclaim();
         assert!(FAKE.id_at(addr).is_none(), "the ordinary path releases it");
 
-        // Now the same address as if the removal had refused: pinned, queued, and retried.
         let addr = add(&idx, "b", &[0.0, 1.0, 0.0, 0.0]);
         idx.stuck.lock().unwrap().push(addr);
         assert!(
@@ -1097,8 +1084,6 @@ mod tests {
         assert!(idx.stuck.lock().unwrap().is_empty());
     }
 
-    /// With nothing reading, the address does not go on the queue at all — it is handed back
-    /// inside the delete, on the thread that asked for it.
     #[test]
     fn a_delete_with_no_search_running_releases_without_queueing() {
         let idx = build(4, Quant::F32, Metric::L2, 2);
@@ -1326,7 +1311,7 @@ mod tests {
         exhaust_contexts(&idx);
 
         let v = crate::handler::quant::encode(&[0.0, 1.0], Quant::F32);
-        assert!(idx.stage(&v, OWNER).is_err());
+        assert!(idx.stage(&v).is_err());
 
         assert_eq!(idx.len(), 1, "the failed write must not count");
     }
@@ -1349,12 +1334,12 @@ mod tests {
         add(&idx, "a", &[1.0, 0.0]);
 
         let v = crate::handler::quant::encode(&[0.0, 1.0], Quant::F32);
-        let staged = idx.stage(&v, OWNER).unwrap();
+        let staged = idx.stage(&v).unwrap();
 
         assert_eq!(idx.len(), 1);
         assert_eq!(search(&idx, &[0.0, 1.0], 5), vec!["a"], "no unnamed hits");
 
-        publish(&idx, "b", staged, OWNER);
+        publish(&idx, "b", staged);
         assert_eq!(idx.len(), 2);
         assert_eq!(search(&idx, &[0.0, 1.0], 1), vec!["b"]);
     }
@@ -1366,7 +1351,7 @@ mod tests {
             add(&idx, &format!("v{i}"), &[1.0 + i as f32, 0.0]);
         }
         let nearest = crate::handler::quant::encode(&[0.0, 0.0], Quant::F32);
-        let staged = idx.stage(&nearest, OWNER).unwrap();
+        let staged = idx.stage(&nearest).unwrap();
 
         let named = search(&idx, &[0.0, 0.0], 3);
         assert_eq!(
@@ -1385,16 +1370,16 @@ mod tests {
         let v = crate::handler::quant::encode(&[1.0, 0.0], Quant::F32);
         assert_eq!(idx.in_flight.load(Ordering::Relaxed), 0);
 
-        let staged = idx.stage(&v, OWNER).unwrap();
+        let staged = idx.stage(&v).unwrap();
         assert_eq!(idx.in_flight.load(Ordering::Relaxed), 1);
-        publish(&idx, "a", staged, OWNER);
+        publish(&idx, "a", staged);
         assert_eq!(idx.in_flight.load(Ordering::Relaxed), 0, "published");
 
-        let staged = idx.stage(&v, OWNER).unwrap();
+        let staged = idx.stage(&v).unwrap();
         idx.discard(staged);
         assert_eq!(idx.in_flight.load(Ordering::Relaxed), 0, "discarded");
 
-        drop(idx.stage(&v, OWNER).unwrap());
+        drop(idx.stage(&v).unwrap());
         assert_eq!(
             idx.in_flight.load(Ordering::Relaxed),
             0,
@@ -1402,7 +1387,7 @@ mod tests {
         );
 
         exhaust_contexts(&idx);
-        assert!(idx.stage(&v, OWNER).is_err());
+        assert!(idx.stage(&v).is_err());
         assert_eq!(idx.in_flight.load(Ordering::Relaxed), 0, "failed insert");
     }
 
@@ -1412,7 +1397,7 @@ mod tests {
         let key = add(&idx, "a", &[1.0, 0.0]);
 
         let v = crate::handler::quant::encode(&[0.0, 1.0], Quant::F32);
-        idx.discard(idx.stage(&v, OWNER).unwrap());
+        idx.discard(idx.stage(&v).unwrap());
 
         assert!(idx.held().contains(key), "the graph never moved");
         assert_eq!(FAKE.id_at(key).as_deref(), Some("a"));
@@ -1421,22 +1406,41 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_takeover_inside_the_staging_window_voids_the_stage() {
+        let idx = build(2, Quant::F32, Metric::Cos, 4);
+        let v = crate::handler::quant::encode(&[0.0, 1.0], Quant::F32);
+
+        let staged = idx.stage(&v).unwrap();
+        let abandoned = staged.key();
+
+        idx.begin_rebuild().unwrap();
+        idx.end_rebuild();
+
+        publish(&idx, "b", staged);
+        assert_eq!(
+            idx.len(),
+            0,
+            "the graph was wiped and refilled, so the node staged before it is gone"
+        );
+        assert!(!idx.held().contains(abandoned));
+    }
+
+    #[test]
     fn a_takeover_inside_the_staging_window_voids_the_stage() {
-        const TAKEOVER: u64 = 0;
         let idx = build(2, Quant::F32, Metric::Cos, 4);
         add(&idx, "a", &[1.0, 0.0]);
 
         let v = crate::handler::quant::encode(&[0.0, 1.0], Quant::F32);
-        let staged = idx.stage(&v, OWNER).unwrap();
+        let staged = idx.stage(&v).unwrap();
         let staged_key = staged.key();
         idx.begin_rebuild().unwrap();
 
-        publish(&idx, "b", staged, TAKEOVER);
+        publish(&idx, "b", staged);
         assert_eq!(idx.len(), 0, "the stage did not survive the takeover");
 
         let abandoned = staged_key;
-        let again = idx.stage(&v, TAKEOVER).unwrap();
-        publish(&idx, "b", again, TAKEOVER);
+        let again = idx.stage(&v).unwrap();
+        publish(&idx, "b", again);
         assert!(
             !idx.held().contains(abandoned),
             "the node staged against the wiped graph is held by nothing"
@@ -1451,12 +1455,12 @@ mod tests {
         add(&idx, "a", &[1.0, 0.0]);
 
         let v = crate::handler::quant::encode(&[0.0, 1.0], Quant::F32);
-        let staged = idx.stage(&v, OWNER).unwrap();
+        let staged = idx.stage(&v).unwrap();
 
         assert!(remove(&idx, "a"));
         assert_eq!(idx.len(), 0);
 
-        publish(&idx, "a", staged, OWNER);
+        publish(&idx, "a", staged);
         assert_eq!(idx.len(), 1);
         assert_eq!(
             search(&idx, &[0.0, 1.0], 5),
@@ -1471,7 +1475,7 @@ mod tests {
         add(&idx, "a", &[1.0, 0.0]);
 
         let v = crate::handler::quant::encode(&[0.0, 1.0], Quant::F32);
-        let staged = idx.stage(&v, OWNER).unwrap();
+        let staged = idx.stage(&v).unwrap();
         assert!(remove(&idx, "a"));
 
         idx.discard(staged);
@@ -1570,7 +1574,7 @@ mod tests {
                     let id = format!("id{}", choice(t, i, IDS));
                     let coords: Vec<f32> = (0..dim).map(|d| (t * 31 + i + d) as f32).collect();
                     let v = crate::handler::quant::encode(&coords, Quant::F32);
-                    let staged = idx.stage(&v, OWNER).unwrap();
+                    let staged = idx.stage(&v).unwrap();
                     let key = staged.key();
                     if choice(t, i + 7, 4) == 0 {
                         discarded.lock().unwrap().insert(key);
@@ -1578,7 +1582,6 @@ mod tests {
                     } else {
                         let done: std::result::Result<(), PublishError<()>> = idx.insert_published(
                             staged,
-                            OWNER,
                             || FAKE.addr_of(&idx, &id),
                             || Ok(FAKE.link(&idx, &id)),
                         );
@@ -1674,10 +1677,9 @@ mod tests {
                     let coords: Vec<f32> = (0..dim).map(|d| (t + i + d) as f32).collect();
                     let v = crate::handler::quant::encode(&coords, Quant::F32);
 
-                    if let Ok(staged) = idx.stage(&v, OWNER) {
+                    if let Ok(staged) = idx.stage(&v) {
                         let done: std::result::Result<(), PublishError<()>> = idx.insert_published(
                             staged,
-                            OWNER,
                             || FAKE.addr_of(&idx, &id),
                             || Ok(FAKE.link(&idx, &id)),
                         );
@@ -1724,16 +1726,13 @@ mod tests {
                 for i in 0..100 {
                     let id = format!("t{t}-{i}");
                     let staged = idx
-                        .stage(
-                            &crate::handler::quant::encode(
-                                &[t as f32, i as f32, 0.0, 0.0],
-                                Quant::F32,
-                            ),
-                            OWNER,
-                        )
+                        .stage(&crate::handler::quant::encode(
+                            &[t as f32, i as f32, 0.0, 0.0],
+                            Quant::F32,
+                        ))
                         .unwrap();
 
-                    let addr = publish(&idx, &id, staged, OWNER);
+                    let addr = publish(&idx, &id, staged);
                     keys.lock().unwrap().push((id, addr));
                     let q =
                         crate::handler::quant::encode(&[t as f32, i as f32, 0.0, 0.0], Quant::F32);
@@ -1783,7 +1782,7 @@ mod tests {
     #[test]
     fn wrong_vector_length_is_rejected() {
         let idx = build(4, Quant::F32, Metric::L2, 2);
-        assert!(idx.stage(&[0u8; 8], OWNER).is_err());
+        assert!(idx.stage(&[0u8; 8]).is_err());
         assert!(idx.search(&[0u8; 8], 1, None).is_err());
     }
 
@@ -1791,7 +1790,6 @@ mod tests {
     #[ignore]
     fn stage_costs_far_more_than_publish() {
         let idx = build(768, Quant::F32, Metric::Cos, 8);
-        let owner = 0;
 
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
         let mut next = move || {
@@ -1805,8 +1803,8 @@ mod tests {
         };
 
         for _ in 0..2000 {
-            let staged = idx.stage(&next(), owner).unwrap();
-            publish(&idx, "warm", staged, owner);
+            let staged = idx.stage(&next()).unwrap();
+            publish(&idx, "warm", staged);
         }
 
         const N: usize = 2000;
@@ -1817,11 +1815,11 @@ mod tests {
 
             let vector = next();
             let t = std::time::Instant::now();
-            let staged = idx.stage(&vector, owner).unwrap();
+            let staged = idx.stage(&vector).unwrap();
             stage_ns += t.elapsed().as_nanos();
 
             let t = std::time::Instant::now();
-            publish(&idx, &id, staged, owner);
+            publish(&idx, &id, staged);
             publish_ns += t.elapsed().as_nanos();
         }
         println!(
@@ -1890,7 +1888,7 @@ mod tests {
     fn a_staged_key_is_never_dereferenced() {
         let idx = build(4, Quant::F32, Metric::L2, 2);
         let v = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], Quant::F32);
-        let staged = idx.stage(&v, OWNER).unwrap();
+        let staged = idx.stage(&v).unwrap();
 
         assert!(
             held::is_staged(staged.key()),

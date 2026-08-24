@@ -131,9 +131,6 @@ mod tests {
     use super::{COARSE, advance, coarse_now};
     use std::sync::atomic::Ordering::Relaxed;
 
-    /// `get_current_time` is `gettimeofday` minus the process start, so it can step backwards.
-    /// Reclamation compares stamps to decide when an address is nobody's to read, and a stamp
-    /// that goes back would free one out from under a search.
     #[test]
     fn the_coarse_clock_never_goes_back_and_never_stalls() {
         COARSE.store(100, Relaxed);

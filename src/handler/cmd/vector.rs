@@ -40,12 +40,11 @@ pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
         Err(e) => return store_failed(name, stamp, e),
     };
 
-    let staged = index.ann.stage(&quantized, index.owner())?;
+    let staged = index.ann.stage(&quantized)?;
     layout.write(pending.value_mut(), &quantized, attr)?;
 
     match index.ann.insert_published(
         staged,
-        index.owner(),
         || store.hold_addr(name, id).ok().map(HeldAddr::keep),
         || {
             let _replaced = pending.insert()?;
