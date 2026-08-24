@@ -7,7 +7,7 @@ use crate::handler::arcus::engine::HeldAddr;
 use crate::handler::arcus::engine::{Store, StoreError};
 use crate::handler::quant;
 use crate::handler::registry;
-use crate::handler::usearch::PublishError;
+use crate::handler::usearch::{PublishError, Published};
 
 pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
     let Add {
@@ -51,10 +51,34 @@ pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
             store.hold_addr(name, id).map(HeldAddr::keep)
         },
     ) {
-        Ok(()) => Ok(Reply::Stored),
+        Ok(Published::Indexed) => Ok(Reply::Stored),
+        Ok(Published::Unindexed(addr)) => {
+            index_it(&index, name, addr, quantized);
+            Ok(Reply::Stored)
+        }
         Err(PublishError::Store(e)) => store_failed(name, stamp, e),
 
         Err(PublishError::Mapping(e)) => Err(e),
+    }
+}
+
+fn index_it(
+    index: &std::sync::Arc<crate::handler::registry::VectorIndex>,
+    name: &str,
+    addr: u64,
+    vector: Vec<u8>,
+) {
+    match index.ann.add_unless_known(addr, || Ok(Some(vector))) {
+        Ok(true) => {}
+        Ok(false) => index.ann.unclaimed(addr),
+        Err(e) => {
+            eprintln!(
+                "ArcVector: '{name}' stored an element its graph would not take ({e}); \
+                 dropping the graph so the next read rebuilds it from the Map"
+            );
+            index.ann.unclaimed(addr);
+            registry::remove_observed(name, index);
+        }
     }
 }
 
@@ -141,6 +165,7 @@ pub fn vsetattr(store: &Store, name: &str, id: &str, attr: &[u8]) -> Result<Repl
     };
 
     let mut gone = false;
+    let mut kept_vector: Option<Vec<u8>> = None;
     let settled = index.ann.update_published(
         || {
             let held = match store.hold_elem(name, id) {
@@ -157,6 +182,7 @@ pub fn vsetattr(store: &Store, name: &str, id: &str, attr: &[u8]) -> Result<Repl
             if value.len() < layout.element_len() {
                 return Err(StoreError::CorruptElement);
             }
+            kept_vector = layout.vector_of(&value).map(<[u8]>::to_vec);
             let body = pending.value_mut();
             let kept = body.len();
             body.copy_from_slice(&value[..kept]);
@@ -180,7 +206,17 @@ pub fn vsetattr(store: &Store, name: &str, id: &str, attr: &[u8]) -> Result<Repl
         return Ok(Reply::NotFound);
     }
     match settled {
-        Ok(Some(())) => Ok(Reply::Stored),
+        Ok(Some(Published::Indexed)) => Ok(Reply::Stored),
+        Ok(Some(Published::Unindexed(addr))) => {
+            match kept_vector {
+                Some(vector) => index_it(&index, name, addr, vector),
+                None => {
+                    index.ann.unclaimed(addr);
+                    registry::remove_observed(name, &index);
+                }
+            }
+            Ok(Reply::Stored)
+        }
         Ok(None) => Ok(Reply::NotFound),
         Err(PublishError::Store(StoreError::ElemGone)) => Ok(Reply::NotFound),
         Err(PublishError::Store(StoreError::KeyGone)) => {

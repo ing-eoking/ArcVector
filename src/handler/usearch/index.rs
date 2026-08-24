@@ -124,6 +124,13 @@ impl Drop for AnnIndex {
 }
 
 #[derive(Debug)]
+pub enum Published {
+    Indexed,
+
+    Unindexed(u64),
+}
+
+#[derive(Debug)]
 pub enum PublishError<E> {
     Store(E),
 
@@ -321,7 +328,7 @@ impl AnnIndex {
         staged: Staged<'_>,
         displaced: impl FnOnce() -> Option<u64>,
         link: impl FnOnce() -> std::result::Result<u64, E>,
-    ) -> std::result::Result<(), PublishError<E>> {
+    ) -> std::result::Result<Published, PublishError<E>> {
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
         let live = staged.at_epoch == self.epoch.load(Ordering::Acquire);
@@ -367,34 +374,44 @@ impl AnnIndex {
             }
         };
 
-        if !live {
-            self.elements.release(&[addr]);
-            let taken = displaced.is_some_and(|old| held.give_up(old, tombstone));
-            drop(held);
-            drop(index);
-            let _ = self.drop_node(key);
-            self.drop_displaced(displaced, taken);
-            return Ok(());
-        }
+        let named = if live {
+            match index.rename(key, addr) {
+                Ok(1) => true,
+                Ok(moved) => {
+                    eprintln!(
+                        "ArcVector: naming a published node moved {moved} keys, not one; \
+                         rebuilding it from its element"
+                    );
+                    false
+                }
+                Err(e) => {
+                    eprintln!("ArcVector: could not name a published node: {e}");
+                    false
+                }
+            }
+        } else {
+            false
+        };
 
-        let renamed = index.rename(key, addr);
-        if let Err(e) = renamed {
-            self.elements.release(&[addr]);
-            let taken = displaced.is_some_and(|old| held.give_up(old, tombstone));
-            drop(held);
-            drop(index);
-            eprintln!("ArcVector: could not name a published node: {e}");
-            let _ = self.drop_node(key);
-            self.drop_displaced(displaced, taken);
-            return Ok(());
+        if named {
+            held.publish(addr);
         }
-        held.publish(addr);
-
         let taken = displaced.is_some_and(|old| held.give_up(old, tombstone));
         drop(held);
         drop(index);
+        if !named {
+            let _ = self.drop_node(key);
+        }
         self.drop_displaced(displaced, taken);
-        Ok(())
+        if named {
+            Ok(Published::Indexed)
+        } else {
+            Ok(Published::Unindexed(addr))
+        }
+    }
+
+    pub fn unclaimed(&self, addr: u64) {
+        self.elements.release(&[addr]);
     }
 
     fn drop_displaced(&self, displaced: Option<u64>, taken: bool) {
@@ -412,7 +429,7 @@ impl AnnIndex {
         &self,
         locate: impl FnOnce() -> Option<(u64, Vec<u8>)>,
         write: impl FnOnce(Vec<u8>) -> std::result::Result<u64, E>,
-    ) -> std::result::Result<Option<()>, PublishError<E>> {
+    ) -> std::result::Result<Option<Published>, PublishError<E>> {
         let _slack = InFlight::new(&self.in_flight);
 
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
@@ -422,7 +439,13 @@ impl AnnIndex {
             return Ok(None);
         };
 
+        let tombstone = self.rebuilding.load(Ordering::Acquire);
         if let Err(e) = held.reserve() {
+            return Err(PublishError::Mapping(Error::Index(format!(
+                "the held set could not grow: {e}"
+            ))));
+        }
+        if tombstone && let Err(e) = held.reserve_tombstone() {
             return Err(PublishError::Mapping(Error::Index(format!(
                 "the held set could not grow: {e}"
             ))));
@@ -430,26 +453,35 @@ impl AnnIndex {
 
         let new = write(value).map_err(PublishError::Store)?;
 
-        if !held.take(old) {
-            self.elements.release(&[new]);
-            return Ok(Some(()));
-        }
+        let had = held.give_up(old, tombstone);
+        let moved = had
+            && match index.rename(old, new) {
+                Ok(1) => true,
+                Ok(count) => {
+                    eprintln!(
+                        "ArcVector: moving a node to its new element moved {count} keys, not one"
+                    );
+                    false
+                }
+                Err(e) => {
+                    eprintln!("ArcVector: could not move a node to its new element: {e}");
+                    false
+                }
+            };
 
-        if let Err(e) = index.rename(old, new) {
-            self.elements.release(&[new]);
-            drop(held);
-            drop(index);
-            eprintln!("ArcVector: could not move a node to its new element: {e}");
-            if self.unlink_node(old) {
-                self.retire(&[old]);
-            }
-            return Ok(Some(()));
+        if moved {
+            held.publish(new);
         }
-        held.publish(new);
         drop(held);
         drop(index);
-        self.retire(&[old]);
-        Ok(Some(()))
+        if had && (moved || self.unlink_node(old)) {
+            self.retire(&[old]);
+        }
+        if moved {
+            Ok(Some(Published::Indexed))
+        } else {
+            Ok(Some(Published::Unindexed(new)))
+        }
     }
 
     pub fn forget_unreadable(&self, addr: u64) -> bool {
@@ -916,7 +948,7 @@ mod tests {
 
     fn publish(idx: &AnnIndex, id: &str, staged: Staged<'_>) -> u64 {
         let linked = std::sync::Mutex::new(0u64);
-        let done: std::result::Result<(), PublishError<()>> = idx.insert_published(
+        let done: std::result::Result<Published, PublishError<()>> = idx.insert_published(
             staged,
             || FAKE.addr_of(idx, id),
             || {
@@ -1587,11 +1619,12 @@ mod tests {
                         discarded.lock().unwrap().insert(key);
                         idx.discard(staged);
                     } else {
-                        let done: std::result::Result<(), PublishError<()>> = idx.insert_published(
-                            staged,
-                            || FAKE.addr_of(&idx, &id),
-                            || Ok(FAKE.link(&idx, &id)),
-                        );
+                        let done: std::result::Result<Published, PublishError<()>> = idx
+                            .insert_published(
+                                staged,
+                                || FAKE.addr_of(&idx, &id),
+                                || Ok(FAKE.link(&idx, &id)),
+                            );
                         done.unwrap();
                     }
                 }
@@ -1677,7 +1710,7 @@ mod tests {
         let live = put(&idx, "k", &coords);
         assert!(idx.held().live_addrs().contains(&live));
 
-        let done: std::result::Result<(), PublishError<()>> = idx.insert_published(
+        let done: std::result::Result<Published, PublishError<()>> = idx.insert_published(
             stale,
             || FAKE.addr_of(&idx, "k"),
             || Ok(FAKE.link(&idx, "k")),
@@ -1689,6 +1722,64 @@ mod tests {
             "the address the stale writer displaced is still held"
         );
         assert_one_key_per_id(&idx, "after a stale publish");
+    }
+
+    #[test]
+    fn a_stale_publish_hands_its_address_back_to_be_indexed() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let coords = [1.0, 2.0, 3.0, 4.0];
+        let v = crate::handler::quant::encode(&coords, Quant::F32);
+        let stale = idx.stage(&v).expect("stage before the rebuild");
+
+        idx.begin_rebuild().expect("begin");
+        idx.end_rebuild();
+
+        let done: std::result::Result<Published, PublishError<()>> = idx.insert_published(
+            stale,
+            || FAKE.addr_of(&idx, "k"),
+            || Ok(FAKE.link(&idx, "k")),
+        );
+        let Ok(Published::Unindexed(addr)) = done else {
+            panic!("a publish whose node the reset took must hand its address back");
+        };
+
+        assert!(
+            idx.add_unless_known(addr, || Ok(Some(v.clone())))
+                .expect("index the element the store already took"),
+            "the address the store took must be indexable"
+        );
+        assert_eq!(search(&idx, &coords, 1), vec!["k"]);
+        assert_one_key_per_id(&idx, "after completing a stale publish");
+    }
+
+    #[test]
+    fn an_update_the_graph_has_lost_hands_its_address_back() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let coords = [1.0, 2.0, 3.0, 4.0];
+        let old = put(&idx, "k", &coords);
+
+        idx.begin_rebuild().expect("begin");
+
+        let settled: std::result::Result<Option<Published>, PublishError<()>> =
+            idx.update_published(|| Some((old, vec![0u8; 8])), |_| Ok(FAKE.link(&idx, "k")));
+        let Ok(Some(Published::Unindexed(new))) = settled else {
+            panic!("an update the graph cannot move must hand its address back");
+        };
+
+        let v = crate::handler::quant::encode(&coords, Quant::F32);
+        assert!(
+            idx.add_unless_known(new, || Ok(Some(v.clone())))
+                .expect("index the rewritten element")
+        );
+        assert!(
+            !idx.add_unless_known(old, || Ok(Some(v)))
+                .expect("replay the snapshot"),
+            "the rebuild put back the element the update replaced"
+        );
+
+        idx.end_rebuild();
+        assert_eq!(search(&idx, &coords, 1), vec!["k"]);
+        assert_one_key_per_id(&idx, "after completing an update during a rebuild");
     }
 
     #[test]
@@ -1737,11 +1828,12 @@ mod tests {
                     let v = crate::handler::quant::encode(&coords, Quant::F32);
 
                     if let Ok(staged) = idx.stage(&v) {
-                        let done: std::result::Result<(), PublishError<()>> = idx.insert_published(
-                            staged,
-                            || FAKE.addr_of(&idx, &id),
-                            || Ok(FAKE.link(&idx, &id)),
-                        );
+                        let done: std::result::Result<Published, PublishError<()>> = idx
+                            .insert_published(
+                                staged,
+                                || FAKE.addr_of(&idx, &id),
+                                || Ok(FAKE.link(&idx, &id)),
+                            );
                         done.unwrap();
                     }
                 }
@@ -1914,7 +2006,7 @@ mod tests {
         let idx = build(4, Quant::F32, Metric::L2, 2);
         let old = add(&idx, "v1", &[1.0, 0.0, 0.0, 0.0]);
 
-        let settled: std::result::Result<Option<()>, PublishError<()>> =
+        let settled: std::result::Result<Option<Published>, PublishError<()>> =
             idx.update_published(|| Some((old, vec![0u8; 8])), |_| Ok(FAKE.link(&idx, "v1")));
         assert!(settled.is_ok(), "the update went through");
 
@@ -1934,7 +2026,7 @@ mod tests {
         let idx = build(4, Quant::F32, Metric::L2, 2);
         let old = add(&idx, "v1", &[1.0, 0.0, 0.0, 0.0]);
 
-        let settled: std::result::Result<Option<()>, PublishError<()>> =
+        let settled: std::result::Result<Option<Published>, PublishError<()>> =
             idx.update_published(|| Some((old, vec![0u8; 8])), |_| Err(()));
         assert!(matches!(settled, Err(PublishError::Store(()))));
 

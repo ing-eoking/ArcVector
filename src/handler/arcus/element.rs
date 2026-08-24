@@ -147,6 +147,17 @@ impl Layout {
         })
     }
 
+    #[cfg(recovery)]
+    pub fn vector_of<'a>(&self, buf: &'a [u8]) -> Option<&'a [u8]> {
+        let need = self.element_len();
+        (buf.len() >= need).then(|| &buf[Self::VECTOR_OFFSET..need])
+    }
+
+    #[cfg(not(recovery))]
+    pub fn vector_of<'a>(&self, _buf: &'a [u8]) -> Option<&'a [u8]> {
+        None
+    }
+
     pub fn set_attr(&self, buf: &mut [u8], attr: &[u8]) -> Result<(), CodecError> {
         if attr.len() > ATTR_BYTES {
             return Err(CodecError::AttrTooLarge {
