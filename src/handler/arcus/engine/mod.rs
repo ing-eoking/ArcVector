@@ -100,62 +100,41 @@ impl Store {
         self.config_u32(c"max_map_size", DEFAULT_MAX_MAP_SIZE)
     }
 
-    /// Whether this node is a replica, asked by trying to write.
+    /// Whether this node is a replica, asked by offering it a write.
     ///
-    /// A master is not told it is a master; only a replica is told it is one, by
-    /// refusing the write with `ENGINE_REPL_SLAVE`. So the question is put as a
-    /// throwaway `SET` on a key that expires in a second, and the refusal is the
-    /// answer. Anything else — including a failure to allocate, which says
-    /// nothing about the role — reads as "not a replica".
+    /// A master is not told it is a master; only a replica is told it is one,
+    /// and it is told by having a write refused with `ENGINE_REPL_SLAVE`. So the
+    /// question is put as a write, and the refusal is the answer.
+    ///
+    /// The write is a delete of a key that does not exist. `default_item_delete`
+    /// runs the replication gate before it looks the key up, so a replica
+    /// answers `ENGINE_REPL_SLAVE` and a master answers `ENGINE_KEY_ENOENT`,
+    /// having touched nothing. Nothing is allocated and nothing is stored, which
+    /// matters twice over: an allocate passes through the same gate, so on a
+    /// replica it would fail before there was anything to write, and arcus
+    /// counts `nbytes` with the trailing CRLF included -- a value this has no
+    /// use for and would have to invent.
+    ///
+    /// Anything else -- including an engine with no `remove` -- reads as "not a
+    /// replica", which is the answer that lets the caller carry on.
     pub fn ping_slave(&self) -> bool {
-        let key = b"arcus:zk-ping";
-        let mut item = ptr::null_mut();
-
-        let allocate = self
-            .vtable()
-            .allocate
-            .expect("allocate function pointer is null");
-        let store_fn = self.vtable().store.expect("store function pointer is null");
-        let release = self
-            .vtable()
-            .release
-            .expect("release function pointer is null");
-
-        let code = unsafe {
-            allocate(
-                self.handle(),
-                self.cookie,
-                &mut item,
-                key.as_ptr() as *const c_void,
-                key.len(),
-                1, // nbytes
-                0, // flags
-                1, // exptime
-                0, // cas
-            )
+        let key = b"arcus:repl-probe";
+        let Some(remove) = self.vtable().remove else {
+            return false;
         };
 
-        if code != ENGINE_ERROR_CODE_ENGINE_SUCCESS || item.is_null() {
-            return false;
-        }
-
-        let mut cas = 0;
         let code = unsafe {
-            store_fn(
+            remove(
                 self.handle(),
                 self.cookie,
-                item,
-                &mut cas,
-                crate::engine_api::ENGINE_STORE_OPERATION_OPERATION_SET,
+                key.as_ptr().cast::<c_void>(),
+                key.len(),
+                0, // cas: any
                 0, // vbucket
             )
         };
 
-        unsafe {
-            release(self.handle(), self.cookie, item);
-        }
-
-        code == crate::handler::arcus::engine::error::ENGINE_REPL_SLAVE
+        code == error::ENGINE_REPL_SLAVE
     }
 }
 
