@@ -105,7 +105,7 @@ pub fn report_mismatch(symptom: &str) {
              ArcVector: identifies one, so the bindings must be generated from the\n\
              ArcVector: server's own headers and configure flags:\n\
              ArcVector:   ARCVECTOR_ENGINE_INCLUDE=<tree>/include \\\n\
-             ArcVector:   cargo build --features replication\n\
+             ArcVector:   cargo build --features regen-bindings,replication\n\
              ArcVector: see docs/내부구조.md §11.",
             built_for(),
         );
@@ -132,7 +132,7 @@ pub unsafe fn verify(server: *const SERVER_HANDLE_V1, vt: &engine_interface_v1) 
                      ArcVector: agree on it, so every engine call would land on the wrong\n\
                      ArcVector: function. Rebuild against this server's headers:\n\
                      ArcVector:   ARCVECTOR_ENGINE_INCLUDE=<tree>/include \\\n\
-                     ArcVector:   cargo build --features replication\n\
+                     ArcVector:   cargo build --features regen-bindings,replication\n\
                      ArcVector: see docs/내부구조.md §11.",
                     fingerprint(version.as_deref()),
                     env!("ARCVECTOR_ABI_TREE"),
@@ -159,7 +159,7 @@ pub unsafe fn verify(server: *const SERVER_HANDLE_V1, vt: &engine_interface_v1) 
              ArcVector: identifies one, so the bindings must be generated against\n\
              ArcVector: the server's own headers and configure flags:\n\
              ArcVector:   ARCVECTOR_ENGINE_INCLUDE=<tree>/include \\\n\
-             ArcVector:   cargo build --features replication\n\
+             ArcVector:   cargo build --features regen-bindings,replication\n\
              ArcVector: see docs/내부구조.md §11.",
             fingerprint(version.as_deref()),
             absent.join(", "),
