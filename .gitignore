@@ -1,7 +1,7 @@
 /target
 arcus.conf
 default_engine.so
-memcached
+/memcached
 /data
 .DS_Store
 __pycache__/
