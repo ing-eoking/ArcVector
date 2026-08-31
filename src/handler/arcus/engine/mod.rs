@@ -111,9 +111,15 @@ impl Store {
         let key = b"arcus:zk-ping";
         let mut item = ptr::null_mut();
 
-        let allocate = self.vtable().allocate.expect("allocate function pointer is null");
+        let allocate = self
+            .vtable()
+            .allocate
+            .expect("allocate function pointer is null");
         let store_fn = self.vtable().store.expect("store function pointer is null");
-        let release = self.vtable().release.expect("release function pointer is null");
+        let release = self
+            .vtable()
+            .release
+            .expect("release function pointer is null");
 
         let code = unsafe {
             allocate(

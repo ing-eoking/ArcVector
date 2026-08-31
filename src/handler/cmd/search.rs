@@ -108,7 +108,11 @@ fn similar(
             };
             Some(String::from_utf8_lossy(&stored).into_owned())
         };
-        rendered.push((id.to_owned(), index.ann.metric.score(distance, layout.dim), attr));
+        rendered.push((
+            id.to_owned(),
+            index.ann.metric.score(distance, layout.dim),
+            attr,
+        ));
     }
 
     out.push_str(&query_header(
