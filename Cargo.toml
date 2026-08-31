@@ -22,7 +22,21 @@ crate-type = ["cdylib", "rlib"]
 # of the effect is in the generated `engine_api.rs`. See docs/내부구조.md §2.2.
 # Named after the flag with arcus's `ENABLE_` prefix dropped; `build.rs` puts it
 # back, so the name is written once.
-replication = []
+#
+# `replication` implies `cluster-aware`, because the server cannot be configured
+# the other way round: in `server_api.h` the `ENABLE_REPLICATION` member of
+# `SERVER_CORE_API` — `set_switchover_node` — is nested *inside* the
+# `ENABLE_CLUSTER_AWARE` block, so replication's own switchover hook does not
+# exist without zk integration. Replication in arcus is a zk-managed
+# master/slave pair; there is no non-clustered form of it to build against.
+#
+# It is also free: `ENABLE_CLUSTER_AWARE` appears nowhere in `engine.h`, so it
+# moves no member of `engine_interface_v1`, and the three members it inserts into
+# `SERVER_CORE_API` all sit after the four this crate calls (`get_current_time`,
+# `server_version`, `store_engine_specific`, `get_engine_specific`). Nothing this
+# crate reaches for shifts either way — what the implication buys is two fewer
+# binding variants to keep honest.
+replication = ["cluster-aware"]
 migration = []
 cluster-aware = []
 
