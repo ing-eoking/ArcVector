@@ -1630,7 +1630,11 @@ pub struct SERVER_STAT_API {
         ::std::option::Option<unsafe extern "C" fn(arg1: *mut ::std::os::raw::c_void)>,
     #[doc = " Tell the server we've evicted an item."]
     pub evicting: ::std::option::Option<
-        unsafe extern "C" fn(key: *const ::std::os::raw::c_void, nkey: ::std::os::raw::c_int),
+        unsafe extern "C" fn(
+            cookie: *const ::std::os::raw::c_void,
+            key: *const ::std::os::raw::c_void,
+            nkey: ::std::os::raw::c_int,
+        ),
     >,
 }
 pub type GET_SERVER_API = ::std::option::Option<unsafe extern "C" fn() -> *mut SERVER_HANDLE_V1>;
@@ -2491,6 +2495,27 @@ pub struct engine_interface_v1 {
             from_posi: ::std::os::raw::c_int,
             to_posi: ::std::os::raw::c_int,
             eresult: *mut elems_result,
+            vbucket: u16,
+        ) -> ENGINE_ERROR_CODE,
+    >,
+    pub btree_elem_smget_old: ::std::option::Option<
+        unsafe extern "C" fn(
+            handle: *mut ENGINE_HANDLE,
+            cookie: *const ::std::os::raw::c_void,
+            karray: *mut token_t,
+            kcount: ::std::os::raw::c_int,
+            bkrange: *const bkey_range,
+            efilter: *const eflag_filter,
+            offset: u32,
+            count: u32,
+            eitem_array: *mut *mut eitem,
+            kfnd_array: *mut u32,
+            flag_array: *mut u32,
+            eitem_count: *mut u32,
+            missed_key_array: *mut u32,
+            missed_key_count: *mut u32,
+            trimmed: *mut bool,
+            duplicated: *mut bool,
             vbucket: u16,
         ) -> ENGINE_ERROR_CODE,
     >,

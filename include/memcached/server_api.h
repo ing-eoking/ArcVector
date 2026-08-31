@@ -280,7 +280,8 @@ extern "C" {
         /**
          * Tell the server we've evicted an item.
          */
-        void (*evicting)(const void *key,
+        void (*evicting)(const void *cookie,
+                         const void *key,
                          int nkey);
     } SERVER_STAT_API;
 
