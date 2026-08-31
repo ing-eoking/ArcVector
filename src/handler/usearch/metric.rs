@@ -44,6 +44,17 @@ impl Metric {
         }
     }
 
+    /// The similarity a caller sees, from the distance usearch reports.
+    ///
+    /// All scores are calculated as `1.0 - distance` according to the new design,
+    /// where L2 uses the euclidean distance (`sqrt` of the squared distance reported by usearch).
+    pub fn score(self, distance: f32, _dim: usize) -> f32 {
+        match self {
+            Self::L2 => 1.0 - distance.max(0.0).sqrt(),
+            _ => 1.0 - distance,
+        }
+    }
+
     pub fn check_quant(self, quant: Quant) -> Result<()> {
         let bitwise = matches!(self, Self::Hamming | Self::Tanimoto);
         match (quant, bitwise) {
@@ -78,6 +89,40 @@ mod tests {
         assert!(Metric::Cos.check_quant(Quant::B1).is_err());
 
         assert!(Metric::Hamming.check_quant(Quant::F32).is_err());
+    }
+
+    #[test]
+    fn identical_vectors_score_one() {
+        assert!((Metric::Cos.score(0.0, 4) - 1.0).abs() < 1e-6);
+        assert!((Metric::IP.score(0.0, 4) - 1.0).abs() < 1e-6);
+        assert!((Metric::Tanimoto.score(0.0, 4) - 1.0).abs() < 1e-6);
+        assert!((Metric::L2.score(0.0, 4) - 1.0).abs() < 1e-6);
+        assert!((Metric::Hamming.score(0.0, 16) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn l2_undoes_the_squaring() {
+        // (0,0) to (3,4): usearch reports 25, the euclidean distance is 5
+        // 1 - 5 = -4
+        assert!((Metric::L2.score(25.0, 2) + 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn score_decreases_as_distance_grows() {
+        for metric in [
+            Metric::Cos,
+            Metric::L2,
+            Metric::IP,
+            Metric::Hamming,
+            Metric::Tanimoto,
+        ] {
+            let near = metric.score(1.0, 64);
+            let far = metric.score(4.0, 64);
+            assert!(
+                near > far,
+                "{metric} ranked a farther vector at least as high: {near} vs {far}"
+            );
+        }
     }
 
     #[test]

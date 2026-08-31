@@ -95,17 +95,17 @@ fn similar(
             };
             Some(String::from_utf8_lossy(&stored).into_owned())
         };
-        rendered.push((id.to_owned(), distance, attr));
+        rendered.push((id.to_owned(), index.ann.metric.score(distance, layout.dim), attr));
     }
 
     let _ = writeln!(out, "QUERY {query_no} {}\r", rendered.len());
-    for (id, distance, attr) in rendered {
+    for (id, score, attr) in rendered {
         match attr {
             Some(attr) => {
-                let _ = write!(out, "VALUE {id} {distance} {}\r\n{attr}\r\n", attr.len());
+                let _ = write!(out, "VALUE {id} {score} {}\r\n{attr}\r\n", attr.len());
             }
             None => {
-                let _ = write!(out, "VALUE {id} {distance}\r\n");
+                let _ = write!(out, "VALUE {id} {score}\r\n");
             }
         }
     }
