@@ -19,6 +19,19 @@ fn judged_attr(judged: &RefCell<Vec<(u64, String)>>, key: u64) -> Option<String>
         .map(|(_, a)| a.clone())
 }
 
+/// The line that opens one query's hits.
+///
+/// A graph still being rebuilt from its Map answers from the part of itself that
+/// exists, which is not the nearest neighbours — it is the nearest of what has
+/// been added so far. `PARTIAL_QUERY` names that, and carries the counts so the
+/// caller can judge how far off the answer may be.
+fn query_header(query_no: usize, hits: usize, rebuild: Option<crate::error::Rebuild>) -> String {
+    match rebuild {
+        None => format!("QUERY {query_no} {hits}\r\n"),
+        Some(p) => format!("PARTIAL_QUERY {query_no} {hits} {}/{}\r\n", p.done, p.total),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn similar(
     store: &Store,
@@ -98,7 +111,11 @@ fn similar(
         rendered.push((id.to_owned(), index.ann.metric.score(distance, layout.dim), attr));
     }
 
-    let _ = writeln!(out, "QUERY {query_no} {}\r", rendered.len());
+    out.push_str(&query_header(
+        query_no,
+        rendered.len(),
+        index.rebuilding_progress(),
+    ));
     for (id, score, attr) in rendered {
         match attr {
             Some(attr) => {
@@ -166,12 +183,52 @@ pub fn vsim_key(store: &Store, spec: &SimKey) -> Result<Reply> {
         Err(e) => return Err(e.into()),
     };
 
-    let Some(query) = index.ann.vector_of(held.addr())? else {
-        return Err(Error::Unreadable);
+    // Mid-rebuild the graph may not hold this key yet, but the Map always does:
+    // read the query vector from there so `vsim KEY` works throughout.
+    let query = match index.ann.vector_of(held.addr())? {
+        Some(query) => query,
+        None => store
+            .with_vector_at(held.addr(), index.ann.layout, <[u8]>::to_vec)
+            .ok_or(Error::Unreadable)?,
     };
 
     let mut out = String::new();
     similar(store, &index, &query, k, filter, with_attr, 0, &mut out)?;
     out.push_str("END\r\n");
     Ok(Reply::Body(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Rebuild;
+
+    #[test]
+    fn a_whole_index_writes_the_plain_header() {
+        assert_eq!(query_header(0, 5, None), "QUERY 0 5\r\n");
+    }
+
+    #[test]
+    fn a_half_built_index_says_what_it_answered_from() {
+        let half = Rebuild {
+            done: 693_000,
+            total: 999_000,
+        };
+        assert_eq!(
+            query_header(0, 5, Some(half)),
+            "PARTIAL_QUERY 0 5 693000/999000\r\n"
+        );
+    }
+
+    #[test]
+    fn a_partial_query_that_found_nothing_still_reports_progress() {
+        let just_begun = Rebuild {
+            done: 0,
+            total: 999_000,
+        };
+        assert_eq!(
+            query_header(2, 0, Some(just_begun)),
+            "PARTIAL_QUERY 2 0 0/999000\r\n"
+        );
+    }
 }

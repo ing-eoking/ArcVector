@@ -183,6 +183,24 @@ impl VectorIndex {
         self.is_refilled()
     }
 
+    /// How far a rebuild has got, or `None` when the graph answers in full.
+    ///
+    /// The two counts are read separately, so this is a moment rather than a
+    /// transaction — good enough to report, not to decide on.
+    #[cfg(recovery)]
+    pub fn rebuilding_progress(&self) -> Option<crate::error::Rebuild> {
+        (self.state() == FILLING).then(|| crate::error::Rebuild {
+            done: self.ann.len(),
+            total: self.rebuild_size(),
+        })
+    }
+
+    /// Without recovery a graph is never rebuilt, so a read is never partial.
+    #[cfg(not(recovery))]
+    pub fn rebuilding_progress(&self) -> Option<crate::error::Rebuild> {
+        None
+    }
+
     pub(in crate::handler) fn mark_ours(&self) {
         self.state.store(SERVING, Ordering::Release);
     }
@@ -517,6 +535,34 @@ mod refill_wait_tests {
         )
         .expect("build a graph");
         Arc::new(VectorIndex::rebuilding(name.to_owned(), ann, 10))
+    }
+
+    #[test]
+    fn only_a_filling_index_reports_progress() {
+        let index = rebuilding("half");
+        assert_eq!(
+            index.rebuilding_progress(),
+            None,
+            "a cold index has no rebuild in flight"
+        );
+
+        assert!(index.enter(COLD, FILLING));
+        index.set_rebuild_size(999_000);
+        assert_eq!(
+            index.rebuilding_progress(),
+            Some(crate::error::Rebuild {
+                done: 0,
+                total: 999_000
+            }),
+            "filling, with nothing published yet"
+        );
+
+        index.mark_ours();
+        assert_eq!(
+            index.rebuilding_progress(),
+            None,
+            "a serving index answers in full"
+        );
     }
 
     #[test]

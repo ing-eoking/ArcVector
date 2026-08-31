@@ -19,6 +19,29 @@ impl Blame {
     }
 }
 
+/// How far a rebuild has got, so a search answered from a half-built graph can
+/// say what it was answered from.
+///
+/// `done` is the count the graph has published, `total` the count the Map held
+/// when the rebuild was queued. The rebuild reads that snapshot start to end, so
+/// the two only meet when it is finished. Both are read without a lock between
+/// them, so a caller sees a moment, not a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rebuild {
+    pub done: usize,
+    pub total: usize,
+}
+
+impl Rebuild {
+    /// Rounded down, and 0 rather than a panic when the total is not yet known.
+    pub const fn percent(self) -> usize {
+        if self.total == 0 {
+            return 0;
+        }
+        self.done * 100 / self.total
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     BadRequest(String),
@@ -175,6 +198,24 @@ mod tests {
         assert!(matches!(e, Error::Filter(_)));
         let e: Error = StoreError::KeyGone.into();
         assert!(matches!(e, Error::Store(_)));
+    }
+
+    #[test]
+    fn percent_rounds_down() {
+        assert_eq!(
+            Rebuild {
+                done: 693_000,
+                total: 999_000
+            }
+            .percent(),
+            69
+        );
+        assert_eq!(Rebuild { done: 1, total: 3 }.percent(), 33);
+    }
+
+    #[test]
+    fn a_rebuild_that_has_counted_nothing_yet_does_not_divide_by_zero() {
+        assert_eq!(Rebuild { done: 0, total: 0 }.percent(), 0);
     }
 
     #[test]

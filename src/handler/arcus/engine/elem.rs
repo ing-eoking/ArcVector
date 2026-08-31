@@ -336,6 +336,28 @@ impl Store {
         Some(f(layout.attr_of(value).ok()?))
     }
 
+    /// The stored vector at `addr`, for a caller that already holds the address.
+    ///
+    /// Like `with_attr_at`, the element is viewed in place and not released here
+    /// — the caller's hold covers it. `Layout::vector_of` answers `None` in a
+    /// build that stores no vector, which makes this `None` there too.
+    pub fn with_vector_at<T>(
+        &self,
+        addr: u64,
+        layout: Layout,
+        f: impl FnOnce(&[u8]) -> T,
+    ) -> Option<T> {
+        let elems = Elems {
+            store: self,
+            array: ptr::null_mut(),
+            count: 0,
+        };
+        let value = elems.view(addr as *mut eitem).ok()?.1;
+
+        std::mem::forget(elems);
+        Some(f(layout.vector_of(value)?))
+    }
+
     pub fn release_held(&self, addrs: &[u64]) {
         if addrs.is_empty() {
             return;

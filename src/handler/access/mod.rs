@@ -155,12 +155,13 @@ pub(super) fn for_read(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
         if index.state() == registry::COLD {
             recovery::fill(store, &index)?;
         }
-        if index.state() == registry::FILLING {
-            if index.rebuild_size() > SMALL_REBUILD
-                || !index.await_refill(REBUILD_WAIT_CAP, WAITING_WORKERS)
-            {
-                return Err(Error::Unreadable);
-            }
+        // A small rebuild is worth waiting out, so the answer is whole. A large
+        // one is not: the read goes to the graph as it stands and the reply says
+        // so, rather than refusing for the minutes the rebuild takes.
+        if index.state() == registry::FILLING
+            && index.rebuild_size() <= SMALL_REBUILD
+            && index.await_refill(REBUILD_WAIT_CAP, WAITING_WORKERS)
+        {
             recovery::claim_refilled(store, &index)?;
         }
     }

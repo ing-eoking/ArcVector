@@ -64,15 +64,20 @@ impl Node {
         String::from_utf8_lossy(&buf).trim().to_owned()
     }
 
+    /// Retries until the index answers in full.
+    ///
+    /// A read taken while the graph rebuilds is answered from the part of it
+    /// that exists and is headed `PARTIAL_QUERY`, so waiting on the error alone
+    /// would let a half-built answer through and assert against it.
     fn cmd_settled(&mut self, line: &str, body: Option<&str>) -> String {
         for _ in 0..40 {
             let reply = self.cmd(line, body);
-            if !reply.contains("unreadable") {
+            if !reply.contains("unreadable") && !reply.contains("PARTIAL_QUERY") {
                 return reply;
             }
             std::thread::sleep(Duration::from_millis(250));
         }
-        panic!("'{line}' never stopped answering 'unreadable'");
+        panic!("'{line}' never finished rebuilding");
     }
 
     fn mode(&mut self) -> String {
