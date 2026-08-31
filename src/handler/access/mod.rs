@@ -22,7 +22,15 @@ pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
         Some(index) if index.state() == registry::BUILDING => return Err(Error::NoSuchIndex),
         Some(index) => (index, false),
 
-        None => empty_graph(store, name, &meta, layout)?,
+        None => {
+            // Taking an index over begins by writing the ownership token.
+            // On a replica, `stamp` will check `ping_slave()` using a dummy write
+            // to `arcus:zk-ping` and return Ok(()) without writing the token,
+            // allowing the replica to build the graph and serve read requests.
+            // `drain` calls the same token logic again below.
+            recovery::stamp(store, name, crate::owner::NOBODY)?;
+            empty_graph(store, name, &meta, layout)?
+        }
     };
 
     if fresh || meta.owner != index.stamped_as() {

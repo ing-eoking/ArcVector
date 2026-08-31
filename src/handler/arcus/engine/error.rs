@@ -53,7 +53,7 @@ impl std::error::Error for StoreError {}
 
 pub(super) type Result<T> = std::result::Result<T, StoreError>;
 
-const ENGINE_REPL_SLAVE: u32 = 0x61;
+pub const ENGINE_REPL_SLAVE: u32 = 0x61;
 
 pub(super) fn translate(code: u32) -> StoreError {
     match code {

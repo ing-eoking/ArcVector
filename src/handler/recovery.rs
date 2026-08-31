@@ -254,6 +254,9 @@ pub fn build_ann(meta: &MetaRecord, layout: Layout) -> Result<AnnIndex> {
 }
 
 pub(super) fn stamp(store: &Store, name: &str, owner: &str) -> Result<()> {
+    if store.ping_slave() {
+        return Ok(());
+    }
     let (meta, layout) = match read_metadata(store, name) {
         MetaState::Usable(meta, layout) => (meta, layout),
         MetaState::NoMap => return Err(Error::NoSuchIndex),

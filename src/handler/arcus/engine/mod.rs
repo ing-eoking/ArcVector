@@ -99,6 +99,58 @@ impl Store {
     pub fn max_map_size(&self) -> u32 {
         self.config_u32(c"max_map_size", DEFAULT_MAX_MAP_SIZE)
     }
+
+    /// Whether this node is a replica, asked by trying to write.
+    ///
+    /// A master is not told it is a master; only a replica is told it is one, by
+    /// refusing the write with `ENGINE_REPL_SLAVE`. So the question is put as a
+    /// throwaway `SET` on a key that expires in a second, and the refusal is the
+    /// answer. Anything else — including a failure to allocate, which says
+    /// nothing about the role — reads as "not a replica".
+    pub fn ping_slave(&self) -> bool {
+        let key = b"arcus:zk-ping";
+        let mut item = ptr::null_mut();
+
+        let allocate = self.vtable().allocate.expect("allocate function pointer is null");
+        let store_fn = self.vtable().store.expect("store function pointer is null");
+        let release = self.vtable().release.expect("release function pointer is null");
+
+        let code = unsafe {
+            allocate(
+                self.handle(),
+                self.cookie,
+                &mut item,
+                key.as_ptr() as *const c_void,
+                key.len(),
+                1, // nbytes
+                0, // flags
+                1, // exptime
+                0, // cas
+            )
+        };
+
+        if code != ENGINE_ERROR_CODE_ENGINE_SUCCESS || item.is_null() {
+            return false;
+        }
+
+        let mut cas = 0;
+        let code = unsafe {
+            store_fn(
+                self.handle(),
+                self.cookie,
+                item,
+                &mut cas,
+                crate::engine_api::ENGINE_STORE_OPERATION_OPERATION_SET,
+                0, // vbucket
+            )
+        };
+
+        unsafe {
+            release(self.handle(), self.cookie, item);
+        }
+
+        code == crate::handler::arcus::engine::error::ENGINE_REPL_SLAVE
+    }
 }
 
 pub struct DetachedElements;
