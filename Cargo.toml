@@ -38,6 +38,21 @@ persistence = []
 # metadata read on every command and the rebuild thread are all dead weight; an
 # index whose graph is missing then answers NOT_FOUND and is recreated by hand.
 
+# --- Bindings ----------------------------------------------------------------
+#
+# `include/memcached/*.h` is fixed and so is what bindgen makes of it, so the
+# translation is committed under `bindings/` -- one file per combination of the
+# three flags above, since each moves members in `engine_interface_v1`. A plain
+# `cargo build` copies the matching one and never runs bindgen, which is what
+# keeps libclang, and so LLVM, out of the build entirely.
+#
+# Turn this on to translate the headers again: after editing anything under
+# `include/`, or to build against a tree named by ARCVECTOR_ENGINE_INCLUDE, which
+# the committed bindings by definition do not describe. It needs libclang, and it
+# writes its output back over `bindings/` so the two cannot drift. `make bindings`
+# runs it over every combination.
+regen-bindings = ["dep:bindgen"]
+
 # --- Test targets ------------------------------------------------------------
 #
 # The integration tests need an arcus server, which this crate does not build.
@@ -69,5 +84,5 @@ usearch = "2.26"
 serde_json = "1"
 
 [build-dependencies]
-bindgen = "0.72.1"
+bindgen = { version = "0.72.1", optional = true }
 cc = "1.4.2"

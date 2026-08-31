@@ -19,9 +19,11 @@ FROM jam2in/arcus-memcached:latest AS arcus
 # --- toolchain + tests -----------------------------------------------------
 FROM rust:1-slim AS test
 
-# clang and libclang for bindgen; g++ because usearch compiles a C++ core.
+# g++ because usearch compiles a C++ core. No clang: the engine bindings are
+# committed under bindings/ rather than translated here, so bindgen -- and the
+# libclang it looks for -- is not in the build at all.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends clang libclang-dev g++ \
+ && apt-get install -y --no-install-recommends g++ \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=arcus /arcus /arcus

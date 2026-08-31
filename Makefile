@@ -2,15 +2,31 @@
 # arcus server that this crate does not build — and because the container builds
 # the Linux .so that actually ships, not the .dylib a macOS workstation produces.
 #
-#   make test     everything, in the container
-#   make unit     unit tests only, on the host (no server needed)
-#   make lint     format check and clippy, on the host
-#   make shell    a shell in the test image, for poking around
+#   make test      everything, in the container
+#   make unit      unit tests only, on the host (no server needed)
+#   make lint      format check and clippy, on the host
+#   make shell     a shell in the test image, for poking around
+#   make bindings  retranslate include/memcached (needs libclang)
 
 IMAGE ?= arcvector-test
 DOCKERFILE := docker/Dockerfile
 
-.PHONY: test image unit lint shell clean
+# Every combination of the flags that move members in `engine_interface_v1`.
+# `base` is the empty one, which cargo spells by taking no --features at all.
+ABI_COMBOS := \
+	base \
+	replication \
+	migration \
+	cluster-aware \
+	replication,migration \
+	replication,cluster-aware \
+	migration,cluster-aware \
+	replication,migration,cluster-aware
+
+# Everything except regen-bindings, which is the one feature that wants libclang.
+LINT_FEATURES := integration,replication-tests,migration,cluster-aware,persistence
+
+.PHONY: test image unit lint shell bindings clean
 
 ## Unit and integration tests against a real server.
 test: image
@@ -23,11 +39,23 @@ image:
 unit:
 	cargo test --lib
 
-# --all-features so the integration target is type-checked here too, even though
-# it is not built by a plain `cargo test`.
+# Every feature but regen-bindings, so the integration target is type-checked
+# here too, even though it is not built by a plain `cargo test` -- and so linting
+# stays possible on a machine with no libclang.
 lint:
 	cargo fmt --check
-	cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy --all-targets --features $(LINT_FEATURES) -- -D warnings
+
+## Retranslate include/memcached into bindings/, one file per flag combination.
+## Only needed after the headers change; the results are committed, which is what
+## keeps libclang out of an ordinary build.
+bindings:
+	@for combo in $(ABI_COMBOS); do \
+		if [ "$$combo" = base ]; then f=regen-bindings; else f="regen-bindings,$$combo"; fi; \
+		echo "  $$combo"; \
+		cargo build --features "$$f" >/dev/null || exit 1; \
+	done
+	@git diff --stat -- bindings/
 
 ## The image with a shell instead of the test run, server paths already set.
 shell: image
