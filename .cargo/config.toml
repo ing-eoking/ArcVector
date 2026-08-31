@@ -1,0 +1,22 @@
+# numkong's `maxsim/neonsdot.h` opens with `#pragma GCC target("+dotprod")`,
+# missing the `arch=` its twelve sibling headers all have -- they say
+# `arch=armv8.2-a+dotprod`. GCC's aarch64 backend does not take the bare form, so
+# on Arm the pragma is ignored, dotprod never turns on for that translation unit,
+# and `vdotq_s32` fails to inline:
+#
+#   arm_neon.h: error: inlining failed in call to 'always_inline' 'vdotq_s32':
+#                      target specific option mismatch
+#
+# The probe that decided NK_TARGET_NEONSDOT=1 passed because it compiles with
+# `-march=armv8.2-a+dotprod`; the sources are then built at `-march=armv8-a`, and
+# the header meant to bridge that gap is the one with the typo. Still there in
+# 7.8.1, and clang is unaffected -- it reads the `#pragma clang attribute push`
+# three lines above instead, which is spelled correctly.
+#
+# So the kernel is switched off through the override numkong provides for exactly
+# this. Cargo does not apply `[env]` per target, so it is off everywhere; on x86
+# the name is never read, and on Arm it costs the dotprod kernels that i8 indexes
+# would otherwise use. Set NK_TARGET_NEONSDOT=1 in the environment to override
+# this back on -- `[env]` yields to a variable that is already set.
+[env]
+NK_TARGET_NEONSDOT = "0"
