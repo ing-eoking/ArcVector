@@ -43,6 +43,11 @@ cargo build --release --features replication
 cargo build --release                          # a server built without it
 ```
 
+`replication` turns `cluster-aware` on with it. The opposite pairing is not a
+server that exists — in `server_api.h` the member replication adds to
+`SERVER_CORE_API` sits inside the `ENABLE_CLUSTER_AWARE` block — and it costs
+nothing, since every core member this crate calls sits above that block.
+
 If you have the server's source tree, its `config.h` lists exactly which to pass.
 
 `ARCVECTOR_ENGINE_INCLUDE` points at a different header tree. A wrong pairing is

@@ -1,8 +1,12 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-/// The server `configure` flags that move members in `engine_interface_v1`, in
-/// the order they read best in a file name.
+/// The server `configure` flags that move members in the structs this crate
+/// binds, in the order they read best in a file name.
+///
+/// `cluster-aware` moves nothing in `engine_interface_v1` -- it is named here
+/// because it shapes `SERVER_CORE_API`, and because Cargo.toml has `replication`
+/// imply it, so the two always appear together in a variant name.
 const ABI_FLAGS: [&str; 3] = ["replication", "migration", "cluster-aware"];
 
 fn main() {
@@ -69,6 +73,9 @@ fn main() {
 /// Names the committed bindings for the flags this build has on.
 ///
 /// The flags decide the vtable's shape, so each combination is its own file.
+/// Cargo has already applied the `replication -> cluster-aware` implication by
+/// the time this reads CARGO_FEATURE_*, so `--features replication` lands on
+/// `replication+cluster-aware.rs` and the lone `replication` name never occurs.
 fn variant() -> String {
     let on: Vec<&str> = ABI_FLAGS.into_iter().filter(|f| enabled(f)).collect();
     if on.is_empty() {

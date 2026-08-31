@@ -11,16 +11,19 @@
 IMAGE ?= arcvector-test
 DOCKERFILE := docker/Dockerfile
 
-# Every combination of the flags that move members in `engine_interface_v1`.
+# Every combination of the flags that shape the structs this crate binds.
 # `base` is the empty one, which cargo spells by taking no --features at all.
+#
+# Six, not eight: `replication` implies `cluster-aware` (see Cargo.toml), so
+# replication-without-it is not a server that exists and names no variant. Asking
+# for `replication` alone still works -- cargo resolves it to the pair -- it just
+# would regenerate the same file twice, so it is not listed.
 ABI_COMBOS := \
 	base \
-	replication \
 	migration \
 	cluster-aware \
-	replication,migration \
-	replication,cluster-aware \
 	migration,cluster-aware \
+	replication,cluster-aware \
 	replication,migration,cluster-aware
 
 # Everything except regen-bindings, which is the one feature that wants libclang.
