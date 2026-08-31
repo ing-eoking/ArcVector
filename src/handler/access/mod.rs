@@ -81,10 +81,10 @@ fn discard_damaged(store: &Store, name: &str, why: &str, stamp: u64) {
 
         Err(_) => {}
 
-        Ok(probe) if !probe.looks_like_index() => {
+        Ok(probe) if !probe.is_map => {
             if registry::remove_if_stale(name, stamp) {
                 eprintln!(
-                    "ArcVector: '{name}' is not our Map ({why}); releasing the graph that used to be there"
+                    "ArcVector: '{name}' is not a Map ({why}); releasing the graph that used to be there"
                 );
             }
         }
@@ -94,10 +94,8 @@ fn discard_damaged(store: &Store, name: &str, why: &str, stamp: u64) {
                 return;
             }
             eprintln!(
-                "ArcVector: index '{name}' has unusable metadata ({why}); deleting the Map, \
-                 which cannot become an index again without it"
+                "ArcVector: '{name}' has unusable metadata ({why}); keeping the Map but releasing the graph"
             );
-            let _ = store.drop_map(name);
             registry::remove_if_stale(name, stamp);
         }
     }

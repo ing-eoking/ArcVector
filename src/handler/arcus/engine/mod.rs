@@ -4,7 +4,7 @@ mod map;
 
 pub use elem::{HeldAddr, HeldElem, HeldMap, PendingElem};
 pub use error::StoreError;
-pub use map::{FORMAT_VERSION, INDEX_FLAGS, MapProbe, index_attr};
+pub use map::{FORMAT_VERSION, MapProbe, index_attr};
 
 use std::ffi::CStr;
 use std::os::raw::c_void;

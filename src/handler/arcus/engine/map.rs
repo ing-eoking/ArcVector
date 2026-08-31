@@ -7,11 +7,6 @@ use crate::engine_api::{ENGINE_ITEM_ATTR_ATTR_FLAGS, ENGINE_ITEM_TYPE_ITEM_TYPE_
 
 pub const FORMAT_VERSION: u16 = 1;
 
-pub const INDEX_FLAGS: u32 = INDEX_TAG | FORMAT_VERSION as u32;
-
-const INDEX_TAG: u32 = 0x4156_0000;
-const VERSION_MASK: u32 = 0x0000_FFFF;
-
 #[derive(Clone, Copy, Debug)]
 pub struct MapProbe {
     pub is_map: bool,
@@ -20,24 +15,9 @@ pub struct MapProbe {
     pub maxcount: u32,
 }
 
-impl MapProbe {
-    pub fn looks_like_index(&self) -> bool {
-        self.is_map && self.is_tagged() && self.format_version() == FORMAT_VERSION
-    }
-
-    pub fn is_tagged(&self) -> bool {
-        self.is_map && (self.flags & !VERSION_MASK) == INDEX_TAG
-    }
-
-    pub fn format_version(&self) -> u16 {
-        (self.flags & VERSION_MASK) as u16
-    }
-}
-
 pub fn index_attr(maxcount: Option<u32>, exptime: Option<u32>) -> item_attr {
     let mut attr: item_attr = unsafe { std::mem::zeroed() };
     attr.readable = 1;
-    attr.flags = INDEX_FLAGS;
     if let Some(m) = maxcount {
         attr.maxcount = i32::try_from(m).unwrap_or(i32::MAX);
     }
