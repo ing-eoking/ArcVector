@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
-use ::usearch::{Index, IndexOptions, ScalarKind, b1x8, f16};
+use ::usearch::{Index, IndexOptions, ScalarKind, VectorType, b1x8, f16, ffi::Matches};
 
 use super::held::{self, Elements, HeldSet};
 use super::metric::Metric;
@@ -153,12 +153,197 @@ impl Drop for InFlight<'_> {
     }
 }
 
+/// How many independent usearch graphs one index spreads its vectors over.
+///
+/// usearch takes a global level lock and a handful of per-structure mutexes on
+/// every insertion, and past two concurrent writers a single graph spends more
+/// of the insert waiting on those than computing distances: the scaling probes
+/// below measure x1.5 over four threads on one shared graph, and x3.0 on four
+/// separate ones -- the machine's own ceiling. Shards are the separate-graphs
+/// case behind one face.
+///
+/// More shards buy insert concurrency and cost search fan-out, since a query
+/// asks every shard for the full k, so the count follows the number of writers
+/// the server realistically runs at once, not the core count.
+const GRAPH_SHARDS: usize = 4;
+
+/// The graph, as `GRAPH_SHARDS` usearch indexes behind the API of one.
+///
+/// A vector is added to the shard its key hashes to and never moves: the
+/// rename from placeholder key to element address happens inside that shard,
+/// so an address does not hash to the shard that holds it, and lookups by key
+/// ask the routed shard first and then the rest. Each ask is one hash-table
+/// probe, nothing next to the distance work it stands in front of.
+///
+/// A search asks every shard for the full k and keeps the k nearest of what
+/// comes back. That answers exactly what the single graph answered: every
+/// vector is in some shard, and a vector among the true k nearest is among its
+/// own shard's k nearest, so the merge cannot have lost it.
+struct Shards {
+    shards: Vec<Index>,
+    /// One gate per shard, closing the only combination usearch cannot take.
+    ///
+    /// usearch promises concurrent inserts and concurrent searches, but an
+    /// insert racing a search segfaults -- the search walks into a slot whose
+    /// vector is not written yet (`usearch_add_search_race` reproduces it on a
+    /// raw index, on 2.26.0 and 2.26.1 both). So inserts share the gate on
+    /// read and a search takes its shard's gate on write: writers still run
+    /// beside writers, searches beside searches on other shards, and the two
+    /// never overlap on one graph. A search holds one gate at a time as it
+    /// walks the shards, so two searches cannot deadlock across them.
+    gates: Vec<RwLock<()>>,
+}
+
+impl Shards {
+    fn new(options: &IndexOptions) -> Result<Self> {
+        let mut shards = Vec::with_capacity(GRAPH_SHARDS);
+        for _ in 0..GRAPH_SHARDS {
+            shards.push(Index::new(options).map_err(usearch_err)?);
+        }
+        let gates = (0..GRAPH_SHARDS).map(|_| RwLock::new(())).collect();
+        Ok(Self { shards, gates })
+    }
+
+    /// Where a new key goes. Placeholder keys count up and element addresses
+    /// are aligned pointers; the Fibonacci multiply spreads either, and taking
+    /// the high half keeps an address's trailing zero bits out of the pick.
+    fn route_to(&self, key: u64) -> usize {
+        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize % GRAPH_SHARDS
+    }
+
+    /// The shard that holds `key` now, or None. Renames keep a key in the
+    /// shard its placeholder hashed to, so this cannot be recomputed -- it is
+    /// asked, routed shard first since most keys were never renamed.
+    fn holding(&self, key: u64) -> Option<&Index> {
+        let routed = self.route_to(key);
+        if self.shards[routed].contains(key) {
+            return Some(&self.shards[routed]);
+        }
+        (0..GRAPH_SHARDS)
+            .filter(|i| *i != routed)
+            .map(|i| &self.shards[i])
+            .find(|shard| shard.contains(key))
+    }
+
+    fn add<T: VectorType>(&self, key: u64, vector: &[T]) -> Result<()> {
+        let shard = self.route_to(key);
+        let _open = self.gates[shard]
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.shards[shard].add(key, vector).map_err(usearch_err)
+    }
+
+    fn get<T: VectorType>(&self, key: u64, buffer: &mut [T]) -> Result<usize> {
+        match self.holding(key) {
+            Some(shard) => shard.get(key, buffer).map_err(usearch_err),
+            None => Ok(0),
+        }
+    }
+
+    /// Only assertions ask this; the paths that act on a key ask holding()
+    /// and keep the shard they were handed.
+    #[cfg(test)]
+    fn contains(&self, key: u64) -> bool {
+        self.holding(key).is_some()
+    }
+
+    fn rename(&self, from: u64, to: u64) -> Result<usize> {
+        match self.holding(from) {
+            Some(shard) => shard.rename(from, to).map_err(usearch_err),
+            None => Ok(0),
+        }
+    }
+
+    fn remove(&self, key: u64) -> Result<usize> {
+        match self.holding(key) {
+            Some(shard) => shard.remove(key).map_err(usearch_err),
+            None => Ok(0),
+        }
+    }
+
+    fn reset(&self) -> Result<()> {
+        for shard in &self.shards {
+            shard.reset().map_err(usearch_err)?;
+        }
+        Ok(())
+    }
+
+    /// Keys spread by hash, not by count, so a shard can run somewhat over an
+    /// even split; an eighth on top covers that spread many times out, and the
+    /// staged placeholders ride in the same slack they always did.
+    fn reserve_capacity_and_threads(&self, capacity: usize, threads: usize) -> Result<()> {
+        let per_shard = capacity / GRAPH_SHARDS + capacity / (8 * GRAPH_SHARDS) + THREAD_SLOTS;
+        for shard in &self.shards {
+            shard
+                .reserve_capacity_and_threads(per_shard, threads)
+                .map_err(usearch_err)?;
+        }
+        Ok(())
+    }
+
+    fn search<T: VectorType>(&self, query: &[T], count: usize) -> Result<Matches> {
+        self.merged(count, |shard| {
+            shard.search(query, count).map_err(usearch_err)
+        })
+    }
+
+    fn filtered_search<T: VectorType, F>(
+        &self,
+        query: &[T],
+        count: usize,
+        filter: F,
+    ) -> Result<Matches>
+    where
+        F: Fn(u64) -> bool,
+    {
+        self.merged(count, |shard| {
+            shard
+                .filtered_search(query, count, &filter)
+                .map_err(usearch_err)
+        })
+    }
+
+    fn merged(&self, count: usize, one: impl Fn(&Index) -> Result<Matches>) -> Result<Matches> {
+        let mut all: Vec<(u64, f32)> = Vec::new();
+        for (shard, gate) in self.shards.iter().zip(&self.gates) {
+            let matches = {
+                let _alone = gate.write().unwrap_or_else(PoisonError::into_inner);
+                one(shard)?
+            };
+            all.extend(matches.keys.into_iter().zip(matches.distances));
+        }
+        all.sort_by(|a, b| a.1.total_cmp(&b.1));
+        all.truncate(count);
+        Ok(Matches {
+            keys: all.iter().map(|(key, _)| *key).collect(),
+            distances: all.iter().map(|(_, distance)| *distance).collect(),
+        })
+    }
+
+    fn memory_usage(&self) -> usize {
+        self.shards.iter().map(Index::memory_usage).sum()
+    }
+
+    fn memory_stats(&self) -> ::usearch::ffi::MemoryStats {
+        let mut total: ::usearch::ffi::MemoryStats = self.shards[0].memory_stats();
+        for shard in &self.shards[1..] {
+            let s = shard.memory_stats();
+            total.graph_allocated += s.graph_allocated;
+            total.graph_wasted += s.graph_wasted;
+            total.graph_reserved += s.graph_reserved;
+            total.vectors_allocated += s.vectors_allocated;
+            total.vectors_wasted += s.vectors_wasted;
+            total.vectors_reserved += s.vectors_reserved;
+        }
+        total
+    }
+}
 pub struct AnnIndex {
     pub layout: Layout,
     pub metric: Metric,
     threads: usize,
 
-    inner: RwLock<Index>,
+    inner: RwLock<Shards>,
     reserved: AtomicUsize,
 
     held: RwLock<HeldSet>,
@@ -223,11 +408,9 @@ impl AnnIndex {
             expansion_search,
             multi: false,
         };
-        let index = Index::new(&options).map_err(usearch_err)?;
         let threads = threads.max(1);
-        index
-            .reserve_capacity_and_threads(MIN_CAPACITY, threads)
-            .map_err(usearch_err)?;
+        let index = Shards::new(&options)?;
+        index.reserve_capacity_and_threads(MIN_CAPACITY, threads)?;
 
         Ok(Self {
             layout,
@@ -301,9 +484,7 @@ impl AnnIndex {
             return Ok(());
         }
         let target = (current * 2).max(needed).max(MIN_CAPACITY);
-        index
-            .reserve_capacity_and_threads(target, self.threads)
-            .map_err(usearch_err)?;
+        index.reserve_capacity_and_threads(target, self.threads)?;
         self.reserved.store(target, Ordering::Release);
         Ok(())
     }
@@ -655,14 +836,13 @@ impl AnnIndex {
         self.held().len()
     }
 
-    fn typed_add(&self, index: &Index, key: u64, vector: &[u8]) -> Result<()> {
+    fn typed_add(&self, index: &Shards, key: u64, vector: &[u8]) -> Result<()> {
         match self.layout.quant {
             Quant::F32 => index.add(key, &to_f32(vector)),
             Quant::F16 => index.add(key, f16::from_i16s(&to_i16(vector))),
             Quant::I8 => index.add(key, &to_i8(vector)),
             Quant::B1 => index.add(key, b1x8::from_u8s(vector)),
         }
-        .map_err(usearch_err)
     }
 
     pub fn vector_of(&self, addr: u64) -> Result<Option<Vec<u8>>> {
@@ -673,36 +853,28 @@ impl AnnIndex {
         let bytes = match self.layout.quant {
             Quant::F32 => {
                 let mut out = vec![0f32; dim];
-                if index.get(key, &mut out).map_err(usearch_err)? == 0 {
+                if index.get(key, &mut out)? == 0 {
                     return Ok(None);
                 }
                 out.iter().flat_map(|v| v.to_le_bytes()).collect()
             }
             Quant::F16 => {
                 let mut out = vec![0i16; dim];
-                if index
-                    .get(key, f16::from_mut_i16s(&mut out))
-                    .map_err(usearch_err)?
-                    == 0
-                {
+                if index.get(key, f16::from_mut_i16s(&mut out))? == 0 {
                     return Ok(None);
                 }
                 out.iter().flat_map(|v| v.to_le_bytes()).collect()
             }
             Quant::I8 => {
                 let mut out = vec![0i8; dim];
-                if index.get(key, &mut out).map_err(usearch_err)? == 0 {
+                if index.get(key, &mut out)? == 0 {
                     return Ok(None);
                 }
                 out.iter().map(|v| *v as u8).collect()
             }
             Quant::B1 => {
                 let mut out = vec![0u8; dim];
-                if index
-                    .get(key, b1x8::from_mut_u8s(&mut out))
-                    .map_err(usearch_err)?
-                    == 0
-                {
+                if index.get(key, b1x8::from_mut_u8s(&mut out))? == 0 {
                     return Ok(None);
                 }
                 out.truncate(self.layout.vector_bytes());
@@ -746,11 +918,8 @@ impl AnnIndex {
     pub fn clear_with(&self) -> Result<()> {
         let index = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
-        index.reset().map_err(usearch_err)?;
-
-        index
-            .reserve_capacity_and_threads(MIN_CAPACITY, self.threads)
-            .map_err(usearch_err)?;
+        index.reset()?;
+        index.reserve_capacity_and_threads(MIN_CAPACITY, self.threads)?;
         self.reserved.store(MIN_CAPACITY, Ordering::Release);
 
         let outgoing = held.take_all();
@@ -803,30 +972,28 @@ impl AnnIndex {
             .collect()
     }
 
-    fn unfiltered(&self, index: &Index, query: &[u8], k: usize) -> Result<::usearch::ffi::Matches> {
+    fn unfiltered(&self, index: &Shards, query: &[u8], k: usize) -> Result<Matches> {
         match self.layout.quant {
             Quant::F32 => index.search(&to_f32(query), k),
             Quant::F16 => index.search(f16::from_i16s(&to_i16(query)), k),
             Quant::I8 => index.search(&to_i8(query), k),
             Quant::B1 => index.search(b1x8::from_u8s(query), k),
         }
-        .map_err(usearch_err)
     }
 
     fn matches<P: Fn(u64) -> bool>(
         &self,
-        index: &Index,
+        index: &Shards,
         query: &[u8],
         k: usize,
         predicate: P,
-    ) -> Result<::usearch::ffi::Matches> {
+    ) -> Result<Matches> {
         match self.layout.quant {
             Quant::F32 => index.filtered_search(&to_f32(query), k, predicate),
             Quant::F16 => index.filtered_search(f16::from_i16s(&to_i16(query)), k, predicate),
             Quant::I8 => index.filtered_search(&to_i8(query), k, predicate),
             Quant::B1 => index.filtered_search(b1x8::from_u8s(query), k, predicate),
         }
-        .map_err(usearch_err)
     }
 
     pub fn search(
@@ -1996,12 +2163,18 @@ mod tests {
         let one_used = idx.used_bytes();
         assert!(one > empty * 2, "the first insert takes a chunk");
 
+        // Enough inserts that every shard has taken its chunk; from here on
+        // the held total must not move, however many vectors arrive.
         for i in 1..500 {
+            add(&idx, &format!("v{i}"), &[i as f32, 0.0, 0.0, 0.0]);
+        }
+        let chunked = idx.held_bytes();
+        for i in 500..1000 {
             add(&idx, &format!("v{i}"), &[i as f32, 0.0, 0.0, 0.0]);
         }
         assert_eq!(
             idx.held_bytes(),
-            one,
+            chunked,
             "held memory is chunked, not per-vector"
         );
         assert!(
@@ -2135,5 +2308,232 @@ mod tests {
             "and resolves to nothing, without the store being asked"
         );
         idx.discard(staged);
+    }
+
+    /// Not a correctness test: a scaling probe for the vadd path.
+    ///
+    /// Drives stage() + insert_published() -- everything vadd does except the
+    /// arcus engine -- at 1 and 4 threads over the real workload's shape
+    /// (1024-dim f32, cosine), and prints the throughput of each. Run it with
+    ///   cargo test --release -- --ignored scaling_probe --nocapture
+    ///
+    /// The second round holds a busy-wait inside the displaced/link closures to
+    /// stand in for the engine round-trips the real path makes at that point,
+    /// which insert_published currently runs under the exclusive held lock. If
+    /// four threads scale at round one and stop scaling at round two, the lock
+    /// window around the closures is the bottleneck; if they never scale, the
+    /// graph itself is.
+    #[test]
+    #[ignore]
+    fn scaling_probe() {
+        const DIM: usize = 1024;
+        const PER_THREAD: usize = 2_000;
+
+        fn spin(micros: u64) {
+            let until = std::time::Instant::now() + std::time::Duration::from_micros(micros);
+            while std::time::Instant::now() < until {
+                std::hint::spin_loop();
+            }
+        }
+
+        fn run(threads: usize, engine_micros: u64) -> f64 {
+            let idx = Arc::new(build(DIM, Quant::F32, Metric::Cos, THREAD_SLOTS));
+            let start = std::time::Instant::now();
+            let mut handles = Vec::new();
+            for t in 0..threads {
+                let idx = Arc::clone(&idx);
+                handles.push(std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let id = format!("s{t}x{i}");
+                        let coords: Vec<f32> = (0..DIM)
+                            .map(|d| ((t * 7919 + i * 31 + d) % 997) as f32)
+                            .collect();
+                        let v = crate::handler::quant::encode(&coords, Quant::F32);
+                        let staged = idx.stage(&v).unwrap();
+                        let done: std::result::Result<Published, PublishError<()>> = idx
+                            .insert_published(
+                                staged,
+                                || {
+                                    if engine_micros > 0 {
+                                        spin(engine_micros);
+                                    }
+                                    FAKE.addr_of(&idx, &id)
+                                },
+                                || {
+                                    if engine_micros > 0 {
+                                        spin(engine_micros * 2);
+                                    }
+                                    Ok(FAKE.link(&idx, &id))
+                                },
+                            );
+                        done.unwrap();
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            (threads * PER_THREAD) as f64 / start.elapsed().as_secs_f64()
+        }
+
+        for engine_micros in [0u64, 100] {
+            let one = run(1, engine_micros);
+            let four = run(4, engine_micros);
+            println!(
+                "engine={engine_micros:>3}us   1 thread: {one:8.0}/s   4 threads: {four:8.0}/s   scaling x{:.2}",
+                four / one
+            );
+        }
+    }
+
+    /// usearch alone, no wrapper: the same vectors pushed straight into a raw
+    /// Index from 1 and 4 threads. If this scales where scaling_probe does
+    /// not, the serialization is in this crate; if this does not scale either,
+    /// it is usearch or the machine.
+    #[test]
+    #[ignore]
+    fn scaling_probe_raw_usearch() {
+        const DIM: usize = 1024;
+        const PER_THREAD: usize = 2_000;
+
+        fn run(threads: usize) -> f64 {
+            let options = ::usearch::IndexOptions {
+                dimensions: DIM,
+                metric: Metric::Cos.kind(),
+                quantization: ScalarKind::F32,
+                connectivity: 0,
+                expansion_add: 0,
+                expansion_search: 0,
+                multi: false,
+            };
+            let index = Index::new(&options).unwrap();
+            index
+                .reserve_capacity_and_threads(threads * PER_THREAD + 16, THREAD_SLOTS)
+                .unwrap();
+            let start = std::time::Instant::now();
+            std::thread::scope(|scope| {
+                for t in 0..threads {
+                    let index = &index;
+                    scope.spawn(move || {
+                        for i in 0..PER_THREAD {
+                            let coords: Vec<f32> = (0..DIM)
+                                .map(|d| ((t * 7919 + i * 31 + d) % 997) as f32)
+                                .collect();
+                            index.add((t * PER_THREAD + i) as u64, &coords).unwrap();
+                        }
+                    });
+                }
+            });
+            (threads * PER_THREAD) as f64 / start.elapsed().as_secs_f64()
+        }
+
+        let one = run(1);
+        let four = run(4);
+        println!(
+            "raw usearch    1 thread: {one:8.0}/s   4 threads: {four:8.0}/s   scaling x{:.2}",
+            four / one
+        );
+    }
+
+    /// Raw usearch, adds racing searches on one small graph -- the shape one
+    /// shard sees. If this crashes, the null-vector segfault is usearch's own
+    /// add/search race and not this crate's bookkeeping.
+    #[test]
+    #[ignore]
+    fn usearch_add_search_race() {
+        for round in 0..200 {
+            let options = ::usearch::IndexOptions {
+                dimensions: 4,
+                metric: Metric::L2.kind(),
+                quantization: ScalarKind::F32,
+                connectivity: 0,
+                expansion_add: 0,
+                expansion_search: 0,
+                multi: false,
+            };
+            let index = Index::new(&options).unwrap();
+            index.reserve_capacity_and_threads(4096, 16).unwrap();
+            std::thread::scope(|scope| {
+                for t in 0..4u64 {
+                    let index = &index;
+                    scope.spawn(move || {
+                        for i in 0..200u64 {
+                            index
+                                .add(t * 1000 + i, &[t as f32, i as f32, 0.0, 0.0])
+                                .unwrap();
+                        }
+                    });
+                }
+                for _ in 0..4 {
+                    let index = &index;
+                    scope.spawn(move || {
+                        for i in 0..200u64 {
+                            let _ = index.search(&[i as f32, 1.0, 0.0, 0.0], 3).unwrap();
+                        }
+                    });
+                }
+            });
+            if round % 50 == 0 {
+                println!("round {round}");
+            }
+        }
+        println!("no crash in 200 rounds");
+    }
+
+    /// Four threads, each with an index of its own -- no shared state at all.
+    /// What this measures is the machine: if even fully independent indexes
+    /// stop at x1.5, the ceiling is memory bandwidth / cores, not locks.
+    #[test]
+    #[ignore]
+    fn scaling_probe_independent_indexes() {
+        const DIM: usize = 1024;
+        const PER_THREAD: usize = 2_000;
+
+        fn make() -> Index {
+            let options = ::usearch::IndexOptions {
+                dimensions: DIM,
+                metric: Metric::Cos.kind(),
+                quantization: ScalarKind::F32,
+                connectivity: 0,
+                expansion_add: 0,
+                expansion_search: 0,
+                multi: false,
+            };
+            let index = Index::new(&options).unwrap();
+            index
+                .reserve_capacity_and_threads(PER_THREAD + 16, 4)
+                .unwrap();
+            index
+        }
+
+        // one thread, one index: the baseline
+        let index = make();
+        let start = std::time::Instant::now();
+        for i in 0..PER_THREAD {
+            let coords: Vec<f32> = (0..DIM).map(|d| ((i * 31 + d) % 997) as f32).collect();
+            index.add(i as u64, &coords).unwrap();
+        }
+        let one = PER_THREAD as f64 / start.elapsed().as_secs_f64();
+
+        // four threads, four indexes: nothing shared
+        let indexes: Vec<Index> = (0..4).map(|_| make()).collect();
+        let start = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            for (t, index) in indexes.iter().enumerate() {
+                scope.spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let coords: Vec<f32> = (0..DIM)
+                            .map(|d| ((t * 7919 + i * 31 + d) % 997) as f32)
+                            .collect();
+                        index.add(i as u64, &coords).unwrap();
+                    }
+                });
+            }
+        });
+        let four = (4 * PER_THREAD) as f64 / start.elapsed().as_secs_f64();
+        println!(
+            "independent    1 thread: {one:8.0}/s   4 threads: {four:8.0}/s   scaling x{:.2}",
+            four / one
+        );
     }
 }
