@@ -2480,6 +2480,81 @@ mod tests {
         println!("no crash in 200 rounds");
     }
 
+    /// What sharding costs in memory: the same vectors in one raw usearch
+    /// graph, then in Shards, with both allocators reported side by side.
+    #[test]
+    #[ignore]
+    fn shard_memory_cost() {
+        const DIM: usize = 1024;
+
+        fn vector(i: usize) -> Vec<f32> {
+            (0..DIM).map(|d| ((i * 31 + d) % 997) as f32).collect()
+        }
+
+        for n in [15_000usize, 30_000, 60_000, 120_000] {
+            measure(n, vector);
+        }
+    }
+
+    fn measure(n: usize, vector: fn(usize) -> Vec<f32>) {
+        const DIM: usize = 1024;
+        let N = n;
+        let options = ::usearch::IndexOptions {
+            dimensions: DIM,
+            metric: Metric::Cos.kind(),
+            quantization: ScalarKind::F32,
+            connectivity: 0,
+            expansion_add: 0,
+            expansion_search: 0,
+            multi: false,
+        };
+
+        let one = Index::new(&options).unwrap();
+        one.reserve_capacity_and_threads(N + THREAD_SLOTS, THREAD_SLOTS)
+            .unwrap();
+        for i in 0..N {
+            one.add(i as u64, &vector(i)).unwrap();
+        }
+        let os = one.memory_stats();
+
+        let many = Shards::new(&options).unwrap();
+        many.reserve_capacity_and_threads(N, THREAD_SLOTS).unwrap();
+        for i in 0..N {
+            many.add(i as u64, &vector(i)).unwrap();
+        }
+        let ms = many.memory_stats();
+
+        let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
+        println!("{N} vectors x {DIM} dims f32  ({} shards)", GRAPH_SHARDS);
+        println!(
+            "  one graph    graph {:7.1} MB (wasted {:5.1}, reserved {:5.1})   vectors {:7.1} MB (wasted {:5.1}, reserved {:5.1})   total {:7.1} MB",
+            mb(os.graph_allocated),
+            mb(os.graph_wasted),
+            mb(os.graph_reserved),
+            mb(os.vectors_allocated),
+            mb(os.vectors_wasted),
+            mb(os.vectors_reserved),
+            mb(one.memory_usage())
+        );
+        println!(
+            "  sharded      graph {:7.1} MB (wasted {:5.1}, reserved {:5.1})   vectors {:7.1} MB (wasted {:5.1}, reserved {:5.1})   total {:7.1} MB",
+            mb(ms.graph_allocated),
+            mb(ms.graph_wasted),
+            mb(ms.graph_reserved),
+            mb(ms.vectors_allocated),
+            mb(ms.vectors_wasted),
+            mb(ms.vectors_reserved),
+            mb(many.memory_usage())
+        );
+        println!(
+            "  delta        total {:+7.1} MB  ({:+.1}%)   data(one) {:7.1} MB  data(sharded) {:7.1} MB",
+            mb(many.memory_usage()) - mb(one.memory_usage()),
+            100.0 * (many.memory_usage() as f64 / one.memory_usage() as f64 - 1.0),
+            mb(os.vectors_allocated - os.vectors_wasted - os.vectors_reserved),
+            mb(ms.vectors_allocated - ms.vectors_wasted - ms.vectors_reserved),
+        );
+    }
+
     /// Four threads, each with an index of its own -- no shared state at all.
     /// What this measures is the machine: if even fully independent indexes
     /// stop at x1.5, the ceiling is memory bandwidth / cores, not locks.
