@@ -2498,7 +2498,6 @@ mod tests {
 
     fn measure(n: usize, vector: fn(usize) -> Vec<f32>) {
         const DIM: usize = 1024;
-        let N = n;
         let options = ::usearch::IndexOptions {
             dimensions: DIM,
             metric: Metric::Cos.kind(),
@@ -2510,22 +2509,22 @@ mod tests {
         };
 
         let one = Index::new(&options).unwrap();
-        one.reserve_capacity_and_threads(N + THREAD_SLOTS, THREAD_SLOTS)
+        one.reserve_capacity_and_threads(n + THREAD_SLOTS, THREAD_SLOTS)
             .unwrap();
-        for i in 0..N {
+        for i in 0..n {
             one.add(i as u64, &vector(i)).unwrap();
         }
         let os = one.memory_stats();
 
         let many = Shards::new(&options).unwrap();
-        many.reserve_capacity_and_threads(N, THREAD_SLOTS).unwrap();
-        for i in 0..N {
+        many.reserve_capacity_and_threads(n, THREAD_SLOTS).unwrap();
+        for i in 0..n {
             many.add(i as u64, &vector(i)).unwrap();
         }
         let ms = many.memory_stats();
 
         let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
-        println!("{N} vectors x {DIM} dims f32  ({} shards)", GRAPH_SHARDS);
+        println!("{n} vectors x {DIM} dims f32  ({} shards)", GRAPH_SHARDS);
         println!(
             "  one graph    graph {:7.1} MB (wasted {:5.1}, reserved {:5.1})   vectors {:7.1} MB (wasted {:5.1}, reserved {:5.1})   total {:7.1} MB",
             mb(os.graph_allocated),
