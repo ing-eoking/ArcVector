@@ -165,7 +165,7 @@ impl Drop for InFlight<'_> {
 /// More shards buy insert concurrency and cost search fan-out, since a query
 /// asks every shard for the full k, so the count follows the number of writers
 /// the server realistically runs at once, not the core count.
-const GRAPH_SHARDS: usize = 4;
+const GRAPH_SHARDS: usize = 1;
 
 /// The graph, as `GRAPH_SHARDS` usearch indexes behind the API of one.
 ///
@@ -186,12 +186,96 @@ struct Shards {
     /// usearch promises concurrent inserts and concurrent searches, but an
     /// insert racing a search segfaults -- the search walks into a slot whose
     /// vector is not written yet (`usearch_add_search_race` reproduces it on a
-    /// raw index, on 2.26.0 and 2.26.1 both). So inserts share the gate on
-    /// read and a search takes its shard's gate on write: writers still run
-    /// beside writers, searches beside searches on other shards, and the two
-    /// never overlap on one graph. A search holds one gate at a time as it
-    /// walks the shards, so two searches cannot deadlock across them.
-    gates: Vec<RwLock<()>>,
+    /// raw index, on 2.26.0 and 2.26.1 both). Inserts beside inserts and
+    /// searches beside searches are both fine; only the pair is not.
+    ///
+    /// That is not what an `RwLock` expresses -- it would serialize one of the
+    /// two classes against itself -- so `Gate` admits any number of one kind
+    /// while the other kind is absent. A search holds one shard's gate at a
+    /// time as it walks the shards, so searches cannot deadlock across them.
+    gates: Vec<Gate>,
+}
+
+/// Lets any number of adders in, or any number of searchers, never both.
+///
+/// A waiting searcher stops new adders from starting, so a bulk load cannot
+/// starve queries: the adders in flight drain, the searches waiting go, and
+/// adders resume behind them. Neither side waits on a count the other cannot
+/// bring to zero, so the pair cannot deadlock.
+#[derive(Default)]
+struct Gate {
+    state: std::sync::Mutex<GateState>,
+    room: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    adding: usize,
+    searching: usize,
+    searchers_waiting: usize,
+}
+
+/// Leaves the gate on drop, so a `?` on the usearch call cannot hold it shut.
+struct Admitted<'a> {
+    gate: &'a Gate,
+    searching: bool,
+}
+
+impl Gate {
+    fn to_add(&self) -> Admitted<'_> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while state.searching > 0 || state.searchers_waiting > 0 {
+            state = self
+                .room
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        state.adding += 1;
+        drop(state);
+        Admitted {
+            gate: self,
+            searching: false,
+        }
+    }
+
+    fn to_search(&self) -> Admitted<'_> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.searchers_waiting += 1;
+        while state.adding > 0 {
+            state = self
+                .room
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        state.searchers_waiting -= 1;
+        state.searching += 1;
+        drop(state);
+        Admitted {
+            gate: self,
+            searching: true,
+        }
+    }
+}
+
+impl Drop for Admitted<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let count = if self.searching {
+            &mut state.searching
+        } else {
+            &mut state.adding
+        };
+        *count -= 1;
+        let empty = *count == 0;
+        drop(state);
+        if empty {
+            self.gate.room.notify_all();
+        }
+    }
 }
 
 impl Shards {
@@ -200,7 +284,7 @@ impl Shards {
         for _ in 0..GRAPH_SHARDS {
             shards.push(Index::new(options).map_err(usearch_err)?);
         }
-        let gates = (0..GRAPH_SHARDS).map(|_| RwLock::new(())).collect();
+        let gates = (0..GRAPH_SHARDS).map(|_| Gate::default()).collect();
         Ok(Self { shards, gates })
     }
 
@@ -208,7 +292,7 @@ impl Shards {
     /// are aligned pointers; the Fibonacci multiply spreads either, and taking
     /// the high half keeps an address's trailing zero bits out of the pick.
     fn route_to(&self, key: u64) -> usize {
-        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize % GRAPH_SHARDS
+        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize % self.shards.len()
     }
 
     /// The shard that holds `key` now, or None. Renames keep a key in the
@@ -216,10 +300,10 @@ impl Shards {
     /// asked, routed shard first since most keys were never renamed.
     fn holding(&self, key: u64) -> Option<&Index> {
         let routed = self.route_to(key);
-        if self.shards[routed].contains(key) {
+        if self.shards.len() == 1 || self.shards[routed].contains(key) {
             return Some(&self.shards[routed]);
         }
-        (0..GRAPH_SHARDS)
+        (0..self.shards.len())
             .filter(|i| *i != routed)
             .map(|i| &self.shards[i])
             .find(|shard| shard.contains(key))
@@ -227,9 +311,7 @@ impl Shards {
 
     fn add<T: VectorType>(&self, key: u64, vector: &[T]) -> Result<()> {
         let shard = self.route_to(key);
-        let _open = self.gates[shard]
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
+        let _admitted = self.gates[shard].to_add();
         self.shards[shard].add(key, vector).map_err(usearch_err)
     }
 
@@ -272,7 +354,8 @@ impl Shards {
     /// even split; an eighth on top covers that spread many times out, and the
     /// staged placeholders ride in the same slack they always did.
     fn reserve_capacity_and_threads(&self, capacity: usize, threads: usize) -> Result<()> {
-        let per_shard = capacity / GRAPH_SHARDS + capacity / (8 * GRAPH_SHARDS) + THREAD_SLOTS;
+        let n = self.shards.len();
+        let per_shard = capacity / n + capacity / (8 * n) + THREAD_SLOTS;
         for shard in &self.shards {
             shard
                 .reserve_capacity_and_threads(per_shard, threads)
@@ -307,7 +390,7 @@ impl Shards {
         let mut all: Vec<(u64, f32)> = Vec::new();
         for (shard, gate) in self.shards.iter().zip(&self.gates) {
             let matches = {
-                let _alone = gate.write().unwrap_or_else(PoisonError::into_inner);
+                let _admitted = gate.to_search();
                 one(shard)?
             };
             all.extend(matches.keys.into_iter().zip(matches.distances));
@@ -2163,18 +2246,17 @@ mod tests {
         let one_used = idx.used_bytes();
         assert!(one > empty * 2, "the first insert takes a chunk");
 
-        // Enough inserts that every shard has taken its chunk; from here on
-        // the held total must not move, however many vectors arrive.
+        // The chunk the first insert took has room for these; nothing the
+        // allocator does here is per-vector. The count is chosen to stay under
+        // the step where usearch's node table doubles, so raising
+        // GRAPH_SHARDS -- which gives every shard a table of its own -- needs
+        // this number revisited.
         for i in 1..500 {
-            add(&idx, &format!("v{i}"), &[i as f32, 0.0, 0.0, 0.0]);
-        }
-        let chunked = idx.held_bytes();
-        for i in 500..1000 {
             add(&idx, &format!("v{i}"), &[i as f32, 0.0, 0.0, 0.0]);
         }
         assert_eq!(
             idx.held_bytes(),
-            chunked,
+            one,
             "held memory is chunked, not per-vector"
         );
         assert!(
@@ -2552,6 +2634,135 @@ mod tests {
             mb(os.vectors_allocated - os.vectors_wasted - os.vectors_reserved),
             mb(ms.vectors_allocated - ms.vectors_wasted - ms.vectors_reserved),
         );
+    }
+
+    /// The gate must let both kinds through under a load that never lets up:
+    /// a bulk insert running flat out must not starve queries, and the two
+    /// must not crash when they overlap.
+    #[test]
+    fn a_bulk_load_does_not_starve_searches() {
+        let idx = Arc::new(build(4, Quant::F32, Metric::L2, 16));
+        for i in 0..200 {
+            add(&idx, &format!("seed{i}"), &[i as f32, 0.0, 0.0, 0.0]);
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let searched = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for t in 0..4 {
+            let idx = Arc::clone(&idx);
+            let stop = Arc::clone(&stop);
+            handles.push(std::thread::spawn(move || {
+                let mut i = 0usize;
+                while !stop.load(Ordering::Relaxed) {
+                    add(
+                        &idx,
+                        &format!("bulk{t}-{i}"),
+                        &[t as f32, i as f32, 1.0, 0.0],
+                    );
+                    i += 1;
+                }
+            }));
+        }
+
+        for _ in 0..2 {
+            let idx = Arc::clone(&idx);
+            let searched = Arc::clone(&searched);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..300 {
+                    let q = crate::handler::quant::encode(&[i as f32, 0.0, 0.0, 0.0], Quant::F32);
+                    idx.search(&q, 5, None).unwrap();
+                    searched.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        // the searchers finish on their own; the adders run until told
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while searched.load(Ordering::Relaxed) < 600 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            searched.load(Ordering::Relaxed),
+            600,
+            "searches did not get through a bulk load"
+        );
+    }
+
+    /// What sharding and the gates cost a search: one raw graph against
+    /// Shards, single-threaded latency and four-thread throughput.
+    #[test]
+    #[ignore]
+    fn search_cost() {
+        const DIM: usize = 1024;
+        const N: usize = 60_000;
+        const K: usize = 100;
+        const QUERIES: usize = 400;
+
+        fn vector(i: usize) -> Vec<f32> {
+            (0..DIM).map(|d| ((i * 31 + d) % 997) as f32).collect()
+        }
+        fn query(i: usize) -> Vec<f32> {
+            (0..DIM).map(|d| ((i * 71 + d * 3) % 997) as f32).collect()
+        }
+
+        let options = ::usearch::IndexOptions {
+            dimensions: DIM,
+            metric: Metric::Cos.kind(),
+            quantization: ScalarKind::F32,
+            connectivity: 0,
+            expansion_add: 0,
+            expansion_search: 0,
+            multi: false,
+        };
+
+        let one = Index::new(&options).unwrap();
+        one.reserve_capacity_and_threads(N + THREAD_SLOTS, THREAD_SLOTS)
+            .unwrap();
+        for i in 0..N {
+            one.add(i as u64, &vector(i)).unwrap();
+        }
+        let many = Shards::new(&options).unwrap();
+        many.reserve_capacity_and_threads(N, THREAD_SLOTS).unwrap();
+        for i in 0..N {
+            many.add(i as u64, &vector(i)).unwrap();
+        }
+
+        let run = |threads: usize, sharded: bool| -> f64 {
+            let start = std::time::Instant::now();
+            std::thread::scope(|scope| {
+                for t in 0..threads {
+                    let one = &one;
+                    let many = &many;
+                    scope.spawn(move || {
+                        for i in 0..QUERIES {
+                            let q = query(t * QUERIES + i);
+                            if sharded {
+                                many.search(&q, K).unwrap();
+                            } else {
+                                one.search(&q, K).unwrap();
+                            }
+                        }
+                    });
+                }
+            });
+            (threads * QUERIES) as f64 / start.elapsed().as_secs_f64()
+        };
+
+        for (label, sharded) in [("one graph", false), ("sharded ", true)] {
+            let s1 = run(1, sharded);
+            let s4 = run(4, sharded);
+            println!(
+                "{label}   1 thread: {s1:8.0} q/s ({:6.2} ms)   4 threads: {s4:8.0} q/s   scaling x{:.2}",
+                1000.0 / s1,
+                s4 / s1
+            );
+        }
     }
 
     /// Four threads, each with an index of its own -- no shared state at all.
