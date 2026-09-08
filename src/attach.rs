@@ -118,6 +118,16 @@ fn run() {
 /// `max_sync_wait_msec`. A timeout here is treated as a dead connection.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often an idle connection is checked for the daemon having closed it.
+/// The cookie is advertised to background threads for as long as the slot is
+/// full, so this bounds how long a freed `conn` can be handed out.
+const IDLE_POLL: Duration = Duration::from_secs(1);
+
+/// How long that check blocks. Held across the `PARKED` lock, so it is kept
+/// far below `IDLE_POLL`: a `request` arriving mid-check waits this long at
+/// worst.
+const IDLE_PEEK: Duration = Duration::from_millis(50);
+
 /// The parked connection, once there is one, and whatever a previous reply
 /// left unconsumed.
 struct Parked {
@@ -216,17 +226,58 @@ fn terminates(line: &str, first: bool) -> bool {
 /// it -- which invalidates the cookie, so the caller must drop it before
 /// reconnecting.
 fn park(sock: Sock) {
-    let _ = sock.set_read_timeout(None);
     let mut guard = PARKED.lock().unwrap_or_else(|e| e.into_inner());
     *guard = Some(Parked {
         sock,
         rest: Vec::new(),
     });
-    // Nothing polls the socket while it is idle: a `request` that fails is
-    // what notices the close, and it clears the slot before signalling. Until
-    // then there is nothing to do but hold the cookie available.
-    while guard.is_some() {
-        guard = CLOSED.wait(guard).unwrap_or_else(|e| e.into_inner());
+
+    loop {
+        let (next, timed_out) = CLOSED
+            .wait_timeout(guard, IDLE_POLL)
+            .unwrap_or_else(|e| e.into_inner());
+        guard = next;
+
+        // A `request` that failed got here first and cleared the slot.
+        let Some(parked) = guard.as_mut() else { return };
+
+        if timed_out.timed_out() && !peer_still_there(parked) {
+            *guard = None;
+            disown();
+            return;
+        }
+    }
+}
+
+/// Whether the daemon still has the other end of an idle connection.
+///
+/// This has to exist, and a `request` failing is not enough on its own. The
+/// cookie stays published for as long as the slot is full, and
+/// `Store::background_keyed` hands it to `recovery::run_builder` and
+/// `access::sweep::probe_round` -- so a `conn` the daemon has freed must stop
+/// being advertised promptly, not whenever something next happens to send. In
+/// a `migration` build nothing sends at all: `repl` is not compiled, so
+/// without this the cookie would dangle for the life of the process.
+///
+/// A short blocking read rather than a peek: the daemon does not talk first on
+/// a client connection, so this times out while the connection is healthy,
+/// returns zero once it is closed, and anything it does read belongs in `rest`
+/// for the next reply to consume anyway.
+fn peer_still_there(parked: &mut Parked) -> bool {
+    if parked.sock.set_read_timeout(Some(IDLE_PEEK)).is_err() {
+        return false;
+    }
+    let mut chunk = [0u8; 256];
+    match (&parked.sock).read(&mut chunk) {
+        Ok(0) => false,
+        Ok(n) => {
+            parked.rest.extend_from_slice(&chunk[..n]);
+            true
+        }
+        Err(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
     }
 }
 
