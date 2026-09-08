@@ -17,8 +17,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::os::raw::{c_int, c_void};
 use std::os::unix::net::UnixStream;
 use std::ptr;
-use std::sync::{Condvar, Mutex, OnceLock};
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 /// The reply the handler sends back, and how the thread recognises its own.

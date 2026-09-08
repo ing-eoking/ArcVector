@@ -3,7 +3,7 @@ use std::ptr;
 
 use super::Store;
 use super::error::{Result, StoreError, as_int, check};
-use crate::engine_api::{ENGINE_STORE_OPERATION_OPERATION_ADD, item, item_info};
+use crate::engine_api::{ENGINE_STORE_OPERATION_OPERATION_SET, item, item_info};
 
 impl Store {
     /// Reads a top-level key.
@@ -46,12 +46,14 @@ impl Store {
         out
     }
 
-    /// Creates a top-level key, and only creates it.
+    /// Writes a top-level key, replacing whatever was there.
     ///
-    /// `OPERATION_ADD`: a key that already exists is left exactly as it is and
-    /// the call answers `ENGINE_NOT_STORED` (`do_item_store_add`,
-    /// `engines/default/items.c`), so a caller replacing a value has to
-    /// [`Store::remove_kv`] it first.
+    /// `OPERATION_SET` rather than `ADD`. `ADD` refuses an existing key
+    /// (`ENGINE_NOT_STORED`, `do_item_store_add`), which matters here because
+    /// the value a promoted node has to replace is the *previous* master's,
+    /// replicated in before the switchover. Emulating a replace with a remove
+    /// and an add leaves the key absent in between -- and a slave attaching in
+    /// that gap reads nothing, which is the one situation this key exists for.
     ///
     /// **Only ever reached from a worker thread, with that thread's own
     /// cookie**, because a keyed write stamps `last_cset_seqs[thr_idx]` --
@@ -77,7 +79,7 @@ impl Store {
     /// replicas and re-promoted on the next beat -- over and over. The allocate
     /// path already used `check` for exactly this reason; only the store call
     /// compared against `ENGINE_SUCCESS` by hand.
-    pub fn add_kv(&self, key: &str, value: &[u8]) -> Result<()> {
+    pub fn set_kv(&self, key: &str, value: &[u8]) -> Result<()> {
         let vt = self.vtable();
         let (Some(allocate), Some(store), Some(release), Some(info_of)) =
             (vt.allocate, vt.store, vt.release, vt.get_item_info)
@@ -126,33 +128,11 @@ impl Store {
                 self.cookie,
                 it,
                 ptr::from_mut(&mut cas),
-                ENGINE_STORE_OPERATION_OPERATION_ADD,
+                ENGINE_STORE_OPERATION_OPERATION_SET,
                 0, // vbucket
             )
         };
         unsafe { release(self.handle(), self.cookie, it) };
-        check(code)
-    }
-
-    /// Removes a top-level key.
-    ///
-    /// [`Store::add_kv`]'s counterpart: `OPERATION_ADD` will not replace a
-    /// value, so publishing a different one means taking the old one out
-    /// first. Carries the same worker-thread requirement.
-    pub fn remove_kv(&self, key: &str) -> Result<()> {
-        let Some(remove) = self.vtable().remove else {
-            return Err(StoreError::Unavailable);
-        };
-        let code = unsafe {
-            remove(
-                self.handle(),
-                self.cookie,
-                key.as_ptr().cast::<c_void>(),
-                key.len(),
-                0, // cas: any
-                0, // vbucket
-            )
-        };
         check(code)
     }
 }

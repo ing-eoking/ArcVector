@@ -1,10 +1,9 @@
 use std::net::{IpAddr, SocketAddr};
-
-use crate::handler::arcus::engine::{Store, StoreError};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::handler::arcus::engine::Store;
 
 /// What this node is, as far as the last probe could tell.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -305,11 +304,10 @@ fn parse_owner_reply(line: &str) -> Option<String> {
 /// durable before the replica has it.
 ///
 /// Reads before it writes, so a settled master writes nothing at all -- the
-/// only writes left are the ones a promotion actually requires. `add_kv` is
-/// `OPERATION_ADD` and will not replace a value, so a stale entry (the
-/// previous master's, replicated here before the switchover) is removed
-/// first; `remove_kv`'s own `KeyGone` is not a failure, it is the state the
-/// remove was for.
+/// only writes left are the ones a promotion actually requires. The write
+/// itself is a plain `set`: what a promoted node replaces is the previous
+/// master's address, and replacing it in one operation is what keeps a slave
+/// attaching at that moment from finding no key at all.
 pub fn owner_command(store: &Store, addr: Option<&str>) -> String {
     let current = store
         .get_kv(OWNER_KEY)
@@ -322,11 +320,7 @@ pub fn owner_command(store: &Store, addr: Option<&str>) -> String {
     if current.as_deref() == Some(wanted) {
         return reply_line(Some(wanted));
     }
-    match store.remove_kv(OWNER_KEY) {
-        Ok(()) | Err(StoreError::KeyGone) => {}
-        Err(_) => return reply_line(current.as_deref()),
-    }
-    match store.add_kv(OWNER_KEY, wanted.as_bytes()) {
+    match store.set_kv(OWNER_KEY, wanted.as_bytes()) {
         Ok(()) => reply_line(Some(wanted)),
         Err(_) => reply_line(None),
     }
@@ -861,21 +855,12 @@ mod tests {
         assert_eq!(state.role(), Role::Replica);
     }
 
-    /// `beat` is the one thing that turns an observed transition into
-    /// `master::open`/`close` and a convergence pass, so it is "the
-    /// transition handler" this task's wiring hangs off of. Nothing else in
-    /// this crate ever calls `shared().set_listen_addr(..)` (only `beat`'s
-    /// own `acquire_listener`/`refresh_listener`, and `repl::mod`'s
-    /// `open_listener` from its fork-restart thread, do -- `repl::start`
-    /// itself no longer opens anything eagerly as of a later round of this
-    /// task; see its doc), none of which run outside a real process, so
+    /// Nothing else in this crate calls `shared().set_listen_addr(..)` -- only
+    /// `beat`'s own `acquire_listener`/`refresh_listener` and `repl::mod`'s
+    /// `open_listener`, none of which run outside a real process -- so
     /// `shared().listen_addr()` starts `None` here.
     ///
-    /// This asserts the actual property correction 5 exists for -- a prior
-    /// version of this test asserted only "does not panic", which a revert
-    /// of correction 5 (`beat` giving up before `probe_once` whenever it had
-    /// no listener) would still have passed, since giving up early panics
-     /// `beat` no longer opens a listener before it knows the role.
+    /// `beat` no longer opens a listener before it knows the role.
     ///
     /// **This test asserted the opposite until the probe moved off the engine.**
     /// The old probe was a write of the owner key, so it needed an address to
