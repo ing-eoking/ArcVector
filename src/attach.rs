@@ -33,6 +33,12 @@ fn secret() -> &'static str {
     SECRET.get_or_init(|| format!("{:016x}", crate::owner::unpredictable()))
 }
 
+/// The token to put in a command sent on the parked connection, so the
+/// handler can tell it apart from a client's.
+pub fn token() -> &'static str {
+    secret()
+}
+
 /// True if `token` came from this process's own attach thread.
 pub fn is_ours(token: &str) -> bool {
     // Length is fixed and both sides are in-process, so a plain compare is
@@ -136,10 +142,13 @@ static CLOSED: Condvar = Condvar::new();
 /// a borrowed cookie does none of that -- see
 /// `handler::arcus::engine::Store::replication_mode` for what it costs.
 ///
-/// Never send a command this crate itself handles. The reply is read on the
-/// calling thread while the daemon's worker thread runs the handler, so a
-/// `v*` command would have this thread waiting on a handler that may want a
-/// lock this thread holds.
+/// The reply is read on the calling thread while the daemon's worker thread
+/// runs the command, so anything this crate handles itself must not want a
+/// lock the caller is holding -- this would wait on it forever. `vowner` is
+/// written to that rule: it reads and writes one key through the engine and
+/// touches nothing else, in particular not [`PARKED`], which the caller holds
+/// for the whole exchange. Anything reaching the index machinery does not
+/// belong here.
 ///
 /// `None` means there was no connection, or the exchange failed -- in which
 /// case the connection is dropped and the attach thread dials a new one.

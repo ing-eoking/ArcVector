@@ -41,6 +41,18 @@ pub unsafe fn run(cookie: *const c_void, request: Request) -> Result<Reply> {
         return Ok(Reply::Body("ATTACHED\r\n".to_owned()));
     }
 
+    // Also answered early, and for the same reason as `Attach`: this is the
+    // parked connection asking the daemon to do a write on its own worker
+    // thread. It needs a store, but not the index machinery below.
+    #[cfg(feature = "replication")]
+    if let Request::Line(Line::Owner { token, addr }) = request {
+        if !crate::attach::is_ours(token) {
+            return Err(Error::bad_request("unknown command vowner"));
+        }
+        let store = &unsafe { store_for(cookie) }?;
+        return Ok(Reply::Body(crate::repl::role::owner_command(store, addr)));
+    }
+
     if arcus::abi::mismatched() {
         return Err(Error::Store(StoreError::AbiMismatch));
     }
@@ -60,6 +72,8 @@ pub unsafe fn run(cookie: *const c_void, request: Request) -> Result<Reply> {
         Request::Line(Line::Stats) => vstats(),
         #[cfg(parked_cookie)]
         Request::Line(Line::Attach { .. }) => unreachable!("answered above"),
+        #[cfg(feature = "replication")]
+        Request::Line(Line::Owner { .. }) => unreachable!("answered above"),
     }
 }
 

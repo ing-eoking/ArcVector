@@ -45,6 +45,15 @@ pub fn parse<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
                 token: tokens.text(1)?,
             }))
         }
+        #[cfg(feature = "replication")]
+        Some(Cmd::VOwner) => Ok(Parsed::Line(Line::Owner {
+            token: tokens.text(1)?,
+            addr: match tokens.len() {
+                2 => None,
+                3 => Some(tokens.text(2)?),
+                _ => return Err(malformed()),
+            },
+        })),
         None => Err(Error::bad_request(format!(
             "unknown command {}",
             tokens.text(0).unwrap_or("")

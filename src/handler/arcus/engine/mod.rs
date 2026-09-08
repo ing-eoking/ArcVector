@@ -1,5 +1,6 @@
 mod elem;
 mod error;
+mod kv;
 mod map;
 
 pub use elem::{HeldAddr, HeldElem, HeldMap, PendingElem};

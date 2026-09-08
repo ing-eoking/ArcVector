@@ -1,4 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
+
+use crate::handler::arcus::engine::{Store, StoreError};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
@@ -109,13 +111,11 @@ impl State {
 /// Not `arcus:`-prefixed on purpose. That prefix marks an item ITEM_INTERNAL,
 /// which exempts it from `scrub stale` -- and from the replication gate, which
 /// is the whole probe. A key nothing refuses answers no question.
-/// No space in it, unlike the `AV OWNER` this used to be. The space was
-/// deliberate -- it made the key unreachable from the ASCII protocol, so no
-/// client could collide with it -- but the key is now written over that same
-/// protocol, which tokenises on spaces. What is given up is that a client can
-/// now name this key; what is bought is that the write is an ordinary one,
-/// performed by the worker thread that owns the connection.
-pub const OWNER_KEY: &str = "AV_OWNER";
+/// The space is deliberate: no ASCII-protocol command can name this key, so
+/// no client can read or overwrite what a node publishes here. Nothing ever
+/// puts it on the wire -- `vowner` carries the *address*, and the handler
+/// names the key on the worker thread -- so the space costs nothing.
+pub const OWNER_KEY: &str = "AV OWNER";
 
 /// Long enough that the write is nothing, short enough that a value lost to
 /// `scrub stale` is back before it matters. That scrub runs once per cluster
@@ -258,33 +258,86 @@ fn classify_mode(mode: &str) -> Option<Probe> {
 /// Publishes `addr` as this master's address, but only when the key does not
 /// already say that.
 ///
-/// The read comes first and does the work in the common case, so a settled
-/// master writes nothing at all and the only writes left are the ones a
-/// promotion actually requires.
-///
-/// Returns whether the key names `addr` by the time this returns.
+/// Sends `vowner`; the daemon runs the actual engine write in
+/// [`owner_command`] below, on the worker thread that owns the parked
+/// connection. Returns whether the key names `addr` afterwards.
 pub fn publish_owner(addr: SocketAddr) -> bool {
-    let wanted = addr.to_string();
-    if read_owner().as_deref() == Some(wanted.as_str()) {
-        return true;
-    }
-    let stored = crate::attach::request(&format!(
-        "set {OWNER_KEY} 0 0 {}\r\n{wanted}",
-        wanted.len()
-    ));
-    matches!(stored.as_deref(), Some([line, ..]) if line == "STORED")
+    let addr = addr.to_string();
+    ask_owner(Some(&addr)).as_deref() == Some(addr.as_str())
 }
 
-/// Reads the owner key back off the daemon, `None` when it is unset or the
-/// exchange failed.
+/// Reads the owner key back, `None` when it is unset or the exchange failed.
 pub fn read_owner() -> Option<String> {
-    let reply = crate::attach::request(&format!("get {OWNER_KEY}"))?;
-    match reply.as_slice() {
-        [head, value, ..] if head.starts_with("VALUE ") => Some(value.clone()),
-        _ => None,
+    ask_owner(None)
+}
+
+/// One `vowner` exchange. `Some(addr)` publishes, `None` only reads.
+fn ask_owner(addr: Option<&str>) -> Option<String> {
+    let mut command = format!("vowner {}", crate::attach::token());
+    if let Some(addr) = addr {
+        command.push(' ');
+        command.push_str(addr);
+    }
+    let reply = crate::attach::request(&command)?;
+    parse_owner_reply(reply.first()?)
+}
+
+/// `OWNER <addr>` carries a value; a bare `OWNER` means the key is unset.
+/// Anything else -- an error line, say -- is no answer at all.
+fn parse_owner_reply(line: &str) -> Option<String> {
+    match line.strip_prefix("OWNER") {
+        Some("") => None,
+        Some(rest) => Some(rest.trim_start().to_owned()),
+        None => None,
     }
 }
 
+/// The `vowner` handler: runs on a memcached worker thread, holding that
+/// thread's own connection cookie.
+///
+/// This is the whole point of routing the write through a command. A keyed
+/// write stamps `last_cset_seqs[thr_idx]`, an unlocked array indexed by
+/// worker thread whose safety rests on memcached's own invariant of one
+/// in-flight write per worker thread. Reached here, that invariant holds: the
+/// daemon picked the thread, and it is the thread that owns the cookie being
+/// used. Reached from a background thread wearing a borrowed cookie it does
+/// not, and a client sharing that worker thread can be told its write is
+/// durable before the replica has it.
+///
+/// Reads before it writes, so a settled master writes nothing at all -- the
+/// only writes left are the ones a promotion actually requires. `add_kv` is
+/// `OPERATION_ADD` and will not replace a value, so a stale entry (the
+/// previous master's, replicated here before the switchover) is removed
+/// first; `remove_kv`'s own `KeyGone` is not a failure, it is the state the
+/// remove was for.
+pub fn owner_command(store: &Store, addr: Option<&str>) -> String {
+    let current = store
+        .get_kv(OWNER_KEY)
+        .ok()
+        .and_then(|raw| String::from_utf8(raw).ok());
+
+    let Some(wanted) = addr else {
+        return reply_line(current.as_deref());
+    };
+    if current.as_deref() == Some(wanted) {
+        return reply_line(Some(wanted));
+    }
+    match store.remove_kv(OWNER_KEY) {
+        Ok(()) | Err(StoreError::KeyGone) => {}
+        Err(_) => return reply_line(current.as_deref()),
+    }
+    match store.add_kv(OWNER_KEY, wanted.as_bytes()) {
+        Ok(()) => reply_line(Some(wanted)),
+        Err(_) => reply_line(None),
+    }
+}
+
+fn reply_line(addr: Option<&str>) -> String {
+    match addr {
+        Some(addr) => format!("OWNER {addr}\r\n"),
+        None => "OWNER\r\n".to_owned(),
+    }
+}
 
 /// Whether writes are refused here.
 ///
@@ -615,6 +668,32 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `OWNER <addr>` carries a value, a bare `OWNER` says the key is unset,
+    /// and anything else -- `CLIENT_ERROR ..` from a token the handler did not
+    /// recognise, say -- is no answer rather than an empty one.
+    #[test]
+    fn an_owner_reply_is_read_apart_from_an_unset_key_and_an_error() {
+        assert_eq!(
+            parse_owner_reply("OWNER 10.0.0.1:7654").as_deref(),
+            Some("10.0.0.1:7654")
+        );
+        assert_eq!(parse_owner_reply("OWNER"), None, "the key is unset");
+        assert_eq!(
+            parse_owner_reply("CLIENT_ERROR unknown command vowner"),
+            None,
+            "an error is not an address"
+        );
+    }
+
+    /// An IPv6 address keeps its colons and brackets intact through the reply.
+    #[test]
+    fn an_ipv6_owner_survives_the_round_trip() {
+        let addr: SocketAddr = "[::1]:7654".parse().expect("literal parses");
+        let line = reply_line(Some(&addr.to_string()));
+        let value = parse_owner_reply(line.trim_end()).expect("a value came back");
+        assert_eq!(value.parse::<SocketAddr>().ok(), Some(addr));
+    }
 
     /// The four values of `rp_mode_string[]`
     /// (`engines/default/replication.c`). `alone` and `disabled` read as

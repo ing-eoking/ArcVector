@@ -47,6 +47,14 @@ pub enum Cmd {
     /// worker thread, with a real cookie -- can hand that cookie to
     /// `crate::attach`.
     VAttach,
+    #[cfg(feature = "replication")]
+    /// Not for clients. Sent on the connection `crate::attach` parks, so that
+    /// the owner key is written by the worker thread that owns that
+    /// connection rather than by a background thread wearing its cookie --
+    /// see `handler::arcus::engine::Store::add_kv`. Carrying it as a command
+    /// is also what lets the key keep its space: `AV OWNER` is unreachable
+    /// from the ASCII protocol, and this never puts it there.
+    VOwner,
 }
 
 impl Cmd {
@@ -66,6 +74,10 @@ impl Cmd {
         #[cfg(parked_cookie)]
         if name.eq_ignore_ascii_case("vattach") {
             return Some(Cmd::VAttach);
+        }
+        #[cfg(feature = "replication")]
+        if name.eq_ignore_ascii_case("vowner") {
+            return Some(Cmd::VOwner);
         }
         NAMES
             .iter()
@@ -163,6 +175,12 @@ pub enum Line<'a> {
     #[cfg(parked_cookie)]
     Attach {
         token: &'a str,
+    },
+    #[cfg(feature = "replication")]
+    Owner {
+        token: &'a str,
+        /// `Some` publishes it, `None` only reads what is there.
+        addr: Option<&'a str>,
     },
 }
 
