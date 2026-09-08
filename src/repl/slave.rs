@@ -225,18 +225,66 @@ pub fn connect_loop() {
     }
     let _slot = Slot;
 
+    // Carried between rounds so a redirect survives the sleep: the owner key
+    // that sent us to the wrong node is still the same stale value, and
+    // re-reading it would send us straight back.
+    let mut redirect: Option<String> = None;
+
     loop {
         if role::shared().role() != role::Role::Replica {
             std::thread::sleep(RETRY);
+            redirect = None;
             continue;
         }
-        if let Some(addr) = master_addr()
-            && let Ok(sock) = TcpStream::connect(&addr)
-        {
-            session(sock);
-        }
+        redirect = dial_round(redirect.take());
         std::thread::sleep(RETRY);
     }
+}
+
+/// How many redirects one round follows before going back to the owner key.
+///
+/// A redirect is one node's opinion, and two nodes with stale views can name
+/// each other. Following a few is what makes a genuine hand-off resolve in
+/// one round instead of one per heartbeat; refusing to follow more is what
+/// keeps a cycle from spinning this thread. Whatever is unresolved after this
+/// waits for `RETRY` and starts again from a freshly read key, which by then
+/// has usually caught up.
+const MAX_REDIRECTS: usize = 3;
+
+/// One round of dialling: the address to try, then whatever it redirects to.
+///
+/// Returns a redirect the next round should start from, if this one ran out
+/// of hops still holding one. `None` means start again from the owner key --
+/// either because the round finished cleanly, or because there is nothing
+/// better to go on than what replication brings in.
+fn dial_round(start: Option<String>) -> Option<String> {
+    let mut target = match start.or_else(master_addr) {
+        Some(addr) => addr,
+        None => return None,
+    };
+
+    for _ in 0..MAX_REDIRECTS {
+        // A redirect can name this node -- the peer's own view can be as
+        // stale as ours -- and dialling ourselves would connect to our own
+        // listener and hang on a snapshot that never comes.
+        if role::shared().is_stale_owner(&target) {
+            return None;
+        }
+        let Ok(sock) = TcpStream::connect(&target) else {
+            // Down, not wrong. The address may still be right and the node
+            // still coming up, so this is left for the next round to re-read
+            // rather than being followed anywhere.
+            return None;
+        };
+        match session(sock) {
+            Some(next) if next != target => target = next,
+            // Either the session ran and ended on its own terms, or the peer
+            // redirected us to the address we just dialled, which is no new
+            // information.
+            _ => return None,
+        }
+    }
+    Some(target)
 }
 
 /// The owner key arrived here through arcus replication, the same path that
@@ -263,7 +311,7 @@ fn master_addr() -> Option<String> {
 /// and a promoted node must stop applying deltas as soon as that is known
 /// rather than riding the socket until it happens to close. The next task's
 /// teardown on role change depends on this loop actually noticing.
-fn session(mut sock: TcpStream) {
+fn session(mut sock: TcpStream) -> Option<String> {
     let _ = sock.set_nodelay(true);
     let hello = wire::encode(&Msg::Sync {
         node_id: crate::owner::ours().to_owned(),
@@ -271,7 +319,7 @@ fn session(mut sock: TcpStream) {
         accepts_graph: false,
     });
     if sock.write_all(&hello).is_err() {
-        return;
+        return None;
     }
 
     let mut pending = Pending::default();
@@ -281,17 +329,24 @@ fn session(mut sock: TcpStream) {
     let mut last_expiry_check: Option<Instant> = None;
     let mut reader = match sock.try_clone() {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => return None,
     };
     let _ = reader.set_read_timeout(Some(RETRY));
 
     loop {
         if role::shared().role() != role::Role::Replica {
-            return;
+            return None;
         }
 
         match wire::read_frame(&mut reader) {
             Ok(frame) => match wire::decode(&frame) {
+                // The node we dialled is not the master. It is the only one
+                // that can say so authoritatively -- the owner key we read to
+                // get here is whatever replicated in last -- so take its word
+                // and its suggestion, and stop reading this connection.
+                Ok(Msg::NotMaster { master }) => {
+                    return Some(master).filter(|m| !m.is_empty());
+                }
                 Ok(msg) => {
                     apply(msg, &mut pending);
                     // Retried right away, not just on the idle tick below:
@@ -308,7 +363,7 @@ fn session(mut sock: TcpStream) {
                         last_retry = Some(Instant::now());
                     }
                 }
-                Err(_) => return, // A frame we cannot read desynchronises us.
+                Err(_) => return None, // A frame we cannot read desynchronises us.
             },
             Err(wire::WireError::Io(e))
                 if e.kind() == std::io::ErrorKind::WouldBlock
@@ -322,7 +377,7 @@ fn session(mut sock: TcpStream) {
                     last_retry = Some(Instant::now());
                 }
             }
-            Err(_) => return,
+            Err(_) => return None,
         }
 
         // Throttled like the retry above and for the same reason: this is an
@@ -365,6 +420,10 @@ fn should_retry(last_retry: Option<Instant>, now: Instant) -> bool {
 
 fn apply(msg: Msg, pending: &mut Pending) {
     match msg {
+        // Handled where the connection can actually be abandoned, in
+        // `session`; a redirect reaching here would mean the read loop let it
+        // past, and there is nothing useful to do with it this far in.
+        Msg::NotMaster { .. } => {}
         Msg::Snapshot { indexes } => {
             for name in indexes {
                 converge(&name);
@@ -736,6 +795,24 @@ mod tests {
         release_loop_slot();
         assert!(claim_loop_slot(), "and the slot is reusable afterwards");
         release_loop_slot();
+    }
+
+    /// A redirect is followed, but only so far. Two nodes with stale views
+    /// can name each other, and this thread must not spin between them.
+    #[test]
+    fn following_redirects_is_bounded() {
+        assert_eq!(MAX_REDIRECTS, 3, "a cycle must cost a bounded round");
+    }
+
+    /// An empty `master` is "I do not know", not "nobody". `session` turns it
+    /// into `None` so the next round re-reads the owner key and polls, rather
+    /// than treating the empty string as an address to dial.
+    #[test]
+    fn a_redirect_that_names_nobody_is_not_an_address() {
+        let named = Some("10.0.0.2:7654".to_owned()).filter(|m: &String| !m.is_empty());
+        let unknown = Some(String::new()).filter(|m: &String| !m.is_empty());
+        assert_eq!(named.as_deref(), Some("10.0.0.2:7654"));
+        assert_eq!(unknown, None);
     }
 
     /// The memo `upsert`'s converge-on-miss is bounded by. Its only job is to

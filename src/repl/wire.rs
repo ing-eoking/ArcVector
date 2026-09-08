@@ -26,6 +26,7 @@ const T_SYNC: u8 = 1;
 const T_SNAPSHOT: u8 = 2;
 const T_DELTA: u8 = 3;
 const T_RESYNC: u8 = 4;
+const T_NOT_MASTER: u8 = 5;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Op {
@@ -55,6 +56,21 @@ pub enum Msg {
         /// Empty means "everything" -- the master has never sent a
         /// targeted resync, only this one sentinel.
         index: String,
+    },
+    /// Sent in place of a `Snapshot` by a node that was dialled as the master
+    /// and is not one, then the connection is closed.
+    ///
+    /// The owner key is read from whatever replicated in most recently, so a
+    /// replica can dial an address that was the master a moment ago. That
+    /// node knows better than the stale key does -- it knows it is a replica,
+    /// and it has its own view of who the master is -- so it says so rather
+    /// than letting the dialler sit on a connection that will never carry a
+    /// delta.
+    NotMaster {
+        /// Where this node believes the master is. Empty when it does not
+        /// know, which is not the same as naming nobody: the dialler keeps
+        /// polling rather than treating it as an answer.
+        master: String,
     },
 }
 
@@ -135,6 +151,10 @@ pub fn encode(msg: &Msg) -> Vec<u8> {
             body.push(T_RESYNC);
             put_str(&mut body, index);
         }
+        Msg::NotMaster { master } => {
+            body.push(T_NOT_MASTER);
+            put_str(&mut body, master);
+        }
     }
     let mut out = Vec::with_capacity(4 + body.len());
     out.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -196,6 +216,9 @@ pub fn decode(frame: &[u8]) -> Result<Msg, WireError> {
         }
         T_RESYNC => Ok(Msg::Resync {
             index: take_str(rest, at)?,
+        }),
+        T_NOT_MASTER => Ok(Msg::NotMaster {
+            master: take_str(rest, at)?,
         }),
         other => Err(WireError::UnknownType(other)),
     }
@@ -265,6 +288,15 @@ mod tests {
         });
         roundtrip(Msg::Resync {
             index: "idx".to_owned(),
+        });
+        roundtrip(Msg::NotMaster {
+            master: "10.0.0.2:7654".to_owned(),
+        });
+        // "I am not the master and I do not know who is" has to survive the
+        // round trip distinctly from naming someone: the dialler polls on the
+        // empty one instead of chasing it.
+        roundtrip(Msg::NotMaster {
+            master: String::new(),
         });
     }
 

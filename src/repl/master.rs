@@ -348,6 +348,17 @@ fn handshake(sock: &TcpStream) -> Option<Weak<Replica>> {
         );
         return None;
     }
+    // The listener can outlive the role. A demotion closes it, but a replica
+    // dialling the owner key's last value can arrive first, and the key it
+    // read may name this node long after it stopped being the master. Saying
+    // so -- with whoever this node now believes the master is -- turns a
+    // connection that would never carry a delta into one redirect.
+    if super::role::shared().role() != super::role::Role::Master {
+        let mut writer = sock.try_clone().ok()?;
+        let master = super::role::read_owner().unwrap_or_default();
+        let _ = writer.write_all(&wire::encode(&Msg::NotMaster { master }));
+        return None;
+    }
 
     let replica = Arc::new(Replica::new(node_id.clone(), DEPTH));
     let weak = Arc::downgrade(&replica);
