@@ -68,6 +68,8 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
 
                 sweep::retire(previous);
             }
+            #[cfg(feature = "replication")]
+            crate::repl::publish(name, "", crate::repl::Op::Upsert);
             Ok(Reply::Created)
         }
 
@@ -134,6 +136,8 @@ pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {
     let known = registry::remove(name);
 
     Ok(if known || dropped {
+        #[cfg(feature = "replication")]
+        crate::repl::publish(name, "", crate::repl::Op::Delete);
         Reply::Dropped
     } else {
         Reply::NotFound

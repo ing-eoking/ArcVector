@@ -559,7 +559,7 @@ impl Drop for HeldMap {
         if self.array.is_null() {
             return;
         }
-        let Some(store) = Store::detached() else {
+        let Some(store) = Store::background() else {
             return;
         };
 

@@ -2,10 +2,11 @@ use std::collections::{HashMap, TryReserveError};
 #[cfg(recovery)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, PoisonError, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
 
 use crate::handler::access::sweep;
 use crate::handler::usearch::AnnIndex;
+use crate::owner;
 
 pub const SERVING: u8 = 0;
 
@@ -40,6 +41,15 @@ pub struct VectorIndex {
     pub maxcount: u32,
     state: AtomicU8,
 
+    /// The owner token last recorded for this index, read back by
+    /// `stamped_as`. Kept separate from `crate::owner::ours()` because a
+    /// replica's `stamp` skips its own write, so its Map keeps whatever
+    /// owner was already there -- usually `owner::NOBODY`, the value
+    /// `drain` last wrote. Recording that same value here, instead of
+    /// always assuming our own token, is what keeps `resolve`'s comparison
+    /// against the Map stable instead of drifting into a permanent re-drain.
+    owner: Mutex<String>,
+
     published: AtomicU64,
 
     last_access: AtomicU64,
@@ -56,7 +66,9 @@ pub struct VectorIndex {
 
 impl VectorIndex {
     pub fn ours(name: String, ann: AnnIndex, maxcount: u32) -> Self {
-        Self::new(name, ann, maxcount, SERVING)
+        let index = Self::new(name, ann, maxcount, SERVING);
+        index.mark_ours();
+        index
     }
 
     pub fn rebuilding(name: String, ann: AnnIndex, maxcount: u32) -> Self {
@@ -73,6 +85,7 @@ impl VectorIndex {
             ann,
             maxcount,
             state: AtomicU8::new(state),
+            owner: Mutex::new(String::new()),
             published: AtomicU64::new(0),
             last_access: AtomicU64::new(0),
             #[cfg(recovery)]
@@ -90,11 +103,41 @@ impl VectorIndex {
         self.state.load(Ordering::Acquire)
     }
 
-    pub fn stamped_as(&self) -> &'static str {
+    /// The owner token as of this call, copied out.
+    ///
+    /// This allocates, which used to rule it out for `resolve` -- a clone on
+    /// every request, thrown away one comparison later, was exactly the cost
+    /// this crate was trying to cut. Now that a recovery build's `resolve`
+    /// only reaches this comparison on first touch (a registry miss), the
+    /// clone is cheap enough there and `stamped_as` is what it calls; a
+    /// build with neither replication nor persistence still runs the
+    /// comparison on every request and uses `owned_by` instead, below.
+    pub fn stamped_as(&self) -> String {
         if self.state() == SERVING {
-            crate::owner::ours()
+            self.owner
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
         } else {
-            crate::owner::NOBODY
+            owner::NOBODY.to_owned()
+        }
+    }
+
+    /// Whether this index is currently serving under exactly `token`.
+    ///
+    /// Same answer as `token == self.stamped_as()`, but without allocating a
+    /// `String` to throw away immediately after -- which is why every build
+    /// that asks this question on the request path uses it. Only a
+    /// `replication` build does not: there the replication stream reports a
+    /// takeover directly, so `resolve` reads the owner on first touch alone
+    /// (`access::map_was_taken_over`), and by then a clone is cheap enough that
+    /// it uses `stamped_as`.
+    #[cfg_attr(all(recovery, feature = "replication"), expect(dead_code))]
+    pub(in crate::handler) fn owned_by(&self, token: &str) -> bool {
+        if self.state() == SERVING {
+            *self.owner.lock().unwrap_or_else(PoisonError::into_inner) == token
+        } else {
+            token == owner::NOBODY
         }
     }
 
@@ -202,6 +245,16 @@ impl VectorIndex {
     }
 
     pub(in crate::handler) fn mark_ours(&self) {
+        self.mark_owned_by(owner::ours());
+    }
+
+    /// Stamps this index as serving under a given owner token, rather than
+    /// assuming it is always our own. `recovery::claim_refilled` uses this on
+    /// a replica, where the token that ends up matching the Map is whatever
+    /// the Map already holds -- not `owner::ours()`, since a replica's
+    /// `stamp` never gets to write that.
+    pub(in crate::handler) fn mark_owned_by(&self, token: &str) {
+        *self.owner.lock().unwrap_or_else(PoisonError::into_inner) = token.to_owned();
         self.state.store(SERVING, Ordering::Release);
     }
 
@@ -212,7 +265,10 @@ impl VectorIndex {
             .is_ok()
     }
 
-    #[cfg_attr(not(recovery), expect(dead_code))]
+    // `not(test)`: the unit tests drive state transitions through this
+    // directly, so under `--all-targets` it is live in every configuration and
+    // an unqualified expectation is itself the warning.
+    #[cfg_attr(all(not(recovery), not(test)), expect(dead_code))]
     pub(super) fn mark_state(&self, now: u8) {
         self.state.store(now, Ordering::Release);
     }
@@ -244,6 +300,7 @@ pub fn contains(name: &str) -> bool {
 pub fn put(
     index: VectorIndex,
 ) -> Result<(Arc<VectorIndex>, Option<Arc<VectorIndex>>), TryReserveError> {
+    sweep::ensure_sweeper();
     let mut reg = write();
     reg.try_reserve(1)?;
     let index = Arc::new(index);
@@ -291,6 +348,7 @@ pub fn remove_if_stale(name: &str, stamp: u64) -> bool {
 }
 
 pub fn insert_or_get(index: VectorIndex) -> Result<(Arc<VectorIndex>, bool), TryReserveError> {
+    sweep::ensure_sweeper();
     let mut reg = write();
     reg.try_reserve(1)?;
     let mut inserted = false;
@@ -322,24 +380,36 @@ pub fn remove_observed(name: &str, observed: &VectorIndex) -> bool {
     }
 }
 
-pub(in crate::handler) fn indexes() -> Vec<Arc<VectorIndex>> {
+/// `Err` means the listing could not be built under memory pressure -- not
+/// that the registry is empty. Callers that would act on the difference
+/// (the replication master, telling a replica what exists) must not collapse
+/// the two; callers that treat "nothing to do this round" as harmless either
+/// way (the sweeper) may flatten it with `unwrap_or_default`.
+pub fn indexes() -> Result<Vec<Arc<VectorIndex>>, TryReserveError> {
     let reg = read();
     let mut all = Vec::new();
-    if all.try_reserve(reg.len()).is_err() {
-        return Vec::new();
-    }
+    all.try_reserve(reg.len())?;
     all.extend(reg.values().cloned());
-    all
+    Ok(all)
 }
 
-pub(in crate::handler) fn coldest(limit: usize) -> Vec<String> {
+/// The least recently used indexes, for the sweeper to look at.
+///
+/// Handing back the indexes rather than their names is what keeps the rotation
+/// honest: a second lookup would go through `get`, which touches what it finds,
+/// and a sweep that warms everything it inspects never reaches a cold name.
+pub(in crate::handler) fn coldest(limit: usize) -> Vec<Arc<VectorIndex>> {
     let reg = read();
-    coldest_of(
+    let names = coldest_of(
         reg.iter()
             .filter(|(_, index)| index.state() != BUILDING)
             .map(|(name, index)| (index.accessed_at(), name.as_str())),
         limit,
-    )
+    );
+    names
+        .iter()
+        .filter_map(|name| reg.get(name).cloned())
+        .collect()
 }
 
 fn coldest_of<'a>(entries: impl Iterator<Item = (u64, &'a str)>, limit: usize) -> Vec<String> {
@@ -417,7 +487,7 @@ mod tests {
             "an entry whose Map is still being written must survive any verdict"
         );
         assert!(
-            !coldest(10).contains(&name.to_owned()),
+            !coldest(10).iter().any(|index| index.name == name),
             "and it is not offered for sweeping either"
         );
 

@@ -24,6 +24,18 @@ fn main() {
         println!("cargo:rustc-cfg=recovery");
     }
 
+    // Builds whose background threads pass a key to the engine, and so need a
+    // real cookie parked by `src/attach.rs` to pass with it. `migration`'s gate
+    // writes the new owner through the cookie on a read of a moved key;
+    // `replication`'s gate reaches `set_switchover_node`/`get_thread_index`,
+    // which dereference it unguarded, on a write during a switchover. Both
+    // arrive at the same requirement, so both compile `attach` and the
+    // `vattach` command it hands its cookie over with.
+    println!("cargo::rustc-check-cfg=cfg(parked_cookie)");
+    if enabled("replication") || enabled("migration") {
+        println!("cargo:rustc-cfg=parked_cookie");
+    }
+
     let generated = out.join("engine_api.rs");
     bindings(&include, &header, &generated);
 

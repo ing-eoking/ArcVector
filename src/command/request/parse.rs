@@ -36,6 +36,15 @@ pub fn parse<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
         }
         Some(Cmd::VList) => no_arguments(tokens).map(|()| Parsed::Line(Line::List)),
         Some(Cmd::VStats) => no_arguments(tokens).map(|()| Parsed::Line(Line::Stats)),
+        #[cfg(parked_cookie)]
+        Some(Cmd::VAttach) => {
+            if tokens.len() != 2 {
+                return Err(malformed());
+            }
+            Ok(Parsed::Line(Line::Attach {
+                token: tokens.text(1)?,
+            }))
+        }
         None => Err(Error::bad_request(format!(
             "unknown command {}",
             tokens.text(0).unwrap_or("")

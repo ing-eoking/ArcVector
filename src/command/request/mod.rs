@@ -41,6 +41,12 @@ pub enum Cmd {
     VDrop,
     VList,
     VStats,
+    #[cfg(parked_cookie)]
+    /// Not for clients. The connection this process parks against its own
+    /// service port sends this once, so that the handler -- which runs on a
+    /// worker thread, with a real cookie -- can hand that cookie to
+    /// `crate::attach`.
+    VAttach,
 }
 
 impl Cmd {
@@ -56,6 +62,11 @@ impl Cmd {
             ("vlist", Cmd::VList),
             ("vstats", Cmd::VStats),
         ];
+        // Kept out of the table so the table stays the list of client commands.
+        #[cfg(parked_cookie)]
+        if name.eq_ignore_ascii_case("vattach") {
+            return Some(Cmd::VAttach);
+        }
         NAMES
             .iter()
             .find(|(text, _)| name.eq_ignore_ascii_case(text))
@@ -149,6 +160,10 @@ pub enum Line<'a> {
     },
     List,
     Stats,
+    #[cfg(parked_cookie)]
+    Attach {
+        token: &'a str,
+    },
 }
 
 #[derive(Debug)]

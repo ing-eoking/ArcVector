@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -9,12 +8,6 @@ const TICK: Duration = Duration::from_secs(1);
 
 const BATCH: usize = 10;
 
-struct Probe {
-    name: String,
-
-    stamp: u64,
-}
-
 struct Sweeper {
     state: Mutex<State>,
     wake: Condvar,
@@ -22,14 +15,8 @@ struct Sweeper {
 
 #[derive(Default)]
 struct State {
-    offered: Vec<Probe>,
-
-    gone: Vec<Probe>,
-
     retired: Vec<Arc<VectorIndex>>,
 }
-
-static OFFERED: AtomicUsize = AtomicUsize::new(0);
 
 static SWEEPER: LazyLock<Sweeper> = LazyLock::new(|| {
     std::thread::Builder::new()
@@ -42,57 +29,22 @@ static SWEEPER: LazyLock<Sweeper> = LazyLock::new(|| {
     }
 });
 
+/// Starts the sweeper if it is not running. Called when an index enters the
+/// registry, which is the first moment there is anything to sweep -- and it has
+/// to be then rather than at load time, because `-d` forks after the extensions
+/// load and no thread survives that.
+pub(in crate::handler) fn ensure_sweeper() {
+    LazyLock::force(&SWEEPER);
+}
+
 fn state() -> MutexGuard<'static, State> {
     SWEEPER.state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-pub fn maybe(store: &Store) {
-    if OFFERED.load(Ordering::Relaxed) == 0 {
-        return;
-    }
-    let Some(probe) = take_offer() else { return };
-    let Some(index) = registry::get(&probe.name) else {
-        return;
-    };
-    if index.is_rebuilding() {
-        return;
-    }
-
-    let name = &probe.name;
-    let counted = index.ann.reconcile(|| {
-        store
-            .probe_map(name)
-            .map(|map| map.count.saturating_sub(1) as usize)
-    });
-    match counted {
-        Ok(None) => {}
-        Ok(Some((in_map, named))) => {
-            eprintln!(
-                "ArcVector: index '{name}' names {named} element(s) but its Map holds {in_map}; \
-                 dropping the graph so the next read rebuilds it"
-            );
-            registry::remove_observed(name, &index);
-        }
-        Err(StoreError::KeyGone) => hand_back(probe),
-        Err(_) => {}
-    }
-}
-
-fn take_offer() -> Option<Probe> {
-    let mut state = state();
-    let probe = state.offered.pop();
-    OFFERED.store(state.offered.len(), Ordering::Relaxed);
-    probe
-}
-
-fn hand_back(probe: Probe) {
-    let mut state = state();
-    if state.gone.try_reserve(1).is_ok() {
-        state.gone.push(probe);
-        SWEEPER.wake.notify_one();
-    }
-}
-
+/// Hands a graph no longer in the registry to the sweeper to drop.
+///
+/// Freeing one returns every element it holds to the engine, which is work a
+/// request should not be made to wait through.
 pub(in crate::handler) fn retire(evicted: Option<Arc<VectorIndex>>) {
     let Some(index) = evicted else { return };
     let mut state = state();
@@ -108,60 +60,83 @@ pub(in crate::handler) fn retire(evicted: Option<Arc<VectorIndex>>) {
 fn run() {
     let mut last_round = Instant::now();
     loop {
-        let (gone, retired) = {
+        let retired = {
             let mut state = state();
-            if state.gone.is_empty() && state.retired.is_empty() {
+            if state.retired.is_empty() {
                 state = SWEEPER
                     .wake
                     .wait_timeout(state, TICK)
                     .unwrap_or_else(PoisonError::into_inner)
                     .0;
             }
-            (
-                std::mem::take(&mut state.gone),
-                std::mem::take(&mut state.retired),
-            )
+            std::mem::take(&mut state.retired)
         };
-
-        for probe in gone {
-            if registry::remove_if_stale(&probe.name, probe.stamp) {
-                let name = &probe.name;
-                eprintln!(
-                    "ArcVector: index '{name}' has no Map; released the graph it was built from"
-                );
-            }
-        }
 
         drop(retired);
 
         if last_round.elapsed() >= TICK {
             last_round = Instant::now();
             crate::server::tick();
-            for index in registry::indexes() {
+            for index in registry::indexes().unwrap_or_default() {
                 index.ann.retry_stuck();
                 index.ann.reclaim();
             }
-            offer_round();
+            probe_round();
         }
     }
 }
 
-fn offer_round() {
-    if OFFERED.load(Ordering::Relaxed) != 0 {
+/// Asks the engine, for the coldest few indexes, whether the Map each graph was
+/// built from is still there and still agrees on how many elements it holds.
+///
+/// The Map can go without anyone telling us -- it expires, or the engine evicts
+/// it -- and until this notices, the graph answers from memory that no longer
+/// has a store behind it. Nothing else asks: a name no command touches is
+/// exactly the one that goes stale unseen, so the question has to come from
+/// here rather than from a request.
+fn probe_round() {
+    // Keyed calls run the migration gate, which writes the new owner through the
+    // cookie when a key has moved. Skip the round until there is one to write
+    // to -- these names will still be the coldest a second from now.
+    let Some(store) = Store::background_keyed() else {
         return;
-    }
+    };
 
     let stamp = registry::now();
-    let round: Vec<Probe> = registry::coldest(BATCH)
-        .into_iter()
-        .rev()
-        .map(|name| Probe { name, stamp })
-        .collect();
-    if round.is_empty() {
+    for index in registry::coldest(BATCH) {
+        probe(&store, &index, stamp);
+    }
+}
+
+fn probe(store: &Store, index: &Arc<VectorIndex>, stamp: u64) {
+    if index.is_rebuilding() {
         return;
     }
 
-    let mut state = state();
-    state.offered = round;
-    OFFERED.store(state.offered.len(), Ordering::Relaxed);
+    let name = &index.name;
+    let counted = index.ann.reconcile(|| {
+        store
+            .probe_map(name)
+            .map(|map| map.count.saturating_sub(1) as usize)
+    });
+    match counted {
+        Ok(None) => {}
+        Ok(Some((in_map, named))) => {
+            eprintln!(
+                "ArcVector: index '{name}' names {named} element(s) but its Map holds {in_map}; \
+                 dropping the graph so the next read rebuilds it"
+            );
+            registry::remove_observed(name, index);
+        }
+        // The Map is gone. `stamp` was taken before the round, so an index
+        // published since then survives -- the answer is about the old one.
+        Err(StoreError::KeyGone) => {
+            if registry::remove_if_stale(name, stamp) {
+                eprintln!(
+                    "ArcVector: index '{name}' has no Map; released the graph it was built from"
+                );
+            }
+        }
+        Err(_) => {}
+    }
 }

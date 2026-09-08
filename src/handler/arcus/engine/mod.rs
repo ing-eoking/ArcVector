@@ -1,5 +1,6 @@
 mod elem;
 mod error;
+mod kv;
 mod map;
 
 pub use elem::{HeldAddr, HeldElem, HeldMap, PendingElem};
@@ -43,6 +44,21 @@ fn engine() -> *mut engine_interface_v1 {
     }
 }
 
+/// Null until `crate::attach` parks a connection. Only `background_keyed`
+/// insists on a real one.
+///
+/// A build with neither `migration` nor `replication` never compiles `attach`
+/// at all, and has no gate that looks at the cookie, so it is always null here.
+#[cfg(not(parked_cookie))]
+fn background_cookie() -> *const c_void {
+    ptr::null()
+}
+
+#[cfg(parked_cookie)]
+fn background_cookie() -> *const c_void {
+    crate::attach::cookie()
+}
+
 #[derive(Clone, Copy)]
 pub struct Store {
     engine: *mut engine_interface_v1,
@@ -55,12 +71,65 @@ impl Store {
         (!engine.is_null()).then_some(Self { engine, cookie })
     }
 
-    pub fn detached() -> Option<Self> {
+    /// A store for work no request asked for, limited to the engine calls that
+    /// never look at the cookie: `get_elem_info`, the `*_elem_release` family,
+    /// `get_config`. Always available, so a release is never skipped.
+    ///
+    /// Anything that takes a key must come from [`Store::background_keyed`],
+    /// which is the same store with the cookie proven present.
+    pub fn background() -> Option<Self> {
         let engine = engine();
         (!engine.is_null()).then_some(Self {
             engine,
-            cookie: ptr::null(),
+            cookie: background_cookie(),
         })
+    }
+
+    /// A store a background thread may pass a key to, `None` until
+    /// `crate::attach` has a connection parked and again while a lost one is
+    /// replaced; the caller skips that round.
+    ///
+    /// The check is unconditional. It used to be `#[cfg(feature = "migration")]`,
+    /// justified by "without `migration` the server compiles `ACTION_BEFORE_READ`
+    /// away, so the null cookie is fine" -- **that justification was wrong**, and
+    /// nothing like it should be reinstated. Two separate gates dereference the
+    /// cookie, and only one of them is migration's:
+    ///
+    /// * `ACTION_BEFORE_READ` really is `#ifdef ENABLE_MIGRATION`, and a read of
+    ///   a key this node has handed off reaches `set_not_my_key_info`, which
+    ///   writes the new owner through the cookie.
+    /// * `ACTION_BEFORE_WRITE` is `#if defined(ENABLE_REPLICATION) ||
+    ///   defined(ENABLE_MIGRATION)` (`engines/default/default_engine.c`), so a
+    ///   `replication`-only build has it too. Its master arm calls
+    ///   `do_check_master_switchover_done(cookie)`, which during a switchover
+    ///   reaches `set_switchover_node(cookie, ..)` (`c->swover_node[0] = ..`) or
+    ///   `get_thread_index(cookie)` (`c->thread->index`) -- both unguarded. Only
+    ///   the slave arm handles a null cookie.
+    ///
+    /// `repl::role`'s ten-second `AV OWNER` heartbeat is exactly such a keyed
+    /// background write, and `AV OWNER` has no `arcus:` prefix, so it does not
+    /// take `rp_before_check`'s skip. Outside a switchover a null cookie survives
+    /// (`WTHREAD_SET_LAST_CSET_SEQ` is `if (cookie)`-guarded); the first
+    /// ZK-driven switchover is where it would take the daemon down.
+    ///
+    /// `cfg(parked_cookie)` -- `migration || replication` -- is exactly the set
+    /// of builds where one of those two gates is compiled into the server, and
+    /// also exactly the set where `attach` is compiled and so a cookie can ever
+    /// arrive. A build with neither has no gate to trip, and refusing the null
+    /// cookie there would refuse *every* keyed background call for the life of
+    /// the process: `recovery::run_builder` would requeue every rebuild
+    /// forever, so a `persistence`-only node could never rebuild a graph from a
+    /// Map that outlived it, and `access::sweep::probe_round` would never probe.
+    /// The `abi::verify` check is what makes the correspondence sound -- a crate
+    /// built without these features cannot attach to a server that has them,
+    /// because the added vtable members change the member count it compares.
+    pub fn background_keyed() -> Option<Self> {
+        let store = Self::background()?;
+        #[cfg(parked_cookie)]
+        if store.cookie.is_null() {
+            return None;
+        }
+        Some(store)
     }
 
     fn handle(&self) -> *mut ENGINE_HANDLE {
@@ -99,54 +168,17 @@ impl Store {
     pub fn max_map_size(&self) -> u32 {
         self.config_u32(c"max_map_size", DEFAULT_MAX_MAP_SIZE)
     }
-
-    /// Whether this node is a replica, asked by offering it a write.
-    ///
-    /// A master is not told it is a master; only a replica is told it is one,
-    /// and it is told by having a write refused with `ENGINE_REPL_SLAVE`. So the
-    /// question is put as a write, and the refusal is the answer.
-    ///
-    /// The write is a delete of a key that does not exist. `default_item_delete`
-    /// runs the replication gate before it looks the key up, so a replica
-    /// answers `ENGINE_REPL_SLAVE` and a master answers `ENGINE_KEY_ENOENT`,
-    /// having touched nothing. Nothing is allocated and nothing is stored, which
-    /// matters twice over: an allocate passes through the same gate, so on a
-    /// replica it would fail before there was anything to write, and arcus
-    /// counts `nbytes` with the trailing CRLF included -- a value this has no
-    /// use for and would have to invent.
-    ///
-    /// Anything else -- including an engine with no `remove` -- reads as "not a
-    /// replica", which is the answer that lets the caller carry on.
-    pub fn ping_slave(&self) -> bool {
-        let key = b"arcus:repl-probe";
-        let Some(remove) = self.vtable().remove else {
-            return false;
-        };
-
-        let code = unsafe {
-            remove(
-                self.handle(),
-                self.cookie,
-                key.as_ptr().cast::<c_void>(),
-                key.len(),
-                0, // cas: any
-                0, // vbucket
-            )
-        };
-
-        code == error::ENGINE_REPL_SLAVE
-    }
 }
 
 pub struct DetachedElements;
 
 impl crate::handler::usearch::Elements for DetachedElements {
     fn id_at(&self, addr: u64) -> Option<std::sync::Arc<str>> {
-        Store::detached()?.id_at(addr)
+        Store::background()?.id_at(addr)
     }
 
     fn release(&self, addrs: &[u64]) {
-        if let Some(store) = Store::detached() {
+        if let Some(store) = Store::background() {
             store.release_held(addrs);
         }
     }

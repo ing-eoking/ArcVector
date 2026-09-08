@@ -32,7 +32,7 @@ fn started() -> u128 {
     })
 }
 
-fn unpredictable() -> u64 {
+pub(crate) fn unpredictable() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     std::collections::hash_map::RandomState::new()
         .build_hasher()
