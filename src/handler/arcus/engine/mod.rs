@@ -1,6 +1,5 @@
 mod elem;
 mod error;
-mod kv;
 mod map;
 
 pub use elem::{HeldAddr, HeldElem, HeldMap, PendingElem};
@@ -89,11 +88,11 @@ impl Store {
     /// `crate::attach` has a connection parked and again while a lost one is
     /// replaced; the caller skips that round.
     ///
-    /// The check is unconditional. It used to be `#[cfg(feature = "migration")]`,
-    /// justified by "without `migration` the server compiles `ACTION_BEFORE_READ`
-    /// away, so the null cookie is fine" -- **that justification was wrong**, and
-    /// nothing like it should be reinstated. Two separate gates dereference the
-    /// cookie, and only one of them is migration's:
+    /// The check used to be `#[cfg(feature = "migration")]`, justified by
+    /// "without `migration` the server compiles `ACTION_BEFORE_READ` away, so the
+    /// null cookie is fine" -- **that justification was wrong**, and nothing like
+    /// it should be reinstated. Two separate gates dereference the cookie, and
+    /// only one of them is migration's:
     ///
     /// * `ACTION_BEFORE_READ` really is `#ifdef ENABLE_MIGRATION`, and a read of
     ///   a key this node has handed off reaches `set_not_my_key_info`, which
@@ -106,10 +105,14 @@ impl Store {
     ///   `get_thread_index(cookie)` (`c->thread->index`) -- both unguarded. Only
     ///   the slave arm handles a null cookie.
     ///
-    /// `repl::role`'s ten-second `AV OWNER` heartbeat is exactly such a keyed
-    /// background write, and `AV OWNER` has no `arcus:` prefix, so it does not
-    /// take `rp_before_check`'s skip. Outside a switchover a null cookie survives
-    /// (`WTHREAD_SET_LAST_CSET_SEQ` is `if (cookie)`-guarded); the first
+    /// No background *write* goes through here any more -- `repl::role` sends
+    /// the owner key over `crate::attach`'s connection instead, so the daemon
+    /// runs it on the worker thread that owns that connection. The null check
+    /// stays regardless: the reads that remain (`recovery::run_builder`,
+    /// `access::sweep::probe_round`, the replica's `slave` resolves) run the
+    /// migration gate, and nothing stops a future caller from adding a write
+    /// back. Outside a switchover a null cookie happens to survive the write
+    /// gate (`WTHREAD_SET_LAST_CSET_SEQ` is `if (cookie)`-guarded); the first
     /// ZK-driven switchover is where it would take the daemon down.
     ///
     /// `cfg(parked_cookie)` -- `migration || replication` -- is exactly the set

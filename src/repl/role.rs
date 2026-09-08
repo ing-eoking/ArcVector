@@ -1,9 +1,8 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::handler::arcus::engine::{Store, StoreError};
 
 /// What this node is, as far as the last probe could tell.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -110,7 +109,13 @@ impl State {
 /// Not `arcus:`-prefixed on purpose. That prefix marks an item ITEM_INTERNAL,
 /// which exempts it from `scrub stale` -- and from the replication gate, which
 /// is the whole probe. A key nothing refuses answers no question.
-pub const OWNER_KEY: &str = "AV OWNER";
+/// No space in it, unlike the `AV OWNER` this used to be. The space was
+/// deliberate -- it made the key unreachable from the ASCII protocol, so no
+/// client could collide with it -- but the key is now written over that same
+/// protocol, which tokenises on spaces. What is given up is that a client can
+/// now name this key; what is bought is that the write is an ordinary one,
+/// performed by the worker thread that owns the connection.
+pub const OWNER_KEY: &str = "AV_OWNER";
 
 /// Long enough that the write is nothing, short enough that a value lost to
 /// `scrub stale` is back before it matters. That scrub runs once per cluster
@@ -196,64 +201,90 @@ pub fn shared() -> &'static State {
     SHARED.get_or_init(State::default)
 }
 
-/// One write of `AV OWNER`, and what it means. `None` when the write's
-/// outcome says nothing about replication -- a transient loss of the vtable,
-/// say -- so the caller has a round to skip rather than a verdict to commit.
+/// This node's replication role, asked of the daemon over the connection
+/// `crate::attach` parks rather than inferred from whether a write is refused.
 ///
-/// `Probe` itself stays two-valued: "cannot tell" is a fact about this one
-/// attempt, not a third thing the state machine can be in.
+/// `None` when the question could not be answered this round -- no parked
+/// connection, or an exchange that failed -- so the caller has a round to skip
+/// rather than a verdict to commit. `Probe` itself stays two-valued: "cannot
+/// tell" is a fact about one attempt, not a third thing the state machine can
+/// be in.
 ///
-/// On a **sync**-replication master this write can enter the daemon's own
-/// replication wait: `rp_after_check` runs `rp_wait` unless
-/// `svcore->get_noreply(cookie)` is true, and that enqueues a `wait_entry`
-/// holding the parked attach connection's cookie, to be released by
-/// `notify_io_complete` once a slave acknowledges the cset. There is no way for
-/// an extension to opt out -- `SERVER_CORE_API` exposes `get_noreply` but no
-/// setter, and the daemon clears `c->noreply` in `out_string` at the end of
-/// every command anyway, so the connection `attach` parks always reads as
-/// "wants a reply". The consequence is bounded rather than removed:
-/// `MULTI_NOTIFY_IO_COMPLETE` is unconditionally defined
-/// (`include/memcached/types.h`), so `waitfor_io_complete` increments
-/// `c->current_io_wait` and the matching `notify_io_complete` decrements it
-/// again; the parked connection is never `io_blocked` (it has no command in
-/// flight), so nothing is queued to a worker thread and no reply is ever
-/// written for nobody to read.
-pub fn probe_once(store: &Store, addr: SocketAddr) -> Option<Probe> {
-    classify(store.set_kv(OWNER_KEY, addr.to_string().as_bytes()))
+/// This used to be a write of the owner key, classified by whether the
+/// replication gate accepted it, issued straight into the engine with the
+/// parked connection's cookie. It read the role correctly and cost the daemon
+/// something it should not have. `rp_before_check` stamps
+/// `last_cset_seqs[thr_idx]`, an unlocked array indexed by *worker thread*
+/// whose safety rests on memcached's own invariant of one in-flight write per
+/// worker thread -- the source calls it "thread specific data". A background
+/// thread borrowing a connection's cookie resolves to the worker thread that
+/// connection sits on, which is also serving real clients, and `LOCK_CACHE`
+/// is taken inside `item_store` rather than across `rp_before_check` and
+/// `rp_after_check`, so it cannot serialise the two. A client whose sequence
+/// is zeroed between its own write and its `rp_after_check` is told the write
+/// is durable before the replica has it -- ordinary `set` traffic, not just
+/// this crate's.
+///
+/// Going over the wire removes the borrowing entirely: the daemon runs
+/// `stats replication` on the worker thread that owns that connection, which
+/// is the arrangement all of that bookkeeping is written for.
+///
+/// `alone` and `disabled` both answer `Accepted`, which is what the old write
+/// probe did: `rp_before_check` only refuses in `RP_MODE_SLAVE`, so a node
+/// with replication off or with no peer attached took the write and read as a
+/// master. Preserving that keeps a single-node deployment behaving as it did.
+pub fn probe_once() -> Option<Probe> {
+    classify_mode(&mode_line(&crate::attach::request("stats replication")?)?)
 }
 
-/// What one `AV OWNER` write means, as a pure function of its outcome.
-///
-/// Lifted out of `probe_once` so it can be tested: `Store` wraps a live engine
-/// pointer and this crate has no in-process substitute for one, so the branch
-/// itself is the only part of the probe a unit test can reach at all.
-fn classify(outcome: std::result::Result<(), StoreError>) -> Option<Probe> {
-    match outcome {
-        Ok(()) => Some(Probe::Accepted),
-        // Defence in depth, and a dead arm as long as `Store::set_kv` keeps
-        // using `check`: `ENGINE_EWOULDBLOCK` is an acceptance there, so it
-        // arrives as `Ok(())` above. If it ever reaches here as an error again
-        // it must NOT read as a refusal. A sync-replication master gets it from
-        // `rp_after_check` -> `rp_wait` whenever a slave is behind on this
-        // write's cset -- an ordinary condition, not a rejection -- and calling
-        // it `Refused` demotes the master, closes its listener, drops its
-        // replicas, and re-promotes on the next beat, forever.
-        Err(StoreError::Engine(code))
-            if code == crate::engine_api::ENGINE_ERROR_CODE_ENGINE_EWOULDBLOCK =>
-        {
-            None
-        }
-        // Every refusal means the same thing. ReplicaSlave is the ordinary
-        // case; a switchover in progress and a key belonging to another
-        // migration group both land in Engine(_).
-        Err(StoreError::ReplicaSlave) | Err(StoreError::Engine(_)) => Some(Probe::Refused),
-        // No engine, or a vtable without `store` or `get_item_info`. This is
-        // silence, not an answer -- committing Replica here would demote a
-        // master the moment its vtable hiccups, which is a conclusion, not
-        // the absence of one.
-        Err(_) => None,
+/// The value of the `mode` line in a `stats replication` reply, if it has one.
+fn mode_line(reply: &[String]) -> Option<String> {
+    reply.iter().find_map(|line| {
+        line.strip_prefix("STAT mode ")
+            .map(|mode| mode.trim().to_owned())
+    })
+}
+
+/// What arcus's four `rp_mode_string` values mean here. An unrecognised one is
+/// `None` -- a mode this crate has not been taught is not a role to guess at.
+fn classify_mode(mode: &str) -> Option<Probe> {
+    match mode {
+        "slave" => Some(Probe::Refused),
+        "master" | "alone" | "disabled" => Some(Probe::Accepted),
+        _ => None,
     }
 }
+
+/// Publishes `addr` as this master's address, but only when the key does not
+/// already say that.
+///
+/// The read comes first and does the work in the common case, so a settled
+/// master writes nothing at all and the only writes left are the ones a
+/// promotion actually requires.
+///
+/// Returns whether the key names `addr` by the time this returns.
+pub fn publish_owner(addr: SocketAddr) -> bool {
+    let wanted = addr.to_string();
+    if read_owner().as_deref() == Some(wanted.as_str()) {
+        return true;
+    }
+    let stored = crate::attach::request(&format!(
+        "set {OWNER_KEY} 0 0 {}\r\n{wanted}",
+        wanted.len()
+    ));
+    matches!(stored.as_deref(), Some([line, ..]) if line == "STORED")
+}
+
+/// Reads the owner key back off the daemon, `None` when it is unset or the
+/// exchange failed.
+pub fn read_owner() -> Option<String> {
+    let reply = crate::attach::request(&format!("get {OWNER_KEY}"))?;
+    match reply.as_slice() {
+        [head, value, ..] if head.starts_with("VALUE ") => Some(value.clone()),
+        _ => None,
+    }
+}
+
 
 /// Whether writes are refused here.
 ///
@@ -345,15 +376,6 @@ fn spawn_heartbeat(delay_first_beat: bool) {
         });
 }
 
-/// The value `probe_once` writes while this node has never published a
-/// real address (see `beat`). Never itself written into `State::published`
-/// -- `is_stale_owner` and `listen_addr()` only ever see a real address or
-/// `None`, exactly as before this existed. `0.0.0.0:0` specifically: no peer
-/// could ever dial it, so a replica that reads this back off `AV OWNER`
-/// simply fails to connect and retries, the same as any other address it
-/// cannot reach.
-const UNPUBLISHED: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-
 fn beat() {
     let state = shared();
     // Role detection needs no dialable listener at all -- `probe_once` only
@@ -364,14 +386,7 @@ fn beat() {
     // function returned before `probe_once` in that case, which is exactly
     // the bug correction 5 exists to fix and correction 3 caught this
     // comment still describing wrong.
-    let addr = match state.listen_addr() {
-        Some(addr) => addr,
-        None => acquire_listener(state).unwrap_or(UNPUBLISHED),
-    };
-    let Some(store) = Store::background_keyed() else {
-        return;
-    };
-    let Some(probe) = probe_once(&store, addr) else {
+    let Some(probe) = probe_once() else {
         return; // Could not tell this round; try again at the next beat.
     };
     let transition = state.observe(probe);
@@ -386,40 +401,40 @@ fn beat() {
         crate::repl::ensure_slave_loop();
     }
     if state.role() == Role::Master {
-        // Every beat, not just the one a transition lands on: a demotion's
-        // `master::close` (or a `-d` fork -- see `repl::mod`'s child hook)
-        // can take the listener out from under a node that still holds
-        // `Role::Master`, and nothing else would ever notice, since
-        // `observe` only reports a change the moment the role itself moves.
-        if let Some(fresh) = refresh_listener(state)
-            && fresh != addr
-        {
-            // The probe above published `addr`, which on a promotion is the
-            // address this node had before it was demoted -- `master::close`
-            // clears `master`'s own `LISTEN_ADDR` but deliberately leaves
-            // `State::published` alone, because `is_stale_owner` needs it to
-            // recognise its own value on `AV OWNER` and not dial itself.
-            // `refresh_listener` has just bound a fresh ephemeral port, so
-            // what is on `AV OWNER` right now is a port nothing is listening
-            // on. Republishing here rather than waiting for the next beat is
-            // the difference between replicas reconnecting immediately after
-            // a switchover and dialling a refused port for up to `HEARTBEAT`
-            // -- which is the latency this whole design exists to remove.
-            //
-            // The result is not fed back into `observe`: a refusal arriving
-            // microseconds after an acceptance is a switchover this node will
-            // see on its next beat anyway, and acting on it here would mean
-            // handling a second transition inside the arm that is already
-            // handling one.
-            // `!= Accepted` rather than `is_none()`: a `Refused` here means
-            // the gate turned this second write down, so the new address is
-            // just as unpublished as if the write could not be attempted.
-            if probe_once(&store, fresh) != Some(Probe::Accepted) {
-                eprintln!(
-                    "ArcVector: could not republish this master's address as {fresh}; \
-                     replicas keep the previous one until the next heartbeat"
-                );
+        // Getting the listener and publishing it happen in this order, on
+        // every beat rather than only on a transition: a demotion's
+        // `master::close` (or a `-d` fork -- see `repl::mod`'s child hook) can
+        // take the listener out from under a node that still holds
+        // `Role::Master`, and `observe` only reports a change the moment the
+        // role itself moves, so nothing else would notice.
+        //
+        // Role detection no longer carries an address, which is what used to
+        // make this awkward: the probe wrote the owner key, so it published
+        // whatever address it had *before* `refresh_listener` could correct
+        // it, and a promoted node advertised a dead port for a whole beat
+        // until a second write fixed it. Now the address is only ever written
+        // by `publish_owner`, after the listener is known, and `publish_owner`
+        // reads before it writes -- so a settled master writes nothing at all.
+        let addr = match state.listen_addr() {
+            Some(_) => {
+                refresh_listener(state);
+                state.listen_addr()
             }
+            None => acquire_listener(state),
+        };
+        match addr {
+            Some(addr) => {
+                if !publish_owner(addr) {
+                    eprintln!(
+                        "ArcVector: could not publish this master's address as {addr}; \
+                         replicas keep the previous one until the next heartbeat"
+                    );
+                }
+            }
+            None => eprintln!(
+                "ArcVector: this master has no listener to publish; \
+                 replicas cannot reach it until one opens"
+            ),
         }
     }
     match transition {
@@ -601,45 +616,46 @@ unsafe extern "C" {
 mod tests {
     use super::*;
 
-    /// A sync-replication master whose slave is behind gets
-    /// `ENGINE_EWOULDBLOCK` from the ordinary write path. `Store::set_kv` turns
-    /// that into `Ok(())` (see its `check`), so the probe reads it as
-    /// acceptance -- the gate did let the write through.
+    /// The four values of `rp_mode_string[]`
+    /// (`engines/default/replication.c`). `alone` and `disabled` read as
+    /// master because the gate they replaced only ever refused in
+    /// `RP_MODE_SLAVE`: a node with no peer, or with replication switched
+    /// off, took the probe write and was read as a master. A single-node
+    /// deployment has to keep behaving that way.
     #[test]
-    fn a_write_that_still_waits_on_a_slave_is_an_acceptance() {
-        assert_eq!(classify(Ok(())), Some(Probe::Accepted));
+    fn only_slave_makes_this_node_a_replica() {
+        assert_eq!(classify_mode("slave"), Some(Probe::Refused));
+        assert_eq!(classify_mode("master"), Some(Probe::Accepted));
+        assert_eq!(classify_mode("alone"), Some(Probe::Accepted));
+        assert_eq!(classify_mode("disabled"), Some(Probe::Accepted));
     }
 
-    /// The defence-in-depth half of the same fix: should `set_kv` ever stop
-    /// flattening `ENGINE_EWOULDBLOCK` into `Ok`, the probe must skip the round
-    /// rather than conclude "not master". A plain `Engine(_)` arm classified it
-    /// as `Probe::Refused`, which is what made a sync master flap.
+    /// A mode this crate has not been taught is silence, not a role. Guessing
+    /// would demote a master the first time arcus grows a fifth state.
     #[test]
-    fn a_would_block_error_is_never_read_as_a_refusal() {
-        let would_block =
-            StoreError::Engine(crate::engine_api::ENGINE_ERROR_CODE_ENGINE_EWOULDBLOCK);
-        assert_eq!(
-            classify(Err(would_block)),
-            None,
-            "EWOULDBLOCK says nothing about who the master is"
-        );
+    fn an_unrecognised_mode_is_not_guessed_at() {
+        assert_eq!(classify_mode("promoting"), None);
+        assert_eq!(classify_mode(""), None);
     }
 
     #[test]
-    fn a_gate_refusal_is_the_only_thing_that_makes_this_node_a_replica() {
-        assert_eq!(
-            classify(Err(StoreError::ReplicaSlave)),
-            Some(Probe::Refused)
-        );
-        assert_eq!(
-            classify(Err(StoreError::Engine(0x62))),
-            Some(Probe::Refused)
-        );
-        assert_eq!(
-            classify(Err(StoreError::Unavailable)),
-            None,
-            "a missing vtable is silence, not a demotion"
-        );
+    fn the_mode_is_picked_out_of_a_whole_stats_reply() {
+        let reply = [
+            "STAT config:loglevel 0".to_owned(),
+            "STAT mode slave".to_owned(),
+            "STAT state RUNNING".to_owned(),
+            "END".to_owned(),
+        ];
+        assert_eq!(mode_line(&reply).as_deref(), Some("slave"));
+    }
+
+    /// `stats replication` on a server with replication compiled out answers
+    /// with no `mode` line at all, which must read as "cannot tell" rather
+    /// than as any role.
+    #[test]
+    fn a_reply_without_a_mode_line_is_no_answer() {
+        assert_eq!(mode_line(&["END".to_owned()]), None);
+        assert_eq!(mode_line(&[]), None);
     }
 
     #[test]
@@ -780,25 +796,26 @@ mod tests {
     /// version of this test asserted only "does not panic", which a revert
     /// of correction 5 (`beat` giving up before `probe_once` whenever it had
     /// no listener) would still have passed, since giving up early panics
-    /// nothing either. Asserting `listen_addr().is_some()` afterward instead
-    /// pins that `beat` actually acquired one (`acquire_listener`, a real
-    /// `TcpListener::bind` -- needs no `Store`, so this runs even here) --
-    /// left open for whatever else in this binary runs after it, since
-    /// `close()` below only closes `master`'s real listener, not `shared()`'s
-    /// own cached address; there is no reset for that, the same as every
-    /// other test in this file that touches the process-global `shared()`.
+     /// `beat` no longer opens a listener before it knows the role.
     ///
-    /// What this cannot pin without a live `Store`: that `beat` reaches
-    /// `state.observe` or either match arm at all -- `Store::background_keyed`
-    /// is `None` with no engine attached, which is guaranteed true in every
-    /// unit test in this crate, so this call still returns right after
-    /// acquiring the listener. A transition's own side effects
-    /// (`master::close` on demotion, `slave::converge` on promotion) are
-    /// exercised by running the daemon, the same limit `mod.rs`'s own
-    /// `publish_is_a_no_op_when_this_node_is_not_master` test already lives
-    /// with for `master::publish`.
+    /// **This test asserted the opposite until the probe moved off the engine.**
+    /// The old probe was a write of the owner key, so it needed an address to
+    /// write, so `beat` called `acquire_listener` first -- unconditionally, on
+    /// every node. That meant a pure replica bound a port and spawned an
+    /// acceptor on its first beat only to close both one arm later.
+    ///
+    /// Now the role is read first (`probe_once`, over `crate::attach`'s
+    /// connection) and the listener is acquired inside the `Role::Master` arm,
+    /// where it is actually wanted. With no parked connection -- guaranteed in
+    /// every unit test in this crate, since nothing here runs a daemon --
+    /// `probe_once` answers `None` and `beat` returns having touched nothing.
+    ///
+    /// What this cannot pin without a live daemon: anything past that early
+    /// return -- `state.observe`, either match arm, or a transition's side
+    /// effects (`master::close` on demotion, `slave::converge` on promotion).
+    /// Those need the integration tier.
     #[test]
-    fn the_heartbeat_acquires_a_listener_for_itself_and_does_not_panic_with_no_engine() {
+    fn the_heartbeat_opens_no_listener_before_it_knows_the_role() {
         // See `master::serialize_tests`: this is the other half of the pair
         // that would otherwise race `master::tests`'s own reopen test over
         // the same process-global `LISTENING`/`LISTEN_ADDR`.
@@ -809,13 +826,9 @@ mod tests {
         );
         beat();
         assert!(
-            shared().listen_addr().is_some(),
-            "beat must acquire a listener for itself, not just survive without one"
+            shared().listen_addr().is_none(),
+            "a node that cannot tell its role must not bind a port speculatively"
         );
-        // Closes `master`'s real listener so it does not linger for
-        // whatever else in this binary runs after it. `shared()`'s own
-        // published address is deliberately left set -- see the doc above.
-        crate::repl::master::close();
     }
 
     /// `beat` republishes `AV OWNER` in the same round only when

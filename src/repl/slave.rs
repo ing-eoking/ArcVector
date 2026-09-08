@@ -28,7 +28,7 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use super::role::{self, OWNER_KEY};
+use super::role;
 use super::wire::{self, Msg, Op, PROTO_VER};
 use crate::handler::arcus::engine::{Store, StoreError};
 use crate::handler::registry;
@@ -239,14 +239,12 @@ pub fn connect_loop() {
     }
 }
 
-/// `AV OWNER` arrived here through arcus replication, the same path that
+/// The owner key arrived here through arcus replication, the same path that
 /// carries the Map. A value equal to our own published address is one we
 /// wrote before being demoted, and the new master's write has not replicated
 /// yet.
 fn master_addr() -> Option<String> {
-    let store = Store::background_keyed()?;
-    let raw = store.get_kv(OWNER_KEY).ok()?;
-    let addr = String::from_utf8(raw).ok()?;
+    let addr = role::read_owner()?;
     if role::shared().is_stale_owner(&addr) {
         return None;
     }

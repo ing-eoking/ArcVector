@@ -13,11 +13,16 @@ pub mod engine_api {
 
 // Two features make a background thread need a real cookie, and `cfg(parked_cookie)`
 // (build.rs) is on for either. Migration's gate writes the new owner through the
-// cookie when a key has moved. Replication's gate is reached by any keyed WRITE --
-// `repl::role`'s `AV OWNER` heartbeat is one -- and on the master arm during a
-// switchover it calls `set_switchover_node`/`get_thread_index`, both of which
-// dereference the cookie with no null check. Without either feature the engine
-// calls these threads make leave the cookie alone.
+// cookie when a key has moved. Replication's gate is reached by any keyed WRITE,
+// and on the master arm during a switchover it calls
+// `set_switchover_node`/`get_thread_index`, both of which dereference the cookie
+// with no null check. Without either feature the engine calls these threads make
+// leave the cookie alone.
+//
+// Replication needs the connection for a second reason, and it is the more
+// important one: `repl::role` sends the owner key and `stats replication` over
+// it as an ordinary client, so the daemon runs them on the worker thread that
+// owns the connection rather than on a background thread wearing its cookie.
 #[cfg(parked_cookie)]
 pub mod attach;
 #[cfg(feature = "replication")]

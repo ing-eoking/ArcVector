@@ -17,7 +17,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::os::raw::{c_int, c_void};
 use std::os::unix::net::UnixStream;
 use std::ptr;
-use std::sync::OnceLock;
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::time::Duration;
 
@@ -106,16 +106,118 @@ fn run() {
     }
 }
 
-/// Holds the socket open, and returns once the daemon has closed it -- which
-/// invalidates the cookie, so the caller must drop it before reconnecting.
-fn park(mut sock: Sock) {
-    let _ = sock.set_read_timeout(None);
-    let mut byte = [0u8; 1];
-    loop {
-        match sock.read(&mut byte) {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {} // The daemon does not talk first; ignore anything it says.
+/// How long one [`request`] waits for its reply. Generous, because a `set` on
+/// a sync-replication master does not answer until a slave acknowledges the
+/// cset (`rp_wait`), and that wait is itself bounded by the server's own
+/// `max_sync_wait_msec`. A timeout here is treated as a dead connection.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The parked connection, once there is one, and whatever a previous reply
+/// left unconsumed.
+struct Parked {
+    sock: Sock,
+    rest: Vec<u8>,
+}
+
+static PARKED: Mutex<Option<Parked>> = Mutex::new(None);
+/// Signalled when [`PARKED`] goes back to `None`, so the attach thread can
+/// stop waiting and dial again.
+static CLOSED: Condvar = Condvar::new();
+
+/// Sends one ASCII command on the parked connection and returns its reply.
+///
+/// This is the reason the connection is worth holding beyond its cookie. The
+/// daemon runs the command on the worker thread that owns this `conn`, which
+/// is what makes it an ordinary client write: it takes the replication gate's
+/// per-worker-thread bookkeeping in the one order that bookkeeping is safe
+/// under, it replicates like any other write, and it waits for the slave's
+/// acknowledgement in the normal way instead of leaving a `wait_entry` behind
+/// for a cookie nobody is reading. Reaching the same engine call directly with
+/// a borrowed cookie does none of that -- see
+/// `handler::arcus::engine::Store::replication_mode` for what it costs.
+///
+/// Never send a command this crate itself handles. The reply is read on the
+/// calling thread while the daemon's worker thread runs the handler, so a
+/// `v*` command would have this thread waiting on a handler that may want a
+/// lock this thread holds.
+///
+/// `None` means there was no connection, or the exchange failed -- in which
+/// case the connection is dropped and the attach thread dials a new one.
+pub fn request(command: &str) -> Option<Vec<String>> {
+    let mut guard = PARKED.lock().unwrap_or_else(|e| e.into_inner());
+    let parked = guard.as_mut()?;
+
+    match exchange(parked, command) {
+        Some(reply) => Some(reply),
+        None => {
+            // The cookie belongs to a connection that is no longer usable.
+            *guard = None;
+            disown();
+            CLOSED.notify_all();
+            None
         }
+    }
+}
+
+fn exchange(parked: &mut Parked, command: &str) -> Option<Vec<String>> {
+    parked.sock.set_read_timeout(Some(REPLY_TIMEOUT)).ok()?;
+    (&parked.sock).write_all(command.as_bytes()).ok()?;
+    (&parked.sock).write_all(b"\r\n").ok()?;
+    (&parked.sock).flush().ok()?;
+
+    let mut lines = Vec::new();
+    loop {
+        while let Some(line) = take_line(&mut parked.rest) {
+            let done = terminates(&line, lines.is_empty());
+            lines.push(line);
+            if done {
+                return Some(lines);
+            }
+        }
+        let mut chunk = [0u8; 1024];
+        match (&parked.sock).read(&mut chunk) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => parked.rest.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+/// Splits one `\r\n`-terminated line off the front of `buf`.
+fn take_line(buf: &mut Vec<u8>) -> Option<String> {
+    let end = buf.windows(2).position(|w| w == b"\r\n")?;
+    let line = String::from_utf8_lossy(&buf[..end]).into_owned();
+    buf.drain(..end + 2);
+    Some(line)
+}
+
+/// Whether `line` ends the reply.
+///
+/// memcached answers either with one status line or with a run of `STAT`/
+/// `VALUE` lines closed by `END`. Deciding on the first line which shape this
+/// is keeps the rule to those two cases, rather than a list of every status
+/// string the server might return.
+fn terminates(line: &str, first: bool) -> bool {
+    if line == "END" {
+        return true;
+    }
+    first && !line.starts_with("STAT ") && !line.starts_with("VALUE ")
+}
+
+/// Publishes the socket for [`request`] and returns once the daemon has closed
+/// it -- which invalidates the cookie, so the caller must drop it before
+/// reconnecting.
+fn park(sock: Sock) {
+    let _ = sock.set_read_timeout(None);
+    let mut guard = PARKED.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(Parked {
+        sock,
+        rest: Vec::new(),
+    });
+    // Nothing polls the socket while it is idle: a `request` that fails is
+    // what notices the close, and it clears the slot before signalling. Until
+    // then there is nothing to do but hold the cookie available.
+    while guard.is_some() {
+        guard = CLOSED.wait(guard).unwrap_or_else(|e| e.into_inner());
     }
 }
 
