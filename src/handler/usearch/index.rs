@@ -181,101 +181,27 @@ const GRAPH_SHARDS: usize = 1;
 /// own shard's k nearest, so the merge cannot have lost it.
 struct Shards {
     shards: Vec<Index>,
-    /// One gate per shard, closing the only combination usearch cannot take.
+    /// Set for a shard once that shard's first `add` has returned. Until then
+    /// a search must not enter that graph at all.
     ///
-    /// usearch promises concurrent inserts and concurrent searches, but an
-    /// insert racing a search segfaults -- the search walks into a slot whose
-    /// vector is not written yet (`usearch_add_search_race` reproduces it on a
-    /// raw index, on 2.26.0 and 2.26.1 both). Inserts beside inserts and
-    /// searches beside searches are both fine; only the pair is not.
+    /// usearch's `add` reserves its slot by bumping `nodes_count_`
+    /// (index.hpp:3222) fifteen lines before it stores the node
+    /// (index.hpp:3237) and eighteen before the callback fills the vector
+    /// pointer (index.hpp:3240). `search` guards on that same counter
+    /// (index.hpp:3448), so it walks into the window and starts at
+    /// `entry_slot_`, still its initial 0 -- the slot being filled.
+    /// `vectors_lookup_` is never zeroed (`buffer_gt` skips `construct_at` for
+    /// trivially constructible types, index.hpp:418), the distance kernel
+    /// takes the pointer with no null check, and the process dies.
+    /// `usearch_add_search_race` reproduces it on a raw index on 2.26.0,
+    /// 2.26.1 and 2.26.2.
     ///
-    /// That is not what an `RwLock` expresses -- it would serialize one of the
-    /// two classes against itself -- so `Gate` admits any number of one kind
-    /// while the other kind is absent. A search holds one shard's gate at a
-    /// time as it walks the shards, so searches cannot deadlock across them.
-    gates: Vec<Gate>,
-}
-
-/// Lets any number of adders in, or any number of searchers, never both.
-///
-/// A waiting searcher stops new adders from starting, so a bulk load cannot
-/// starve queries: the adders in flight drain, the searches waiting go, and
-/// adders resume behind them. Neither side waits on a count the other cannot
-/// bring to zero, so the pair cannot deadlock.
-#[derive(Default)]
-struct Gate {
-    state: std::sync::Mutex<GateState>,
-    room: std::sync::Condvar,
-}
-
-#[derive(Default)]
-struct GateState {
-    adding: usize,
-    searching: usize,
-    searchers_waiting: usize,
-}
-
-/// Leaves the gate on drop, so a `?` on the usearch call cannot hold it shut.
-struct Admitted<'a> {
-    gate: &'a Gate,
-    searching: bool,
-}
-
-impl Gate {
-    fn to_add(&self) -> Admitted<'_> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        while state.searching > 0 || state.searchers_waiting > 0 {
-            state = self
-                .room
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-        state.adding += 1;
-        drop(state);
-        Admitted {
-            gate: self,
-            searching: false,
-        }
-    }
-
-    fn to_search(&self) -> Admitted<'_> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.searchers_waiting += 1;
-        while state.adding > 0 {
-            state = self
-                .room
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-        state.searchers_waiting -= 1;
-        state.searching += 1;
-        drop(state);
-        Admitted {
-            gate: self,
-            searching: true,
-        }
-    }
-}
-
-impl Drop for Admitted<'_> {
-    fn drop(&mut self) {
-        let mut state = self
-            .gate
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let count = if self.searching {
-            &mut state.searching
-        } else {
-            &mut state.adding
-        };
-        *count -= 1;
-        let empty = *count == 0;
-        drop(state);
-        if empty {
-            self.gate.room.notify_all();
-        }
-    }
+    /// Only the entry point is exposed this way. Every other slot is reached
+    /// through links, and a link to a slot is formed after that slot's vector
+    /// is in place, so one finished add per shard closes the window for good.
+    /// The flag has to live here because usearch cannot answer the question:
+    /// `size()` reads the very counter that is published too early.
+    populated: Vec<AtomicBool>,
 }
 
 impl Shards {
@@ -284,8 +210,8 @@ impl Shards {
         for _ in 0..GRAPH_SHARDS {
             shards.push(Index::new(options).map_err(usearch_err)?);
         }
-        let gates = (0..GRAPH_SHARDS).map(|_| Gate::default()).collect();
-        Ok(Self { shards, gates })
+        let populated = (0..GRAPH_SHARDS).map(|_| AtomicBool::new(false)).collect();
+        Ok(Self { shards, populated })
     }
 
     /// Where a new key goes. Placeholder keys count up and element addresses
@@ -311,8 +237,11 @@ impl Shards {
 
     fn add<T: VectorType>(&self, key: u64, vector: &[T]) -> Result<()> {
         let shard = self.route_to(key);
-        let _admitted = self.gates[shard].to_add();
-        self.shards[shard].add(key, vector).map_err(usearch_err)
+        self.shards[shard].add(key, vector).map_err(usearch_err)?;
+        // Strictly after the add returns: a search that observes this has the
+        // shard's entry point pointing at a node whose vector is written.
+        self.populated[shard].store(true, Ordering::Release);
+        Ok(())
     }
 
     fn get<T: VectorType>(&self, key: u64, buffer: &mut [T]) -> Result<usize> {
@@ -344,7 +273,10 @@ impl Shards {
     }
 
     fn reset(&self) -> Result<()> {
-        for shard in &self.shards {
+        for (shard, populated) in self.shards.iter().zip(&self.populated) {
+            // Cleared before the graph goes, so a part-way failure leaves
+            // searches reading empty rather than entering a reset graph.
+            populated.store(false, Ordering::Release);
             shard.reset().map_err(usearch_err)?;
         }
         Ok(())
@@ -388,11 +320,13 @@ impl Shards {
 
     fn merged(&self, count: usize, one: impl Fn(&Index) -> Result<Matches>) -> Result<Matches> {
         let mut all: Vec<(u64, f32)> = Vec::new();
-        for (shard, gate) in self.shards.iter().zip(&self.gates) {
-            let matches = {
-                let _admitted = gate.to_search();
-                one(shard)?
-            };
+        for (shard, populated) in self.shards.iter().zip(&self.populated) {
+            // A shard nothing has landed in yet is skipped, not asked: see
+            // `populated`. An empty shard has nothing to contribute anyway.
+            if !populated.load(Ordering::Acquire) {
+                continue;
+            }
+            let matches = one(shard)?;
             all.extend(matches.keys.into_iter().zip(matches.distances));
         }
         all.sort_by(|a, b| a.1.total_cmp(&b.1));
@@ -881,6 +815,20 @@ impl AnnIndex {
         addr: u64,
         vector: impl FnOnce() -> Result<Option<Vec<u8>>>,
     ) -> Result<bool> {
+        // Before the locks, not inside them: `ensure_capacity` takes
+        // `inner.write()`, and this holds `inner.read()` for the rest of the
+        // function -- asking for the write half while holding the read half
+        // deadlocks against itself.
+        //
+        // `stage` has always done this and this had not, which is why only a
+        // replica hit it: `vadd` reaches the graph through `stage`, while a
+        // replicated delta reaches it here. Once a rebuild's `reserve` was
+        // used up, the next delta got usearch's "Reserve capacity ahead of
+        // insertions!" and the caller's error arm threw the whole graph away
+        // -- then the rebuild refilled it, the next delta overran again, and
+        // the two took turns forever.
+        self.ensure_capacity(self.live() + THREAD_SLOTS)?;
+
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
 
@@ -2636,9 +2584,46 @@ mod tests {
         );
     }
 
-    /// The gate must let both kinds through under a load that never lets up:
-    /// a bulk insert running flat out must not starve queries, and the two
-    /// must not crash when they overlap.
+    /// Searches racing the very first add on a fresh index. usearch bumps
+    /// `nodes_count_` before it fills the slot and `search` guards on that
+    /// counter, so without `Shards::populated` a searcher enters the window,
+    /// starts at the still-initial `entry_slot_` of 0 and derefs a vector
+    /// pointer that was never written. That killed the process; the assertion
+    /// is that it no longer does.
+    #[test]
+    fn searches_racing_the_first_add_do_not_crash() {
+        for _ in 0..200 {
+            let idx = Arc::new(build(4, Quant::F32, Metric::L2, 16));
+            let mut handles = Vec::new();
+
+            for t in 0..2u64 {
+                let idx = Arc::clone(&idx);
+                handles.push(std::thread::spawn(move || {
+                    for i in 0..50 {
+                        add(&idx, &format!("k{t}-{i}"), &[t as f32, i as f32, 0.0, 0.0]);
+                    }
+                }));
+            }
+            for _ in 0..4 {
+                let idx = Arc::clone(&idx);
+                handles.push(std::thread::spawn(move || {
+                    for i in 0..50 {
+                        let q =
+                            crate::handler::quant::encode(&[i as f32, 0.0, 0.0, 0.0], Quant::F32);
+                        idx.search(&q, 3, None).unwrap();
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        }
+    }
+
+    /// Adds and searches overlapping under a load that never lets up: a bulk
+    /// insert running flat out must not hold queries up, and the two must not
+    /// crash when they overlap. Nothing serialises them any more, so this is
+    /// the soak that says so.
     #[test]
     fn a_bulk_load_does_not_starve_searches() {
         let idx = Arc::new(build(4, Quant::F32, Metric::L2, 16));
@@ -2694,7 +2679,7 @@ mod tests {
         );
     }
 
-    /// What sharding and the gates cost a search: one raw graph against
+    /// What sharding costs a search: one raw graph against
     /// Shards, single-threaded latency and four-thread throughput.
     #[test]
     #[ignore]
