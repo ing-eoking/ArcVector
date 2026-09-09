@@ -215,13 +215,14 @@ Built with `--features replication`, ArcVector replicates its indexes alongside
 arcus's own replication, so **a promoted node serves from a warm graph** instead of
 rebuilding.
 
-Roles are discovered, not configured. Every node writes a heartbeat key that
-arcus's replication gate accepts on the master and refuses on a replica, so the
-verdict is the role; the same beat detects switchover in either direction. The
-master then streams *which id changed in which index* to its replicas over plain
-TCP, and each replica resolves those ids against its own arcus-replicated Map —
-identifiers only, never vectors. A replica that falls too far behind rebuilds
-rather than chasing.
+Roles are discovered, not configured. A ten-second heartbeat asks the daemon
+itself — `stats replication`'s `mode` — so the same beat detects a switchover in
+either direction. The master then streams *which id changed in which index* to
+its replicas over plain TCP, and each replica resolves those ids against its own
+arcus-replicated Map — identifiers only, never vectors. A graph that drifts from
+its Map is repaired against it rather than rebuilt from nothing.
+
+See [docs/복제.md](docs/복제.md) for the flow.
 
 A restart is still cold: the graph is not serialized, and is rebuilt from the Map
 on first use.
@@ -327,5 +328,6 @@ compare it against `vectors` to tell the two apart.
 | | |
 |---|---|
 | [docs/내부구조.md](docs/내부구조.md) | internals, build, recovery |
+| [docs/복제.md](docs/복제.md) | how index replication works |
 | [docs/미해결.md](docs/미해결.md) | known and unfixed |
 | [docs/코드리뷰.md](docs/코드리뷰.md) | review guide — a source excerpt and a checklist per section |
