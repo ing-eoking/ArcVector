@@ -236,6 +236,68 @@ fn run_builder() {
     }
 }
 
+/// Brings a serving index back into agreement with its Map, in place.
+///
+/// The remedy a count mismatch used to get was `remove_observed` -- throw the
+/// graph away and let the next read rebuild it from nothing. On a replica that
+/// is both wasteful and unstable: the stream leaves the graph a little behind
+/// or a little ahead all the time, so the mismatch recurs, and each round
+/// discards a graph that was almost entirely correct. Under a write load the
+/// two took turns and the replica never finished converging.
+///
+/// This repairs the difference instead, in both directions:
+///
+/// * **Missing.** An element the Map holds that the graph does not, added the
+///   same way `refill` adds one, keeping the hold `hold_all` took so the graph
+///   owns that element's refcount.
+/// * **Stale.** An address the graph holds that the Map no longer does. A
+///   replica gets these whenever an id is updated: arcus links a fresh element
+///   and unlinks the old, but the old stays alive because the graph holds a
+///   refcount on it, and nothing in the delta path ever took it back.
+///
+/// What is forgotten is bounded by `before` -- the addresses the graph held
+/// when this started. An address added by a delta while this runs is not in
+/// it, so a concurrent insert can never be mistaken for something the Map has
+/// dropped.
+pub fn reconcile(store: &Store, index: &Arc<VectorIndex>) -> Result<(usize, usize)> {
+    let before = index.ann.held_addrs();
+    let mut held = store.hold_all(&index.name)?;
+
+    let layout = index.ann.layout;
+    let mut present: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut added = 0usize;
+    for (addr, field, value) in held.read(store) {
+        if field == META_FIELD.as_bytes() {
+            continue;
+        }
+        if present.try_reserve(1).is_err() {
+            return Err(Error::Index(format!(
+                "could not track the elements of '{}' while reconciling it",
+                index.name
+            )));
+        }
+        present.insert(addr);
+
+        let element = layout.decode(&value).map_err(|e| {
+            Error::bad_request(format!(
+                "{e} in element {}",
+                String::from_utf8_lossy(&field)
+            ))
+        })?;
+        let vector = element.vector.to_vec();
+        if index.ann.add_unless_known(addr, || Ok(Some(vector)))? {
+            added += 1;
+            held.keep(addr);
+        }
+    }
+
+    let doomed: Vec<u64> = before
+        .into_iter()
+        .filter(|addr| !present.contains(addr))
+        .collect();
+    Ok((added, index.ann.forget(&doomed)))
+}
+
 fn refill(store: &Store, index: &VectorIndex, held: &mut HeldMap) -> Result<usize> {
     index.ann.reserve(held.len())?;
 

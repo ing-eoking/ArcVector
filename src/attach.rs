@@ -466,7 +466,9 @@ fn decode(raw: &[u8; SOCKADDR_STORAGE_LEN]) -> Option<Addr> {
             if end == 0 {
                 return None;
             }
-            Some(Addr::Unix(String::from_utf8_lossy(&path[..end]).into_owned()))
+            Some(Addr::Unix(
+                String::from_utf8_lossy(&path[..end]).into_owned(),
+            ))
         }
         _ => None,
     }

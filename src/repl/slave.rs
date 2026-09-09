@@ -478,17 +478,32 @@ pub fn converge(name: &str) {
             let in_map = map.count.saturating_sub(1) as usize;
             let named = index.ann.len();
             if in_map != named {
-                eprintln!(
-                    "ArcVector: replica's index '{name}' names {named} element(s) but its Map \
-                     holds {in_map}; resynchronising"
-                );
-                // Passing the exact `Arc` just observed, not just the name:
-                // `rebuild`'s eviction then goes through `remove_observed`'s
-                // pointer check, so if another thread already rebuilt this
-                // name correctly while this round trip to the Map was in
-                // flight, that fresh index is left alone rather than
-                // evicted on the strength of what we saw a moment ago.
-                rebuild(name, Some(&index));
+                // Repair the difference rather than discard the graph. On a
+                // replica the two counts disagree as a matter of course --
+                // the stream runs a little behind the Map, and an updated id
+                // leaves the address it used to live at behind -- so a
+                // rebuild here meant throwing away an almost-correct graph
+                // over and over, and under a write load it never converged.
+                match crate::handler::recovery::reconcile(&store, &index) {
+                    Ok((added, forgotten)) => eprintln!(
+                        "ArcVector: replica's index '{name}' named {named} element(s) against a \
+                         Map holding {in_map}; reconciled it (+{added}, -{forgotten})"
+                    ),
+                    // The repair could not read the Map, so fall back to the
+                    // rebuild. Passing the exact `Arc` just observed, not
+                    // just the name: `rebuild`'s eviction then goes through
+                    // `remove_observed`'s pointer check, so if another thread
+                    // already rebuilt this name correctly while this was in
+                    // flight, that fresh index is left alone rather than
+                    // evicted on the strength of what we saw a moment ago.
+                    Err(e) => {
+                        eprintln!(
+                            "ArcVector: replica's index '{name}' named {named} element(s) against \
+                             a Map holding {in_map} and could not be reconciled ({e}); rebuilding"
+                        );
+                        rebuild(name, Some(&index));
+                    }
+                }
             }
         }
         Err(StoreError::KeyGone) => {

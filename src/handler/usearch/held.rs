@@ -72,7 +72,6 @@ impl HeldSet {
         self.tombstones.clear();
     }
 
-    #[cfg(test)]
     pub(super) fn live_addrs(&self) -> Vec<u64> {
         self.live.iter().copied().collect()
     }

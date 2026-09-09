@@ -2,6 +2,8 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::handler::arcus::engine::{Store, StoreError};
+#[cfg(recovery)]
+use crate::handler::recovery;
 use crate::handler::registry::{self, VectorIndex};
 
 const TICK: Duration = Duration::from_secs(1);
@@ -121,13 +123,7 @@ fn probe(store: &Store, index: &Arc<VectorIndex>, stamp: u64) {
     });
     match counted {
         Ok(None) => {}
-        Ok(Some((in_map, named))) => {
-            eprintln!(
-                "ArcVector: index '{name}' names {named} element(s) but its Map holds {in_map}; \
-                 dropping the graph so the next read rebuilds it"
-            );
-            registry::remove_observed(name, index);
-        }
+        Ok(Some((in_map, named))) => reunite(store, index, in_map, named),
         // The Map is gone. `stamp` was taken before the round, so an index
         // published since then survives -- the answer is about the old one.
         Err(StoreError::KeyGone) => {
@@ -139,4 +135,44 @@ fn probe(store: &Store, index: &Arc<VectorIndex>, stamp: u64) {
         }
         Err(_) => {}
     }
+}
+
+/// Puts a graph and its Map back into agreement.
+///
+/// Repairing beats discarding wherever a repair exists -- the counts disagree
+/// as a matter of course on a replica, and dropping an almost-correct graph
+/// every time cost a full rebuild for a handful of elements. Only a build with
+/// no rebuild path at all still discards, because there it is that or nothing.
+#[cfg(recovery)]
+fn reunite(store: &Store, index: &Arc<VectorIndex>, in_map: usize, named: usize) {
+    let name = &index.name;
+    match recovery::reconcile(store, index) {
+        Ok((added, forgotten)) => eprintln!(
+            "ArcVector: index '{name}' named {named} element(s) against a Map holding {in_map}; \
+             reconciled it (+{added}, -{forgotten})"
+        ),
+        // Only now is the graph worth giving up on: the repair itself could
+        // not read the Map, or would not take what it read.
+        Err(e) => {
+            eprintln!(
+                "ArcVector: index '{name}' named {named} element(s) against a Map holding \
+                 {in_map} and could not be reconciled ({e}); dropping the graph so the next read \
+                 rebuilds it"
+            );
+            registry::remove_observed(name, index);
+        }
+    }
+}
+
+/// Without `cfg(recovery)` nothing can rebuild a graph from its Map, so there
+/// is no repair to attempt and no rebuild to fall back on: the graph goes, and
+/// `resolve` reports the name as missing.
+#[cfg(not(recovery))]
+fn reunite(_: &Store, index: &Arc<VectorIndex>, in_map: usize, named: usize) {
+    let name = &index.name;
+    eprintln!(
+        "ArcVector: index '{name}' names {named} element(s) but its Map holds {in_map}; dropping \
+         the graph"
+    );
+    registry::remove_observed(name, index);
 }

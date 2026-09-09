@@ -25,12 +25,12 @@ pub mod engine_api {
 // owns the connection rather than on a background thread wearing its cookie.
 #[cfg(parked_cookie)]
 pub mod attach;
-#[cfg(feature = "replication")]
-pub mod repl;
 pub mod command;
 pub mod error;
 pub mod handler;
 pub mod owner;
+#[cfg(feature = "replication")]
+pub mod repl;
 pub mod server;
 
 pub use handler::arcus::element::ATTR_BYTES;

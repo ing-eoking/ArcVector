@@ -626,6 +626,50 @@ impl AnnIndex {
         self.elements.release(&[addr]);
     }
 
+    /// The addresses the graph holds right now.
+    ///
+    /// A snapshot, taken so a reconcile can decide what to forget from what
+    /// the graph held *before* it started: an address added while the
+    /// reconcile runs is absent here, and so can never be mistaken for one
+    /// the Map has dropped.
+    pub fn held_addrs(&self) -> Vec<u64> {
+        self.held
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .live_addrs()
+    }
+
+    /// Forgets every address in `doomed` the graph still holds, releasing the
+    /// element each one keeps alive. Returns how many left the graph.
+    ///
+    /// The counterpart of `add_unless_known` for a reconcile. An element the
+    /// Map has replaced is unlinked there but stays alive here, because the
+    /// graph holds a refcount on it -- so without this the held set only ever
+    /// grows, and a replica that has seen an id updated ends up naming more
+    /// elements than its Map holds.
+    pub fn forget(&self, doomed: &[u64]) -> usize {
+        if doomed.is_empty() {
+            return 0;
+        }
+        let tombstone = self.rebuilding.load(Ordering::Acquire);
+        let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
+        let gone: Vec<u64> = doomed
+            .iter()
+            .copied()
+            .filter(|addr| held.give_up(*addr, tombstone))
+            .collect();
+        drop(held);
+
+        let mut forgotten = 0;
+        for addr in gone {
+            if self.unlink_node(addr) {
+                self.retire(&[addr]);
+                forgotten += 1;
+            }
+        }
+        forgotten
+    }
+
     fn drop_displaced(&self, displaced: Option<u64>, taken: bool) {
         let Some(old) = displaced else {
             return;
@@ -2590,6 +2634,43 @@ mod tests {
     /// starts at the still-initial `entry_slot_` of 0 and derefs a vector
     /// pointer that was never written. That killed the process; the assertion
     /// is that it no longer does.
+    /// The reconcile's remove half. An address the Map no longer has must
+    /// leave the graph, or a replica that has seen ids updated keeps naming
+    /// elements that are gone -- which is what made its count climb past its
+    /// Map's and got the whole graph thrown away every sweep.
+    #[test]
+    fn forgetting_an_address_takes_it_out_of_the_graph() {
+        let idx = build(4, Quant::F32, Metric::L2, 1);
+        let keep = add(&idx, "keep", &[1.0, 0.0, 0.0, 0.0]);
+        let drop = add(&idx, "drop", &[0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(idx.len(), 2);
+
+        assert_eq!(idx.forget(&[drop]), 1, "one address left the graph");
+        assert_eq!(idx.len(), 1);
+
+        let addrs = idx.held_addrs();
+        assert!(addrs.contains(&keep), "the surviving address is still held");
+        assert!(!addrs.contains(&drop), "the forgotten one is not");
+    }
+
+    /// Forgetting is idempotent and does not invent work: an address the
+    /// graph never held, or one already forgotten, counts for nothing. The
+    /// reconcile hands it whatever the Map has dropped, which on a healthy
+    /// index is nothing at all.
+    #[test]
+    fn forgetting_what_the_graph_does_not_hold_is_a_no_op() {
+        let idx = build(4, Quant::F32, Metric::L2, 1);
+        let only = add(&idx, "only", &[1.0, 0.0, 0.0, 0.0]);
+
+        assert_eq!(idx.forget(&[]), 0);
+        assert_eq!(idx.forget(&[0xdead_beef]), 0, "never held");
+        assert_eq!(idx.len(), 1, "nothing else moved");
+
+        assert_eq!(idx.forget(&[only]), 1);
+        assert_eq!(idx.forget(&[only]), 0, "already gone");
+        assert_eq!(idx.len(), 0);
+    }
+
     #[test]
     fn searches_racing_the_first_add_do_not_crash() {
         for _ in 0..200 {
