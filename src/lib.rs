@@ -32,6 +32,7 @@ pub mod owner;
 #[cfg(feature = "replication")]
 pub mod repl;
 pub mod server;
+pub mod trigger;
 
 pub use handler::arcus::element::ATTR_BYTES;
 pub use handler::quant::Quant;
