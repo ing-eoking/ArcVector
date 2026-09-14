@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 /// imply it, so the two always appear together in a variant name.
 const ABI_FLAGS: [&str; 3] = ["replication", "migration", "cluster-aware"];
 
+/// Where the fingerprint of the headers the committed bindings were made from
+/// lives. Written by a `regen-bindings` build, checked by every other one.
+const FINGERPRINT: &str = "bindings/headers.fingerprint";
+
 fn main() {
     println!("cargo:rerun-if-changed=include");
     println!("cargo:rerun-if-changed=bindings");
@@ -88,7 +92,7 @@ fn variant() -> String {
 /// libclang, and hence no LLVM: bindgen is not in the dependency graph at all
 /// unless `regen-bindings` is on.
 #[cfg(not(feature = "regen-bindings"))]
-fn bindings(_include: &str, _header: &str, generated: &Path) {
+fn bindings(include: &str, _header: &str, generated: &Path) {
     let variant = variant();
     let committed = Path::new("bindings").join(format!("{variant}.rs"));
 
@@ -106,8 +110,82 @@ fn bindings(_include: &str, _header: &str, generated: &Path) {
          `make bindings` regenerates the set on a machine that has libclang"
     );
 
+    check_headers_match(include);
+
     std::fs::copy(&committed, generated).expect("failed to copy the committed bindings");
     println!("cargo:rerun-if-changed={}", committed.display());
+}
+
+/// Refuses to build when `include/memcached` has moved since the committed
+/// bindings were generated from it.
+///
+/// The vtable is called by offset, so a header that adds or drops one member
+/// shifts every member after it -- and the runtime check cannot see that,
+/// because the slot it lands on still holds a perfectly valid function pointer
+/// from the neighbouring entry. That is how a `types.h` that stopped defining
+/// `JHPARK_OLD_SMGET_INTERFACE` turned `get_config` into `item_cachedump` and
+/// segfaulted the daemon on the first `vcreate`. Comparing a fingerprint here
+/// turns that into a build error that names the fix.
+#[cfg(not(feature = "regen-bindings"))]
+fn check_headers_match(include: &str) {
+    let now = header_fingerprint(include);
+    let recorded = std::fs::read_to_string(FINGERPRINT).map(|t| t.trim().to_owned());
+
+    match recorded {
+        Ok(recorded) if recorded == now => {}
+        Ok(recorded) => panic!(
+            "\n\
+             {include}/memcached has changed since bindings/ was generated from it.\n\
+             \n\
+               recorded: {recorded}\n\
+               now:      {now}\n\
+             \n\
+             The engine vtable is called by offset, so a member added or removed\n\
+             in a header silently shifts every call after it. Regenerate:\n\
+             \n\
+               make bindings          # needs libclang\n\
+             \n\
+             or, to follow a server tree: make sync-headers TREE=<path>\n"
+        ),
+        Err(_) => panic!(
+            "\n\
+             {FINGERPRINT} is missing, so nothing records which headers\n\
+             bindings/ was generated from. Run `make bindings` to write it.\n"
+        ),
+    }
+}
+
+/// A cheap content hash over every header bindgen reads.
+///
+/// FNV-1a rather than anything stronger on purpose: this catches an honest
+/// edit, not an adversary, and it keeps build.rs free of dependencies.
+fn header_fingerprint(include: &str) -> String {
+    let dir = Path::new(include).join("memcached");
+    let mut names: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "h"))
+        .collect();
+    names.sort();
+
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for b in bytes {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for path in &names {
+        feed(
+            path.file_name()
+                .expect("a directory entry has a name")
+                .as_encoded_bytes(),
+        );
+        feed(
+            &std::fs::read(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display())),
+        );
+    }
+    format!("fnv1a64={hash:016x} files={}", names.len())
 }
 
 /// Translates the headers afresh, and writes the result back over the committed
@@ -151,6 +229,11 @@ fn bindings(include: &str, header: &str, generated: &Path) {
         std::fs::create_dir_all(dir).expect("failed to create bindings/");
         std::fs::copy(generated, dir.join(format!("{}.rs", variant())))
             .expect("failed to refresh the committed bindings");
+        // Only now, with the committed copy actually made from these headers,
+        // is the fingerprint true. A build pointed elsewhere by
+        // ARCVECTOR_ENGINE_INCLUDE refreshes neither.
+        std::fs::write(FINGERPRINT, format!("{}\n", header_fingerprint(include)))
+            .expect("failed to record the header fingerprint");
     }
 }
 

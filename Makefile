@@ -29,7 +29,7 @@ ABI_COMBOS := \
 # Everything except regen-bindings, which is the one feature that wants libclang.
 LINT_FEATURES := integration,replication,migration,cluster-aware,persistence
 
-.PHONY: test image unit lint shell bindings clean
+.PHONY: test image unit lint shell bindings sync-headers clean
 
 ## Unit and integration tests against a real server.
 test: image
@@ -48,6 +48,19 @@ unit:
 lint:
 	cargo fmt --check
 	cargo clippy --all-targets --features $(LINT_FEATURES) -- -D warnings
+
+## Point this crate at a server tree: copy its headers in, then retranslate.
+##
+## The vtable is called by offset, so the headers and bindings/ have to come
+## from the same tree. build.rs refuses to build when they drift; this is how
+## you make them agree again.
+##
+##   make sync-headers TREE=../arcus-memcached-EE
+sync-headers:
+	@test -n "$(TREE)" || { echo "usage: make sync-headers TREE=<path to a server tree>"; exit 1; }
+	@test -d "$(TREE)/include/memcached" || { echo "no $(TREE)/include/memcached"; exit 1; }
+	cp $(TREE)/include/memcached/*.h include/memcached/
+	@$(MAKE) bindings
 
 ## Retranslate include/memcached into bindings/, one file per flag combination.
 ## Only needed after the headers change; the results are committed, which is what
