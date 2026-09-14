@@ -58,14 +58,15 @@ impl Layout {
 
     pub const STORED_TERMINATOR: usize = 2;
 
-    #[cfg(recovery)]
+    /// Header, attributes, then the vector.
+    ///
+    /// The vector is always here now. It used to be left out of a build that
+    /// could not rebuild a graph from storage, because nothing would ever read
+    /// it back -- but it is what arcus carries to a replica, and the trigger
+    /// callback reads it straight out of the item, so it is the only copy that
+    /// reaches another node.
     pub const fn element_len(&self) -> usize {
         Self::VECTOR_OFFSET + self.vector_bytes()
-    }
-
-    #[cfg(not(recovery))]
-    pub const fn element_len(&self) -> usize {
-        Self::VECTOR_OFFSET
     }
 
     pub const fn stored_len(&self) -> usize {
@@ -126,7 +127,6 @@ impl Layout {
 
         buf[ATTR_OFFSET..Self::VECTOR_OFFSET].fill(0);
         buf[ATTR_OFFSET..ATTR_OFFSET + attr.len()].copy_from_slice(attr);
-        #[cfg(recovery)]
         buf[Self::VECTOR_OFFSET..].copy_from_slice(vector);
         Ok(())
     }
@@ -142,20 +142,13 @@ impl Layout {
         }
         Ok(Element {
             attr: &buf[ATTR_OFFSET..ATTR_OFFSET + head.attr_len],
-            #[cfg(recovery)]
             vector: &buf[Self::VECTOR_OFFSET..need],
         })
     }
 
-    #[cfg(recovery)]
     pub fn vector_of<'a>(&self, buf: &'a [u8]) -> Option<&'a [u8]> {
         let need = self.element_len();
         (buf.len() >= need).then(|| &buf[Self::VECTOR_OFFSET..need])
-    }
-
-    #[cfg(not(recovery))]
-    pub fn vector_of<'a>(&self, _buf: &'a [u8]) -> Option<&'a [u8]> {
-        None
     }
 
     pub fn set_attr(&self, buf: &mut [u8], attr: &[u8]) -> Result<(), CodecError> {
@@ -215,21 +208,18 @@ pub struct MetaRecord {
     pub connectivity: usize,
     pub expansion_add: usize,
     pub expansion_search: usize,
-
-    pub owner: String,
 }
 
 impl MetaRecord {
     pub fn encode(&self, layout: Layout) -> Vec<u8> {
         format!(
-            r#"{{"dim":{},"quant":"{}","metric":"{}","m":{},"efc":{},"efs":{},"owner":{}}}"#,
+            r#"{{"dim":{},"quant":"{}","metric":"{}","m":{},"efc":{},"efs":{}}}"#,
             layout.dim,
             layout.quant,
             self.metric,
             self.connectivity,
             self.expansion_add,
             self.expansion_search,
-            serde_json::Value::from(self.owner.as_str()),
         )
         .into_bytes()
     }
@@ -245,13 +235,6 @@ impl MetaRecord {
                 .ok_or_else(|| miss(k))
         };
 
-        let owner = json
-            .get("owner")
-            .and_then(serde_json::Value::as_str)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| miss("owner"))?
-            .to_owned();
-
         Ok((
             Self {
                 metric: json
@@ -262,7 +245,6 @@ impl MetaRecord {
                 connectivity: num("m")?,
                 expansion_add: num("efc")?,
                 expansion_search: num("efs")?,
-                owner,
             },
             Layout::new(
                 num("dim")?,
@@ -279,7 +261,6 @@ impl MetaRecord {
 pub struct Element<'a> {
     pub attr: &'a [u8],
 
-    #[cfg(recovery)]
     pub vector: &'a [u8],
 }
 
@@ -323,11 +304,7 @@ mod tests {
         for dim in [1usize, 128, 4096] {
             for q in [Quant::F32, Quant::F16, Quant::I8, Quant::B1] {
                 let l = Layout::new(dim, q);
-                #[cfg(recovery)]
                 assert_eq!(l.element_len(), 130 + l.vector_bytes());
-
-                #[cfg(not(recovery))]
-                assert_eq!(l.element_len(), 130);
                 assert_eq!(l.full_stored_len(), 132 + l.vector_bytes());
             }
         }
@@ -358,7 +335,6 @@ mod tests {
         let from_bare = l.decode(&bare).expect("old shape decodes");
         let from_terminated = l.decode(&terminated).expect("new shape decodes");
         assert_eq!(from_bare.attr, from_terminated.attr);
-        #[cfg(recovery)]
         {
             assert_eq!(from_bare.vector, from_terminated.vector);
             assert_eq!(from_bare.vector, &vector[..]);
@@ -381,7 +357,6 @@ mod tests {
 
         let e = l.decode(&buf).unwrap();
         assert_eq!(e.attr, attr);
-        #[cfg(recovery)]
         {
             assert_eq!(buf.len(), 130 + 4);
             assert_eq!(e.vector, &vector[..]);
@@ -428,7 +403,6 @@ mod tests {
         let attr = vec![b'x'; ATTR_BYTES];
         let buf = l.encode(&[1, 2, 3, 4], &attr).unwrap();
         assert_eq!(l.decode(&buf).unwrap().attr, &attr[..]);
-        #[cfg(recovery)]
         assert_eq!(l.decode(&buf).unwrap().vector, &[1, 2, 3, 4]);
     }
 
@@ -449,7 +423,6 @@ mod tests {
             connectivity: u32::MAX as usize,
             expansion_add: u32::MAX as usize,
             expansion_search: u32::MAX as usize,
-            owner: "ffee/1/2".to_owned(),
         };
         let encoded = meta.encode(layout);
         let (back, back_layout) = MetaRecord::decode(&encoded).unwrap();
@@ -504,7 +477,6 @@ mod tests {
         let short = &good[..Layout::VECTOR_OFFSET];
         assert_eq!(l.attr_of(short).unwrap(), b"{}");
 
-        #[cfg(recovery)]
         assert!(l.decode(short).is_err());
     }
 

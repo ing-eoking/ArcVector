@@ -11,26 +11,9 @@ pub mod engine_api {
     include!(concat!(env!("OUT_DIR"), "/engine_api.rs"));
 }
 
-// Two features make a background thread need a real cookie, and `cfg(parked_cookie)`
-// (build.rs) is on for either. Migration's gate writes the new owner through the
-// cookie when a key has moved. Replication's gate is reached by any keyed WRITE,
-// and on the master arm during a switchover it calls
-// `set_switchover_node`/`get_thread_index`, both of which dereference the cookie
-// with no null check. Without either feature the engine calls these threads make
-// leave the cookie alone.
-//
-// Replication needs the connection for a second reason, and it is the more
-// important one: `repl::role` sends the owner key and `stats replication` over
-// it as an ordinary client, so the daemon runs them on the worker thread that
-// owns the connection rather than on a background thread wearing its cookie.
-#[cfg(parked_cookie)]
-pub mod attach;
 pub mod command;
 pub mod error;
 pub mod handler;
-pub mod owner;
-#[cfg(feature = "replication")]
-pub mod repl;
 pub mod server;
 pub mod trigger;
 
@@ -117,7 +100,6 @@ pub extern "C" fn memcached_extensions_initialize(
         return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
     };
     server::set_api(get_api);
-    eprintln!("ArcVector: owner {}", owner::install());
 
     unsafe {
         let server = get_api();
@@ -138,11 +120,5 @@ pub extern "C" fn memcached_extensions_initialize(
             return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
         }
     }
-    // The listening socket does not exist yet -- `server_socket()` runs later in
-    // the daemon's startup -- so this only starts the thread that waits for it.
-    #[cfg(parked_cookie)]
-    attach::start();
-    #[cfg(feature = "replication")]
-    repl::start();
     EXTENSION_ERROR_CODE_EXTENSION_SUCCESS
 }

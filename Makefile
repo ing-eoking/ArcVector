@@ -27,7 +27,7 @@ ABI_COMBOS := \
 	replication,migration,cluster-aware
 
 # Everything except regen-bindings, which is the one feature that wants libclang.
-LINT_FEATURES := integration,replication-tests,migration,cluster-aware,persistence
+LINT_FEATURES := integration,replication,migration,cluster-aware,persistence
 
 .PHONY: test image unit lint shell bindings clean
 

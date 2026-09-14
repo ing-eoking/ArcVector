@@ -51,15 +51,9 @@ pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
             store.hold_addr(name, id).map(HeldAddr::keep)
         },
     ) {
-        Ok(Published::Indexed) => {
-            #[cfg(feature = "replication")]
-            crate::repl::publish(name, id, crate::repl::Op::Upsert);
-            Ok(Reply::Stored)
-        }
+        Ok(Published::Indexed) => Ok(Reply::Stored),
         Ok(Published::Unindexed(addr)) => {
             index_it(&index, name, addr, quantized);
-            #[cfg(feature = "replication")]
-            crate::repl::publish(name, id, crate::repl::Op::Upsert);
             Ok(Reply::Stored)
         }
         Err(PublishError::Store(e)) => store_failed(name, stamp, e),
@@ -261,11 +255,7 @@ pub fn vdel(store: &Store, name: &str, id: &str) -> Result<Reply> {
         map_is_gone(name, stamp);
     }
     match removed {
-        Ok(Some(_)) => {
-            #[cfg(feature = "replication")]
-            crate::repl::publish(name, id, crate::repl::Op::Delete);
-            Ok(Reply::Deleted)
-        }
+        Ok(Some(_)) => Ok(Reply::Deleted),
         Ok(None) => Ok(Reply::NotFound),
         Err(PublishError::Store(e)) => Err(e.into()),
 

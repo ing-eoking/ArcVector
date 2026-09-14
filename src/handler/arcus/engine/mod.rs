@@ -44,19 +44,14 @@ fn engine() -> *mut engine_interface_v1 {
     }
 }
 
-/// Null until `crate::attach` parks a connection. Only `background_keyed`
-/// insists on a real one.
+/// Always null.
 ///
-/// A build with neither `migration` nor `replication` never compiles `attach`
-/// at all, and has no gate that looks at the cookie, so it is always null here.
-#[cfg(not(parked_cookie))]
+/// There is no parked connection any more: nothing this crate runs in the
+/// background passes a key to the engine. The trigger callback reads items
+/// through `get_item_info`, which ignores the cookie, and the sweeper only
+/// releases references, which ignores it too.
 fn background_cookie() -> *const c_void {
     ptr::null()
-}
-
-#[cfg(parked_cookie)]
-fn background_cookie() -> *const c_void {
-    crate::attach::cookie()
 }
 
 #[derive(Clone, Copy)]
@@ -83,57 +78,6 @@ impl Store {
             engine,
             cookie: background_cookie(),
         })
-    }
-
-    /// A store a background thread may pass a key to, `None` until
-    /// `crate::attach` has a connection parked and again while a lost one is
-    /// replaced; the caller skips that round.
-    ///
-    /// The check used to be `#[cfg(feature = "migration")]`, justified by
-    /// "without `migration` the server compiles `ACTION_BEFORE_READ` away, so the
-    /// null cookie is fine" -- **that justification was wrong**, and nothing like
-    /// it should be reinstated. Two separate gates dereference the cookie, and
-    /// only one of them is migration's:
-    ///
-    /// * `ACTION_BEFORE_READ` really is `#ifdef ENABLE_MIGRATION`, and a read of
-    ///   a key this node has handed off reaches `set_not_my_key_info`, which
-    ///   writes the new owner through the cookie.
-    /// * `ACTION_BEFORE_WRITE` is `#if defined(ENABLE_REPLICATION) ||
-    ///   defined(ENABLE_MIGRATION)` (`engines/default/default_engine.c`), so a
-    ///   `replication`-only build has it too. Its master arm calls
-    ///   `do_check_master_switchover_done(cookie)`, which during a switchover
-    ///   reaches `set_switchover_node(cookie, ..)` (`c->swover_node[0] = ..`) or
-    ///   `get_thread_index(cookie)` (`c->thread->index`) -- both unguarded. Only
-    ///   the slave arm handles a null cookie.
-    ///
-    /// No background *write* goes through here any more -- `repl::role` sends
-    /// the owner key over `crate::attach`'s connection instead, so the daemon
-    /// runs it on the worker thread that owns that connection. The null check
-    /// stays regardless: the reads that remain (`recovery::run_builder`,
-    /// `access::sweep::probe_round`, the replica's `slave` resolves) run the
-    /// migration gate, and nothing stops a future caller from adding a write
-    /// back. Outside a switchover a null cookie happens to survive the write
-    /// gate (`WTHREAD_SET_LAST_CSET_SEQ` is `if (cookie)`-guarded); the first
-    /// ZK-driven switchover is where it would take the daemon down.
-    ///
-    /// `cfg(parked_cookie)` -- `migration || replication` -- is exactly the set
-    /// of builds where one of those two gates is compiled into the server, and
-    /// also exactly the set where `attach` is compiled and so a cookie can ever
-    /// arrive. A build with neither has no gate to trip, and refusing the null
-    /// cookie there would refuse *every* keyed background call for the life of
-    /// the process: `recovery::run_builder` would requeue every rebuild
-    /// forever, so a `persistence`-only node could never rebuild a graph from a
-    /// Map that outlived it, and `access::sweep::probe_round` would never probe.
-    /// The `abi::verify` check is what makes the correspondence sound -- a crate
-    /// built without these features cannot attach to a server that has them,
-    /// because the added vtable members change the member count it compares.
-    pub fn background_keyed() -> Option<Self> {
-        let store = Self::background()?;
-        #[cfg(parked_cookie)]
-        if store.cookie.is_null() {
-            return None;
-        }
-        Some(store)
     }
 
     fn handle(&self) -> *mut ENGINE_HANDLE {

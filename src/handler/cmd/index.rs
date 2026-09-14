@@ -2,7 +2,6 @@ use std::fmt::Write as _;
 
 use crate::command::request::Create;
 use crate::error::{Error, Reply, Result};
-#[cfg(recovery)]
 use crate::handler::access::resolve;
 use crate::handler::access::sweep;
 use crate::handler::arcus::element::{self, Layout, MetaRecord};
@@ -34,13 +33,11 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
 
     let held = map_size_for(store, spec.maxcount);
     let maxcount = held - 1;
-    let owner = crate::owner::ours();
     let meta = MetaRecord {
         metric: metric.as_str().to_owned(),
         connectivity: spec.connectivity,
         expansion_add: spec.expansion_add,
         expansion_search: spec.expansion_search,
-        owner: owner.to_owned(),
     };
     let index = VectorIndex::building(name.to_owned(), ann, maxcount);
 
@@ -60,7 +57,7 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
     match settled {
         Ok(true) => {
             registered.publish();
-            registered.mark_ours();
+            registered.mark_serving();
             if previous.is_some() {
                 eprintln!(
                     "ArcVector: index '{name}' had no Map; released the graph it was built from"
@@ -68,8 +65,6 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
 
                 sweep::retire(previous);
             }
-            #[cfg(feature = "replication")]
-            crate::repl::publish(name, "", crate::repl::Op::Upsert);
             Ok(Reply::Created)
         }
 
@@ -92,20 +87,8 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
 }
 
 fn already_there(store: &Store, name: &str) -> Result<Reply> {
-    #[cfg(recovery)]
-    {
-        resolve(store, name)?;
-        Ok(Reply::Exists)
-    }
-
-    #[cfg(not(recovery))]
-    {
-        let _ = store;
-        Err(Error::bad_request(format!(
-            "a Map already exists at '{name}' and this build cannot rebuild an \
-             index from it; drop it with 'vdrop {name}' and create it again"
-        )))
-    }
+    resolve(store, name)?;
+    Ok(Reply::Exists)
 }
 
 fn check_dimension_fits(store: &Store, layout: Layout, quant: Quant) -> Result<()> {
@@ -136,8 +119,6 @@ pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {
     let known = registry::remove(name);
 
     Ok(if known || dropped {
-        #[cfg(feature = "replication")]
-        crate::repl::publish(name, "", crate::repl::Op::Delete);
         Reply::Dropped
     } else {
         Reply::NotFound
