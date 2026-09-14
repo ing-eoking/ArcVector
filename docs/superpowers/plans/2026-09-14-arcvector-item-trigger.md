@@ -46,78 +46,30 @@
 
 ---
 
-## Task 1: C 훅 마무리 (arcus-memcached-EE)
+## 전제조건 — arcus-memcached-EE 쪽 (이 계획의 범위 밖)
 
-**Files:**
-- Modify: `engines/default/item_base.c:1094-1100` (link 훅), `engines/default/item_base.c:1132-1136` (unlink 훅)
+**이 계획은 ArcVector만 고친다.** 서버 쪽은 따로 작업되며, 아래가 그 계약이다. 하나라도
+어긋나면 Task 4 이후의 통합 테스트가 실패하고, 그때 봐야 할 곳이 여기다.
 
-**Interfaces:**
-- Consumes: 없음
-- Produces: `ON_ITEM_TRIGER` 콜백 계약 — `cookie`는 `hash_item*`, `event_data`가 NULL이 아니면 link, NULL이면 unlink. link 이벤트는 **refcount가 하나 올라간 참조를 확장에 넘긴다.**
+| 요구 | 어디 | 지금 상태 |
+|---|---|---|
+| `ON_ITEM_TRIGER = 5`가 `ENGINE_EVENT_TYPE`에 있고 `MAX_ENGINE_EVENT_TYPE`이 6 | `include/memcached/callback.h` | 되어 있음 |
+| `do_item_link`가 `arcus_trig` + `{`로 시작하는 키에 대해 콜백을 쏜다 | `engines/default/item_base.c` | 훅은 있으나 `RP_ROLE_MODE == RP_MODE_SLAVE` 게이트가 남아 있고 `key[10] == '{'` 가드가 없다 |
+| **link 훅이 `ITEM_REFCOUNT_INCR(it)`로 참조를 확장에 넘긴다** | 같은 곳 | 아직 없음 |
+| `do_item_unlink`가 같은 조건에 `event_data = NULL`로 콜백을 쏜다 | 같은 곳 | 되어 있음 (`{` 가드만 없음) |
+| `mc_engine.v1`이 `init_engine` **전에** 채워진다 | `memcached.c` | 적용됨 |
 
-**현재 상태와 남은 차이 셋**
+세 번째 줄이 이 계획에서 가장 중요하다. 그래프는 아이템 포인터를 들고 락 없이 읽으므로,
+link 시점에 refcount가 올라가 있지 않으면 **검색이 해제된 메모리를 읽는다.** 서버 쪽에
+그것이 들어가기 전에는 Task 5 이후를 실서버에 붙이지 않는다.
 
-1. link 훅에 `RP_ROLE_MODE == RP_MODE_SLAVE`가 남아 있다. 이게 있으면 마스터의 자기 쓰기와 persistence 복구에서 트리거가 안 뜨고, 그러면 그래프를 저장소에서 다시 짓는 코드가 계속 필요하다.
-2. 10바이트 비교만으로는 `arcus_trigger:foo` 같은 평범한 클라이언트 키도 걸린다.
-3. refcount를 안 올리므로 확장이 받은 포인터가 언제든 free될 수 있다.
-
-- [ ] **Step 1: link 훅을 고친다**
-
-`engines/default/item_base.c`의 `do_item_link()` 안, `assoc_insert(it, it->khash);` 바로 다음 블록을 이것으로 바꾼다.
-
-```c
-#ifdef ENABLE_REPLICATION
-    if (it->nkey > 10 && memcmp(key, "arcus_trig", 10) == 0 && key[10] == '{') {
-        /* The extension keeps this pointer in its graph and reads it without
-         * the cache lock, so hand it an owned reference. It releases through
-         * the engine's own release(), never from inside this callback.
-         */
-        ITEM_REFCOUNT_INCR(it);
-        engine->server.callback->perform_callbacks(ON_ITEM_TRIGER,
-                                                   (const void *)1,
-                                                   (const void *)it);
-    }
-#endif
-```
-
-`RP_ROLE_MODE` 조건이 사라진 것, `key[10] == '{'`가 붙은 것, `ITEM_REFCOUNT_INCR(it)`가 앞에 온 것 셋이 전부다. `ITEM_REFCOUNT_INCR`는 같은 파일 152행에 있고 `item_base.h`에 선언돼 있다. 여기는 이미 `cache_lock` 아래이므로 그냥 부르면 된다.
-
-- [ ] **Step 2: unlink 훅에 `{` 가드를 붙인다**
-
-`do_item_unlink()` 안, `item_unlink_q(it);` 다음 블록:
-
-```c
-#ifdef ENABLE_REPLICATION
-        if (it->nkey > 10 && memcmp(key, "arcus_trig", 10) == 0 && key[10] == '{') {
-            engine->server.callback->perform_callbacks(ON_ITEM_TRIGER,
-                                                       NULL,
-                                                       (const void *)it);
-        }
-#endif
-```
-
-**refcount를 올리지 않는다.** 그 아이템의 참조는 link 때 이미 넘겼다. 들여쓰기를 주변 블록(8칸)에 맞춘다 — 지금 것은 4칸이라 어긋나 있다.
-
-- [ ] **Step 3: 빌드해서 통과하는지 본다**
-
-```bash
-cd /Users/yeoncheol/Github/arcus-memcached-EE
-make -j
-```
-
-Expected: 경고 없이 빌드 성공. `ITEM_REFCOUNT_INCR` implicit declaration 경고가 나오면 `item_base.h`에 선언이 없는 것이니 확인한다.
-
-- [ ] **Step 4: 커밋**
-
-```bash
-cd /Users/yeoncheol/Github/arcus-memcached-EE
-git add engines/default/item_base.c
-git commit -m "INTERNAL: Fire the item trigger on every link, with an owned reference"
-```
+게이트(`RP_ROLE_MODE == RP_MODE_SLAVE`)가 남아 있는 동안에는 마스터의 자기 쓰기와
+persistence 복구에서 트리거가 안 뜨므로, Task 5의 통합 테스트가 `count=0`으로 실패한다.
+그 실패는 ArcVector의 버그가 아니라 이 표의 두 번째 줄이다.
 
 ---
 
-## Task 2: 트리거 키 코덱
+## Task 1: 트리거 키 코덱
 
 **Files:**
 - Create: `src/repl/trigger/key.rs`
@@ -296,7 +248,7 @@ pub fn parse(key: &[u8]) -> Option<Parsed<'_>> {
 pub mod trigger;
 ```
 
-그리고 `src/repl/trigger/mod.rs`를 만들어 한 줄만 둔다 (Task 6이 채운다):
+그리고 `src/repl/trigger/mod.rs`를 만들어 한 줄만 둔다 (Task 5가 채운다):
 
 ```rust
 pub mod key;
@@ -321,14 +273,14 @@ git commit -m "feat: the trigger key's shape, in one tested module"
 
 ---
 
-## Task 3: KV 원시 연산
+## Task 2: KV 원시 연산
 
 **Files:**
 - Modify: `src/handler/arcus/engine/kv.rs`
-- Test: 같은 파일의 `#[cfg(test)]` 없음 — 엔진이 있어야 하므로 Task 5의 통합 테스트가 덮는다
+- Test: 같은 파일의 `#[cfg(test)]` 없음 — 엔진이 있어야 하므로 Task 4의 통합 테스트가 덮는다
 
 **Interfaces:**
-- Consumes: `key::vector_key`, `key::index_prefix` (Task 2)
+- Consumes: `key::vector_key`, `key::index_prefix` (Task 1)
 - Produces: `Store`의 메서드 다섯
   - `pub fn delete_kv(&self, key: &str) -> Result<()>`
   - `pub fn hold_kv(&self, key: &str) -> Result<u64>` — 참조를 쥔 채 아이템 포인터를 `u64`로 돌려준다. 호출자가 `release_items`로 놓아줄 책임을 진다
@@ -494,7 +446,7 @@ git commit -m "feat: KV primitives the trigger path needs"
 
 ---
 
-## Task 4: 델타 채널과 그 부속을 걷어낸다
+## Task 3: 델타 채널과 그 부속을 걷어낸다
 
 **Files:**
 - Delete: `src/repl/master.rs`, `src/repl/slave.rs`, `src/repl/wire.rs`, `src/repl/role.rs`, `src/attach.rs`, `src/owner.rs`, `src/handler/recovery.rs`
@@ -505,7 +457,7 @@ git commit -m "feat: KV primitives the trigger path needs"
 - Consumes: 없음
 - Produces: `repl::start()`가 사라지고, `repl::publish()`가 사라지고, `MetaRecord`에서 `owner` 필드가 사라지고, `Layout::element_len`의 `cfg(recovery)` 분기가 사라진다 (벡터가 항상 값 안에 들어간다).
 
-이 Task가 끝나면 남는 것은 **Map 기반 단일 노드 ArcVector**다. 복제도 재구축도 없다. Task 5가 저장을 KV로 옮기고, Task 6이 복제를 트리거로 되살린다.
+이 Task가 끝나면 남는 것은 **Map 기반 단일 노드 ArcVector**다. 복제도 재구축도 없다. Task 4가 저장을 KV로 옮기고, Task 5가 복제를 트리거로 되살린다.
 
 - [ ] **Step 1: 지운다**
 
@@ -631,7 +583,7 @@ the trigger itself arrives with the KV storage it needs."
 
 ---
 
-## Task 5: 저장을 Map에서 KV로 옮긴다
+## Task 4: 저장을 Map에서 KV로 옮긴다
 
 **Files:**
 - Modify: `src/handler/arcus/engine/mod.rs`, `src/handler/cmd/index.rs`, `src/handler/cmd/vector.rs`, `src/handler/cmd/search.rs`, `src/handler/access/mod.rs`, `src/handler/access/meta.rs`
@@ -639,7 +591,7 @@ the trigger itself arrives with the KV storage it needs."
 - Test: `tests/integration.rs` (기존 테스트가 그대로 통과해야 한다)
 
 **Interfaces:**
-- Consumes: Task 2의 `key::*`, Task 3의 `Store::{delete_kv, hold_kv, release_items, flush_prefix, with_item_at, get_kv, set_kv}`
+- Consumes: Task 1의 `key::*`, Task 2의 `Store::{delete_kv, hold_kv, release_items, flush_prefix, with_item_at, get_kv, set_kv}`
 - Produces:
   - `pub struct ItemElements;` — `crate::handler::usearch::Elements` 구현. `DetachedElements`를 대체한다
   - `Store::read_meta(&self, index: &str) -> Result<(MetaRecord, Layout)>`
@@ -647,7 +599,7 @@ the trigger itself arrives with the KV storage it needs."
 
 이 Task는 크다. 명령의 겉모습(`vcreate`/`vadd`/`vdel`/`vdrop`/`vsearch`/`vgetattr`의 응답)이 하나도 바뀌지 않는 것이 성공 기준이고, 그래서 **기존 통합 테스트가 그대로 판정한다.**
 
-그래프 삽입은 아직 명령 핸들러가 한다. Task 6이 그것을 콜백으로 옮긴다.
+그래프 삽입은 아직 명령 핸들러가 한다. Task 5가 그것을 콜백으로 옮긴다.
 
 - [ ] **Step 1: `ItemElements`를 쓴다**
 
@@ -784,7 +736,7 @@ pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {
     }
 
     // The write has committed, so the item exists and this reference is the
-    // one the graph keeps. Task 6 moves this to the callback.
+    // one the graph keeps. Task 5 moves this to the callback.
     match store.hold_kv(&vkey) {
         Ok(addr) => match index.ann.insert_published(staged, || None, || Ok::<u64, StoreError>(addr)) {
             Ok(_) => Ok(Reply::Stored),
@@ -832,7 +784,7 @@ pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {
 
 - [ ] **Step 5b: `ItemElements`를 꽂고 크기 예산을 바꾼다**
 
-`DetachedElements`를 만드는 자리 둘을 `ItemElements`로 바꾼다 (`recovery.rs`의 것은 Task 4에서 이미 파일째 사라졌다).
+`DetachedElements`를 만드는 자리 둘을 `ItemElements`로 바꾼다 (`recovery.rs`의 것은 Task 3에서 이미 파일째 사라졌다).
 
 ```bash
 grep -rn "DetachedElements" src/
@@ -924,14 +876,14 @@ own -- vdrop is a delete plus a flush. Commands answer exactly as before."
 
 ---
 
-## Task 6: 트리거 콜백
+## Task 5: 트리거 콜백
 
 **Files:**
 - Modify: `src/repl/trigger/mod.rs`, `src/lib.rs`, `src/handler/cmd/vector.rs`, `src/handler/cmd/index.rs`
 - Test: `src/repl/trigger/mod.rs`의 `#[cfg(test)]`, 그리고 `tests/integration.rs`에 새 테스트 하나
 
 **Interfaces:**
-- Consumes: Task 2의 `key::parse`, Task 3의 `Store::with_item_at`, Task 5의 `ItemElements`
+- Consumes: Task 1의 `key::parse`, Task 2의 `Store::with_item_at`, Task 4의 `ItemElements`
 - Produces:
   - `pub fn install()` — `register_callback(NULL, ON_ITEM_TRIGER, ..)`
   - `pub enum Event<'a> { MetaLink { index: &'a str, value: &'a [u8] }, MetaUnlink { index: &'a str }, VectorLink { index: &'a str, id: &'a str, value: &'a [u8] }, VectorUnlink { index: &'a str, id: &'a str } }`
@@ -1174,7 +1126,7 @@ fn apply_owned(event: Event<'_>, addr: u64) -> Kept {
     repl::trigger::install();
 ```
 
-그리고 Task 5의 Step 4에서 남겨 둔 `hold_kv` + `insert_published` 블록을 지운다. `vadd`는 이제 `set_kv`까지만 한다 — 그래프는 그 `set_kv` 안에서 콜백이 채운다. `vdel`의 `remove_published`도 지운다. `vcreate`의 레지스트리 등록도 지운다 (메타 KV의 link 콜백이 한다).
+그리고 Task 4의 Step 4에서 남겨 둔 `hold_kv` + `insert_published` 블록을 지운다. `vadd`는 이제 `set_kv`까지만 한다 — 그래프는 그 `set_kv` 안에서 콜백이 채운다. `vdel`의 `remove_published`도 지운다. `vcreate`의 레지스트리 등록도 지운다 (메타 KV의 link 콜백이 한다).
 
 - [ ] **Step 7b: `vadd`가 그래프에 들어갔는지 확인하고 못 들어갔으면 되돌린다**
 
@@ -1248,7 +1200,7 @@ make lint
 make test
 ```
 
-Expected: 전부 PASS. `count=1`이 안 나오면 콜백이 안 뜬 것이다 — 서버가 Task 1의 훅을 가진 빌드인지, `key[10] == '{'`가 맞는지 확인한다.
+Expected: 전부 PASS. `count=1`이 안 나오면 콜백이 안 뜬 것이다 — 서버가 전제조건의 훅을 가진 빌드인지, `key[10] == '{'`가 맞는지 확인한다.
 
 - [ ] **Step 10: 커밋**
 
@@ -1262,13 +1214,13 @@ recovery, because all three reach do_item_link."
 
 ---
 
-## Task 7: 지연 해제
+## Task 6: 지연 해제
 
 **Files:**
 - Modify: `src/handler/access/sweep.rs`
 
 **Interfaces:**
-- Consumes: Task 3의 `Store::release_items`
+- Consumes: Task 2의 `Store::release_items`
 - Produces:
   - `pub(crate) fn release_later(addr: u64)` — 엔진을 부르지 않는다. 목록에 넣고 sweeper를 깨운다
   - `pub(crate) fn retire(evicted: Option<Arc<VectorIndex>>)` — 지금 것 그대로
@@ -1410,7 +1362,7 @@ git commit -m "fix: release item references from the sweeper, never under a lock
 
 ---
 
-## Task 8: 문서
+## Task 7: 문서
 
 **Files:**
 - Rewrite: `docs/복제.md`
