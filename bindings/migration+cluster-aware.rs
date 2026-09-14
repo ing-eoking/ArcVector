@@ -166,7 +166,7 @@ pub const MEMCACHED_VISIBILITY_H: u32 = 1;
 pub const POWER_SMALLEST: u32 = 1;
 pub const POWER_LARGEST: u32 = 200;
 pub const MAX_SLAB_CLASSES: u32 = 201;
-pub const MAX_ENGINE_EVENT_TYPE: u32 = 5;
+pub const MAX_ENGINE_EVENT_TYPE: u32 = 6;
 pub const MEMCACHED_VBUCKET_H: u32 = 1;
 pub const NUM_VBUCKETS: u32 = 65536;
 pub const CMD_SET_VBUCKET: u32 = 131;
@@ -1673,11 +1673,7 @@ pub struct SERVER_STAT_API {
         ::std::option::Option<unsafe extern "C" fn(arg1: *mut ::std::os::raw::c_void)>,
     #[doc = " Tell the server we've evicted an item."]
     pub evicting: ::std::option::Option<
-        unsafe extern "C" fn(
-            cookie: *const ::std::os::raw::c_void,
-            key: *const ::std::os::raw::c_void,
-            nkey: ::std::os::raw::c_int,
-        ),
+        unsafe extern "C" fn(key: *const ::std::os::raw::c_void, nkey: ::std::os::raw::c_int),
     >,
 }
 pub type GET_SERVER_API = ::std::option::Option<unsafe extern "C" fn() -> *mut SERVER_HANDLE_V1>;
@@ -1698,6 +1694,8 @@ pub const ENGINE_EVENT_TYPE_ON_AUTH: ENGINE_EVENT_TYPE = 2;
 pub const ENGINE_EVENT_TYPE_ON_SWITCH_CONN: ENGINE_EVENT_TYPE = 3;
 #[doc = "< Changed log level"]
 pub const ENGINE_EVENT_TYPE_ON_LOG_LEVEL: ENGINE_EVENT_TYPE = 4;
+#[doc = "< An item was triggered"]
+pub const ENGINE_EVENT_TYPE_ON_ITEM_TRIGER: ENGINE_EVENT_TYPE = 5;
 #[doc = " Event types for callbacks to the engine indicating state\n changes in the server."]
 pub type ENGINE_EVENT_TYPE = ::std::os::raw::c_uint;
 #[doc = " Callback for server events.\n\n @param cookie The cookie provided by the frontend\n @param type the type of event\n @param event_data additional event-specific data.\n @param cb_data data as registered"]
@@ -2538,27 +2536,6 @@ pub struct engine_interface_v1 {
             from_posi: ::std::os::raw::c_int,
             to_posi: ::std::os::raw::c_int,
             eresult: *mut elems_result,
-            vbucket: u16,
-        ) -> ENGINE_ERROR_CODE,
-    >,
-    pub btree_elem_smget_old: ::std::option::Option<
-        unsafe extern "C" fn(
-            handle: *mut ENGINE_HANDLE,
-            cookie: *const ::std::os::raw::c_void,
-            karray: *mut token_t,
-            kcount: ::std::os::raw::c_int,
-            bkrange: *const bkey_range,
-            efilter: *const eflag_filter,
-            offset: u32,
-            count: u32,
-            eitem_array: *mut *mut eitem,
-            kfnd_array: *mut u32,
-            flag_array: *mut u32,
-            eitem_count: *mut u32,
-            missed_key_array: *mut u32,
-            missed_key_count: *mut u32,
-            trimmed: *mut bool,
-            duplicated: *mut bool,
             vbucket: u16,
         ) -> ENGINE_ERROR_CODE,
     >,
