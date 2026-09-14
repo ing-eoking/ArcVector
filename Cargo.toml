@@ -9,62 +9,30 @@ edition = "2024"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# --- How the memcached server was configured ---------------------------------
+# --- How the server was configured ------------------------------------------
 #
-# These name the server's `configure` flags, not features of this crate. It calls
-# no replication, migration or cluster API at all; each flag inserts members into
-# `engine_interface_v1`, which is called by offset, so `get_item_info` and
-# `get_elem_info` move even though nothing about them changes. The bindings must
-# be generated with the same set the server has, and the server's own `config.h`
-# lists which those are.
+# There are no feature flags for that any more. Which members
+# `engine_interface_v1` has is decided by the server's own `config.h`, and that
+# file is vendored beside the headers it configures (`include/config.h`), where
+# `build.rs` hands it to clang exactly as the server's own build does. Copy a
+# server tree's `config.h` and `include/memcached` in, retranslate, and the
+# bindings match that server -- including any ENABLE_* flag added to arcus after
+# this was written.
 #
-# `build.rs` reads CARGO_FEATURE_* and passes the matching `-D` to bindgen, so most
-# of the effect is in the generated `engine_api.rs`. See docs/내부구조.md §2.2.
-# Named after the flag with arcus's `ENABLE_` prefix dropped; `build.rs` puts it
-# back, so the name is written once.
-#
-# `replication` implies `cluster-aware`, because the server cannot be configured
-# the other way round: in `server_api.h` the `ENABLE_REPLICATION` member of
-# `SERVER_CORE_API` — `set_switchover_node` — is nested *inside* the
-# `ENABLE_CLUSTER_AWARE` block, so replication's own switchover hook does not
-# exist without zk integration. Replication in arcus is a zk-managed
-# master/slave pair; there is no non-clustered form of it to build against.
-#
-# It is also free: `ENABLE_CLUSTER_AWARE` appears nowhere in `engine.h`, so it
-# moves no member of `engine_interface_v1`, and the three members it inserts into
-# `SERVER_CORE_API` all sit after the four this crate calls (`get_current_time`,
-# `server_version`, `store_engine_specific`, `get_engine_specific`). Nothing this
-# crate reaches for shifts either way — what the implication buys is two fewer
-# binding variants to keep honest.
-replication = ["cluster-aware"]
-migration = []
-cluster-aware = []
-
-# ENABLE_PERSISTENCE. Unlike the three above it changes no header this crate
-# reads — it lives in `engines/default/*.h`, not `include/memcached/` — so it
-# passes no define and moves no vtable member. It states one fact: the server
-# restores items on restart, so a Map can outlive this process's graph.
-persistence = []
-
-# Recovery — rebuilding a graph from Map — is what those two facts imply, and
-# `build.rs` turns `cfg(recovery)` on when either is set. Neither replication nor
-# persistence means nothing can outlive the graph, so the ownership token, the
-# metadata read on every command and the rebuild thread are all dead weight; an
-# index whose graph is missing then answers NOT_FOUND and is recreated by hand.
+#   make sync-headers TREE=<path to the server tree>
 
 # --- Bindings ----------------------------------------------------------------
 #
-# `include/memcached/*.h` is fixed and so is what bindgen makes of it, so the
-# translation is committed under `bindings/` -- one file per combination of the
-# three flags above, since each moves members in `engine_interface_v1`. A plain
-# `cargo build` copies the matching one and never runs bindgen, which is what
-# keeps libclang, and so LLVM, out of the build entirely.
+# The translation of `include/` is committed, as `bindings/engine_api.rs`, so a
+# plain `cargo build` copies it and never runs bindgen. That is what keeps
+# libclang, and so LLVM, out of an ordinary build entirely.
 #
-# Turn this on to translate the headers again: after editing anything under
-# `include/`, or to build against a tree named by ARCVECTOR_ENGINE_INCLUDE, which
-# the committed bindings by definition do not describe. It needs libclang, and it
-# writes its output back over `bindings/` so the two cannot drift. `make bindings`
-# runs it over every combination.
+# Turn this on to translate the headers again: after copying a server tree's
+# `config.h` and `include/memcached` in, or to build against a tree named by
+# ARCVECTOR_ENGINE_INCLUDE. It needs libclang, and it writes its output back
+# over the committed copy so the two cannot drift. `build.rs` also records a
+# fingerprint of what it read, and refuses a later build whose headers no longer
+# match it.
 regen-bindings = ["dep:bindgen"]
 
 # --- Test targets ------------------------------------------------------------

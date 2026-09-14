@@ -180,11 +180,10 @@ mod tests {
 
         if env!("ARCVECTOR_ABI_HEADERS") == "include" {
             assert!(text.contains("scan"), "{text}");
-            assert_eq!(
-                text.contains("replication"),
-                cfg!(feature = "replication"),
-                "ENABLE_REPLICATION comes from the feature or not at all: {text}"
-            );
+            // Which ENABLE_* flags are on is read off the translated headers,
+            // not off a cargo feature, so this reports what the bindings
+            // actually contain -- see build.rs.
+            assert!(text.contains("tree"), "{text}");
         }
     }
 

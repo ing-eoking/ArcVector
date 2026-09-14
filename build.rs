@@ -1,16 +1,15 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-/// The server `configure` flags that move members in the structs this crate
-/// binds, in the order they read best in a file name.
+/// Where the committed translation of the headers lives.
 ///
-/// `cluster-aware` moves nothing in `engine_interface_v1` -- it is named here
-/// because it shapes `SERVER_CORE_API`, and because Cargo.toml has `replication`
-/// imply it, so the two always appear together in a variant name.
-const ABI_FLAGS: [&str; 3] = ["replication", "migration", "cluster-aware"];
+/// One file, not a set: which members `engine_interface_v1` has is decided by
+/// the server's `config.h`, and that file is vendored next to the headers it
+/// configures. There is nothing left for a cargo feature to select.
+const COMMITTED: &str = "bindings/engine_api.rs";
 
-/// Where the fingerprint of the headers the committed bindings were made from
-/// lives. Written by a `regen-bindings` build, checked by every other one.
+/// A fingerprint of the headers the committed translation was made from,
+/// written when it is generated and compared on every other build.
 const FINGERPRINT: &str = "bindings/headers.fingerprint";
 
 fn main() {
@@ -34,6 +33,8 @@ fn main() {
         .unwrap_or_default();
     let members = vtable.matches("pub ").count();
 
+    // Read back off the translation rather than off a cargo feature, so what
+    // this reports is what the bindings actually contain.
     let mut features: Vec<&str> = [
         ("replication", "pub rp_cmd"),
         ("migration", "pub mg_prepare"),
@@ -47,8 +48,7 @@ fn main() {
     if text.contains("pub is_zk_integrated") {
         features.push("cluster_aware");
     }
-
-    if enabled("persistence") {
+    if defined(&include, "ENABLE_PERSISTENCE") {
         features.push("persistence");
     }
     features.sort_unstable();
@@ -69,103 +69,102 @@ fn main() {
     println!("cargo:rustc-env=ARCVECTOR_ABI_TREE={tree}");
 }
 
-/// Names the committed bindings for the flags this build has on.
+/// Whether the vendored `config.h` turns a macro on.
 ///
-/// The flags decide the vtable's shape, so each combination is its own file.
-/// Cargo has already applied the `replication -> cluster-aware` implication by
-/// the time this reads CARGO_FEATURE_*, so `--features replication` lands on
-/// `replication+cluster-aware.rs` and the lone `replication` name never occurs.
-fn variant() -> String {
-    let on: Vec<&str> = ABI_FLAGS.into_iter().filter(|f| enabled(f)).collect();
-    if on.is_empty() {
-        "base".to_owned()
-    } else {
-        on.join("+")
-    }
+/// autoconf writes the off case as `/* #undef NAME */`, so a plain substring
+/// search would answer yes to both. Only a real `#define` counts.
+fn defined(include: &str, macro_name: &str) -> bool {
+    let path = Path::new(include).join("config.h");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        line.strip_prefix("#define")
+            .map(str::trim_start)
+            .and_then(|rest| rest.strip_prefix(macro_name))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    })
 }
 
 /// Puts `engine_api.rs` in `OUT_DIR`, from the copy committed under `bindings/`.
 ///
-/// The headers under `include/` are fixed and so is what bindgen makes of them,
-/// so the generated file is committed rather than regenerated on every machine
-/// that builds this. That is the whole reason a plain `cargo build` needs no
-/// libclang, and hence no LLVM: bindgen is not in the dependency graph at all
-/// unless `regen-bindings` is on.
+/// The committed copy is what keeps libclang, and hence LLVM, out of an
+/// ordinary build: bindgen is not in the dependency graph at all unless
+/// `regen-bindings` is on.
 #[cfg(not(feature = "regen-bindings"))]
 fn bindings(include: &str, _header: &str, generated: &Path) {
-    let variant = variant();
-    let committed = Path::new("bindings").join(format!("{variant}.rs"));
+    let committed = Path::new(COMMITTED);
 
     assert!(
         env::var_os("ARCVECTOR_ENGINE_INCLUDE").is_none(),
         "ARCVECTOR_ENGINE_INCLUDE points this build at headers other than the ones \
-         under include/, and the bindings committed in bindings/ were generated \
-         from those. Build with --features regen-bindings (which needs libclang) \
-         to translate the headers you are pointing at."
+         under include/, and {COMMITTED} was generated from those. Build with \
+         --features regen-bindings (which needs libclang) to translate the \
+         headers you are pointing at."
     );
-
     assert!(
         committed.exists(),
-        "no bindings committed for this combination of flags ({variant}); \
-         `make bindings` regenerates the set on a machine that has libclang"
+        "{COMMITTED} is missing; `cargo build --features regen-bindings` writes it"
     );
 
     check_headers_match(include);
 
-    std::fs::copy(&committed, generated).expect("failed to copy the committed bindings");
-    println!("cargo:rerun-if-changed={}", committed.display());
+    std::fs::copy(committed, generated).expect("failed to copy the committed bindings");
+    println!("cargo:rerun-if-changed={COMMITTED}");
 }
 
-/// Refuses to build when `include/memcached` has moved since the committed
-/// bindings were generated from it.
+/// Refuses to build when `include/` has moved since the bindings were
+/// generated from it.
 ///
 /// The vtable is called by offset, so a header that adds or drops one member
 /// shifts every member after it -- and the runtime check cannot see that,
 /// because the slot it lands on still holds a perfectly valid function pointer
-/// from the neighbouring entry. That is how a `types.h` that stopped defining
+/// from the neighbouring entry. That is how a `types.h` which stopped defining
 /// `JHPARK_OLD_SMGET_INTERFACE` turned `get_config` into `item_cachedump` and
 /// segfaulted the daemon on the first `vcreate`. Comparing a fingerprint here
 /// turns that into a build error that names the fix.
 #[cfg(not(feature = "regen-bindings"))]
 fn check_headers_match(include: &str) {
     let now = header_fingerprint(include);
-    let recorded = std::fs::read_to_string(FINGERPRINT).map(|t| t.trim().to_owned());
-
-    match recorded {
+    match std::fs::read_to_string(FINGERPRINT).map(|t| t.trim().to_owned()) {
         Ok(recorded) if recorded == now => {}
         Ok(recorded) => panic!(
             "\n\
-             {include}/memcached has changed since bindings/ was generated from it.\n\
+             {include}/ has changed since {COMMITTED} was generated from it.\n\
              \n\
                recorded: {recorded}\n\
                now:      {now}\n\
              \n\
              The engine vtable is called by offset, so a member added or removed\n\
-             in a header silently shifts every call after it. Regenerate:\n\
+             in a header silently shifts every call after it. Retranslate:\n\
              \n\
-               make bindings          # needs libclang\n\
+               cargo build --features regen-bindings\n\
              \n\
-             or, to follow a server tree: make sync-headers TREE=<path>\n"
+             or, to follow a server tree in one step:\n\
+             \n\
+               make sync-headers TREE=<path to the server tree>\n"
         ),
         Err(_) => panic!(
             "\n\
              {FINGERPRINT} is missing, so nothing records which headers\n\
-             bindings/ was generated from. Run `make bindings` to write it.\n"
+             {COMMITTED} was generated from. Run:\n\
+             \n\
+               cargo build --features regen-bindings\n"
         ),
     }
 }
 
-/// A cheap content hash over every header bindgen reads.
+/// A cheap content hash over every header under `include/`.
+///
+/// `config.h` and `config_static.h` are in here for the same reason `config.h`
+/// is passed to clang: they decide which members the vtable has, so a build
+/// against a differently configured server must not reuse this translation.
 ///
 /// FNV-1a rather than anything stronger on purpose: this catches an honest
-/// edit, not an adversary, and it keeps build.rs free of dependencies.
+/// edit, not an adversary, and it keeps build.rs dependency-free.
 fn header_fingerprint(include: &str) -> String {
-    let dir = Path::new(include).join("memcached");
-    let mut names: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|e| e == "h"))
-        .collect();
+    let mut names = Vec::new();
+    collect_headers(Path::new(include), &mut names);
     names.sort();
 
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -176,11 +175,9 @@ fn header_fingerprint(include: &str) -> String {
         }
     };
     for path in &names {
-        feed(
-            path.file_name()
-                .expect("a directory entry has a name")
-                .as_encoded_bytes(),
-        );
+        // The path, not just the name: a header moving between directories
+        // changes what includes resolve to.
+        feed(path.as_os_str().as_encoded_bytes());
         feed(
             &std::fs::read(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display())),
         );
@@ -188,28 +185,50 @@ fn header_fingerprint(include: &str) -> String {
     format!("fnv1a64={hash:016x} files={}", names.len())
 }
 
-/// Translates the headers afresh, and writes the result back over the committed
-/// copy so the two cannot drift apart unnoticed.
+fn collect_headers(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+    for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+        if path.is_dir() {
+            collect_headers(&path, out);
+        } else if path.extension().is_some_and(|e| e == "h") {
+            out.push(path);
+        }
+    }
+}
+
+/// Translates the headers afresh, and writes the result back over the
+/// committed copy so the two cannot drift apart unnoticed.
 ///
-/// Everything the C library declares is kept out. Those headers are written per
-/// platform -- the macOS run emitted a hundred `__darwin_*` aliases where glibc
-/// would emit its own -- and letting them through is what would stop one
+/// `-include config.h` is what makes the cargo features unnecessary. The
+/// server's own build puts that file in front of every translation unit, so
+/// doing the same here means `ENABLE_REPLICATION`, `ENABLE_MIGRATION` and
+/// everything after them come from the file the server was configured with
+/// rather than from flags a person has to remember to repeat. A flag added to
+/// arcus tomorrow needs no change here.
+///
+/// Everything the C library declares is kept out. Those headers are written
+/// per platform -- the macOS run emitted a hundred `__darwin_*` aliases where
+/// glibc would emit its own -- and letting them through is what would stop one
 /// generated file from serving every target.
 #[cfg(feature = "regen-bindings")]
 fn bindings(include: &str, header: &str, generated: &Path) {
-    let mut builder = bindgen::Builder::default()
+    let config = Path::new(include).join("config.h");
+    assert!(
+        config.exists(),
+        "{} is missing. Copy it from the server tree together with include/memcached: \
+         it is what says which ENABLE_* flags that server was built with, and so what \
+         shape its vtable has.",
+        config.display()
+    );
+
+    bindgen::Builder::default()
         .header(header)
         .clang_arg(format!("-I{include}"))
+        .clang_arg("-include")
+        .clang_arg(config.to_str().expect("the include path is utf8"))
         .clang_arg("-pthread")
-        .clang_arg("-D_GNU_SOURCE");
-
-    for flag in ABI_FLAGS {
-        if enabled(flag) {
-            builder = builder.clang_arg(format!("-DENABLE_{}", macro_case(flag)));
-        }
-    }
-
-    builder
+        .clang_arg("-D_GNU_SOURCE")
         .layout_tests(false)
         .blocklist_type("c_void")
         .allowlist_file(".*memcached/.*\\.h")
@@ -227,20 +246,11 @@ fn bindings(include: &str, header: &str, generated: &Path) {
     if env::var_os("ARCVECTOR_ENGINE_INCLUDE").is_none() {
         let dir = Path::new("bindings");
         std::fs::create_dir_all(dir).expect("failed to create bindings/");
-        std::fs::copy(generated, dir.join(format!("{}.rs", variant())))
-            .expect("failed to refresh the committed bindings");
+        std::fs::copy(generated, COMMITTED).expect("failed to refresh the committed bindings");
         // Only now, with the committed copy actually made from these headers,
         // is the fingerprint true. A build pointed elsewhere by
         // ARCVECTOR_ENGINE_INCLUDE refreshes neither.
         std::fs::write(FINGERPRINT, format!("{}\n", header_fingerprint(include)))
             .expect("failed to record the header fingerprint");
     }
-}
-
-fn macro_case(feature: &str) -> String {
-    feature.to_uppercase().replace('-', "_")
-}
-
-fn enabled(feature: &str) -> bool {
-    env::var_os(format!("CARGO_FEATURE_{}", macro_case(feature))).is_some()
 }
