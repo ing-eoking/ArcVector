@@ -64,6 +64,15 @@ typedef enum {
 `key[10] == '{'`까지 보는 이유는 10바이트 비교만으로는 `arcus_trigger:foo` 같은 평범한
 클라이언트 키도 걸리기 때문이다. 우리 키는 이름 다음이 반드시 `{`다.
 
+**훅은 `perform_callbacks` 전에 `it`의 refcount를 올려 확장에 소유권을 넘긴다.** 그래프가
+아이템 메모리를 포인터로 들고 있고 검색이 그걸 락 없이 읽기 때문에(§6), 아이템이 확장보다
+먼저 free되면 안 된다. `do_item_get`이 하는 그 증가를 여기서 미리 해 주는 것이다 — 이미
+`cache_lock` 아래이므로 안전하고, 확장이 락을 잡을 방법도 없다.
+
+확장은 그 참조의 주인이 되고, 반드시 둘 중 하나를 해야 한다: 그래프에 넣어 보관하거나,
+해제 목록에 넘기거나(§6). unlink 훅은 refcount를 올리지 않는다 — 그 아이템의 참조는
+link 때 이미 받았다.
+
 게이트를 빼는 것이 이 설계의 핵심이다. 그러면 **세 가지 경로가 한 코드로 수렴한다.**
 
 | 경로 | 무엇이 link를 부르나 |
@@ -97,7 +106,7 @@ unlink라는 뜻이다.
 축출된 벡터를 그래프에서 빼는 것보다 나쁘다. `set` 덮어쓰기는 unlink 직후 link가 따라오므로
 순 효과가 갱신이 된다(§8).
 
-### 3.3 `mc_engine` 대입을 한 줄 올린다
+### 3.3 `mc_engine` 대입을 한 줄 올린다 *(적용됨)*
 
 확장은 `load_extension`([memcached.c:16493](../../../../arcus-memcached-EE/memcached.c),
 getopt 루프)에서 엔진보다 먼저 적재되므로 콜백 등록은 제때 끝난다. 그런데 persistence 복구는
@@ -167,10 +176,16 @@ arcus_trig{<index>}:          인덱스 메타 (id가 빈 문자열)
 
 | 키 | 값 |
 |---|---|
-| 벡터 KV | 지금의 `Layout` 인코딩 그대로 — 헤더 + attr 128바이트 + 양자화된 벡터 |
+| 벡터 KV | 지금의 `Layout` 인코딩 — 헤더 + attr 128바이트 + 양자화된 벡터 |
 | 메타 KV | 지금의 `MetaRecord` — dim, quant, metric, maxcount. **소유자 필드는 뺀다**(§2) |
 
 Map, `AV META` 원소, `probe_map`, `hold_all`, `getattr` 개수는 전부 없어진다.
+
+**벡터는 이제 항상 값 안에 들어간다.** 지금은 `cfg(not(recovery))` 빌드가 벡터를 빼고
+헤더와 attr만 저장하는데([element.rs:67](../../../src/handler/arcus/element.rs)), 그 벡터
+사본이 복제본에게 실려 가는 유일한 통로가 되므로 더는 뺄 수 없다. `Layout::element_len`의
+`cfg` 분기가 없어진다 — arcus 쪽 사본의 목적이 "재구축을 위한 것"에서 "복제를 위한 것"으로
+바뀔 뿐, 메모리는 `recovery` 빌드와 같다.
 
 ### 4.3 크기 한계와 개수
 
@@ -208,39 +223,68 @@ on_item_trigger(cookie = hash_item*, type, event_data, cb_data)
 2. 키를 파싱한다 → (index, id)
 3. id가 비었으면 메타 이벤트:
      link   → MetaRecord를 읽어 registry에 인덱스를 만든다
-     unlink → registry에서 빼고 그래프를 놓아준다
+     unlink → registry에서 빼고, 그래프를 sweep::retire에 넘긴다
    id가 있으면 벡터 이벤트:
-     link   → 값에서 벡터와 attr을 복사해 그래프에 넣는다
-     unlink → 그래프에서 뺀다
+     link   → 값에서 벡터를 읽어 usearch에 넣고, 아이템 포인터를 HeldSet에 등록한다
+     unlink → HeldSet에서 빼고 해제 목록에 넘긴다
 ```
 
-큐도 스레드도 없다. HNSW 삽입이 그 자리에서 끝난다.
+link에서 받은 참조(§3.1)는 **반드시 처분한다.** 그래프에 넣었으면 HeldSet이 주인이고,
+넣지 못했으면(알 수 없는 인덱스, 디코드 실패, 메모리 부족) 그 자리에서 해제 목록에 넘긴다.
+어느 쪽도 아니면 아이템이 영원히 free되지 않는다.
+
+**그래프를 free하는 일도 콜백 안에서 하지 않는다.** 메타 unlink는 수 GB짜리 HNSW를
+놓아주는 일인데, `cache_lock`을 쥔 채 그걸 하면 그동안 데몬의 모든 요청이 멈춘다.
+레지스트리에서 빼고 `sweep::retire`에 넘기기만 한다.
+
+큐는 없다. HNSW 삽입이 그 자리에서 끝난다.
 
 ## 6. 잠금 순서 — 왜 데드락이 없나
 
 콜백은 `cache_lock`을 쥔 채 **그래프 락**을 잡는다. 그러므로 반대 방향이 하나라도 있으면
-AB-BA가 된다. 이 설계는 반대 방향을 **전부 없애서** 성립한다.
+AB-BA가 된다.
 
-지금은 반대 방향이 있다. 검색이 `with_attr_at`/`with_vector_at`으로 저장소를 되읽고
-([search.rs:57](../../../src/handler/cmd/search.rs),
-[search.rs:195](../../../src/handler/cmd/search.rs)), 원소를 놓아주는 `release_held`는
-`map_elem_release` → `cache_lock`이다.
+### 6.1 검색은 반대 방향이 아니다
 
-**그래프가 자기 복사본을 갖게 하면 그 방향이 사라진다.** 콜백이 벡터와 attr 128바이트를
-복사해 넣고, 검색은 엔진을 한 번도 부르지 않는다. 그러면:
+그래프는 아이템 포인터를 들고, 검색은 그걸 따라가 **락 없이** 엔진 메모리를 읽는다
+([search.rs:57](../../../src/handler/cmd/search.rs)의 attr 필터, `id_at`). 락을 안 잡으니
+반대 방향이 아니다. 안전한 이유는 §3.1에서 받은 refcount다 — 그 아이템은 우리가 놓아줄
+때까지 free되지 않는다.
+
+읽는 것이 attr 128바이트와 id뿐이라는 점이 중요하다. **벡터는 usearch가 이미 자기 메모리에
+복사해 갖고 있다** — `AnnIndex`는 커스텀 metric 콜백이 아니라 평범한 usearch 인덱스이고
+([index.rs:520](../../../src/handler/usearch/index.rs)의 `typed_add`), `cfg(not(recovery))`
+빌드에서는 arcus 원소에 벡터가 아예 없다
+([element.rs:67](../../../src/handler/arcus/element.rs)). 검색 중에 엔진 메모리를 따라가는
+것은 벡터 때문이 아니다.
+
+### 6.2 반대 방향은 `release` 하나뿐이고, 미룬다
+
+`release`는 `cache_lock`을 잡는다. 그러므로 **그래프 락을 쥔 채로는 절대 부르지 않는다.**
 
 ```
-cache_lock  →  그래프 락        (콜백. 유일한 방향)
-그래프 락   →  (순수 계산)      (검색. 엔진을 안 부른다)
+unlink 콜백   HeldSet에서 빼고 해제 목록에 push      // 엔진 호출 없음. 순수 메모리
+sweeper       release(items...)                    // cache_lock만. 그래프 락은 안 잡는다
 ```
 
-한 방향뿐이므로 인버전이 불가능하다.
+이 지연 해제는 새로 만드는 것이 아니다. 지금 `HeldSet` → `sweep`이 하는 일이 그것이고,
+Map 원소 대신 KV 아이템을 놓아주도록 바꾸면 된다(`map_elem_release` → `release`).
 
-이 결정이 `hold_addr` · `HeldAddr` · `HeldMap` · `release_held` · `id_at` ·
-`held_addrs` · `reclaim` · `unclaimed` · `forget_unreadable`을 전부 지운다. 그래프는
-주소를 들지 않으므로 놓아줄 것도 없다.
+그래서 방향이 이렇게 된다.
 
-**대가: 벡터가 두 벌 상주한다** — arcus KV에 한 벌, 그래프에 한 벌.
+```
+cache_lock  →  그래프 락     (콜백)
+그래프 락   →  (락 없음)     (검색. 포인터를 읽을 뿐)
+             cache_lock      (sweeper. 그래프 락을 쥐고 있지 않다)
+```
+
+`cache_lock`과 그래프 락을 **동시에** 쥐는 곳이 콜백 하나뿐이므로 인버전이 성립하지 않는다.
+
+### 6.3 우리가 든 참조가 미루는 것
+
+unlink된 아이템은 우리가 release할 때까지 메모리에 남는다. 축출로 회수될 메모리가 sweeper가
+한 바퀴 돌 때까지 늦게 풀린다는 뜻이고, 이것이 refcount를 드는 대가다. 해제 목록이 무한히
+길어지지 않도록 sweeper의 배치 크기와 주기는 지금 값을 그대로 쓴다.
 
 ## 7. 명령 경로
 
@@ -302,6 +346,10 @@ vdrop idx
 | 메타 디코드 실패 | 인덱스를 만들지 않는다. 이후 그 인덱스의 벡터는 위 첫 줄로 떨어진다 |
 | 그래프 삽입 실패(메모리) | **데몬을 죽이지 않는다.** 로그를 남기고 그 벡터를 건너뛴다 |
 
+**어느 줄이든 link에서 받은 참조를 해제 목록에 넘기고 끝낸다**(§5). 실패 경로에서
+그것을 빠뜨리면 아이템이 영원히 free되지 않는다 — 실패가 잦을수록 새는 양이 늘어나므로,
+처분을 `Drop`으로 묶어 빠뜨릴 수 없게 만든다.
+
 마지막 줄에는 갚을 수 없는 빚이 있다. 화해 수단이 없으므로 **건너뛴 벡터는 영구히
 그래프에 없다.** 클라이언트 경로(`vadd`)에서는 이를 갚을 수 있다 — 핸들러가 `set` 직후
 그래프에 들어갔는지 확인하고, 아니면 방금 쓴 KV를 지우고 `SERVER_ERROR`로 답한다.
@@ -319,35 +367,41 @@ vdrop idx
 | `src/owner.rs` | 278 | 소유권 토큰·`vowner` |
 | `src/handler/recovery.rs` | 대부분 | fill·rebuild·drain·claim 프로토콜 |
 | `src/handler/arcus/engine/map.rs` | 전부 | Map |
-| `src/handler/arcus/engine/elem.rs` | 대부분 | 원소 계열 전체 |
-| `src/handler/access/sweep.rs` | 절반 | `probe_round`(Map 개수와 그래프 개수의 비교)만. 아래 참조 |
+| `src/handler/arcus/engine/elem.rs` | 대부분 | 원소 계열. `hold_addr`/`release_held`는 KV판으로 옮겨간다 |
 
-`cfg(parked_cookie)`와 `cfg(recovery)`도 함께 없어진다.
+`cfg(parked_cookie)`·`cfg(recovery)`도 함께 없어진다.
 
-새로 생기는 것은 `src/repl/trigger.rs` 하나 — 콜백 등록, 키 파싱, 이벤트 적용.
+**남는 것과 새로 생기는 것.** 새 파일은 `src/repl/trigger.rs` 하나 — 콜백 등록, 키 파싱,
+이벤트 적용. 그리고 **스레드는 sweeper 하나만 남는다.** sweeper는 이 설계에서 할 일이
+둘로 늘어난다.
 
-**스레드는 하나만 남는다: sweeper.** `access::sweep::retire`는 레지스트리에서 빠진 그래프를
-배경에서 놓아주는 일을 하는데, 이 설계에서 더 필요해졌다 — 인덱스를 놓아주는 것이 이제
-메타 KV의 unlink 콜백이고, 그 콜백은 `cache_lock`을 쥐고 있다. 큰 HNSW를 그 자리에서
-free하면 데몬 전체가 그동안 멈춘다. 콜백은 레지스트리에서 빼고 `retire`에 넘기기만 하고,
-실제 해제는 sweeper가 한다. sweeper는 엔진을 부르지 않으므로 §6의 잠금 방향을 깨지 않는다.
-개수를 비교하던 `probe_round` 쪽은 비교 대상이 없어져 사라진다.
+| sweeper가 하는 일 | 왜 배경이어야 하나 |
+|---|---|
+| 버려진 그래프를 free (`retire`) | 메타 unlink 콜백이 `cache_lock`을 쥐고 있다 (§5) |
+| 해제 목록의 아이템을 `release` | `release`가 `cache_lock`을 잡으므로 그래프 락 아래에서 부를 수 없다 (§6.2) |
+
+개수를 비교하던 `access::sweep::probe_round`는 비교 대상이 없어져 사라진다.
+`HeldSet`은 그대로 남되 Map 원소 주소가 아니라 KV 아이템 포인터를 담는다.
 
 ## 11. 대가와 한계
 
-1. **벡터가 두 벌 상주한다** (§6). 그래프가 주소 대신 복사본을 든다.
-2. **복제 적용과 persistence 복구가 HNSW 삽입 시간만큼 `cache_lock`을 쥔다.** 평소 이 락은
+1. **복제 적용과 persistence 복구가 HNSW 삽입 시간만큼 `cache_lock`을 쥔다.** 평소 이 락은
    해시테이블 삽입 정도만 쥐는데, HNSW 삽입은 그래프 탐색을 수반해 자릿수가 다르다. 특히
    **복제본이 처음 붙어 풀싱크를 받는 동안** 아이템마다 이것이 걸리므로 그 데몬의 다른 요청이
    전부 뒤에 줄을 선다. 큐를 없앤 대가가 정확히 이것이고, 설계로 피할 수 없다.
-3. **삽입 실패는 갚을 수 없다** (§9). 복제·복구 경로에서 메모리 부족으로 건너뛴 벡터는
+2. **삽입 실패는 갚을 수 없다** (§9). 복제·복구 경로에서 메모리 부족으로 건너뛴 벡터는
    영구히 빠진다. 화해 수단이 없다.
-4. **클라이언트가 벡터 아이템을 직접 지우거나 덮어쓸 수 있다** (§4.1). 프리픽스 이름에 공백을
+3. **우리가 든 참조만큼 메모리 회수가 늦다** (§6.3). unlink된 아이템은 sweeper가 놓아줄
+   때까지 남는다.
+4. **`cfg(not(recovery))`의 벡터 없는 레이아웃을 더는 쓸 수 없다** (§4.2). 그 사본이
+   복제본에게 벡터를 실어 나르는 통로가 되기 때문이다. `recovery` 빌드 기준으로는 메모리
+   변화가 없다.
+5. **클라이언트가 벡터 아이템을 직접 지우거나 덮어쓸 수 있다** (§4.1). 프리픽스 이름에 공백을
    넣을 수 없어 키를 가릴 수단이 없다. `delete`는 그래프에서도 빠지게 하고, 뜻 없는 값을
    `set`하면 디코드 실패로 그 벡터가 조용히 빠진다. arcus에 키 단위 접근 제어가 없으므로
    설계로 막을 수 없고, 운영 규약에 맡긴다.
-5. **인덱스 이름이 238자 이하로 제한되고** `{`, `}`, `:`, 공백을 쓸 수 없다 (§4.1).
-6. **`ARCUS_ENABLE_SHARD_KEY=1`이 아니면** `{}`가 평범한 문자가 되어 한 인덱스의 키가
+6. **인덱스 이름이 238자 이하로 제한되고** `{`, `}`, `:`, 공백을 쓸 수 없다 (§4.1).
+7. **`ARCUS_ENABLE_SHARD_KEY=1`이 아니면** `{}`가 평범한 문자가 되어 한 인덱스의 키가
    여러 노드로 흩어진다. 배포 전제 조건이다.
 
 ## 12. 설정
