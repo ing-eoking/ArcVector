@@ -5,7 +5,7 @@ use crate::engine_api::{
     ENGINE_ERROR_CODE_ENGINE_EBADTYPE, ENGINE_ERROR_CODE_ENGINE_ELEM_EEXISTS,
     ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT, ENGINE_ERROR_CODE_ENGINE_EOVERFLOW,
     ENGINE_ERROR_CODE_ENGINE_EWOULDBLOCK, ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT,
-    ENGINE_ERROR_CODE_ENGINE_SUCCESS,
+    ENGINE_ERROR_CODE_ENGINE_NOT_STORED, ENGINE_ERROR_CODE_ENGINE_SUCCESS,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -16,6 +16,11 @@ pub enum StoreError {
     ElemGone,
 
     ElemExists,
+
+    /// `add` refused because the key was already there. `vcreate` reads this
+    /// as `EXISTS` -- it is how the engine answers "does this index exist?"
+    /// without a separate read.
+    NotStored,
 
     BadType,
 
@@ -40,6 +45,7 @@ impl fmt::Display for StoreError {
             Self::CorruptElement => {
                 f.write_str("the engine described an element that cannot be read")
             }
+            Self::NotStored => f.write_str("the key is already there"),
             Self::Overflow => f.write_str("index is full"),
             Self::ReplicaSlave => {
                 f.write_str("this node is a replica; vector commands are served by the master")
@@ -60,6 +66,7 @@ pub(super) fn translate(code: u32) -> StoreError {
         ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT => StoreError::KeyGone,
         ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT => StoreError::ElemGone,
         ENGINE_ERROR_CODE_ENGINE_ELEM_EEXISTS => StoreError::ElemExists,
+        ENGINE_ERROR_CODE_ENGINE_NOT_STORED => StoreError::NotStored,
         ENGINE_ERROR_CODE_ENGINE_EBADTYPE => StoreError::BadType,
         ENGINE_ERROR_CODE_ENGINE_EOVERFLOW => StoreError::Overflow,
         ENGINE_REPL_SLAVE => StoreError::ReplicaSlave,
