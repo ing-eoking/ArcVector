@@ -10,7 +10,7 @@
 
 ## 1. 무엇이 바뀌었나
 
-arcus-memcached-EE에 `ON_ITEM_TRIGER` 콜백이 생겼다. 키가 `arcus trig:`로 시작하는
+arcus-memcached-EE에 `ON_ITEM_TRIGER` 콜백이 생겼다. 키가 `arcus_trig{`로 시작하는
 아이템이 link/unlink될 때 엔진이 확장을 불러준다.
 
 ```c
@@ -26,7 +26,7 @@ typedef enum {
 ## 2. 착상 — 트리거가 곧 데이터
 
 벡터를 arcus Map의 원소가 아니라 **KV 아이템 하나**로 저장하고, 그 키가
-`arcus trig:`로 시작하게 한다.
+`arcus_trig{`로 시작하게 한다.
 
 그러면 arcus가 그 아이템을 복제본에 복제하는 순간, 복제본의 `do_item_link`가 콜백을 부른다.
 콜백이 받는 `hash_item *`에는 **키(인덱스 이름과 id)와 값(벡터)이 둘 다 들어 있다.**
@@ -53,13 +53,16 @@ typedef enum {
 
 ```c
 #ifdef ENABLE_REPLICATION
-    if (it->nkey > 11 && memcmp(key, "arcus trig:", 11) == 0) {
+    if (it->nkey > 10 && memcmp(key, "arcus_trig", 10) == 0 && key[10] == '{') {
         engine->server.callback->perform_callbacks(ON_ITEM_TRIGER,
                                                    (const void *)&ret,
                                                    (const void *)it);
     }
 #endif
 ```
+
+`key[10] == '{'`까지 보는 이유는 10바이트 비교만으로는 `arcus_trigger:foo` 같은 평범한
+클라이언트 키도 걸리기 때문이다. 우리 키는 이름 다음이 반드시 `{`다.
 
 게이트를 빼는 것이 이 설계의 핵심이다. 그러면 **세 가지 경로가 한 코드로 수렴한다.**
 
@@ -80,7 +83,7 @@ unlink라는 뜻이다.
 
 ```c
 #ifdef ENABLE_REPLICATION
-    if (it->nkey > 11 && memcmp(key, "arcus trig:", 11) == 0) {
+    if (it->nkey > 10 && memcmp(key, "arcus_trig", 10) == 0 && key[10] == '{') {
         engine->server.callback->perform_callbacks(ON_ITEM_TRIGER,
                                                    NULL,
                                                    (const void *)it);
@@ -123,21 +126,42 @@ getopt 루프)에서 엔진보다 먼저 적재되므로 콜백 등록은 제때
 ### 4.1 키
 
 ```
-arcus trig:{<index>}:<id>      벡터 하나
-arcus trig:{<index>}:          인덱스 메타 (id가 빈 문자열)
+arcus_trig{<index>}:<id>      벡터 하나
+arcus_trig{<index>}:          인덱스 메타 (id가 빈 문자열)
 ```
 
-- 앞 11바이트 `arcus trig:`가 C 훅의 판별자다.
-- `{}`는 arcus의 샤드키 구분자다
-  ([cluster_config.c:125](../../../../arcus-memcached-EE/cluster_config.c)의 `get_shard_key`).
-  인덱스 이름을 그 안에 넣으면 **한 인덱스의 모든 키가 같은 노드에 모인다.**
+**공백을 쓸 수 없다.** `prefix_link`는 키에 구분자 `:`가 있으면 그 앞을 프리픽스 이름으로
+보고 `mc_isvalidname`으로 검사하는데
+([prefix.c:373](../../../../arcus-memcached-EE/engines/default/prefix.c)), 허용 문자가
+영숫자와 `_ - + . { }`뿐이고 공백이 없다
+([util.c:164](../../../../arcus-memcached-EE/util.c)). 공백이 들어가면
+`ENGINE_PREFIX_ENAME`이 나고 `do_item_link`는 콜백에 닿기도 전에 되돌아간다
+([item_base.c:1080](../../../../arcus-memcached-EE/engines/default/item_base.c)) —
+즉 그런 키는 **저장 자체가 안 된다.** (`AV OWNER`가 되던 것은 `:`가 없어 널 프리픽스였기
+때문이다.)
+
+`arcus_trig{idx}`는 `_`, `{`, `}`가 모두 허용 문자라 통과한다. 그래서:
+
+- **프리픽스가 인덱스별로 생긴다.** 깊이가 1이므로
+  ([prefix.c:34](../../../../arcus-memcached-EE/engines/default/prefix.c)) 첫 `:` 앞
+  전체가 프리픽스 이름이 되고, 그게 곧 `arcus_trig{idx}`다. `flush`로 인덱스 하나만
+  지울 수 있고(§7.1), `stats prefix`에 인덱스별 아이템 개수가 공짜로 잡힌다.
+- **`{}`는 arcus의 샤드키 구분자다**
+  ([cluster_config.c:125](../../../../arcus-memcached-EE/cluster_config.c)의
+  `get_shard_key`). 인덱스 이름을 그 안에 넣으면 한 인덱스의 모든 키가 같은 노드에 모인다.
   `ARCUS_ENABLE_SHARD_KEY=1`이 필요하다
   ([cluster_config.c:668](../../../../arcus-memcached-EE/cluster_config.c)).
-- 키에 공백이 있으므로 **어떤 ASCII 명령도 이 키를 지목할 수 없다.** 클라이언트가 벡터
-  아이템을 직접 읽거나 망가뜨릴 수 없다. ArcVector는 엔진 vtable을 직접 부르므로 영향받지 않는다.
-- 인덱스 이름은 `}`를 포함할 수 없다. id는 ASCII 키 규칙(공백·제어문자 금지)만 지키면 되고
-  `:`를 포함해도 된다 — 파싱은 첫 `{`와 그 뒤 첫 `}`로 이름을 떼고, 이어지는 `:` 다음
-  전부를 id로 본다.
+- 프리픽스 이름은 250자까지이므로(`PREFIX_MAX_LENGTH`,
+  [types.h:54](../../../../arcus-memcached-EE/include/memcached/types.h)) **인덱스 이름은
+  238자 이하**여야 한다. 이름에 `{`, `}`, `:`, 공백을 넣을 수 없다.
+- id는 ASCII 키 규칙(공백·제어문자 금지)만 지키면 되고 `:`를 포함해도 된다. 파싱은 첫 `{`와
+  그 뒤 첫 `}`로 이름을 떼고, 이어지는 `:` 다음 전부를 id로 본다.
+- 프리픽스 이름이 `arcus`가 아니므로 이 아이템들은 `ITEM_INTERNAL`이 **아니다.** 복제본에서
+  클라이언트 쓰기는 `ACTION_BEFORE_WRITE` 게이트가 막고, 복제 적용은 그 게이트를 지나지
+  않는다 — 둘 다 원하는 동작이다.
+- 대신 **클라이언트가 이 키를 ASCII로 지목할 수 있다.** `delete arcus_trig{idx}:v42`를 치면
+  unlink가 떠서 그래프에서도 빠진다. 공백으로 가려 두던 보호막이 없어진 것이고, 프리픽스별
+  flush와 프리픽스 통계를 얻은 대가다(§11).
 
 ### 4.2 값
 
@@ -156,6 +180,7 @@ Map, `AV META` 원소, `probe_map`, `hold_all`, `getattr` 개수는 전부 없�
 
 인덱스의 원소 개수는 이제 **그래프 자신이 답한다**(`ann.len()`). `vstats`가 Map의
 `getattr` 개수와 그래프 개수를 비교하던 항목은 비교 대상이 없어지므로 하나로 합친다.
+저장소 쪽 개수가 필요하면 `stats prefix`가 `arcus_trig{idx}` 단위로 답한다(§4.1).
 
 ## 5. 콜백 계약
 
@@ -236,23 +261,23 @@ cache_lock  →  그래프 락        (콜백. 유일한 방향)
 
 재진입은 안전하다. 핸들러는 `set`을 부를 때 그래프 락을 쥐고 있지 않다.
 
-### 7.1 `vdrop` — 그래프가 id 목록이다
+### 7.1 `vdrop` — 메타를 지우고 프리픽스를 flush한다
 
-프리픽스 깊이가 1이라([prefix.c:34](../../../../arcus-memcached-EE/engines/default/prefix.c))
-등록되는 프리픽스는 `arcus trig` 하나뿐이고, 따라서 `flush`로 인덱스 하나만 지울 수 없다.
-
-그럴 필요가 없다. **그래프가 그 인덱스의 모든 id를 갖고 있다.** `vdrop`은 그래프를 걸어
-id마다 KV를 지우고, 마지막에 메타 KV를 지운다. arcus 쪽 열거는 끝내 필요하지 않다.
+키가 `arcus_trig{idx}:`로 시작하므로 그 인덱스만의 프리픽스가 존재한다(§4.1). 엔진 vtable의
+`flush(handle, cookie, prefix, nprefix, when)`는 프리픽스 버퍼를 그대로 받으므로 ASCII
+토큰화를 거치지 않는다.
 
 ```
 vdrop idx
-  for id in graph.ids():            // 그래프가 곧 목록
-      delete_kv("arcus trig:{idx}:" + id)   // 각 unlink가 그래프에서 뺀다
-  delete_kv("arcus trig:{idx}:")            // 메타. 인덱스를 놓아준다
+  delete_kv("arcus_trig{idx}:")        // 메타. unlink 콜백이 그래프를 즉시 놓아준다
+  flush("arcus_trig{idx}")             // 벡터 전부
 ```
 
-큰 인덱스에서는 삭제가 원소 수만큼 걸린다. 지금의 `drop_map` 한 번과 달라지는 점이고,
-`vdrop`이 드문 명령이라 받아들인다.
+메타를 **먼저** 지운다. `flush`는 `oldest_live`를 세우고 LRU를 일부만 즉시 unlink한 뒤
+나머지는 접근 시점에 지연 무효화하므로
+([items.c:491](../../../../arcus-memcached-EE/engines/default/items.c)), flush만으로는
+그래프가 언제 놓여질지 보장되지 않는다. 메타를 먼저 지우면 그래프는 그 자리에서 사라지고,
+뒤늦게 뜨는 벡터 unlink 콜백들은 인덱스를 못 찾아 무동작이 된다.
 
 ## 8. 순서
 
@@ -295,12 +320,18 @@ vdrop idx
 | `src/handler/recovery.rs` | 대부분 | fill·rebuild·drain·claim 프로토콜 |
 | `src/handler/arcus/engine/map.rs` | 전부 | Map |
 | `src/handler/arcus/engine/elem.rs` | 대부분 | 원소 계열 전체 |
-| `src/handler/access/sweep.rs` | 전부 | Map 개수와 그래프 개수의 비교 |
+| `src/handler/access/sweep.rs` | 절반 | `probe_round`(Map 개수와 그래프 개수의 비교)만. 아래 참조 |
 
 `cfg(parked_cookie)`와 `cfg(recovery)`도 함께 없어진다.
 
 새로 생기는 것은 `src/repl/trigger.rs` 하나 — 콜백 등록, 키 파싱, 이벤트 적용.
-**ArcVector에 백그라운드 스레드가 하나도 남지 않는다.**
+
+**스레드는 하나만 남는다: sweeper.** `access::sweep::retire`는 레지스트리에서 빠진 그래프를
+배경에서 놓아주는 일을 하는데, 이 설계에서 더 필요해졌다 — 인덱스를 놓아주는 것이 이제
+메타 KV의 unlink 콜백이고, 그 콜백은 `cache_lock`을 쥐고 있다. 큰 HNSW를 그 자리에서
+free하면 데몬 전체가 그동안 멈춘다. 콜백은 레지스트리에서 빼고 `retire`에 넘기기만 하고,
+실제 해제는 sweeper가 한다. sweeper는 엔진을 부르지 않으므로 §6의 잠금 방향을 깨지 않는다.
+개수를 비교하던 `probe_round` 쪽은 비교 대상이 없어져 사라진다.
 
 ## 11. 대가와 한계
 
@@ -311,9 +342,11 @@ vdrop idx
    전부 뒤에 줄을 선다. 큐를 없앤 대가가 정확히 이것이고, 설계로 피할 수 없다.
 3. **삽입 실패는 갚을 수 없다** (§9). 복제·복구 경로에서 메모리 부족으로 건너뛴 벡터는
    영구히 빠진다. 화해 수단이 없다.
-4. **`vdrop`이 원소 수만큼 걸린다** (§7.1).
-5. **클라이언트가 벡터 아이템을 볼 수 없다.** 키에 공백이 있어 `get`·`scan`·`stats prefix`
-   어디에도 잡히지 않는다. 의도한 성질이지만, 운영 중 눈으로 확인할 길도 같이 막힌다.
+4. **클라이언트가 벡터 아이템을 직접 지우거나 덮어쓸 수 있다** (§4.1). 프리픽스 이름에 공백을
+   넣을 수 없어 키를 가릴 수단이 없다. `delete`는 그래프에서도 빠지게 하고, 뜻 없는 값을
+   `set`하면 디코드 실패로 그 벡터가 조용히 빠진다. arcus에 키 단위 접근 제어가 없으므로
+   설계로 막을 수 없고, 운영 규약에 맡긴다.
+5. **인덱스 이름이 238자 이하로 제한되고** `{`, `}`, `:`, 공백을 쓸 수 없다 (§4.1).
 6. **`ARCUS_ENABLE_SHARD_KEY=1`이 아니면** `{}`가 평범한 문자가 되어 한 인덱스의 키가
    여러 노드로 흩어진다. 배포 전제 조건이다.
 
