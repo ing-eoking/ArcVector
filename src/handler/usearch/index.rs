@@ -804,7 +804,7 @@ impl AnnIndex {
         if addrs.is_empty() {
             return;
         }
-        let after = crate::server::coarse_now() + 1;
+        let after = crate::server::advance_epoch();
         let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
         if retired.try_reserve(addrs.len()).is_err() {
             eprintln!(
@@ -1464,6 +1464,37 @@ mod tests {
         );
         assert_eq!(idx.queued.load(Ordering::Relaxed), 0);
         assert!(idx.retired.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn overlapping_searches_do_not_starve_a_retirement() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let addr = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
+
+        // One search is already running when the delete lands.
+        let first = Searching::new(&idx);
+
+        let taken: std::result::Result<Option<bool>, PublishError<()>> =
+            idx.remove_published(|| Ok(Some(addr)));
+        assert_eq!(taken.unwrap(), Some(true));
+
+        // A second starts before the first ends, so the reader table is never
+        // empty from here on. Nothing ticks the clock in this test -- that is
+        // the point: `retire` moves it itself, so this searcher's stamp is
+        // already past the retirement and does not hold it back.
+        let second = Searching::new(&idx);
+        assert!(
+            FAKE.id_at(addr).is_some(),
+            "the first search could have seen it, so it is still held"
+        );
+
+        drop(first);
+        assert!(
+            FAKE.id_at(addr).is_none(),
+            "once the only search that could have seen it is gone, it goes back \
+             -- even though another search is still running"
+        );
+        drop(second);
     }
 
     #[test]
