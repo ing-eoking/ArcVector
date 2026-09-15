@@ -318,18 +318,30 @@ fn an_incompatible_metric_and_quantization_are_refused() {
 }
 
 #[test]
-fn a_dimension_over_the_element_limit_is_refused() {
-    session!(_server, client);
+fn a_vector_over_the_server_item_limit_is_refused() {
+    // A vector is an item now, so the ceiling is the server's item size (-I),
+    // not `max_element_bytes`. The engine does not report that number through
+    // get_config, so it is the engine that enforces it: `allocate` answers
+    // ENGINE_E2BIG when no slab class fits. `vcreate` only catches the obvious
+    // case against the 1 MiB default, which no dimension the protocol accepts
+    // (1..65535) can exceed -- so the refusal lands on the write.
+    let server = Server::start_with(&["-I", "20k"]);
+    let mut client = server.connect();
     let ix = index_name("toobig");
 
-    let reply = client.send(&format!("vcreate {ix} 5000 QUANT f32"));
-    assert_contains(&reply, "CLIENT_ERROR");
-    assert_contains(&reply, "max_element_bytes");
     assert_reply(
-        &client.send(&format!("vcreate {ix} 5000 QUANT i8")),
+        &client.send(&format!("vcreate {ix} 6000 QUANT f32")),
         "CREATED\r\n",
     );
+    let coords = (0..6000)
+        .map(|i| ((i % 7) as f32).to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let reply = client.vadd(&ix, "v1", 6000, &coords);
+    assert_contains(&reply, "item size limit");
+
     client.send(&format!("vdrop {ix}"));
+    drop(server);
 }
 
 #[test]
@@ -421,35 +433,25 @@ fn many_connections_search_the_same_index_at_once() {
 }
 
 #[test]
-fn the_metadata_field_is_unreachable_from_the_protocol() {
+fn an_index_answers_after_its_metadata_and_vectors_round_trip() {
     session!(_server, client);
     let ix = index_name("reserved");
     assert_reply(&client.send(&format!("vcreate {ix} 2")), "CREATED\r\n");
     assert_reply(&client.vadd(&ix, "v1", 2, "1 0"), "STORED\r\n");
 
-    let reply = client.send(&format!("mop insert {ix} AV META 5 0 0 0"));
-    assert!(
-        reply.contains("CLIENT_ERROR"),
-        "a client must not be able to create the reserved field: {reply}"
-    );
-
-    let reply = client.send_body(&format!("mop get {ix} 7 1"), "AV META");
-    assert!(
-        reply.contains("CLIENT_ERROR"),
-        "nor request it by name: {reply}"
-    );
-
-    let dump = client.send(&format!("mop get {ix} 0 0"));
-    assert!(
-        dump.contains("AV META") && dump.contains("\"metric\""),
-        "a full dump must still show the metadata element: {dump}"
-    );
-
+    // This replaces a test of a property the storage no longer has. Metadata
+    // used to be a reserved field inside the index's Map, which no ASCII
+    // command could name. It is a key of its own now -- `arcus_event{ix}:` --
+    // and a client can reach it, which docs/claude.md records as a deliberate
+    // cost of the key shape. What is still worth pinning is that the commands
+    // keep answering over the new layout.
     assert_reply(
         &client.send(&format!("vgetattr {ix} v1")),
         "VALUE v1 0\r\n\r\nEND\r\n",
     );
-    client.send(&format!("vdrop {ix}"));
+    assert_contains(&client.send("vlist"), &format!("INDEX {ix} dim=2"));
+    assert_contains(&client.send("vlist"), "count=1");
+    assert_reply(&client.send(&format!("vdrop {ix}")), "DROPPED\r\n");
 }
 
 #[test]

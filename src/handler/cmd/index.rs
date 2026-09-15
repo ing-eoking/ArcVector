@@ -28,16 +28,16 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         spec.connectivity,
         spec.expansion_add,
         spec.expansion_search,
-        std::sync::Arc::new(engine::DetachedElements),
+        std::sync::Arc::new(engine::ItemElements),
     )?;
 
-    let held = map_size_for(store, spec.maxcount);
-    let maxcount = held - 1;
+    let maxcount = spec.maxcount.unwrap_or(DEFAULT_MAXCOUNT);
     let meta = MetaRecord {
         metric: metric.as_str().to_owned(),
         connectivity: spec.connectivity,
         expansion_add: spec.expansion_add,
         expansion_search: spec.expansion_search,
+        maxcount,
     };
     let index = VectorIndex::building(name.to_owned(), ann, maxcount);
 
@@ -50,79 +50,80 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         }
     };
 
-    let settled = store
-        .alloc_elem(name, element::META_FIELD, &meta.encode(layout))
-        .and_then(|pending| pending.insert_creating(engine::index_attr(Some(held), spec.exptime)));
-
-    match settled {
-        Ok(true) => {
+    match store.add_meta(name, &meta, layout) {
+        Ok(()) => {
             registered.publish();
             registered.mark_serving();
             if previous.is_some() {
                 eprintln!(
-                    "ArcVector: index '{name}' had no Map; released the graph it was built from"
+                    "ArcVector: index '{name}' had no metadata; released the graph it stood on"
                 );
-
                 sweep::retire(previous);
             }
             Ok(Reply::Created)
         }
 
-        Ok(false) => {
+        // `add` refuses a key already there, which is exactly the question
+        // `vcreate` is asking.
+        Err(StoreError::NotStored) => {
             registry::unput(&registered, previous);
-            let _ = store.delete_elem(name, element::META_FIELD);
             already_there(store, name)
         }
         Err(e) => {
             registry::unput(&registered, previous);
-            match e {
-                StoreError::ElemExists => already_there(store, name),
-                StoreError::BadType => Err(Error::bad_request(format!(
-                    "'{name}' holds an item that is not a Map"
-                ))),
-                e => Err(e.into()),
-            }
+            Err(e.into())
         }
     }
 }
+
+/// What an index accepts when `vcreate` names no limit.
+///
+/// A Map had `maxcount` as an attribute and the engine enforced it. Nothing
+/// enforces a count across separate items, so this is ArcVector's own ceiling
+/// and the graph is what counts against it.
+const DEFAULT_MAXCOUNT: u32 = 50_000;
 
 fn already_there(store: &Store, name: &str) -> Result<Reply> {
     resolve(store, name)?;
     Ok(Reply::Exists)
 }
 
-fn check_dimension_fits(store: &Store, layout: Layout, quant: Quant) -> Result<()> {
-    let limit = store.max_element_bytes() as usize;
-
-    if layout.full_stored_len() <= limit {
-        return Ok(());
-    }
-    Err(Error::bad_request(format!(
-        "element would be {} bytes, over max_element_bytes {limit} \
-         (max dimension is {} for quant {quant})",
-        layout.full_stored_len(),
-        Layout::max_dim_for(quant, limit),
-    )))
-}
-
-fn map_size_for(store: &Store, maxcount: Option<u32>) -> u32 {
-    let ceiling = store.max_map_size();
-    maxcount.unwrap_or(ceiling).saturating_add(1).min(ceiling)
-}
-
 pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {
-    let dropped = match store.drop_map(name) {
+    // The metadata goes first: deleting it fires the unlink callback, which
+    // releases the graph outright. The flush only promises the vectors stop
+    // being visible -- it stamps the prefix and walks part of the LRU, leaving
+    // the rest to expire when touched -- so it cannot be relied on to end the
+    // graph. Late vector callbacks then land on a name nothing has registered.
+    let had_meta = match store.delete_kv(&crate::trigger::key::meta_key(name)) {
         Ok(()) => true,
         Err(StoreError::KeyGone) => false,
         Err(e) => return Err(e.into()),
     };
     let known = registry::remove(name);
 
-    Ok(if known || dropped {
+    if had_meta && let Err(e) = store.flush_prefix(&crate::trigger::key::index_prefix(name)) {
+        eprintln!("ArcVector: '{name}' was dropped, but its vectors were not flushed ({e})");
+    }
+
+    Ok(if known || had_meta {
         Reply::Dropped
     } else {
         Reply::NotFound
     })
+}
+
+fn check_dimension_fits(store: &Store, layout: Layout, quant: Quant) -> Result<()> {
+    let limit = store.max_item_size() as usize;
+
+    if layout.full_stored_len() <= limit {
+        return Ok(());
+    }
+    Err(Error::bad_request(format!(
+        "element would be {} bytes, over max_item_size {limit} \
+         (max dimension is {} for quant {quant})",
+        layout.full_stored_len(),
+        Layout::max_dim_for(quant, limit),
+    )))
 }
 
 pub fn vstats() -> Result<Reply> {

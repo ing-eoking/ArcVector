@@ -2,10 +2,11 @@ use std::fmt;
 use std::os::raw::c_int;
 
 use crate::engine_api::{
-    ENGINE_ERROR_CODE_ENGINE_EBADTYPE, ENGINE_ERROR_CODE_ENGINE_ELEM_EEXISTS,
-    ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT, ENGINE_ERROR_CODE_ENGINE_EOVERFLOW,
-    ENGINE_ERROR_CODE_ENGINE_EWOULDBLOCK, ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT,
-    ENGINE_ERROR_CODE_ENGINE_NOT_STORED, ENGINE_ERROR_CODE_ENGINE_SUCCESS,
+    ENGINE_ERROR_CODE_ENGINE_E2BIG, ENGINE_ERROR_CODE_ENGINE_EBADTYPE,
+    ENGINE_ERROR_CODE_ENGINE_ELEM_EEXISTS, ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT,
+    ENGINE_ERROR_CODE_ENGINE_EOVERFLOW, ENGINE_ERROR_CODE_ENGINE_EWOULDBLOCK,
+    ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT, ENGINE_ERROR_CODE_ENGINE_NOT_STORED,
+    ENGINE_ERROR_CODE_ENGINE_SUCCESS,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -21,6 +22,10 @@ pub enum StoreError {
     /// as `EXISTS` -- it is how the engine answers "does this index exist?"
     /// without a separate read.
     NotStored,
+
+    /// The engine refused an item this large: no slab class fits it. The
+    /// authority on the limit, since `get_config` does not report it.
+    TooBig,
 
     BadType,
 
@@ -46,6 +51,9 @@ impl fmt::Display for StoreError {
                 f.write_str("the engine described an element that cannot be read")
             }
             Self::NotStored => f.write_str("the key is already there"),
+            Self::TooBig => {
+                f.write_str("the value is larger than this server's item size limit (memcached -I)")
+            }
             Self::Overflow => f.write_str("index is full"),
             Self::ReplicaSlave => {
                 f.write_str("this node is a replica; vector commands are served by the master")
@@ -67,6 +75,7 @@ pub(super) fn translate(code: u32) -> StoreError {
         ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT => StoreError::ElemGone,
         ENGINE_ERROR_CODE_ENGINE_ELEM_EEXISTS => StoreError::ElemExists,
         ENGINE_ERROR_CODE_ENGINE_NOT_STORED => StoreError::NotStored,
+        ENGINE_ERROR_CODE_ENGINE_E2BIG => StoreError::TooBig,
         ENGINE_ERROR_CODE_ENGINE_EBADTYPE => StoreError::BadType,
         ENGINE_ERROR_CODE_ENGINE_EOVERFLOW => StoreError::Overflow,
         ENGINE_REPL_SLAVE => StoreError::ReplicaSlave,

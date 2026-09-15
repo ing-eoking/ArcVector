@@ -1,11 +1,7 @@
-mod elem;
 mod error;
 mod kv;
-mod map;
 
-pub use elem::{HeldAddr, HeldElem, HeldMap, PendingElem};
 pub use error::StoreError;
-pub use map::{FORMAT_VERSION, MapProbe, index_attr};
 
 use std::ffi::CStr;
 use std::os::raw::c_void;
@@ -16,7 +12,7 @@ use crate::engine_api::{ENGINE_ERROR_CODE_ENGINE_SUCCESS, ENGINE_HANDLE, engine_
 use crate::handler::arcus::abi;
 
 pub const DEFAULT_MAX_ELEMENT_BYTES: u32 = 16 * 1024;
-const DEFAULT_MAX_MAP_SIZE: u32 = 50_000;
+const DEFAULT_MAX_ITEM_SIZE: u32 = 1024 * 1024;
 
 static ENGINE: AtomicPtr<engine_interface_v1> = AtomicPtr::new(ptr::null_mut());
 fn engine() -> *mut engine_interface_v1 {
@@ -113,21 +109,76 @@ impl Store {
         self.config_u32(c"max_element_bytes", DEFAULT_MAX_ELEMENT_BYTES)
     }
 
-    pub fn max_map_size(&self) -> u32 {
-        self.config_u32(c"max_map_size", DEFAULT_MAX_MAP_SIZE)
+    /// The item size this crate assumes, for the early check in `vcreate`.
+    ///
+    /// **Not the server's real limit.** The engine answers `get_config` for
+    /// `max_element_bytes` and the collection sizes but not for
+    /// `item_size_max`, so there is nothing to ask. The authority is the engine
+    /// itself: `allocate` returns `ENGINE_E2BIG` when no slab class fits
+    /// (`default_engine.c`), which surfaces as `StoreError::TooBig` on the
+    /// `vadd` that trips it.
+    ///
+    /// This constant only catches the obvious case at `vcreate` time, against
+    /// the engine's own default. A server started with a smaller `-I` accepts
+    /// the `vcreate` and refuses the first `vadd`.
+    pub fn max_item_size(&self) -> u32 {
+        DEFAULT_MAX_ITEM_SIZE
+    }
+
+    /// Reads an index's metadata item.
+    pub fn read_meta(
+        &self,
+        index: &str,
+    ) -> Result<
+        (
+            crate::handler::arcus::element::MetaRecord,
+            crate::handler::arcus::element::Layout,
+        ),
+        StoreError,
+    > {
+        let raw = self.get_kv(&crate::trigger::key::meta_key(index))?;
+        crate::handler::arcus::element::MetaRecord::decode(&raw)
+            .map_err(|_| StoreError::CorruptElement)
+    }
+
+    /// Writes an index's metadata item, refusing to replace one already there.
+    ///
+    /// `add` rather than `set`: `vcreate` has to answer `EXISTS` for a name
+    /// already taken, and asking the engine is one round trip where a read
+    /// followed by a write is two and races.
+    pub fn add_meta(
+        &self,
+        index: &str,
+        meta: &crate::handler::arcus::element::MetaRecord,
+        layout: crate::handler::arcus::element::Layout,
+    ) -> Result<(), StoreError> {
+        // `add_kv` keeps the reference `allocate` took. Nothing holds metadata
+        // the way the graph holds a vector, so it goes straight back.
+        let addr = self.add_kv(&crate::trigger::key::meta_key(index), &meta.encode(layout))?;
+        self.release_items(&[addr]);
+        Ok(())
     }
 }
 
-pub struct DetachedElements;
+/// How the graph reaches the item behind an address.
+///
+/// The graph holds raw item pointers and reads through them with no lock, which
+/// the reference the link hook handed over makes sound. Releasing is the only
+/// call here that takes the cache lock, and it must not run while the graph
+/// lock is held -- `AnnIndex::reclaim` is the one caller, and its doc says why.
+pub struct ItemElements;
 
-impl crate::handler::usearch::Elements for DetachedElements {
+impl crate::handler::usearch::Elements for ItemElements {
     fn id_at(&self, addr: u64) -> Option<std::sync::Arc<str>> {
-        Store::background()?.id_at(addr)
+        let store = Store::background()?;
+        store.with_item_at(addr, |key, _value| {
+            crate::trigger::key::parse(key).map(|p| std::sync::Arc::from(p.id))
+        })?
     }
 
     fn release(&self, addrs: &[u64]) {
         if let Some(store) = Store::background() {
-            store.release_held(addrs);
+            store.release_items(addrs);
         }
     }
 }

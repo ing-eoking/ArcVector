@@ -90,6 +90,15 @@ pub struct Server {
 
 impl Server {
     pub fn start() -> Self {
+        Self::start_with(&[])
+    }
+
+    /// A server with extra command-line options, for a test whose subject is a
+    /// server limit rather than the extension's own behaviour.
+    ///
+    /// `ARCVECTOR_MEMCACHED_ARGS` cannot serve this: it is read from the
+    /// environment, which every concurrently running test shares.
+    pub fn start_with(options: &[&str]) -> Self {
         let (Some(memcached), Some(engine)) = (
             from_env("ARCVECTOR_MEMCACHED"),
             from_env("ARCVECTOR_ENGINE"),
@@ -128,6 +137,7 @@ impl Server {
             .args(["-X".as_ref(), module.as_os_str()])
             .args(["-s".as_ref(), socket.as_os_str()])
             .args(["-t", "4"])
+            .args(options)
             .args(extra_args())
             .stdout(Stdio::null())
             .stderr(File::create(&log).map_or(Stdio::null(), Stdio::from))

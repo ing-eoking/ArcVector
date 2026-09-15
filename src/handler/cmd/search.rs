@@ -54,10 +54,12 @@ fn similar(
             return true;
         };
 
-        let Some(passed) = store.with_attr_at(key, layout, |attr| {
-            filter
-                .matches(attr)
-                .then(|| String::from_utf8_lossy(attr).into_owned())
+        let Some(passed) = store.with_item_at(key, |_key, value| {
+            layout.attr_of(value).ok().and_then(|attr| {
+                filter
+                    .matches(attr)
+                    .then(|| String::from_utf8_lossy(attr).into_owned())
+            })
         }) else {
             return false;
         };
@@ -88,7 +90,14 @@ fn similar(
         } else if let Some(attr) = judged_attr(&judged, key) {
             Some(attr)
         } else {
-            let stored = match store.get_attr(&index.name, &id, layout) {
+            let stored = match store
+                .get_kv(&crate::trigger::key::vector_key(&index.name, &id))
+                .and_then(|body| {
+                    layout
+                        .attr_of(&body)
+                        .map(<[u8]>::to_vec)
+                        .map_err(|_| StoreError::CorruptElement)
+                }) {
                 Ok(stored) => stored,
 
                 Err(StoreError::KeyGone) => {
@@ -177,9 +186,8 @@ pub fn vsim_key(store: &Store, spec: &SimKey) -> Result<Reply> {
     let index = for_read(store, name)?;
     let stamp = crate::handler::registry::now();
 
-    let held = match store.hold_addr(name, key) {
-        Ok(held) => held,
-        Err(StoreError::ElemGone) => return Ok(Reply::NotFound),
+    let addr = match store.hold_kv(&crate::trigger::key::vector_key(name, key)) {
+        Ok(addr) => addr,
         Err(StoreError::KeyGone) => {
             map_is_gone(name, stamp);
             return Ok(Reply::NotFound);
@@ -187,14 +195,20 @@ pub fn vsim_key(store: &Store, spec: &SimKey) -> Result<Reply> {
         Err(e) => return Err(e.into()),
     };
 
-    // Mid-rebuild the graph may not hold this key yet, but the Map always does:
-    // read the query vector from there so `vsim KEY` works throughout.
-    let query = match index.ann.vector_of(held.addr())? {
+    // The graph may not hold this key yet, but the item always carries the
+    // vector: read it from there so `vsim KEY` works either way.
+    let layout = index.ann.layout;
+    let query = match index.ann.vector_of(addr)? {
         Some(query) => query,
         None => store
-            .with_vector_at(held.addr(), index.ann.layout, <[u8]>::to_vec)
+            .with_item_at(addr, |_key, value| {
+                layout.vector_of(value).map(<[u8]>::to_vec)
+            })
+            .flatten()
             .ok_or(Error::Unreadable)?,
     };
+    // Only taken to read the query out; the graph keeps its own.
+    store.release_items(&[addr]);
 
     let mut out = String::new();
     similar(store, &index, &query, k, filter, with_attr, 0, &mut out)?;

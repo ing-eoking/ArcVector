@@ -3,7 +3,6 @@ use crate::command::request::Add;
 use crate::error::{Error, Reply, Result};
 use crate::handler::access::{for_read, for_write, map_is_gone};
 use crate::handler::arcus::element::Layout;
-use crate::handler::arcus::engine::HeldAddr;
 use crate::handler::arcus::engine::{Store, StoreError};
 use crate::handler::quant;
 use crate::handler::registry;
@@ -35,21 +34,33 @@ pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
     let stamp = registry::now();
     let quantized = quant::encode(&vector, layout.quant);
 
-    let mut pending = match store.reserve_elem(name, id, layout.element_len()) {
-        Ok(pending) => pending,
-        Err(e) => return store_failed(name, stamp, e),
-    };
+    let vkey = crate::trigger::key::vector_key(name, id);
+
+    // A Map enforced `maxcount` as an attribute; separate items have nothing to
+    // count against each other, so the graph is the count and this is the gate.
+    // An id already stored is an update and must not be refused -- it does not
+    // grow the index -- so the existence check runs only once the limit is hit.
+    if index.ann.len() >= index.maxcount as usize {
+        match store.hold_kv(&vkey) {
+            Ok(addr) => store.release_items(&[addr]),
+            Err(StoreError::KeyGone) => return Ok(Reply::Overflowed),
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    let mut body = vec![0u8; layout.stored_len()];
+    layout.write(&mut body[..layout.element_len()], &quantized, attr)?;
+    // The daemon hands an item's body to a client verbatim, and these keys are
+    // reachable from the ASCII protocol now, so the body ends the way every
+    // other item's does.
+    body[layout.element_len()..].copy_from_slice(b"\r\n");
 
     let staged = index.ann.stage(&quantized)?;
-    layout.write(pending.value_mut(), &quantized, attr)?;
 
     match index.ann.insert_published(
         staged,
-        || store.hold_addr(name, id).ok().map(HeldAddr::keep),
-        || {
-            let _replaced = pending.insert()?;
-            store.hold_addr(name, id).map(HeldAddr::keep)
-        },
+        || store.hold_kv(&vkey).ok(),
+        || store.set_kv(&vkey, &body),
     ) {
         Ok(Published::Indexed) => Ok(Reply::Stored),
         Ok(Published::Unindexed(addr)) => {
@@ -105,12 +116,12 @@ fn check_attr(attr: &[u8]) -> Result<()> {
 }
 
 fn check_still_fits(store: &Store, layout: Layout) -> Result<()> {
-    let limit = store.max_element_bytes() as usize;
+    let limit = store.max_item_size() as usize;
     if layout.stored_len() <= limit {
         return Ok(());
     }
     Err(Error::bad_request(format!(
-        "element is {} bytes ({} header+ATTR + {} vector), over max_element_bytes {limit}",
+        "element is {} bytes ({} header+ATTR + {} vector), over max_item_size {limit}",
         layout.stored_len(),
         Layout::VECTOR_OFFSET,
         layout.vector_bytes(),
@@ -121,7 +132,15 @@ pub fn vgetattr(store: &Store, name: &str, id: &str) -> Result<Reply> {
     let index = for_read(store, name)?;
     let stamp = registry::now();
 
-    match store.get_attr(name, id, index.ann.layout) {
+    let layout = index.ann.layout;
+    match store
+        .get_kv(&crate::trigger::key::vector_key(name, id))
+        .and_then(|body| {
+            layout
+                .attr_of(&body)
+                .map(<[u8]>::to_vec)
+                .map_err(|_| StoreError::CorruptElement)
+        }) {
         Ok(attr) => {
             let json = String::from_utf8_lossy(&attr);
             Ok(Reply::Body(format!(
@@ -132,8 +151,9 @@ pub fn vgetattr(store: &Store, name: &str, id: &str) -> Result<Reply> {
         Err(StoreError::ElemGone) => Ok(Reply::NotFound),
 
         Err(StoreError::CorruptElement) => {
-            if let Ok(held) = store.hold_addr(name, id) {
-                index.ann.forget_unreadable(held.addr());
+            if let Ok(addr) = store.hold_kv(&crate::trigger::key::vector_key(name, id)) {
+                index.ann.forget_unreadable(addr);
+                store.release_items(&[addr]);
             }
             eprintln!(
                 "ArcVector: element '{id}' of index '{name}' is unreadable; dropped from the graph"
@@ -154,50 +174,40 @@ pub fn vsetattr(store: &Store, name: &str, id: &str, attr: &[u8]) -> Result<Repl
     let stamp = registry::now();
     check_attr(attr)?;
     let layout = index.ann.layout;
-
-    let mut pending = match store.reserve_elem(name, id, layout.element_len()) {
-        Ok(pending) => pending,
-        Err(StoreError::KeyGone) => {
-            map_is_gone(name, stamp);
-            return Ok(Reply::NotFound);
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let vkey = crate::trigger::key::vector_key(name, id);
 
     let mut gone = false;
     let mut kept_vector: Option<Vec<u8>> = None;
     let settled = index.ann.update_published(
         || {
-            let held = match store.hold_elem(name, id) {
-                Ok(held) => held,
+            let addr = match store.hold_kv(&vkey) {
+                Ok(addr) => addr,
                 Err(StoreError::KeyGone) => {
                     gone = true;
                     return None;
                 }
                 Err(_) => return None,
             };
-            Some((held.addr(), held.value().to_vec()))
+            let body = store.with_item_at(addr, |_key, value| value.to_vec());
+            // The lookup's own reference has done its job; the graph keeps the
+            // one it already holds.
+            store.release_items(&[addr]);
+            body.map(|body| (addr, body))
         },
         |value| {
             if value.len() < layout.element_len() {
                 return Err(StoreError::CorruptElement);
             }
             kept_vector = layout.vector_of(&value).map(<[u8]>::to_vec);
-            let body = pending.value_mut();
-            let kept = body.len();
-            body.copy_from_slice(&value[..kept]);
-            layout
-                .set_attr(body, attr)
-                .map_err(|_| StoreError::CorruptElement)?;
-            let addr = pending.addr();
-            if !pending.insert()? {
-                let _ = store.delete_elem(name, id);
-                return Err(StoreError::ElemGone);
-            }
 
-            let held = store.hold_addr(name, id)?;
-            debug_assert_eq!(held.addr(), addr, "the engine linked a different element");
-            Ok(held.keep())
+            let mut body = vec![0u8; layout.stored_len()];
+            body[..layout.element_len()].copy_from_slice(&value[..layout.element_len()]);
+            layout
+                .set_attr(&mut body[..layout.element_len()], attr)
+                .map_err(|_| StoreError::CorruptElement)?;
+            body[layout.element_len()..].copy_from_slice(b"\r\n");
+
+            store.set_kv(&vkey, &body)
         },
     );
 
@@ -232,25 +242,29 @@ pub fn vdel(store: &Store, name: &str, id: &str) -> Result<Reply> {
     let index = for_write(store, name)?;
     let stamp = registry::now();
 
+    let vkey = crate::trigger::key::vector_key(name, id);
     let mut map_gone = false;
 
-    let mut taken = None;
-    let removed = index
-        .ann
-        .remove_published(|| match store.take_addr(name, id) {
-            Ok(held) => {
-                let addr = held.as_ref().map(HeldAddr::addr);
-                taken = held;
-                Ok(addr)
-            }
-            Err(StoreError::KeyGone) => {
-                map_gone = true;
-                Ok(None)
-            }
-            Err(e) => Err(e),
-        });
-    drop(taken);
+    // A second reference, taken only to learn the address the graph is holding.
+    // The one the graph owns is what `remove_published` retires; this extra one
+    // goes back below, from this request thread, where no lock is held.
+    let looked_up = match store.hold_kv(&vkey) {
+        Ok(addr) => Some(addr),
+        Err(StoreError::KeyGone) => {
+            map_gone = true;
+            None
+        }
+        Err(e) => return Err(e.into()),
+    };
 
+    let removed = index.ann.remove_published(|| match looked_up {
+        Some(addr) => store.delete_kv(&vkey).map(|()| Some(addr)),
+        None => Ok(None),
+    });
+
+    if let Some(addr) = looked_up {
+        store.release_items(&[addr]);
+    }
     if map_gone {
         map_is_gone(name, stamp);
     }

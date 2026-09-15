@@ -222,7 +222,7 @@ its replicas over plain TCP, and each replica resolves those ids against its own
 arcus-replicated Map — identifiers only, never vectors. A graph that drifts from
 its Map is repaired against it rather than rebuilt from nothing.
 
-See [docs/복제.md](docs/복제.md) for the flow.
+See [docs/복제.md](docs/복제.md) for the flow, the channel and what a full queue means.
 
 A restart is still cold: the graph is not serialized, and is rebuilt from the Map
 on first use.

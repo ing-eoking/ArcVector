@@ -250,7 +250,7 @@ mod tests {
             0,
             0,
             0,
-            Arc::new(crate::handler::arcus::engine::DetachedElements),
+            Arc::new(crate::handler::arcus::engine::ItemElements),
         )
         .expect("build the graph");
         VectorIndex::ours(name.to_owned(), ann, 8)
