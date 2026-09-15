@@ -81,7 +81,12 @@ impl Store {
     /// replicas and re-promoted on the next beat -- over and over. The allocate
     /// path already used `check` for exactly this reason; only the store call
     /// compared against `ENGINE_SUCCESS` by hand.
-    pub fn set_kv(&self, key: &str, value: &[u8]) -> Result<()> {
+    ///
+    /// **Keeps the reference `allocate` took** and hands back the item address,
+    /// so the graph can read through it with no lock -- the same contract as
+    /// [`Store::hold_kv`]. Give it back with [`Store::release_items`]. A failed
+    /// store releases before returning.
+    pub fn set_kv(&self, key: &str, value: &[u8]) -> Result<u64> {
         self.store_kv(key, value, ENGINE_STORE_OPERATION_OPERATION_SET)
     }
 
@@ -89,11 +94,13 @@ impl Store {
     ///
     /// `vcreate` needs that distinction and nothing else does: asking the
     /// engine is one round trip where a read-then-write is two and races.
-    pub fn add_kv(&self, key: &str, value: &[u8]) -> Result<()> {
+    ///
+    /// Owns its reference on success, like [`Store::set_kv`].
+    pub fn add_kv(&self, key: &str, value: &[u8]) -> Result<u64> {
         self.store_kv(key, value, ENGINE_STORE_OPERATION_OPERATION_ADD)
     }
 
-    fn store_kv(&self, key: &str, value: &[u8], operation: u32) -> Result<()> {
+    fn store_kv(&self, key: &str, value: &[u8], operation: u32) -> Result<u64> {
         let vt = self.vtable();
         let (Some(allocate), Some(store), Some(release), Some(info_of)) =
             (vt.allocate, vt.store, vt.release, vt.get_item_info)
@@ -146,8 +153,11 @@ impl Store {
                 0, // vbucket
             )
         };
-        unsafe { release(self.handle(), self.cookie, it) };
-        check(code)
+        if let Err(err) = check(code) {
+            unsafe { release(self.handle(), self.cookie, it) };
+            return Err(err);
+        }
+        Ok(it as u64)
     }
 
     /// Reads an item's key and value in place, taking no lock and no reference.

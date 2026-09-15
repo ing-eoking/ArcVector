@@ -69,6 +69,9 @@ const READER_SLOTS: usize = 128;
 
 const NO_READER: u64 = u64::MAX;
 
+/// How many references one `reclaim` hands back. See `AnnIndex::reclaim`.
+const RECLAIM_BATCH: usize = 64;
+
 #[must_use = "the search is only counted while this is alive"]
 struct Searching<'a> {
     index: &'a AnnIndex,
@@ -107,6 +110,11 @@ impl Drop for Searching<'_> {
                 self.index.unslotted.fetch_sub(1, Ordering::AcqRel);
             }
         }
+        // Registered as gone first, so this reader does not hold up the very
+        // addresses it is about to hand back. By here the search holds no graph
+        // lock and no engine lock, which is what makes calling `release` from a
+        // request thread sound -- see `AnnIndex::reclaim`.
+        self.index.reclaim();
     }
 }
 
@@ -755,40 +763,36 @@ impl AnnIndex {
         let _ = self.drop_node(staged.key);
     }
 
+    /// Queues addresses for release once every reader that could be holding one
+    /// has finished.
+    ///
+    /// **This never releases anything itself**, even when no reader is
+    /// registered. It is reached from the item-unlink callback, which runs with
+    /// the engine's cache lock held, and `release` takes that same lock -- so an
+    /// inline release there is a deadlock, not an optimisation. The earlier
+    /// version had exactly that shortcut, which was safe only while `retire`
+    /// was reached from request threads alone.
+    ///
+    /// Dropping the address on an allocation failure leaks one item: it stays
+    /// pinned for the life of the process, because nothing else will ever hand
+    /// its reference back. That is the lesser of the two evils available here --
+    /// the alternative is releasing from a thread that may hold the cache lock.
     fn retire(&self, addrs: &[u64]) {
         if addrs.is_empty() {
             return;
         }
         let after = crate::server::coarse_now() + 1;
-        let done = self.oldest_reader();
-
-        if done >= after && self.queued.load(Ordering::Relaxed) == 0 {
-            self.elements.release(addrs);
+        let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
+        if retired.try_reserve(addrs.len()).is_err() {
+            eprintln!(
+                "ArcVector: could not queue {} item reference(s) for release; \
+                 they stay pinned until this process ends",
+                addrs.len()
+            );
             return;
         }
-
-        let mut ready: Vec<u64> = Vec::new();
-        {
-            let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
-            if retired.try_reserve(addrs.len()).is_err() {
-                drop(retired);
-                self.drain_then_release(addrs, after);
-                return;
-            }
-            retired.extend(addrs.iter().map(|addr| (*addr, after)));
-            take_ready(&mut retired, done, &mut ready);
-            self.queued.store(retired.len(), Ordering::Relaxed);
-        }
-        if !ready.is_empty() {
-            self.elements.release(&ready);
-        }
-    }
-
-    fn drain_then_release(&self, addrs: &[u64], after: u64) {
-        while self.oldest_reader() < after {
-            std::thread::yield_now();
-        }
-        self.elements.release(addrs);
+        retired.extend(addrs.iter().map(|addr| (*addr, after)));
+        self.queued.store(retired.len(), Ordering::Relaxed);
     }
 
     fn oldest_reader(&self) -> u64 {
@@ -802,6 +806,23 @@ impl AnnIndex {
             .unwrap_or(NO_READER)
     }
 
+    /// Hands back the references whose grace period has passed.
+    ///
+    /// Called from two places. A searcher calls it on its way out, which is the
+    /// moment the last reader of a retired address disappears -- so memory comes
+    /// back immediately rather than at the next sweeper tick. The sweeper calls
+    /// it too, as the backstop for an index nothing is reading: without that, a
+    /// `vdrop` on an idle index would never reclaim anything.
+    ///
+    /// The caller must hold neither the graph lock nor the engine's cache lock.
+    /// `release` takes the cache lock, and `do_item_release` can re-enter the
+    /// unlink callback from there (an expired item the LRU scan skipped because
+    /// we held it), which wants the graph lock and this very mutex -- so the
+    /// batch is taken under the lock and released after it is dropped.
+    ///
+    /// `RECLAIM_BATCH` bounds what one caller pays. Dropping a large index
+    /// retires millions of addresses at once, and whichever search happens to
+    /// leave next should not wear all of it.
     pub fn reclaim(&self) {
         if self.queued.load(Ordering::Relaxed) == 0 {
             return;
@@ -810,7 +831,7 @@ impl AnnIndex {
         let mut ready: Vec<u64> = Vec::new();
         {
             let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
-            take_ready(&mut retired, done, &mut ready);
+            take_ready(&mut retired, done, &mut ready, RECLAIM_BATCH);
             self.queued.store(retired.len(), Ordering::Relaxed);
         }
         if !ready.is_empty() {
@@ -1106,8 +1127,10 @@ impl AnnIndex {
     }
 }
 
-fn take_ready(retired: &mut Vec<(u64, u64)>, done: u64, ready: &mut Vec<u64>) {
-    let cut = retired.partition_point(|(_, after)| *after <= done);
+fn take_ready(retired: &mut Vec<(u64, u64)>, done: u64, ready: &mut Vec<u64>, limit: usize) {
+    let cut = retired
+        .partition_point(|(_, after)| *after <= done)
+        .min(limit);
     if cut == 0 || ready.try_reserve(cut).is_err() {
         return;
     }
@@ -1389,7 +1412,7 @@ mod tests {
     }
 
     #[test]
-    fn a_delete_with_no_search_running_releases_without_queueing() {
+    fn a_delete_queues_the_reference_and_reclaim_hands_it_back() {
         let idx = build(4, Quant::F32, Metric::L2, 2);
         let addr = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
 
@@ -1397,16 +1420,53 @@ mod tests {
             idx.remove_published(|| Ok(Some(addr)));
         assert_eq!(taken.unwrap(), Some(true));
 
-        assert!(
-            FAKE.id_at(addr).is_none(),
-            "it should be back already, without waiting for a reclaim"
-        );
+        // `retire` used to release on the spot when no search was registered.
+        // It must not: the item-unlink callback reaches it holding the engine's
+        // cache lock, and `release` takes that same lock.
         assert_eq!(
             idx.queued.load(Ordering::Relaxed),
-            0,
-            "the queue was not used"
+            1,
+            "the address is queued, never released by the deleting thread"
         );
+        assert!(
+            FAKE.id_at(addr).is_some(),
+            "and so it is still held at this point"
+        );
+
+        idx.reclaim();
+
+        assert!(
+            FAKE.id_at(addr).is_none(),
+            "reclaim is what hands it back -- a searcher on its way out, or the sweeper"
+        );
+        assert_eq!(idx.queued.load(Ordering::Relaxed), 0);
         assert!(idx.retired.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_search_on_its_way_out_reclaims_what_a_delete_queued() {
+        let idx = build(4, Quant::F32, Metric::L2, 4);
+        let doomed = add(&idx, "gone", &[1.0, 0.0, 0.0, 0.0]);
+        add(&idx, "stays", &[0.0, 1.0, 0.0, 0.0]);
+
+        let taken: std::result::Result<Option<bool>, PublishError<()>> =
+            idx.remove_published(|| Ok(Some(doomed)));
+        assert_eq!(taken.unwrap(), Some(true));
+        assert!(
+            FAKE.id_at(doomed).is_some(),
+            "the deleting thread queues, it does not release"
+        );
+
+        // No explicit reclaim: finishing a search is what does it. That is the
+        // moment the last reader of a retired address disappears, and it is a
+        // thread holding neither the graph lock nor the engine's.
+        assert_eq!(search(&idx, &[0.0, 1.0, 0.0, 0.0], 5), vec!["stays"]);
+
+        assert!(
+            FAKE.id_at(doomed).is_none(),
+            "the searcher handed it back on the way out"
+        );
+        assert_eq!(idx.queued.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1556,6 +1616,7 @@ mod tests {
             !idx.held().contains(first),
             "the displaced address is not held any more"
         );
+        idx.reclaim();
         assert_eq!(
             FAKE.id_at(first),
             None,
@@ -2319,6 +2380,7 @@ mod tests {
         let entered = idx.epoch.load(Ordering::Acquire);
 
         idx.clear_with().unwrap();
+        idx.reclaim();
         assert_eq!(
             FAKE.id_at(key),
             None,
@@ -2344,6 +2406,7 @@ mod tests {
         let live = idx.held().live_addrs();
         assert_eq!(live.len(), 1, "one node, not two");
         assert_ne!(live[0], old, "and it stands on the new element");
+        idx.reclaim();
         assert_eq!(
             FAKE.id_at(old),
             None,
