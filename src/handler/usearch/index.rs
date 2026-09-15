@@ -72,6 +72,10 @@ const NO_READER: u64 = u64::MAX;
 /// How many references one `reclaim` hands back. See `AnnIndex::reclaim`.
 const RECLAIM_BATCH: usize = 64;
 
+/// A slot taken but whose stamp is not published yet. Below every real stamp,
+/// so it holds back every reclamation -- see `Searching::new`.
+const REGISTERING: u64 = 0;
+
 #[must_use = "the search is only counted while this is alive"]
 struct Searching<'a> {
     index: &'a AnnIndex,
@@ -86,17 +90,36 @@ thread_local! {
 
 impl<'a> Searching<'a> {
     fn new(index: &'a AnnIndex) -> Self {
-        let stamp = crate::server::coarse_now();
         let home = HOME.with(|home| *home);
+        // Claim the slot with `REGISTERING` before reading the clock, not after.
+        //
+        // The stamp says "no address retired from now on may be released while
+        // I am here". Reading it first left a window: between the read and the
+        // compare-exchange this searcher is invisible to `oldest_reader`, so a
+        // `reclaim` in that gap sees no readers, frees an address, and then this
+        // searcher walks the graph and can still reach the node -- usearch's
+        // `remove` only flips a key, and this thread may not see that store yet.
+        //
+        // `REGISTERING` is 0, which is below every real stamp, so `oldest_reader`
+        // returns 0 for as long as the slot is in this state and nothing can be
+        // reclaimed. The real stamp is published a moment later, and because it
+        // is read after the claim it is at least as late as the claim -- so any
+        // retire that happens after this searcher could have seen anything is
+        // still held back by it.
         let slot = (0..READER_SLOTS)
             .map(|step| (home + step) % READER_SLOTS)
             .find(|slot| {
                 index.readers[*slot]
-                    .compare_exchange(NO_READER, stamp, Ordering::AcqRel, Ordering::Relaxed)
+                    .compare_exchange(NO_READER, REGISTERING, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             });
-        if slot.is_none() {
-            index.unslotted.fetch_add(1, Ordering::AcqRel);
+        match slot {
+            Some(slot) => {
+                index.readers[slot].store(crate::server::coarse_now(), Ordering::Release);
+            }
+            None => {
+                index.unslotted.fetch_add(1, Ordering::AcqRel);
+            }
         }
         Searching { index, slot }
     }
@@ -1441,6 +1464,34 @@ mod tests {
         );
         assert_eq!(idx.queued.load(Ordering::Relaxed), 0);
         assert!(idx.retired.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_slot_claimed_before_its_stamp_lands_blocks_every_reclamation() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let addr = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
+
+        let taken: std::result::Result<Option<bool>, PublishError<()>> =
+            idx.remove_published(|| Ok(Some(addr)));
+        assert_eq!(taken.unwrap(), Some(true));
+
+        // A searcher that has taken a slot but not yet published its stamp: the
+        // window `Searching::new` used to leave open between reading the clock
+        // and the compare-exchange. While a slot reads REGISTERING, nothing may
+        // be handed back -- that searcher is about to walk the graph and can
+        // still reach a node whose removal it has not observed.
+        idx.readers[0].store(REGISTERING, Ordering::Release);
+        assert_eq!(idx.oldest_reader(), REGISTERING);
+
+        idx.reclaim();
+        assert!(
+            FAKE.id_at(addr).is_some(),
+            "a half-registered searcher holds the address back"
+        );
+
+        idx.readers[0].store(NO_READER, Ordering::Release);
+        idx.reclaim();
+        assert!(FAKE.id_at(addr).is_none(), "and lets it go once it is gone");
     }
 
     #[test]
