@@ -5,7 +5,7 @@ use super::coords::coord_vectors;
 use crate::command::filter::Filter;
 use crate::command::request::{Sim, SimKey};
 use crate::error::{Error, Reply, Result};
-use crate::handler::access::{for_read, map_is_gone};
+use crate::handler::access::for_read;
 use crate::handler::arcus::engine::{Store, StoreError};
 use crate::handler::quant;
 use crate::handler::registry::VectorIndex;
@@ -45,8 +45,6 @@ fn similar(
 ) -> Result<()> {
     let layout = index.ann.layout;
     let k = k.min((index.maxcount as usize).max(1));
-
-    let stamp = crate::handler::registry::now();
 
     let judged: RefCell<Vec<(u64, String)>> = RefCell::new(Vec::new());
     let by_attr = |key: u64| -> bool {
@@ -100,10 +98,9 @@ fn similar(
                 }) {
                 Ok(stored) => stored,
 
-                Err(StoreError::KeyGone) => {
-                    map_is_gone(&index.name, stamp);
-                    break;
-                }
+                // This vector's key, not the index's: a delete that landed
+                // between `resolve` and here. One hit goes, the query stands.
+                Err(StoreError::KeyGone) => continue,
 
                 Err(StoreError::CorruptElement) => {
                     index.ann.forget_unreadable(key);
@@ -184,14 +181,11 @@ pub fn vsim_key(store: &Store, spec: &SimKey) -> Result<Reply> {
     let (k, with_attr, filter) = (*k, *with_attr, filter.as_ref());
 
     let index = for_read(store, name)?;
-    let stamp = crate::handler::registry::now();
-
     let addr = match store.hold_kv(&crate::trigger::key::vector_key(name, key)) {
         Ok(addr) => addr,
-        Err(StoreError::KeyGone) => {
-            map_is_gone(name, stamp);
-            return Ok(Reply::NotFound);
-        }
+        // The query vector's own key. Gone means gone: this is a NOT_FOUND for
+        // the query, never a verdict on the index.
+        Err(StoreError::KeyGone) => return Ok(Reply::NotFound),
         Err(e) => return Err(e.into()),
     };
 

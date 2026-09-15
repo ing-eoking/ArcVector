@@ -1076,13 +1076,28 @@ impl AnnIndex {
         Ok(Some(had_node))
     }
 
+    /// Turns the traversal's hits into answerable results, dropping the ones
+    /// that stopped being answerable while the search ran.
+    ///
+    /// A delete that lands mid-search is the case this exists for. The search
+    /// may have put that address in its candidate list before the delete, and
+    /// usearch will still offer it afterwards -- `remove` only flips a key
+    /// under a mutex the traversal does not take. The graph's own set is the
+    /// authority on what is still there, and asking it costs one lock and a
+    /// hash lookup per hit, with no engine call.
+    ///
+    /// The address itself stays valid throughout: the reference the graph took
+    /// is not handed back until every search that could hold it has finished.
+    /// So this is about answering a stale hit, never about reading freed
+    /// memory.
     fn resolve(&self, hits: &[(u64, f32)], entered: u64) -> Vec<(u64, Arc<str>, f32)> {
         if self.epoch.load(Ordering::Acquire) != entered {
             return Vec::new();
         }
+        let held = self.held();
         hits.iter()
             .filter_map(|(key, distance)| {
-                if held::is_staged(*key) {
+                if held::is_staged(*key) || !held.contains(*key) {
                     return None;
                 }
                 let id = self.elements.id_at(*key)?;
@@ -1464,6 +1479,37 @@ mod tests {
         );
         assert_eq!(idx.queued.load(Ordering::Relaxed), 0);
         assert!(idx.retired.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_hit_deleted_while_the_search_ran_is_not_answered() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let doomed = add(&idx, "gone", &[1.0, 0.0, 0.0, 0.0]);
+        let kept = add(&idx, "stays", &[0.0, 1.0, 0.0, 0.0]);
+        let entered = idx.epoch.load(Ordering::Acquire);
+
+        // The shape of the race: the traversal put both addresses in its
+        // candidate list, then a delete landed, and now the search is finishing.
+        // usearch would still offer the deleted one -- its `remove` flips a key
+        // under a mutex the traversal never took.
+        let taken: std::result::Result<Option<bool>, PublishError<()>> =
+            idx.remove_published(|| Ok(Some(doomed)));
+        assert_eq!(taken.unwrap(), Some(true));
+
+        let answered = idx.resolve(&[(doomed, 0.0), (kept, 1.0)], entered);
+        let ids: Vec<&str> = answered.iter().map(|(_, id, _)| &**id).collect();
+        assert_eq!(
+            ids,
+            ["stays"],
+            "the deleted hit is dropped, the other stands"
+        );
+
+        // And the address was readable the whole time: the reference is not
+        // handed back until every search that could hold it has gone.
+        assert!(
+            FAKE.id_at(doomed).is_some(),
+            "no reader has left yet, so nothing was released"
+        );
     }
 
     #[test]

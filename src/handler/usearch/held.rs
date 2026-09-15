@@ -19,7 +19,12 @@ impl HeldSet {
         self.live.len()
     }
 
-    #[cfg(test)]
+    /// Whether the graph still stands on this address.
+    ///
+    /// `resolve` asks this of every hit: a delete that lands mid-search takes
+    /// the address out of here, and usearch can still offer it as a candidate
+    /// afterwards -- its `remove` only flips a key under a mutex the traversal
+    /// does not take, so a search already under way need not have seen it.
     pub(super) fn contains(&self, addr: u64) -> bool {
         self.live.contains(&addr)
     }
