@@ -9,6 +9,7 @@
 //!
 //! 자세한 논증은 `docs/superpowers/specs/2026-09-16-arcvector-retire-barrier-queue-design.md`.
 
+use crate::handler::usearch::held::Elements;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -91,6 +92,16 @@ fn seal(cell: &AtomicUsize) -> usize {
     cell.fetch_or(SEALED, Ordering::AcqRel) & COUNT
 }
 
+/// `drain_once` 한 번이 무엇을 했는지.
+pub(super) enum Progress {
+    /// 항목 하나를 처리했다. 값은 놓아준 주소 수(배리어면 0).
+    Released(usize),
+    /// 머리의 배리어가 아직 안 풀렸다.
+    Blocked,
+    /// 큐가 비었다.
+    Empty,
+}
+
 pub(super) struct Retirement {
     slots: Box<[AtomicUsize]>,
     /// 지금 열린 슬롯 번호. retire만 쓰고 검색은 읽기만 한다.
@@ -140,6 +151,39 @@ impl Retirement {
         let live = seal(&self.slots[slot]);
         self.open.store((slot + 1) % POOL, Ordering::Release);
         live
+    }
+
+    /// 큐의 머리 하나를 처리한다.
+    ///
+    /// `release`는 **뮤텍스를 놓은 뒤에** 부른다. `release` → `do_item_release`가
+    /// unlink 콜백을 재진입시킬 수 있고, 그 콜백이 같은 뮤텍스를 다시 잡는다.
+    pub(super) fn drain_once(&self, elements: &dyn Elements) -> Progress {
+        let batch = {
+            let mut q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+            match q.events.front() {
+                None => return Progress::Empty,
+
+                Some(Event::Barrier(slot)) => {
+                    let slot = *slot;
+                    if self.slots[slot].load(Ordering::Acquire) & COUNT > 0 {
+                        return Progress::Blocked;
+                    }
+                    // 봉인만 푼다. `store(0)`이면 물러나는 중인 검색의 `+1`을
+                    // 덮어써 그 `-1`에서 언더플로가 난다.
+                    self.slots[slot].fetch_and(COUNT, Ordering::AcqRel);
+                    q.events.pop_front();
+                    return Progress::Released(0);
+                }
+
+                Some(Event::Release(_)) => match q.events.pop_front() {
+                    Some(Event::Release(addrs)) => addrs,
+                    _ => unreachable!("just matched a release"),
+                },
+            }
+        };
+
+        elements.release(&batch);
+        Progress::Released(batch.len())
     }
 
     /// 주소를 놓아줄 목록에 넣는다. 엔진을 건드리지 않는다.
@@ -229,7 +273,90 @@ impl Drop for Reading<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handler::usearch::held::Elements;
     use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct FakeElements {
+        freed: StdMutex<Vec<u64>>,
+    }
+
+    impl Elements for FakeElements {
+        fn id_at(&self, _addr: u64) -> Option<Arc<str>> {
+            None
+        }
+        fn release(&self, addrs: &[u64]) {
+            self.freed.lock().unwrap().extend_from_slice(addrs);
+        }
+    }
+
+    impl FakeElements {
+        fn freed(&self) -> Vec<u64> {
+            self.freed.lock().unwrap().clone()
+        }
+    }
+
+    #[test]
+    fn an_unresolved_barrier_blocks_everything_behind_it() {
+        let r = Retirement::new();
+        let e = FakeElements::default();
+
+        let reading = r.enter();
+        r.retire(&[0x10]);
+
+        assert!(matches!(r.drain_once(&e), Progress::Blocked));
+        assert!(e.freed().is_empty(), "앞선 검색이 살아 있으면 못 놓아준다");
+
+        drop(reading);
+        assert!(
+            matches!(r.drain_once(&e), Progress::Released(0)),
+            "배리어를 버린다"
+        );
+        assert!(
+            matches!(r.drain_once(&e), Progress::Released(1)),
+            "그 다음이 릴리스"
+        );
+        assert_eq!(e.freed(), vec![0x10]);
+    }
+
+    #[test]
+    fn a_search_that_started_after_the_retire_does_not_block_it() {
+        let r = Retirement::new();
+        let e = FakeElements::default();
+
+        r.retire(&[0x10]);
+        let late = r.enter(); // retire 뒤에 시작했으므로 0x10에 닿을 수 없다
+
+        assert!(matches!(r.drain_once(&e), Progress::Released(1)));
+        assert_eq!(
+            e.freed(),
+            vec![0x10],
+            "나중 검색은 앞의 릴리스를 막지 않는다"
+        );
+        drop(late);
+    }
+
+    #[test]
+    fn an_empty_queue_reports_empty() {
+        let r = Retirement::new();
+        let e = FakeElements::default();
+        assert!(matches!(r.drain_once(&e), Progress::Empty));
+    }
+
+    #[test]
+    fn a_resolved_barrier_gives_its_slot_back() {
+        let r = Retirement::new();
+        let e = FakeElements::default();
+
+        let reading = r.enter();
+        let slot = r.open_slot();
+        r.retire(&[0x10]);
+        drop(reading);
+
+        assert!(matches!(r.drain_once(&e), Progress::Released(0)));
+        assert_eq!(r.slot_count(slot), 0, "버린 슬롯은 깨끗하게 되돌아왔다");
+    }
 
     #[test]
     fn a_search_holds_the_open_slot_until_it_ends() {
