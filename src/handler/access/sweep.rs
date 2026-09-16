@@ -13,6 +13,11 @@ struct Sweeper {
 #[derive(Default)]
 struct State {
     retired: Vec<Arc<VectorIndex>>,
+    /// 종이 울렸다. 훑을 것이 있다는 표시.
+    ///
+    /// 뮤텍스 안에서 세우는 것이 요점이다. 밖에서 `notify_one`만 하면 sweeper가
+    /// "일 없음"을 확인하고 `wait`에 들어가기 전에 울린 알림이 사라진다.
+    pending: bool,
 }
 
 static SWEEPER: LazyLock<Sweeper> = LazyLock::new(|| {
@@ -36,6 +41,7 @@ pub(in crate::handler) fn ensure_sweeper() {
 
 /// sweeper를 깨운다. 봉인된 배리어를 푼 검색이 부른다.
 pub(in crate::handler) fn wake() {
+    state().pending = true;
     SWEEPER.wake.notify_one();
 }
 
@@ -64,24 +70,34 @@ fn run() {
     loop {
         let retired = {
             let mut state = state();
-            if state.retired.is_empty() {
+            if state.retired.is_empty() && !state.pending {
                 state = SWEEPER
                     .wake
                     .wait_timeout(state, TICK)
                     .unwrap_or_else(PoisonError::into_inner)
                     .0;
             }
+            // 훑기 전에 내린다. 훑는 도중에 울린 종은 플래그를 다시 세우므로
+            // 다음 바퀴가 집어간다 -- 헛도는 경우는 있어도 빠뜨리지 않는다.
+            state.pending = false;
             std::mem::take(&mut state.retired)
         };
 
         drop(retired);
 
+        let indexes = registry::indexes().unwrap_or_default();
+
+        // 종이 울렸든 틱이 왔든, 놓아줄 것은 매 바퀴 놓아준다.
+        for index in &indexes {
+            while index.ann.drain_retired() {}
+        }
+
+        // 종을 울려줄 주체가 없는 일만 틱 주기로 남긴다.
         if last_round.elapsed() >= TICK {
             last_round = Instant::now();
             crate::server::tick();
-            for index in registry::indexes().unwrap_or_default() {
+            for index in &indexes {
                 index.ann.retry_stuck();
-                while index.ann.drain_retired() {}
             }
         }
     }

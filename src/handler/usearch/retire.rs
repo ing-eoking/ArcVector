@@ -154,12 +154,13 @@ impl Retirement {
         let _ = self.bell.set(bell);
     }
 
-    /// 종을 울린다. 큐 뮤텍스를 한 번 거치는 것은 알림 유실을 막기 위해서다 --
-    /// sweeper가 "안 풀렸다"를 확인하고 `wait`에 들어가기 전에 울리면 그 알림이
-    /// 사라진다.
+    /// 종을 울린다. 봉인된 배리어를 0으로 만든 검색만 부른다.
+    ///
+    /// 알림 유실을 막는 것은 여기가 아니라 종 자체의 몫이다 -- sweeper가 기다리는
+    /// 뮤텍스는 이 큐의 것이 아니라 sweeper 자신의 것이라, 여기서 큐 락을 거쳐봐야
+    /// 아무것도 지켜주지 않는다. `sweep::wake`가 그 뮤텍스 안에서 플래그를 세운다.
     fn ring(&self) {
         let Some(bell) = self.bell.get() else { return };
-        drop(self.queue.lock().unwrap_or_else(PoisonError::into_inner));
         bell();
     }
 
