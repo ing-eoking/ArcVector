@@ -12,7 +12,10 @@
 use crate::handler::usearch::held::Elements;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Condvar, Mutex, PoisonError};
+use std::time::Duration;
+
+use crate::error::{Error, Result};
 
 /// 큐가 이만큼 차면 게이트를 닫는다. 고수위 표시이지 상한이 아니다.
 pub(super) const CAP: usize = 1024;
@@ -37,9 +40,19 @@ enum Event {
 #[derive(Default)]
 struct Queue {
     events: VecDeque<Event>,
+    gated: bool,
 }
 
 impl Queue {
+    /// 자리가 났으면 게이트를 연다. 푸는 것은 `drain_once`가 한다.
+    fn reopen_if_room(&mut self, cap: usize) -> bool {
+        if self.gated && self.events.len() < cap {
+            self.gated = false;
+            return true;
+        }
+        false
+    }
+
     /// 꼬리가 `Release`면 칸을 늘리지 않고 주소만 붙인다.
     ///
     /// 할당이 실패하면 그 배치를 포기한다. 아이템이 프로세스 끝까지 묶이지만,
@@ -102,19 +115,35 @@ pub(super) enum Progress {
     Empty,
 }
 
+/// 게이트가 닫혀 있을 때 검색이 기다리는 시간. 넘으면 거절한다.
+const GATE_TIMEOUT: Duration = Duration::from_secs(1);
+
 pub(super) struct Retirement {
     slots: Box<[AtomicUsize]>,
     /// 지금 열린 슬롯 번호. retire만 쓰고 검색은 읽기만 한다.
     open: AtomicUsize,
     queue: Mutex<Queue>,
+    gate: Condvar,
+    cap: usize,
 }
 
 impl Retirement {
     pub(super) fn new() -> Self {
+        Self::with_cap_inner(CAP)
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_cap(cap: usize) -> Self {
+        Self::with_cap_inner(cap)
+    }
+
+    fn with_cap_inner(cap: usize) -> Self {
         Self {
             slots: (0..POOL).map(|_| AtomicUsize::new(0)).collect(),
             open: AtomicUsize::new(0),
             queue: Mutex::new(Queue::default()),
+            gate: Condvar::new(),
+            cap,
         }
     }
 
@@ -122,14 +151,44 @@ impl Retirement {
     ///
     /// 봉인 중이면 물러났다가 `open`을 다시 읽는다. 물러나는 것은 `held`를 읽기
     /// 전이므로 그 검색은 아무 주소도 보지 못했다.
-    pub(super) fn enter(&self) -> Reading<'_> {
+    pub(super) fn enter(&self) -> Result<Reading<'_>> {
+        self.enter_deadline(GATE_TIMEOUT)
+    }
+
+    pub(super) fn enter_deadline(&self, timeout: Duration) -> Result<Reading<'_>> {
+        self.wait_for_gate(timeout)?;
         loop {
             let slot = self.open.load(Ordering::Acquire);
             if attach(&self.slots[slot]) {
-                return Reading { owner: self, slot };
+                return Ok(Reading { owner: self, slot });
             }
             std::hint::spin_loop();
         }
+    }
+
+    /// 게이트가 열릴 때까지 기다린다. 기다리는 동안 이 검색은 어떤 배리어에도
+    /// 붙어 있지 않으므로, 진행 중인 검색들이 끝나 큐가 빠지는 것을 막지 않는다.
+    fn wait_for_gate(&self, timeout: Duration) -> Result<()> {
+        let q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        if !q.gated {
+            return Ok(());
+        }
+        let (q, wait) = self
+            .gate
+            .wait_timeout_while(q, timeout, |q| q.gated)
+            .unwrap_or_else(PoisonError::into_inner);
+        if wait.timed_out() && q.gated {
+            return Err(Error::Busy);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_gated(&self) -> bool {
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .gated
     }
 
     #[cfg(test)]
@@ -172,13 +231,22 @@ impl Retirement {
                     // 덮어써 그 `-1`에서 언더플로가 난다.
                     self.slots[slot].fetch_and(COUNT, Ordering::AcqRel);
                     q.events.pop_front();
+                    if q.reopen_if_room(self.cap) {
+                        self.gate.notify_all();
+                    }
                     return Progress::Released(0);
                 }
 
-                Some(Event::Release(_)) => match q.events.pop_front() {
-                    Some(Event::Release(addrs)) => addrs,
-                    _ => unreachable!("just matched a release"),
-                },
+                Some(Event::Release(_)) => {
+                    let taken = match q.events.pop_front() {
+                        Some(Event::Release(addrs)) => addrs,
+                        _ => unreachable!("just matched a release"),
+                    };
+                    if q.reopen_if_room(self.cap) {
+                        self.gate.notify_all();
+                    }
+                    taken
+                }
             }
         };
 
@@ -226,6 +294,7 @@ impl Retirement {
         }
 
         q.push_addrs(addrs);
+        q.gated = q.events.len() >= self.cap;
     }
 
     #[cfg(test)]
@@ -304,7 +373,7 @@ mod tests {
         let r = Retirement::new();
         let e = FakeElements::default();
 
-        let reading = r.enter();
+        let reading = r.enter().unwrap();
         r.retire(&[0x10]);
 
         assert!(matches!(r.drain_once(&e), Progress::Blocked));
@@ -334,7 +403,7 @@ mod tests {
         let r = Retirement::new();
         let e = FakeElements::default();
 
-        let reading = r.enter();
+        let reading = r.enter().unwrap();
         let slot = r.open_slot();
         r.retire(&[0x10]);
         drop(reading);
@@ -357,12 +426,12 @@ mod tests {
         let e = FakeElements::default();
 
         // 먼저 붙은 검색이 첫 배리어를 만든다.
-        let first = r.enter();
+        let first = r.enter().unwrap();
         r.retire(&[0x10]);
 
         // 이 검색은 0x10이 held에서 빠진 뒤에 시작했으므로 그 주소에 닿을 수 없고,
         // 그래서 두 번째 배리어에 붙는다 -- Rel(0x10) 뒤에.
-        let late = r.enter();
+        let late = r.enter().unwrap();
         r.retire(&[0x20]);
         assert_eq!(r.queue_shape(), vec!['B', 'R', 'B', 'R']);
 
@@ -392,7 +461,7 @@ mod tests {
         let slot = r.open_slot();
         assert_eq!(r.slot_count(slot), 0);
 
-        let reading = r.enter();
+        let reading = r.enter().unwrap();
         assert_eq!(r.slot_count(slot), 1, "검색이 붙었다");
 
         drop(reading);
@@ -404,8 +473,8 @@ mod tests {
         let r = Retirement::new();
         let slot = r.open_slot();
 
-        let a = r.enter();
-        let b = r.enter();
+        let a = r.enter().unwrap();
+        let b = r.enter().unwrap();
         assert_eq!(r.slot_count(slot), 2);
 
         drop(a);
@@ -417,8 +486,8 @@ mod tests {
     #[test]
     fn sealing_returns_the_count_at_that_moment() {
         let r = Retirement::new();
-        let a = r.enter();
-        let b = r.enter();
+        let a = r.enter().unwrap();
+        let b = r.enter().unwrap();
 
         assert_eq!(r.seal_open(), 2, "봉인 순간의 카운트를 정확히 돌려준다");
         drop(a);
@@ -430,10 +499,10 @@ mod tests {
         let r = Retirement::new();
         let first = r.open_slot();
 
-        let held_open = r.enter(); // 봉인이 0을 돌려주지 않도록 하나 붙여둔다
+        let held_open = r.enter().unwrap(); // 봉인이 0을 돌려주지 않도록 하나 붙여둔다
         assert_eq!(r.seal_open(), 1);
 
-        let late = r.enter();
+        let late = r.enter().unwrap();
         assert_ne!(
             r.open_slot(),
             first,
@@ -459,7 +528,7 @@ mod tests {
         let r = Retirement::new();
         let slot = r.open_slot();
 
-        let holder = r.enter(); // 먼저 붙은 검색 하나
+        let holder = r.enter().unwrap(); // 먼저 붙은 검색 하나
         assert_eq!(seal(&r.slots[slot]), 1, "봉인 순간의 카운트");
 
         // 봉인된 칸에 붙으려는 검색은 물러난다. enter()로는 이 경로를 못 밟는다 --
@@ -518,7 +587,7 @@ mod tests {
     fn a_retire_with_a_search_attached_queues_a_barrier_first() {
         let r = Retirement::new();
         let slot = r.open_slot();
-        let reading = r.enter();
+        let reading = r.enter().unwrap();
 
         r.retire(&[0x10]);
 
@@ -540,14 +609,14 @@ mod tests {
         // 봉인과 push가 한 덩어리가 아니면 [B, B, R, R]처럼 배리어가 붙어 나오고,
         // 그러면 두 번째 배리어 뒤의 릴리스를 첫 배리어가 안 막게 된다.
         let r = Arc::new(Retirement::new());
-        let _reading = r.enter(); // 모든 retire가 배리어를 만들도록 하나 붙여둔다
+        let _reading = r.enter().unwrap(); // 모든 retire가 배리어를 만들도록 하나 붙여둔다
 
         std::thread::scope(|s| {
             for t in 0..4u64 {
                 let r = Arc::clone(&r);
                 s.spawn(move || {
                     for i in 0..50u64 {
-                        let _hold = r.enter();
+                        let _hold = r.enter().unwrap();
                         r.retire(&[t * 1000 + i]);
                     }
                 });
@@ -563,9 +632,9 @@ mod tests {
     #[test]
     fn a_search_that_starts_after_a_retire_joins_the_next_barrier() {
         let r = Retirement::new();
-        let first = r.enter();
+        let first = r.enter().unwrap();
         r.retire(&[0x10]);
-        let second = r.enter();
+        let second = r.enter().unwrap();
 
         r.retire(&[0x20]);
 
@@ -576,5 +645,40 @@ mod tests {
         );
         drop(first);
         drop(second);
+    }
+
+    #[test]
+    fn the_gate_closes_when_the_queue_reaches_the_cap() {
+        let r = Retirement::with_cap(2);
+        let a = r.enter().unwrap();
+        r.retire(&[0x10]); // [B, R]  = 2칸
+        assert!(r.is_gated(), "캡에 닿으면 게이트가 닫힌다");
+        drop(a);
+    }
+
+    #[test]
+    fn a_drained_queue_opens_the_gate_again() {
+        let r = Retirement::with_cap(2);
+        let e = FakeElements::default();
+        let a = r.enter().unwrap();
+        r.retire(&[0x10]);
+        assert!(r.is_gated());
+
+        drop(a);
+        while !matches!(r.drain_once(&e), Progress::Empty) {}
+        assert!(!r.is_gated(), "큐가 빠지면 게이트가 열린다");
+    }
+
+    #[test]
+    fn a_gated_search_gives_up_rather_than_waiting_forever() {
+        let r = Retirement::with_cap(2);
+        let a = r.enter().unwrap();
+        r.retire(&[0x10]);
+        assert!(r.is_gated());
+
+        // a가 끝나지 않으므로 큐가 빠지지 않는다. 대기는 타임아웃으로 끝난다.
+        let refused = r.enter_deadline(std::time::Duration::from_millis(50));
+        assert!(matches!(refused, Err(crate::error::Error::Busy)));
+        drop(a);
     }
 }
