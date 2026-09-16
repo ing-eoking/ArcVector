@@ -593,12 +593,14 @@ impl AnnIndex {
         let addr = match written {
             Ok(addr) => addr,
             Err(e) => {
-                if let Some(old) = displaced {
-                    self.elements.release(&[old]);
-                }
+                // held에서 먼저 빼고 큐로 보낸다. 여기서 release하면 아직 held에
+                // 있는 주소를 놓아주는 것이고, 게다가 두 락을 쥔 채 cache lock을
+                // 잡는 것이라 잠금 순서도 뒤집힌다.
+                let taken = displaced.is_some_and(|old| held.give_up(old, tombstone));
                 drop(held);
                 drop(index);
                 let _ = self.drop_node(key);
+                self.drop_displaced(displaced, taken);
                 return Err(PublishError::Store(e));
             }
         };
@@ -1541,6 +1543,29 @@ mod tests {
              -- even though another search is still running"
         );
         drop(second);
+    }
+
+    #[test]
+    fn a_failed_link_does_not_release_the_displaced_address_inline() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let old = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
+
+        // 같은 id를 다시 쓰는데 link가 실패한다. 옛 주소는 아직 held에 있으므로
+        // 그 자리에서 놓아주면 안 된다 -- 도는 검색이 그것을 hit으로 낼 수 있다.
+        let staged = idx
+            .stage(&crate::handler::quant::encode(
+                &[1.0, 0.0, 0.0, 0.0],
+                idx.layout.quant,
+            ))
+            .unwrap();
+        let done: std::result::Result<Published, PublishError<()>> =
+            idx.insert_published(staged, || FAKE.addr_of(&idx, "a"), || Err(()));
+        assert!(matches!(done, Err(PublishError::Store(()))));
+
+        assert!(
+            FAKE.id_at(old).is_some(),
+            "실패 경로가 옛 주소를 즉시 놓아주었다. 큐를 거쳐야 한다"
+        );
     }
 
     #[test]
