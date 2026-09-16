@@ -12,7 +12,7 @@
 use crate::handler::usearch::held::Elements;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -125,6 +125,7 @@ pub(super) struct Retirement {
     queue: Mutex<Queue>,
     gate: Condvar,
     cap: usize,
+    bell: OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Retirement {
@@ -144,7 +145,22 @@ impl Retirement {
             queue: Mutex::new(Queue::default()),
             gate: Condvar::new(),
             cap,
+            bell: OnceLock::new(),
         }
+    }
+
+    /// sweeper를 깨우는 방법을 알려준다. 등록 전에는 아무것도 하지 않는다.
+    pub(super) fn set_bell(&self, bell: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.bell.set(bell);
+    }
+
+    /// 종을 울린다. 큐 뮤텍스를 한 번 거치는 것은 알림 유실을 막기 위해서다 --
+    /// sweeper가 "안 풀렸다"를 확인하고 `wait`에 들어가기 전에 울리면 그 알림이
+    /// 사라진다.
+    fn ring(&self) {
+        let Some(bell) = self.bell.get() else { return };
+        drop(self.queue.lock().unwrap_or_else(PoisonError::into_inner));
+        bell();
     }
 
     /// 검색 하나를 지금 열린 배리어에 붙인다.
@@ -335,7 +351,11 @@ pub(super) struct Reading<'a> {
 
 impl Drop for Reading<'_> {
     fn drop(&mut self) {
-        self.owner.slots[self.slot].fetch_sub(1, Ordering::AcqRel);
+        let prev = self.owner.slots[self.slot].fetch_sub(1, Ordering::AcqRel);
+        if prev & COUNT == 1 && prev & SEALED != 0 {
+            // 내가 마지막이고, 이 배리어는 큐에서 sweeper를 세우고 있다.
+            self.owner.ring();
+        }
     }
 }
 
@@ -680,5 +700,45 @@ mod tests {
         let refused = r.enter_deadline(std::time::Duration::from_millis(50));
         assert!(matches!(refused, Err(crate::error::Error::Busy)));
         drop(a);
+    }
+
+    #[test]
+    fn the_last_search_of_a_sealed_barrier_rings_the_bell() {
+        use std::sync::atomic::AtomicUsize as Counter;
+
+        let r = Retirement::new();
+        let rings = Arc::new(Counter::new(0));
+        let seen = Arc::clone(&rings);
+        r.set_bell(Arc::new(move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        let a = r.enter().unwrap();
+        let b = r.enter().unwrap();
+        r.retire(&[0x10]); // 봉인(2)
+
+        drop(a);
+        assert_eq!(rings.load(Ordering::Relaxed), 0, "아직 마지막이 아니다");
+        drop(b);
+        assert_eq!(rings.load(Ordering::Relaxed), 1, "마지막이 울린다");
+    }
+
+    #[test]
+    fn an_unsealed_barrier_does_not_ring() {
+        use std::sync::atomic::AtomicUsize as Counter;
+
+        let r = Retirement::new();
+        let rings = Arc::new(Counter::new(0));
+        let seen = Arc::clone(&rings);
+        r.set_bell(Arc::new(move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        drop(r.enter().unwrap());
+        assert_eq!(
+            rings.load(Ordering::Relaxed),
+            0,
+            "봉인 안 된 배리어는 아무도 안 기다린다"
+        );
     }
 }

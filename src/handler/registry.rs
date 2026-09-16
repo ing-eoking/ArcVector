@@ -134,6 +134,7 @@ pub fn put(
     index: VectorIndex,
 ) -> Result<(Arc<VectorIndex>, Option<Arc<VectorIndex>>), TryReserveError> {
     sweep::ensure_sweeper();
+    index.ann.set_bell();
     let mut reg = write();
     reg.try_reserve(1)?;
     let index = Arc::new(index);
@@ -182,6 +183,7 @@ pub fn remove_if_stale(name: &str, stamp: u64) -> bool {
 
 pub fn insert_or_get(index: VectorIndex) -> Result<(Arc<VectorIndex>, bool), TryReserveError> {
     sweep::ensure_sweeper();
+    index.ann.set_bell();
     let mut reg = write();
     reg.try_reserve(1)?;
     let mut inserted = false;

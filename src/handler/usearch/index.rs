@@ -863,6 +863,12 @@ impl AnnIndex {
         )
     }
 
+    /// sweeper를 깨우는 종을 단다. 레지스트리에 들어갈 때 한 번 부른다.
+    pub fn set_bell(&self) {
+        self.retirement
+            .set_bell(std::sync::Arc::new(crate::handler::access::sweep::wake));
+    }
+
     fn drop_node(&self, key: u64) -> bool {
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         index.remove(key).is_ok()

@@ -34,6 +34,11 @@ pub(in crate::handler) fn ensure_sweeper() {
     LazyLock::force(&SWEEPER);
 }
 
+/// sweeper를 깨운다. 봉인된 배리어를 푼 검색이 부른다.
+pub(in crate::handler) fn wake() {
+    SWEEPER.wake.notify_one();
+}
+
 fn state() -> MutexGuard<'static, State> {
     SWEEPER.state.lock().unwrap_or_else(PoisonError::into_inner)
 }
