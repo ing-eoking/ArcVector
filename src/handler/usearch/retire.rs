@@ -179,4 +179,25 @@ mod tests {
         drop(late);
         drop(held_open);
     }
+
+    #[test]
+    fn attaching_to_a_sealed_slot_backs_out_without_disturbing_the_count() {
+        let r = Retirement::new();
+        let slot = r.open_slot();
+
+        let holder = r.enter(); // 먼저 붙은 검색 하나
+        assert_eq!(seal(&r.slots[slot]), 1, "봉인 순간의 카운트");
+
+        // 봉인된 칸에 붙으려는 검색은 물러난다. enter()로는 이 경로를 못 밟는다 --
+        // open이 안 넘어간 채로 부르면 영영 돈다.
+        assert!(!attach(&r.slots[slot]), "봉인돼 있으면 붙지 못한다");
+        assert_eq!(
+            r.slot_count(slot),
+            1,
+            "물러난 검색이 카운트를 남기지도, 먼저 붙은 하나를 지우지도 않았다"
+        );
+
+        drop(holder);
+        assert_eq!(r.slot_count(slot), 0, "언더플로 없이 0으로 돌아온다");
+    }
 }
