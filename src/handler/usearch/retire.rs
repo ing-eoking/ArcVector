@@ -273,9 +273,11 @@ impl Drop for Reading<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::usearch::held::Elements;
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::Ordering;
+
+    use crate::handler::usearch::held::Elements;
 
     #[derive(Default)]
     struct FakeElements {
@@ -321,23 +323,6 @@ mod tests {
     }
 
     #[test]
-    fn a_search_that_started_after_the_retire_does_not_block_it() {
-        let r = Retirement::new();
-        let e = FakeElements::default();
-
-        r.retire(&[0x10]);
-        let late = r.enter(); // retire 뒤에 시작했으므로 0x10에 닿을 수 없다
-
-        assert!(matches!(r.drain_once(&e), Progress::Released(1)));
-        assert_eq!(
-            e.freed(),
-            vec![0x10],
-            "나중 검색은 앞의 릴리스를 막지 않는다"
-        );
-        drop(late);
-    }
-
-    #[test]
     fn an_empty_queue_reports_empty() {
         let r = Retirement::new();
         let e = FakeElements::default();
@@ -355,7 +340,50 @@ mod tests {
         drop(reading);
 
         assert!(matches!(r.drain_once(&e), Progress::Released(0)));
-        assert_eq!(r.slot_count(slot), 0, "버린 슬롯은 깨끗하게 되돌아왔다");
+
+        // 카운트가 0인 것만으로는 부족하다 -- slot_count가 SEALED를 가리므로,
+        // fetch_and를 아예 안 해도 통과한다. 봉인이 실제로 풀렸는지 본다.
+        assert!(
+            attach(&r.slots[slot]),
+            "봉인이 안 풀렸다. 이 칸이 다시 열리면 enter()가 영영 돈다"
+        );
+        r.slots[slot].fetch_sub(1, Ordering::AcqRel);
+        assert_eq!(r.slot_count(slot), 0, "깨끗하게 되돌아왔다");
+    }
+
+    #[test]
+    fn a_barrier_behind_a_release_does_not_block_it() {
+        let r = Retirement::new();
+        let e = FakeElements::default();
+
+        // 먼저 붙은 검색이 첫 배리어를 만든다.
+        let first = r.enter();
+        r.retire(&[0x10]);
+
+        // 이 검색은 0x10이 held에서 빠진 뒤에 시작했으므로 그 주소에 닿을 수 없고,
+        // 그래서 두 번째 배리어에 붙는다 -- Rel(0x10) 뒤에.
+        let late = r.enter();
+        r.retire(&[0x20]);
+        assert_eq!(r.queue_shape(), vec!['B', 'R', 'B', 'R']);
+
+        drop(first);
+        assert!(
+            matches!(r.drain_once(&e), Progress::Released(0)),
+            "첫 배리어가 풀렸다"
+        );
+        assert!(matches!(r.drain_once(&e), Progress::Released(1)));
+        assert_eq!(
+            e.freed(),
+            vec![0x10],
+            "늦게 시작한 검색이 아직 도는데도 첫 릴리스는 통과한다"
+        );
+
+        // 그 뒤의 것은 late가 막고 있다.
+        assert!(matches!(r.drain_once(&e), Progress::Blocked));
+        drop(late);
+        assert!(matches!(r.drain_once(&e), Progress::Released(0)));
+        assert!(matches!(r.drain_once(&e), Progress::Released(1)));
+        assert_eq!(e.freed(), vec![0x10, 0x20]);
     }
 
     #[test]
