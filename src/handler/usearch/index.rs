@@ -1525,9 +1525,10 @@ mod tests {
         assert_eq!(taken.unwrap(), Some(true));
 
         // A second starts before the first ends, so the reader table is never
-        // empty from here on. Nothing ticks the clock in this test -- that is
-        // the point: `retire` moves it itself, so this searcher's stamp is
-        // already past the retirement and does not hold it back.
+        // empty from here on. It does not hold the retirement back regardless:
+        // `retire()` already sealed the barrier `first` is attached to and
+        // opened the next one, so `second` attaches to that next barrier --
+        // behind the release in the queue, not in front of it.
         let second = idx.retirement.enter().unwrap();
         while idx.drain_retired() {}
         assert!(
@@ -1581,6 +1582,12 @@ mod tests {
         // `a_delete_queues_the_reference_and_reclaim_hands_it_back`), so this
         // test seeds the old reader-slot queue directly -- it exercises
         // `oldest_reader`/`reclaim` in isolation until Task 8 removes them.
+        //
+        // `remove_published` above also queued `addr` in the *new*
+        // `retirement` queue -- that is safe here only because nothing in
+        // this test ever calls `drain_retired()`/`drain_once()`. Adding one
+        // would release `addr` a second time through the new path after the
+        // old `reclaim()` below already released it.
         idx.retired.lock().unwrap().push((addr, 1));
         idx.queued.store(1, Ordering::Relaxed);
 
@@ -1604,7 +1611,7 @@ mod tests {
     }
 
     #[test]
-    fn a_search_on_its_way_out_reclaims_what_a_delete_queued() {
+    fn a_delete_during_a_search_is_handed_back_once_the_queue_is_drained() {
         let idx = build(4, Quant::F32, Metric::L2, 4);
         let doomed = add(&idx, "gone", &[1.0, 0.0, 0.0, 0.0]);
         add(&idx, "stays", &[0.0, 1.0, 0.0, 0.0]);
@@ -1619,15 +1626,15 @@ mod tests {
 
         assert_eq!(search(&idx, &[0.0, 1.0, 0.0, 0.0], 5), vec!["stays"]);
 
-        // Finishing a search no longer releases inline -- dropping a `Reading`
-        // only drops the barrier's count. Only draining the queue (the
-        // sweeper's job) hands the address back.
+        // Draining the queue is what hands it back now, not the search
+        // finishing -- the sweeper is the one that calls this.
         while idx.drain_retired() {}
 
         assert!(
             FAKE.id_at(doomed).is_none(),
             "draining the queue after the searcher left hands it back"
         );
+        assert_eq!(idx.retirement.queue_len(), 0, "큐가 비었다");
     }
 
     #[test]
