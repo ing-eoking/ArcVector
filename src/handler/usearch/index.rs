@@ -67,6 +67,15 @@ impl Drop for Staged<'_> {
 static NEXT_IDENTITY: AtomicUsize = AtomicUsize::new(1);
 
 impl Drop for AnnIndex {
+    /// `held`뿐 아니라 `retirement`에 아직 남아 있는 `Release`도 여기서 놓아준다.
+    ///
+    /// 이게 안전한 것은 오직 여기뿐이다: 검색은 `Arc<VectorIndex>`를 쥐고 도므로
+    /// ([access/mod.rs] 참고) 이 `drop`이 불릴 수 있는 시점에는 어떤 검색도 존재할
+    /// 수 없다. `retirement`에 남은 배리어가 무엇을 막고 있었든 더 이상 지킬
+    /// 대상이 없다는 뜻이고, 그래서 큐 순서를 거치지 않고 곧장 반납해도 된다.
+    /// `retirement`를 통째로 버리기만 하면(예전 코드) 이미 `held`에서 빠져
+    /// `Release`로만 남아 있는 주소는 아무도 돌려주지 않아, 인덱스가 레지스트리를
+    /// 떠난 뒤로는 sweeper도 닿을 수 없는 채로 프로세스 끝까지 붙잡힌다.
     fn drop(&mut self) {
         let outgoing = self
             .held
@@ -76,6 +85,7 @@ impl Drop for AnnIndex {
         if !outgoing.is_empty() {
             self.elements.release(&outgoing);
         }
+        self.retirement.release_pending(&*self.elements);
     }
 }
 
@@ -574,6 +584,22 @@ impl AnnIndex {
         Ok((in_map != named).then_some((in_map, named)))
     }
 
+    /// Releases the caller's own reference to `addr`, bypassing `held` and the
+    /// retirement queue entirely.
+    ///
+    /// This is not only for an address `held` has never heard of. `vector.rs`
+    /// also calls it when `add_unless_known` answers `Ok(false)` because
+    /// `held.is_known(addr)` was already true -- so `addr` can be live in
+    /// `held` right now, with the graph actively naming it. That is still
+    /// sound, but for a different reason than "never held": the reference
+    /// released here is the *caller's own* second reference (taken via
+    /// `store.hold_kv`/`set_kv` before the graph was ever asked about the
+    /// address), never the graph's own. The graph keeps its reference
+    /// regardless of what happens here, so the element survives either way.
+    ///
+    /// It must never be called on an address whose only reference is the
+    /// graph's -- that one has to go through `retire()`, so a search already
+    /// under way cannot be left holding a freed pointer.
     pub fn unclaimed(&self, addr: u64) {
         self.elements.release(&[addr]);
     }
@@ -1310,7 +1336,7 @@ mod tests {
     }
 
     #[test]
-    fn a_delete_queues_the_reference_and_reclaim_hands_it_back() {
+    fn a_delete_queues_the_reference_and_the_drain_hands_it_back() {
         let idx = build(4, Quant::F32, Metric::L2, 2);
         let addr = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
 
@@ -1338,6 +1364,58 @@ mod tests {
             "drain_retired is what hands it back -- a searcher on its way out, or the sweeper"
         );
         assert_eq!(idx.retirement.queue_len(), 0);
+    }
+
+    #[test]
+    fn dropping_the_index_hands_back_addresses_still_queued_for_release() {
+        // IMPORTANT 3: `Drop for AnnIndex` used to release only `held.take_all()`.
+        // An address a delete had already queued in `retirement` is by
+        // construction no longer in `held` -- so with the old code nothing
+        // ever returned it once the index left the registry, and it stayed
+        // pinned for the rest of the process.
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let addr = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
+
+        let taken: std::result::Result<Option<bool>, PublishError<()>> =
+            idx.remove_published(|| Ok(Some(addr)));
+        assert_eq!(taken.unwrap(), Some(true));
+
+        // Nothing has drained the queue yet -- the address sits in a `Release`
+        // event, already out of `held`.
+        assert_eq!(idx.retirement.queue_len(), 1);
+        assert!(FAKE.id_at(addr).is_some());
+
+        drop(idx);
+
+        assert!(
+            FAKE.id_at(addr).is_none(),
+            "Drop must hand back addresses still sitting in the retirement queue, \
+             not just the ones still in `held`"
+        );
+    }
+
+    #[test]
+    fn dropping_the_index_does_not_release_what_a_live_barrier_still_guards() {
+        // The queue can also hold a Barrier ahead of the Release. Dropping must
+        // still hand the address back (nothing can be reading it any more --
+        // Drop cannot run while a search holds the Arc), and must not panic or
+        // double-release on the barrier it discards.
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let addr = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
+
+        let reading = idx.retirement.enter().unwrap();
+        let taken: std::result::Result<Option<bool>, PublishError<()>> =
+            idx.remove_published(|| Ok(Some(addr)));
+        assert_eq!(taken.unwrap(), Some(true));
+        assert_eq!(idx.retirement.queue_len(), 2, "[Barrier, Release]");
+
+        drop(reading);
+        drop(idx);
+
+        assert!(
+            FAKE.id_at(addr).is_none(),
+            "the barrier ahead of it must not stop Drop from handing the address back"
+        );
     }
 
     #[test]
@@ -1894,7 +1972,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_searchers_within_the_slot_count_succeed() {
+    fn concurrent_searchers_all_succeed() {
         let idx = Arc::new(build(8, Quant::F32, Metric::Cos, 16));
         for i in 0..200 {
             add(

@@ -18,7 +18,21 @@ use crate::error::{Error, Result};
 /// 큐가 이만큼 차면 게이트를 닫는다. 고수위 표시이지 상한이 아니다.
 pub(super) const CAP: usize = 1024;
 
-/// 배리어 슬롯 수. 게이트가 `CAP`에서 닫힌 뒤 배리어는 최대 하나 더 생긴다.
+/// 배리어 슬롯 수.
+///
+/// `wait_for_gate`는 `gated`를 확인하고 뮤텍스를 놓은 **뒤에** `attach`를 부른다.
+/// 그 확인을 통과했지만 아직 붙지 않은 검색은 게이트가 그 사이 닫혀도 물러나지
+/// 않으므로, 게이트가 닫힌 뒤에도 배리어가 하나만 더 생긴다는 보장은 없다 --
+/// 실제 상한은 **그 순간 확인을 통과하고 아직 슬롯에 붙지 않은, 동시에 살아
+/// 있는 검색의 수**다.
+///
+/// 이 코드베이스에서 그 수는 워커 스레드 수(`THREAD_SLOTS`, 64) 근방을 넘지
+/// 않는다. `POOL - CAP - 1`칸의 여유를 다 태워 아직 큐에 있는 배리어를 감아서
+/// 덮어쓰려면, 그 여유만큼의 검색이 정확히 이 좁은 창에 동시에 몰려야 한다 --
+/// 수백에서 천 단위인데, 지금 스레드 수로는 닿지 않는다.
+///
+/// 그래도 이건 증명이 아니라 여유고, `retire()`의 `debug_assert`가 실제
+/// tripwire다. 그게 걸리면 이 상수를 늘리거나 왜 배리어가 안 빠지는지부터 본다.
 pub(super) const POOL: usize = CAP + 2;
 
 /// 최상위 비트. 이 배리어는 봉인되어 새 검색을 받지 않는다.
@@ -89,10 +103,18 @@ impl Queue {
 /// `fetch_add`의 반환값에 SEALED 비트가 원자적으로 실려 오는 것이 요점이다.
 /// 플래그와 카운트를 다른 워드에 두면 이 확인과 `seal`의 확인이 서로를 못 보는
 /// 실행이 허용되어(Dekker) `SeqCst`가 필요해진다.
-fn attach(cell: &AtomicUsize) -> bool {
+fn attach(owner: &Retirement, cell: &AtomicUsize) -> bool {
     let prev = cell.fetch_add(1, Ordering::AcqRel);
     if prev & SEALED != 0 {
-        cell.fetch_sub(1, Ordering::AcqRel);
+        let before_backout = cell.fetch_sub(1, Ordering::AcqRel);
+        if before_backout & COUNT == 1 && before_backout & SEALED != 0 {
+            // 내가 붙었다 물러나는 것으로 이 배리어의 카운트를 0으로 만들었다.
+            // `Reading::drop`과 같은 모양의 검사다 -- sweeper가 이 배리어를
+            // 기다리고 있을 수 있으므로 종을 울린다. 아무도 안 기다리고 있으면
+            // (배리어가 아예 큐에 없으면) 헛울림이지만, `run()`의 다음 바퀴가
+            // 놀 뿐 틀리지는 않는다.
+            owner.ring();
+        }
         return false;
     }
     true
@@ -119,7 +141,13 @@ pub(super) enum Progress {
 }
 
 /// 게이트가 닫혀 있을 때 검색이 기다리는 시간. 넘으면 거절한다.
-const GATE_TIMEOUT: Duration = Duration::from_secs(1);
+///
+/// sweeper의 `TICK`(`sweep.rs`, 1초)의 두 배다. `retire()`가 게이트를 닫을 때마다
+/// 이제 종을 울리므로(아래) 보통은 그걸로 sweeper가 바로 깨지만, 이 값이 `TICK`과
+/// 같으면 그 종과 sweeper가 `wait_timeout(TICK)`에 막 들어가는 순간이 겹쳤을 때
+/// 대기 중인 검색이 sweeper의 다음 바퀴를 한 번도 못 얻고 시간 초과로 `Busy`를
+/// 받을 수 있었다. 두 배로 두면 종이 어떻게 엇갈리든 최소 한 바퀴는 보장된다.
+const GATE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) struct Retirement {
     slots: Box<[AtomicUsize]>,
@@ -177,12 +205,21 @@ impl Retirement {
 
     pub(super) fn enter_deadline(&self, timeout: Duration) -> Result<Reading<'_>> {
         self.wait_for_gate(timeout)?;
+        let mut spins = 0u32;
         loop {
             let slot = self.open.load(Ordering::Acquire);
-            if attach(&self.slots[slot]) {
+            if attach(self, &self.slots[slot]) {
                 return Ok(Reading { owner: self, slot });
             }
-            std::hint::spin_loop();
+            spins += 1;
+            if spins > 4 {
+                // 봉인 중인 슬롯에 걸렸다. `open`을 넘기는 쪽은 이 큐 뮤텍스를
+                // 쥔 채로 할당까지 할 수 있으므로(push_addrs), 몇 바퀴 돌고도
+                // 안 풀리면 그 스레드를 놓아준다.
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
         }
     }
 
@@ -274,6 +311,35 @@ impl Retirement {
         Progress::Released(batch.len())
     }
 
+    /// 큐에 남은 `Release`를 전부 즉시 놓아주고 큐를 비운다. `Barrier`는 버린다.
+    ///
+    /// **`Drop for AnnIndex`에서만 부른다.** 검색은 `Arc<VectorIndex>`를 쥐고
+    /// 도므로 그 `drop`이 불릴 수 있는 시점에는 어떤 검색도 존재하지 않는다 --
+    /// 그래서 배리어가 무엇을 막고 있었든 더 이상 지킬 대상이 없고, 큐 순서를
+    /// 거치지 않고 곧장 반납해도 §2의 순서 논증이 깨지지 않는다. 다른 어떤
+    /// 자리에서도 이 가정은 성립하지 않는다.
+    ///
+    /// 큐에 이미 들어 있던 `Vec`들을 그대로 넘긴다 -- 새로 이어 붙이는 할당을
+    /// 하지 않는다. `release`는 큐 뮤텍스를 놓은 뒤에 부른다: 재진입한 unlink
+    /// 콜백이 같은 뮤텍스를 다시 잡을 수 있어서다(drain_once와 같은 이유).
+    pub(super) fn release_pending(&self, elements: &dyn Elements) {
+        let batches: Vec<Vec<u64>> = {
+            let mut q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+            q.events
+                .drain(..)
+                .filter_map(|event| match event {
+                    Event::Release(addrs) => Some(addrs),
+                    Event::Barrier(_) => None,
+                })
+                .collect()
+        };
+        for addrs in batches {
+            if !addrs.is_empty() {
+                elements.release(&addrs);
+            }
+        }
+    }
+
     /// 주소를 놓아줄 목록에 넣는다. 엔진을 건드리지 않는다.
     ///
     /// **호출 전에 그 주소가 `held`에서 빠져 있어야 한다.** 그래야 이 뒤에 시작한
@@ -289,7 +355,18 @@ impl Retirement {
         let mut q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
 
         let slot = self.open.load(Ordering::Acquire);
-        if seal(&self.slots[slot]) == 0 {
+        // `seal()`을 단일 RMW로 두려고 이 확인은 별도의 `load`로 한다. 그 사이의
+        // TOCTOU는 이 tripwire의 정밀도만 떨어뜨린다 -- 놓치는 쪽으로만 어긋나고,
+        // 놓친 경우에도 뒤따르는 로직(언더플로, 이중 Barrier)이 그대로 문제를
+        // 드러내므로 검증 목적을 해치지 않는다.
+        let already_sealed = self.slots[slot].load(Ordering::Acquire) & SEALED != 0;
+        let live = seal(&self.slots[slot]);
+        debug_assert!(
+            !already_sealed,
+            "POOL이 감아서 아직 큐에 배리어가 남아 있는 슬롯 {slot}을 다시 봉인했다 \
+             -- POOL을 늘리거나 그 배리어가 왜 안 빠졌는지부터 본다"
+        );
+        if live == 0 {
             // 아무도 안 붙었다. 봉인만 풀고 슬롯을 그대로 쓴다.
             //
             // `store(0)`이 아니라 `fetch_and`인 이유: 봉인과 이 줄 사이에 붙으려다
@@ -314,7 +391,19 @@ impl Retirement {
         }
 
         q.push_addrs(addrs);
-        q.gated = q.events.len() >= self.cap;
+        // `|=`다: `gated`를 끄는 것은 `reopen_if_room`뿐이어야 한다. 오늘은 이
+        // 줄이 계산하는 값이 항상 실제 길이와 일치해 `=`와 `|=`가 같지만, 그건
+        // "여기 말고는 아무도 `gated`를 세우지 않는다"는 먼 불변식에 기댄 것이라
+        // 방어적으로 or로 둔다.
+        q.gated |= q.events.len() >= self.cap;
+        drop(q);
+
+        // Barrier든 Release든 뭔가 큐에 들어갔다는 뜻이니 sweeper를 깨운다.
+        // `GATE_TIMEOUT`이 sweeper의 `TICK`과 맞물려 있어서(retire.rs 상단) 이
+        // 종이 없으면 게이트가 막 닫힌 뒤 대기를 시작한 검색이 sweeper가
+        // `wait_timeout(TICK)`에 막 들어간 순간과 겹쳐 시간 초과로 `Busy`를 받을
+        // 수 있다.
+        self.ring();
     }
 
     #[cfg(test)]
@@ -437,7 +526,7 @@ mod tests {
         // 카운트가 0인 것만으로는 부족하다 -- slot_count가 SEALED를 가리므로,
         // fetch_and를 아예 안 해도 통과한다. 봉인이 실제로 풀렸는지 본다.
         assert!(
-            attach(&r.slots[slot]),
+            attach(&r, &r.slots[slot]),
             "봉인이 안 풀렸다. 이 칸이 다시 열리면 enter()가 영영 돈다"
         );
         r.slots[slot].fetch_sub(1, Ordering::AcqRel);
@@ -557,7 +646,7 @@ mod tests {
 
         // 봉인된 칸에 붙으려는 검색은 물러난다. enter()로는 이 경로를 못 밟는다 --
         // open이 안 넘어간 채로 부르면 영영 돈다.
-        assert!(!attach(&r.slots[slot]), "봉인돼 있으면 붙지 못한다");
+        assert!(!attach(&r, &r.slots[slot]), "봉인돼 있으면 붙지 못한다");
         assert_eq!(
             r.slot_count(slot),
             1,
@@ -719,12 +808,136 @@ mod tests {
 
         let a = r.enter().unwrap();
         let b = r.enter().unwrap();
-        r.retire(&[0x10]); // 봉인(2)
+        r.retire(&[0x10]); // 봉인(2). retire() 자신도 이제 한 번 울린다 (아래 별도 테스트)
 
+        let after_retire = rings.load(Ordering::Relaxed);
         drop(a);
-        assert_eq!(rings.load(Ordering::Relaxed), 0, "아직 마지막이 아니다");
+        assert_eq!(
+            rings.load(Ordering::Relaxed),
+            after_retire,
+            "아직 마지막이 아니다"
+        );
         drop(b);
-        assert_eq!(rings.load(Ordering::Relaxed), 1, "마지막이 울린다");
+        assert_eq!(
+            rings.load(Ordering::Relaxed),
+            after_retire + 1,
+            "마지막이 울린다"
+        );
+    }
+
+    #[test]
+    fn retire_itself_rings_the_bell() {
+        use std::sync::atomic::AtomicUsize as Counter;
+
+        // IMPORTANT 1: retire()가 끝나면서 종을 울리지 않으면, 게이트가 막 닫힌
+        // 뒤 대기를 시작한 검색이 sweeper의 TICK 만큼 잠들어 있다가 시간 초과로
+        // Busy를 받을 수 있다. 배리어가 생기지 않는 경우(검색이 없을 때)도 포함해
+        // retire() 호출 자체가 항상 울려야 한다.
+        let r = Retirement::new();
+        let rings = Arc::new(Counter::new(0));
+        let seen = Arc::clone(&rings);
+        r.set_bell(Arc::new(move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        r.retire(&[0x10]);
+
+        assert_eq!(
+            rings.load(Ordering::Relaxed),
+            1,
+            "retire()는 큐에 뭔가 넣을 때마다 sweeper를 깨워야 한다"
+        );
+    }
+
+    #[test]
+    fn an_empty_retire_does_not_ring() {
+        use std::sync::atomic::AtomicUsize as Counter;
+
+        let r = Retirement::new();
+        let rings = Arc::new(Counter::new(0));
+        let seen = Arc::clone(&rings);
+        r.set_bell(Arc::new(move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        r.retire(&[]);
+
+        assert_eq!(
+            rings.load(Ordering::Relaxed),
+            0,
+            "아무것도 큐에 들어가지 않았으니 깨울 이유가 없다"
+        );
+    }
+
+    #[test]
+    fn a_backing_out_search_that_clears_the_last_count_rings_the_bell() {
+        use std::sync::atomic::AtomicUsize as Counter;
+
+        // MINOR 4: `attach`의 봉인-슬롯 backout 경로도 `Reading::drop`과 같은
+        // 조건으로 울려야 한다. 슬롯이 봉인된 채 카운트가 이미 0인 상태를
+        // 직접 흉내낸다 -- 마지막 리더가 막 떨어졌지만 sweeper가 아직 그
+        // 배리어를 못 지운 순간과 같은 비트 모양이다.
+        let r = Retirement::new();
+        let rings = Arc::new(Counter::new(0));
+        let seen = Arc::clone(&rings);
+        r.set_bell(Arc::new(move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        let slot = r.open_slot();
+        r.slots[slot].store(SEALED, Ordering::Release);
+
+        assert!(!attach(&r, &r.slots[slot]), "봉인돼 있으면 붙지 못한다");
+        assert_eq!(
+            rings.load(Ordering::Relaxed),
+            1,
+            "물러나면서 카운트를 도로 0으로 만들었으니 sweeper를 깨워야 한다"
+        );
+        assert_eq!(r.slot_count(slot), 0, "언더플로 없이 0으로 돌아온다");
+    }
+
+    #[test]
+    fn a_backing_out_search_that_is_not_last_does_not_ring() {
+        use std::sync::atomic::AtomicUsize as Counter;
+
+        let r = Retirement::new();
+        let rings = Arc::new(Counter::new(0));
+        let seen = Arc::clone(&rings);
+        r.set_bell(Arc::new(move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        let slot = r.open_slot();
+        let holder = r.enter().unwrap(); // 진짜 리더 하나가 이 배리어를 붙잡고 있다
+        assert_eq!(seal(&r.slots[slot]), 1);
+
+        assert!(!attach(&r, &r.slots[slot]), "봉인돼 있으면 붙지 못한다");
+        assert_eq!(
+            rings.load(Ordering::Relaxed),
+            0,
+            "물러난 뒤에도 진짜 리더가 남아 있으니 아직 안 울린다"
+        );
+
+        drop(holder);
+    }
+
+    #[test]
+    fn gated_is_or_ed_not_overwritten() {
+        // MINOR 5: `q.gated = ...`가 아니라 `|=`여야 한다. `gated`가 (미래의
+        // 다른 이유로) 이미 켜져 있는데 이 호출의 큐 길이만 보고 그대로
+        // 대입하면, 대기 중인 검색을 깨우지도 않고 게이트를 꺼 버릴 수 있다.
+        let r = Retirement::with_cap(1024);
+        {
+            let mut q = r.queue.lock().unwrap_or_else(PoisonError::into_inner);
+            q.gated = true;
+        }
+
+        r.retire(&[0x10]); // 캡(1024)에는 한참 못 미치는 길이
+
+        assert!(
+            r.is_gated(),
+            "retire()가 자기 계산만으로 이미 켜져 있던 게이트를 꺼서는 안 된다"
+        );
     }
 
     #[test]
