@@ -26,52 +26,6 @@ fn core() -> *const SERVER_CORE_API {
     unsafe { (*server).core }
 }
 
-static COARSE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-pub fn coarse_now() -> u64 {
-    COARSE.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-pub fn tick() {
-    advance(now());
-}
-
-/// Moves the clock on by one and answers the value it lands on.
-///
-/// A retirement calls this rather than reading the clock, so that progress does
-/// not depend on anything else moving it. `tick` is driven by the sweeper
-/// alone; if that thread is not running -- it is spawned lazily, and a spawn can
-/// fail -- the clock stands still, every search that starts afterwards records
-/// the same stamp as the retirement, and the grace condition
-/// (`after <= oldest_reader`) is never satisfied while searches keep arriving.
-/// Nothing would ever be handed back to the engine.
-///
-/// Bumping here removes that dependency: a search beginning after this call
-/// reads a stamp of at least `after`, so it never holds back the retirement it
-/// could not have seen.
-pub fn advance_epoch() -> u64 {
-    use std::sync::atomic::Ordering::AcqRel;
-    COARSE.fetch_add(1, AcqRel) + 1
-}
-
-fn advance(seen: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let _ = COARSE.fetch_update(Relaxed, Relaxed, |cur| Some(seen.max(cur + 1)));
-}
-
-fn now() -> u64 {
-    let core = core();
-    if core.is_null() {
-        return 0;
-    }
-    unsafe {
-        match (*core).get_current_time {
-            Some(get) => u64::from(get()),
-            None => 0,
-        }
-    }
-}
-
 pub unsafe fn store_conn_state(cookie: *const c_void, data: *mut c_void) -> bool {
     let core = core();
     if core.is_null() {
@@ -141,40 +95,5 @@ impl Responder {
             Ok(reply) => self.send(reply.as_str()),
             Err(e) => self.send(&format!("{} {e}\r\n", e.blame().prefix())),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{COARSE, advance, coarse_now};
-    use std::sync::atomic::Ordering::Relaxed;
-
-    #[test]
-    fn the_coarse_clock_never_goes_back_and_never_stalls() {
-        COARSE.store(100, Relaxed);
-
-        advance(140);
-        assert_eq!(coarse_now(), 140, "it follows the server's clock forward");
-
-        advance(50);
-        assert_eq!(
-            coarse_now(),
-            141,
-            "a step backwards still moves it on by one"
-        );
-
-        advance(50);
-        assert_eq!(
-            coarse_now(),
-            142,
-            "and keeps moving, so reclamation cannot stall"
-        );
-
-        advance(200);
-        assert_eq!(
-            coarse_now(),
-            200,
-            "once the clock catches up it takes over again"
-        );
     }
 }

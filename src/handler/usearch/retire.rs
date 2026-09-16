@@ -1,5 +1,3 @@
-#![allow(dead_code)] // 다음 Task들이 채운다.
-
 //! 아이템 참조를 언제 엔진에 돌려줘도 되는지를 큐 순서로 답한다.
 //!
 //! 검색과 retire를 같은 FIFO에 넣으면 "누가 먼저였나"가 큐 순서 그 자체가 된다.
@@ -108,7 +106,12 @@ fn seal(cell: &AtomicUsize) -> usize {
 /// `drain_once` 한 번이 무엇을 했는지.
 pub(super) enum Progress {
     /// 항목 하나를 처리했다. 값은 놓아준 주소 수(배리어면 0).
-    Released(usize),
+    ///
+    /// 운영 경로(`AnnIndex::drain_retired`)는 `Released(_)`로 값을 버린다 --
+    /// 몇 개를 놓아줬는지가 아니라 뭔가 놓아줬다는 사실만 있으면 된다. 값을
+    /// 들여다보는 것은 테스트뿐이라 `cfg(test)`가 아닌 빌드에서는 죽은
+    /// 필드로 보인다.
+    Released(#[cfg_attr(not(test), expect(dead_code))] usize),
     /// 머리의 배리어가 아직 안 풀렸다.
     Blocked,
     /// 큐가 비었다.

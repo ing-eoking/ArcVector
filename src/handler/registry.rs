@@ -29,8 +29,6 @@ pub struct VectorIndex {
     state: AtomicU8,
 
     published: AtomicU64,
-
-    last_access: AtomicU64,
 }
 
 impl VectorIndex {
@@ -55,7 +53,6 @@ impl VectorIndex {
             maxcount,
             state: AtomicU8::new(state),
             published: AtomicU64::new(0),
-            last_access: AtomicU64::new(0),
         }
     }
 
@@ -66,13 +63,6 @@ impl VectorIndex {
     pub fn publish(&self) {
         self.published
             .store(CLOCK.fetch_add(1, Ordering::AcqRel), Ordering::Release);
-    }
-
-    fn touch(&self) {
-        let now = crate::server::coarse_now();
-        if self.last_access.load(Ordering::Relaxed) != now {
-            self.last_access.store(now, Ordering::Relaxed);
-        }
     }
 
     fn published_at(&self) -> u64 {
@@ -119,11 +109,7 @@ fn write() -> std::sync::RwLockWriteGuard<'static, HashMap<String, Arc<VectorInd
 }
 
 pub fn get(name: &str) -> Option<Arc<VectorIndex>> {
-    let index = read().get(name).cloned();
-    if let Some(index) = &index {
-        index.touch();
-    }
-    index
+    read().get(name).cloned()
 }
 
 pub fn contains(name: &str) -> bool {

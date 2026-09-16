@@ -95,7 +95,6 @@ fn run() {
         // 종을 울려줄 주체가 없는 일만 틱 주기로 남긴다.
         if last_round.elapsed() >= TICK {
             last_round = Instant::now();
-            crate::server::tick();
             for index in &indexes {
                 index.ann.retry_stuck();
             }

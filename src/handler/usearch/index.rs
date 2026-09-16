@@ -66,91 +66,6 @@ impl Drop for Staged<'_> {
 #[cfg(test)]
 static NEXT_IDENTITY: AtomicUsize = AtomicUsize::new(1);
 
-const READER_SLOTS: usize = 128;
-
-const NO_READER: u64 = u64::MAX;
-
-/// How many references one `reclaim` hands back. See `AnnIndex::reclaim`.
-const RECLAIM_BATCH: usize = 64;
-
-/// A slot taken but whose stamp is not published yet. Below every real stamp,
-/// so it holds back every reclamation -- see `Searching::new`.
-///
-/// Dead since `search()` moved onto `Retirement` -- kept, unconstructed,
-/// until Task 8 deletes the whole old reader-slot apparatus.
-#[allow(dead_code)]
-const REGISTERING: u64 = 0;
-
-/// Dead since `search()` moved onto `Retirement`; Task 8 deletes this.
-#[allow(dead_code)]
-#[must_use = "the search is only counted while this is alive"]
-struct Searching<'a> {
-    index: &'a AnnIndex,
-    slot: Option<usize>,
-}
-
-#[allow(dead_code)]
-static NEXT_HOME: AtomicUsize = AtomicUsize::new(0);
-
-thread_local! {
-    #[allow(dead_code)]
-    static HOME: usize = NEXT_HOME.fetch_add(1, Ordering::Relaxed) % READER_SLOTS;
-}
-
-#[allow(dead_code)]
-impl<'a> Searching<'a> {
-    fn new(index: &'a AnnIndex) -> Self {
-        let home = HOME.with(|home| *home);
-        // Claim the slot with `REGISTERING` before reading the clock, not after.
-        //
-        // The stamp says "no address retired from now on may be released while
-        // I am here". Reading it first left a window: between the read and the
-        // compare-exchange this searcher is invisible to `oldest_reader`, so a
-        // `reclaim` in that gap sees no readers, frees an address, and then this
-        // searcher walks the graph and can still reach the node -- usearch's
-        // `remove` only flips a key, and this thread may not see that store yet.
-        //
-        // `REGISTERING` is 0, which is below every real stamp, so `oldest_reader`
-        // returns 0 for as long as the slot is in this state and nothing can be
-        // reclaimed. The real stamp is published a moment later, and because it
-        // is read after the claim it is at least as late as the claim -- so any
-        // retire that happens after this searcher could have seen anything is
-        // still held back by it.
-        let slot = (0..READER_SLOTS)
-            .map(|step| (home + step) % READER_SLOTS)
-            .find(|slot| {
-                index.readers[*slot]
-                    .compare_exchange(NO_READER, REGISTERING, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-            });
-        match slot {
-            Some(slot) => {
-                index.readers[slot].store(crate::server::coarse_now(), Ordering::Release);
-            }
-            None => {
-                index.unslotted.fetch_add(1, Ordering::AcqRel);
-            }
-        }
-        Searching { index, slot }
-    }
-}
-
-impl Drop for Searching<'_> {
-    fn drop(&mut self) {
-        match self.slot {
-            Some(slot) => self.index.readers[slot].store(NO_READER, Ordering::Release),
-            None => {
-                self.index.unslotted.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-        // Registered as gone first, so this reader does not hold up the very
-        // addresses it is about to hand back. By here the search holds no graph
-        // lock and no engine lock, which is what makes calling `release` from a
-        // request thread sound -- see `AnnIndex::reclaim`.
-        self.index.reclaim();
-    }
-}
-
 impl Drop for AnnIndex {
     fn drop(&mut self) {
         let outgoing = self
@@ -419,11 +334,7 @@ pub struct AnnIndex {
     #[cfg(test)]
     identity: usize,
 
-    readers: [AtomicU64; READER_SLOTS],
     stuck: std::sync::Mutex<Vec<u64>>,
-    unslotted: AtomicUsize,
-    retired: std::sync::Mutex<Vec<(u64, u64)>>,
-    queued: AtomicUsize,
     pub(super) retirement: Retirement,
 }
 
@@ -485,11 +396,7 @@ impl AnnIndex {
             rebuilding: AtomicBool::new(false),
             #[cfg(test)]
             identity: NEXT_IDENTITY.fetch_add(1, Ordering::Relaxed),
-            readers: std::array::from_fn(|_| AtomicU64::new(NO_READER)),
             stuck: std::sync::Mutex::new(Vec::new()),
-            unslotted: AtomicUsize::new(0),
-            retired: std::sync::Mutex::new(Vec::new()),
-            queued: AtomicUsize::new(0),
             retirement: Retirement::new(),
         })
     }
@@ -806,50 +713,6 @@ impl AnnIndex {
     /// 검색이 `resolve()`에서 걸러진다.
     fn retire(&self, addrs: &[u64]) {
         self.retirement.retire(addrs);
-    }
-
-    fn oldest_reader(&self) -> u64 {
-        if self.unslotted.load(Ordering::Acquire) > 0 {
-            return 0;
-        }
-        self.readers
-            .iter()
-            .map(|cell| cell.load(Ordering::Acquire))
-            .min()
-            .unwrap_or(NO_READER)
-    }
-
-    /// Hands back the references whose grace period has passed.
-    ///
-    /// Called from two places. A searcher calls it on its way out, which is the
-    /// moment the last reader of a retired address disappears -- so memory comes
-    /// back immediately rather than at the next sweeper tick. The sweeper calls
-    /// it too, as the backstop for an index nothing is reading: without that, a
-    /// `vdrop` on an idle index would never reclaim anything.
-    ///
-    /// The caller must hold neither the graph lock nor the engine's cache lock.
-    /// `release` takes the cache lock, and `do_item_release` can re-enter the
-    /// unlink callback from there (an expired item the LRU scan skipped because
-    /// we held it), which wants the graph lock and this very mutex -- so the
-    /// batch is taken under the lock and released after it is dropped.
-    ///
-    /// `RECLAIM_BATCH` bounds what one caller pays. Dropping a large index
-    /// retires millions of addresses at once, and whichever search happens to
-    /// leave next should not wear all of it.
-    pub fn reclaim(&self) {
-        if self.queued.load(Ordering::Relaxed) == 0 {
-            return;
-        }
-        let done = self.oldest_reader();
-        let mut ready: Vec<u64> = Vec::new();
-        {
-            let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
-            take_ready(&mut retired, done, &mut ready, RECLAIM_BATCH);
-            self.queued.store(retired.len(), Ordering::Relaxed);
-        }
-        if !ready.is_empty() {
-            self.elements.release(&ready);
-        }
     }
 
     /// 큐의 항목 하나를 처리한다. 무언가 했으면 `true`.
@@ -1170,16 +1033,6 @@ impl AnnIndex {
         let hits: Vec<(u64, f32)> = matches.keys.into_iter().zip(matches.distances).collect();
         Ok(self.resolve(&hits, entered))
     }
-}
-
-fn take_ready(retired: &mut Vec<(u64, u64)>, done: u64, ready: &mut Vec<u64>, limit: usize) {
-    let cut = retired
-        .partition_point(|(_, after)| *after <= done)
-        .min(limit);
-    if cut == 0 || ready.try_reserve(cut).is_err() {
-        return;
-    }
-    ready.extend(retired.drain(..cut).map(|(addr, _)| addr));
 }
 
 fn to_f32(bytes: &[u8]) -> Vec<f32> {
@@ -1573,47 +1426,6 @@ mod tests {
             FAKE.id_at(old).is_some(),
             "실패 경로가 옛 주소를 즉시 놓아주었다. 큐를 거쳐야 한다"
         );
-    }
-
-    #[test]
-    fn a_slot_claimed_before_its_stamp_lands_blocks_every_reclamation() {
-        let idx = build(4, Quant::F32, Metric::L2, 2);
-        let addr = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
-
-        let taken: std::result::Result<Option<bool>, PublishError<()>> =
-            idx.remove_published(|| Ok(Some(addr)));
-        assert_eq!(taken.unwrap(), Some(true));
-
-        // `retire()` now feeds only the new barrier queue (see
-        // `a_delete_queues_the_reference_and_reclaim_hands_it_back`), so this
-        // test seeds the old reader-slot queue directly -- it exercises
-        // `oldest_reader`/`reclaim` in isolation until Task 8 removes them.
-        //
-        // `remove_published` above also queued `addr` in the *new*
-        // `retirement` queue -- that is safe here only because nothing in
-        // this test ever calls `drain_retired()`/`drain_once()`. Adding one
-        // would release `addr` a second time through the new path after the
-        // old `reclaim()` below already released it.
-        idx.retired.lock().unwrap().push((addr, 1));
-        idx.queued.store(1, Ordering::Relaxed);
-
-        // A searcher that has taken a slot but not yet published its stamp: the
-        // window `Searching::new` used to leave open between reading the clock
-        // and the compare-exchange. While a slot reads REGISTERING, nothing may
-        // be handed back -- that searcher is about to walk the graph and can
-        // still reach a node whose removal it has not observed.
-        idx.readers[0].store(REGISTERING, Ordering::Release);
-        assert_eq!(idx.oldest_reader(), REGISTERING);
-
-        idx.reclaim();
-        assert!(
-            FAKE.id_at(addr).is_some(),
-            "a half-registered searcher holds the address back"
-        );
-
-        idx.readers[0].store(NO_READER, Ordering::Release);
-        idx.reclaim();
-        assert!(FAKE.id_at(addr).is_none(), "and lets it go once it is gone");
     }
 
     #[test]
