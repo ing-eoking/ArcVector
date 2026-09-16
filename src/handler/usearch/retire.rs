@@ -9,7 +9,9 @@
 //!
 //! 자세한 논증은 `docs/superpowers/specs/2026-09-16-arcvector-retire-barrier-queue-design.md`.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 /// 큐가 이만큼 차면 게이트를 닫는다. 고수위 표시이지 상한이 아니다.
 pub(super) const CAP: usize = 1024;
@@ -22,6 +24,53 @@ const SEALED: usize = 1 << (usize::BITS - 1);
 
 /// 나머지 비트. 붙어 있는 검색 수.
 const COUNT: usize = !SEALED;
+
+/// 큐에 들어가는 두 가지.
+enum Event {
+    /// 이 슬롯의 배리어가 풀릴 때까지 sweeper가 선다.
+    Barrier(usize),
+    /// 놓아줄 주소들.
+    Release(Vec<u64>),
+}
+
+#[derive(Default)]
+struct Queue {
+    events: VecDeque<Event>,
+}
+
+impl Queue {
+    /// 꼬리가 `Release`면 칸을 늘리지 않고 주소만 붙인다.
+    ///
+    /// 할당이 실패하면 그 배치를 포기한다. 아이템이 프로세스 끝까지 묶이지만,
+    /// 메모리 부족으로 데몬을 죽이는 것보다 낫다.
+    fn push_addrs(&mut self, addrs: &[u64]) {
+        if let Some(Event::Release(tail)) = self.events.back_mut()
+            && tail.try_reserve(addrs.len()).is_ok()
+        {
+            tail.extend_from_slice(addrs);
+            return;
+        }
+        let mut owned = Vec::new();
+        if owned.try_reserve_exact(addrs.len()).is_err() || self.events.try_reserve(1).is_err() {
+            eprintln!(
+                "ArcVector: could not queue {} item reference(s) for release; \
+                 they stay pinned until this process ends",
+                addrs.len()
+            );
+            return;
+        }
+        owned.extend_from_slice(addrs);
+        self.events.push_back(Event::Release(owned));
+    }
+
+    fn push_barrier(&mut self, slot: usize) -> bool {
+        if self.events.try_reserve(1).is_err() {
+            return false;
+        }
+        self.events.push_back(Event::Barrier(slot));
+        true
+    }
+}
 
 /// 검색 하나를 슬롯에 붙인다. 봉인돼 있었으면 물러나고 `false`.
 ///
@@ -46,6 +95,7 @@ pub(super) struct Retirement {
     slots: Box<[AtomicUsize]>,
     /// 지금 열린 슬롯 번호. retire만 쓰고 검색은 읽기만 한다.
     open: AtomicUsize,
+    queue: Mutex<Queue>,
 }
 
 impl Retirement {
@@ -53,6 +103,7 @@ impl Retirement {
         Self {
             slots: (0..POOL).map(|_| AtomicUsize::new(0)).collect(),
             open: AtomicUsize::new(0),
+            queue: Mutex::new(Queue::default()),
         }
     }
 
@@ -81,12 +132,79 @@ impl Retirement {
     }
 
     /// 열린 슬롯을 봉인하고 다음 칸을 연다. 테스트에서 retire 없이 쓴다.
+    ///
+    /// 슬롯 넘김의 진짜 규칙은 `retire()`에 있다.
     #[cfg(test)]
     pub(super) fn seal_open(&self) -> usize {
         let slot = self.open.load(Ordering::Acquire);
         let live = seal(&self.slots[slot]);
         self.open.store((slot + 1) % POOL, Ordering::Release);
         live
+    }
+
+    /// 주소를 놓아줄 목록에 넣는다. 엔진을 건드리지 않는다.
+    ///
+    /// **호출 전에 그 주소가 `held`에서 빠져 있어야 한다.** 그래야 이 뒤에 시작한
+    /// 검색이 `resolve()`에서 걸러져 그 주소에 닿지 못한다.
+    ///
+    /// 봉인과 push가 한 덩어리인 것은 retire 둘이 겹칠 때 순서가 뒤집히지 않게
+    /// 하기 위해서다. `[B(b1), R(y), B(b), R(x)]`가 되면 b에 붙은 검색이 y를 들고
+    /// 있을 수 있는데 `R(y)`를 막지 못한다.
+    pub(super) fn retire(&self, addrs: &[u64]) {
+        if addrs.is_empty() {
+            return;
+        }
+        let mut q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let slot = self.open.load(Ordering::Acquire);
+        if seal(&self.slots[slot]) == 0 {
+            // 아무도 안 붙었다. 봉인만 풀고 슬롯을 그대로 쓴다.
+            //
+            // `store(0)`이 아니라 `fetch_and`인 이유: 봉인과 이 줄 사이에 붙으려다
+            // 물러나는 검색이 있을 수 있고, 그 `fetch_add`와 `fetch_sub` 사이에
+            // 0을 덮어쓰면 뺄 때 언더플로가 난다. 플래그만 끈다.
+            self.slots[slot].fetch_and(COUNT, Ordering::AcqRel);
+        } else if q.push_barrier(slot) {
+            // 배리어가 큐에 들어갔을 때만 슬롯이 넘어간다. 그래야 살아 있는
+            // 배리어 수가 큐 안의 배리어 수와 같아져 슬롯이 감기지 않는다.
+            self.open.store((slot + 1) % POOL, Ordering::Release);
+        } else {
+            // 배리어를 못 넣었다. 그대로 주소를 넣으면 그것을 지켜줄 배리어가 없는
+            // 채로 큐에 들어간다 -- 붙어 있던 검색이 그 주소를 들고 있을 수 있다.
+            // 이 배치를 포기한다. 아이템이 묶이지만 해제 순서를 깨는 것보다 낫다.
+            self.slots[slot].fetch_and(COUNT, Ordering::AcqRel);
+            eprintln!(
+                "ArcVector: could not queue a barrier; {} item reference(s) stay \
+                 pinned until this process ends",
+                addrs.len()
+            );
+            return;
+        }
+
+        q.push_addrs(addrs);
+    }
+
+    #[cfg(test)]
+    pub(super) fn queue_len(&self) -> usize {
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .events
+            .len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn queue_shape(&self) -> Vec<char> {
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .events
+            .iter()
+            .map(|e| match e {
+                Event::Barrier(_) => 'B',
+                Event::Release(_) => 'R',
+            })
+            .collect()
     }
 }
 
@@ -111,6 +229,7 @@ impl Drop for Reading<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn a_search_holds_the_open_slot_until_it_ends() {
@@ -199,5 +318,108 @@ mod tests {
 
         drop(holder);
         assert_eq!(r.slot_count(slot), 0, "언더플로 없이 0으로 돌아온다");
+    }
+
+    #[test]
+    fn a_retire_with_no_search_attached_queues_no_barrier() {
+        let r = Retirement::new();
+        let slot = r.open_slot();
+
+        r.retire(&[0x10]);
+        r.retire(&[0x20]);
+
+        assert_eq!(
+            r.queue_shape(),
+            vec!['R'],
+            "붙은 검색이 없으면 배리어가 없다"
+        );
+        assert_eq!(r.open_slot(), slot, "슬롯도 넘어가지 않았다");
+    }
+
+    #[test]
+    fn consecutive_releases_coalesce_into_the_tail() {
+        let r = Retirement::new();
+        for addr in 0..50u64 {
+            r.retire(&[addr]);
+        }
+        assert_eq!(r.queue_len(), 1, "꼬리에 주소만 붙는다");
+    }
+
+    #[test]
+    fn slots_do_not_wrap_when_no_search_is_running() {
+        let r = Retirement::new();
+        let slot = r.open_slot();
+        for addr in 0..(POOL as u64 * 3) {
+            r.retire(&[addr]);
+        }
+        assert_eq!(
+            r.open_slot(),
+            slot,
+            "배리어가 큐에 안 들어가면 슬롯은 제자리다"
+        );
+    }
+
+    #[test]
+    fn a_retire_with_a_search_attached_queues_a_barrier_first() {
+        let r = Retirement::new();
+        let slot = r.open_slot();
+        let reading = r.enter();
+
+        r.retire(&[0x10]);
+
+        assert_eq!(
+            r.queue_shape(),
+            vec!['B', 'R'],
+            "배리어가 릴리스보다 앞이다"
+        );
+        assert_ne!(
+            r.open_slot(),
+            slot,
+            "배리어가 큐에 들어갔으므로 슬롯이 넘어갔다"
+        );
+        drop(reading);
+    }
+
+    #[test]
+    fn concurrent_retires_never_put_two_barriers_side_by_side() {
+        // 봉인과 push가 한 덩어리가 아니면 [B, B, R, R]처럼 배리어가 붙어 나오고,
+        // 그러면 두 번째 배리어 뒤의 릴리스를 첫 배리어가 안 막게 된다.
+        let r = Arc::new(Retirement::new());
+        let _reading = r.enter(); // 모든 retire가 배리어를 만들도록 하나 붙여둔다
+
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                let r = Arc::clone(&r);
+                s.spawn(move || {
+                    for i in 0..50u64 {
+                        let _hold = r.enter();
+                        r.retire(&[t * 1000 + i]);
+                    }
+                });
+            }
+        });
+
+        let shape = r.queue_shape();
+        for pair in shape.windows(2) {
+            assert_ne!(pair, ['B', 'B'], "배리어 둘이 붙어 나왔다: {shape:?}");
+        }
+    }
+
+    #[test]
+    fn a_search_that_starts_after_a_retire_joins_the_next_barrier() {
+        let r = Retirement::new();
+        let first = r.enter();
+        r.retire(&[0x10]);
+        let second = r.enter();
+
+        r.retire(&[0x20]);
+
+        assert_eq!(
+            r.queue_shape(),
+            vec!['B', 'R', 'B', 'R'],
+            "두 번째 검색은 두 번째 배리어에 붙어 첫 릴리스를 막지 않는다"
+        );
+        drop(first);
+        drop(second);
     }
 }
