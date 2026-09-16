@@ -8,6 +8,7 @@ use super::metric::Metric;
 use crate::error::Error;
 use crate::handler::arcus::element::Layout;
 use crate::handler::quant::Quant;
+use crate::handler::usearch::retire::{Progress, Retirement};
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -74,20 +75,29 @@ const RECLAIM_BATCH: usize = 64;
 
 /// A slot taken but whose stamp is not published yet. Below every real stamp,
 /// so it holds back every reclamation -- see `Searching::new`.
+///
+/// Dead since `search()` moved onto `Retirement` -- kept, unconstructed,
+/// until Task 8 deletes the whole old reader-slot apparatus.
+#[allow(dead_code)]
 const REGISTERING: u64 = 0;
 
+/// Dead since `search()` moved onto `Retirement`; Task 8 deletes this.
+#[allow(dead_code)]
 #[must_use = "the search is only counted while this is alive"]
 struct Searching<'a> {
     index: &'a AnnIndex,
     slot: Option<usize>,
 }
 
+#[allow(dead_code)]
 static NEXT_HOME: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
+    #[allow(dead_code)]
     static HOME: usize = NEXT_HOME.fetch_add(1, Ordering::Relaxed) % READER_SLOTS;
 }
 
+#[allow(dead_code)]
 impl<'a> Searching<'a> {
     fn new(index: &'a AnnIndex) -> Self {
         let home = HOME.with(|home| *home);
@@ -414,6 +424,7 @@ pub struct AnnIndex {
     unslotted: AtomicUsize,
     retired: std::sync::Mutex<Vec<(u64, u64)>>,
     queued: AtomicUsize,
+    pub(super) retirement: Retirement,
 }
 
 impl AnnIndex {
@@ -479,6 +490,7 @@ impl AnnIndex {
             unslotted: AtomicUsize::new(0),
             retired: std::sync::Mutex::new(Vec::new()),
             queued: AtomicUsize::new(0),
+            retirement: Retirement::new(),
         })
     }
 
@@ -788,36 +800,12 @@ impl AnnIndex {
         let _ = self.drop_node(staged.key);
     }
 
-    /// Queues addresses for release once every reader that could be holding one
-    /// has finished.
+    /// 주소를 놓아줄 목록에 넣는다. 엔진을 건드리지 않는다.
     ///
-    /// **This never releases anything itself**, even when no reader is
-    /// registered. It is reached from the item-unlink callback, which runs with
-    /// the engine's cache lock held, and `release` takes that same lock -- so an
-    /// inline release there is a deadlock, not an optimisation. The earlier
-    /// version had exactly that shortcut, which was safe only while `retire`
-    /// was reached from request threads alone.
-    ///
-    /// Dropping the address on an allocation failure leaks one item: it stays
-    /// pinned for the life of the process, because nothing else will ever hand
-    /// its reference back. That is the lesser of the two evils available here --
-    /// the alternative is releasing from a thread that may hold the cache lock.
+    /// 호출 전에 그 주소가 `held`에서 빠져 있어야 한다 -- 그래야 이 뒤에 시작한
+    /// 검색이 `resolve()`에서 걸러진다.
     fn retire(&self, addrs: &[u64]) {
-        if addrs.is_empty() {
-            return;
-        }
-        let after = crate::server::advance_epoch();
-        let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
-        if retired.try_reserve(addrs.len()).is_err() {
-            eprintln!(
-                "ArcVector: could not queue {} item reference(s) for release; \
-                 they stay pinned until this process ends",
-                addrs.len()
-            );
-            return;
-        }
-        retired.extend(addrs.iter().map(|addr| (*addr, after)));
-        self.queued.store(retired.len(), Ordering::Relaxed);
+        self.retirement.retire(addrs);
     }
 
     fn oldest_reader(&self) -> u64 {
@@ -862,6 +850,17 @@ impl AnnIndex {
         if !ready.is_empty() {
             self.elements.release(&ready);
         }
+    }
+
+    /// 큐의 항목 하나를 처리한다. 무언가 했으면 `true`.
+    ///
+    /// sweeper만 부른다. `release`가 cache lock을 잡으므로 그래프 락 아래에서
+    /// 부르면 안 된다.
+    pub fn drain_retired(&self) -> bool {
+        matches!(
+            self.retirement.drain_once(&*self.elements),
+            Progress::Released(_)
+        )
     }
 
     fn drop_node(&self, key: u64) -> bool {
@@ -1146,7 +1145,7 @@ impl AnnIndex {
             )));
         }
 
-        let _searching = Searching::new(self);
+        let _reading = self.retirement.enter()?;
         let entered = self.epoch.load(Ordering::Acquire);
 
         let k = k.saturating_add(self.in_flight.load(Ordering::Relaxed));
@@ -1432,7 +1431,7 @@ mod tests {
         let taken: std::result::Result<Option<bool>, PublishError<()>> =
             idx.remove_published(|| Ok(Some(addr)));
         assert_eq!(taken.unwrap(), Some(true));
-        idx.reclaim();
+        while idx.drain_retired() {}
         assert!(FAKE.id_at(addr).is_none(), "the ordinary path releases it");
 
         let addr = add(&idx, "b", &[0.0, 1.0, 0.0, 0.0]);
@@ -1443,7 +1442,7 @@ mod tests {
         );
 
         idx.retry_stuck();
-        idx.reclaim();
+        while idx.drain_retired() {}
         assert!(
             FAKE.id_at(addr).is_none(),
             "the retry took the node out, so the element went back"
@@ -1464,7 +1463,7 @@ mod tests {
         // It must not: the item-unlink callback reaches it holding the engine's
         // cache lock, and `release` takes that same lock.
         assert_eq!(
-            idx.queued.load(Ordering::Relaxed),
+            idx.retirement.queue_len(),
             1,
             "the address is queued, never released by the deleting thread"
         );
@@ -1473,14 +1472,13 @@ mod tests {
             "and so it is still held at this point"
         );
 
-        idx.reclaim();
+        while idx.drain_retired() {}
 
         assert!(
             FAKE.id_at(addr).is_none(),
-            "reclaim is what hands it back -- a searcher on its way out, or the sweeper"
+            "drain_retired is what hands it back -- a searcher on its way out, or the sweeper"
         );
-        assert_eq!(idx.queued.load(Ordering::Relaxed), 0);
-        assert!(idx.retired.lock().unwrap().is_empty());
+        assert_eq!(idx.retirement.queue_len(), 0);
     }
 
     #[test]
@@ -1520,7 +1518,7 @@ mod tests {
         let addr = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
 
         // One search is already running when the delete lands.
-        let first = Searching::new(&idx);
+        let first = idx.retirement.enter().unwrap();
 
         let taken: std::result::Result<Option<bool>, PublishError<()>> =
             idx.remove_published(|| Ok(Some(addr)));
@@ -1530,13 +1528,15 @@ mod tests {
         // empty from here on. Nothing ticks the clock in this test -- that is
         // the point: `retire` moves it itself, so this searcher's stamp is
         // already past the retirement and does not hold it back.
-        let second = Searching::new(&idx);
+        let second = idx.retirement.enter().unwrap();
+        while idx.drain_retired() {}
         assert!(
             FAKE.id_at(addr).is_some(),
             "the first search could have seen it, so it is still held"
         );
 
         drop(first);
+        while idx.drain_retired() {}
         assert!(
             FAKE.id_at(addr).is_none(),
             "once the only search that could have seen it is gone, it goes back \
@@ -1577,6 +1577,13 @@ mod tests {
             idx.remove_published(|| Ok(Some(addr)));
         assert_eq!(taken.unwrap(), Some(true));
 
+        // `retire()` now feeds only the new barrier queue (see
+        // `a_delete_queues_the_reference_and_reclaim_hands_it_back`), so this
+        // test seeds the old reader-slot queue directly -- it exercises
+        // `oldest_reader`/`reclaim` in isolation until Task 8 removes them.
+        idx.retired.lock().unwrap().push((addr, 1));
+        idx.queued.store(1, Ordering::Relaxed);
+
         // A searcher that has taken a slot but not yet published its stamp: the
         // window `Searching::new` used to leave open between reading the clock
         // and the compare-exchange. While a slot reads REGISTERING, nothing may
@@ -1610,16 +1617,17 @@ mod tests {
             "the deleting thread queues, it does not release"
         );
 
-        // No explicit reclaim: finishing a search is what does it. That is the
-        // moment the last reader of a retired address disappears, and it is a
-        // thread holding neither the graph lock nor the engine's.
         assert_eq!(search(&idx, &[0.0, 1.0, 0.0, 0.0], 5), vec!["stays"]);
+
+        // Finishing a search no longer releases inline -- dropping a `Reading`
+        // only drops the barrier's count. Only draining the queue (the
+        // sweeper's job) hands the address back.
+        while idx.drain_retired() {}
 
         assert!(
             FAKE.id_at(doomed).is_none(),
-            "the searcher handed it back on the way out"
+            "draining the queue after the searcher left hands it back"
         );
-        assert_eq!(idx.queued.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1627,27 +1635,62 @@ mod tests {
         let idx = build(4, Quant::F32, Metric::L2, 4);
         let addr = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
 
-        let first = Searching::new(&idx);
-        let second = Searching::new(&idx);
+        let first = idx.retirement.enter().unwrap();
+        let second = idx.retirement.enter().unwrap();
 
         let taken: std::result::Result<Option<bool>, PublishError<()>> =
             idx.remove_published(|| Ok(Some(addr)));
         assert_eq!(taken.unwrap(), Some(true));
 
         drop(second);
-        drop(Searching::new(&idx));
-        idx.reclaim();
+        drop(idx.retirement.enter().unwrap());
+        while idx.drain_retired() {}
         assert!(
             FAKE.id_at(addr).is_some(),
             "two searches ended, but the one that started first is still running"
         );
 
         drop(first);
-        idx.reclaim();
+        while idx.drain_retired() {}
         assert!(
             FAKE.id_at(addr).is_none(),
             "nothing is reading it any more, so it should have gone back"
         );
+    }
+
+    #[test]
+    fn a_running_search_holds_back_the_address_it_could_have_seen() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let addr = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
+
+        let reading = idx.retirement.enter().unwrap();
+        assert!(remove(&idx, "a"), "그래프에서 뺐다");
+
+        while idx.drain_retired() {}
+        assert!(
+            FAKE.id_at(addr).is_some(),
+            "이 검색이 그 주소를 봤을 수 있으므로 아직 못 놓아준다"
+        );
+
+        drop(reading);
+        while idx.drain_retired() {}
+        assert!(FAKE.id_at(addr).is_none(), "검색이 끝났으니 돌려준다");
+    }
+
+    #[test]
+    fn a_search_that_starts_after_the_delete_does_not_hold_it_back() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let addr = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
+
+        assert!(remove(&idx, "a"));
+        let late = idx.retirement.enter().unwrap();
+
+        while idx.drain_retired() {}
+        assert!(
+            FAKE.id_at(addr).is_none(),
+            "삭제 뒤에 시작한 검색은 그 주소에 닿을 수 없으므로 막지 않는다"
+        );
+        drop(late);
     }
 
     #[test]
@@ -1693,7 +1736,7 @@ mod tests {
             "the element was released while a search could still dereference its address"
         );
 
-        idx.reclaim();
+        while idx.drain_retired() {}
         assert!(
             FAKE.id_at(addr).is_none(),
             "the search has ended, so the address should have gone back"
@@ -1769,7 +1812,7 @@ mod tests {
             !idx.held().contains(first),
             "the displaced address is not held any more"
         );
-        idx.reclaim();
+        while idx.drain_retired() {}
         assert_eq!(
             FAKE.id_at(first),
             None,
@@ -2533,7 +2576,7 @@ mod tests {
         let entered = idx.epoch.load(Ordering::Acquire);
 
         idx.clear_with().unwrap();
-        idx.reclaim();
+        while idx.drain_retired() {}
         assert_eq!(
             FAKE.id_at(key),
             None,
@@ -2559,7 +2602,7 @@ mod tests {
         let live = idx.held().live_addrs();
         assert_eq!(live.len(), 1, "one node, not two");
         assert_ne!(live[0], old, "and it stands on the new element");
-        idx.reclaim();
+        while idx.drain_retired() {}
         assert_eq!(
             FAKE.id_at(old),
             None,

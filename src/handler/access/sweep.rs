@@ -76,7 +76,7 @@ fn run() {
             crate::server::tick();
             for index in registry::indexes().unwrap_or_default() {
                 index.ann.retry_stuck();
-                index.ann.reclaim();
+                while index.ann.drain_retired() {}
             }
         }
     }
