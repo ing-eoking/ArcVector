@@ -65,9 +65,10 @@ const COUNT: usize = !SEALED;
 enum Event {
     /// 이 슬롯의 배리어가 풀릴 때까지 sweeper가 선다.
     Barrier(usize),
-    /// 놓아줄 주소들이 링의 `[from, to)`에 있다. 위치는 단조 증가하고
-    /// `% RING`으로 칸을 고른다.
-    Release { from: usize, to: usize },
+    /// 놓아줄 주소가 링의 이 위치까지 있다. 시작은 언제나 `Queue::head`이고
+    /// 칸끼리도 이어져 있어서, 끝만 있으면 구간이 정해진다. 위치는 단조
+    /// 증가하고 `% RING`으로 칸을 고른다.
+    Release(usize),
 }
 
 #[derive(Default)]
@@ -93,6 +94,38 @@ impl Queue {
             return true;
         }
         false
+    }
+}
+
+/// `draining`을 반드시 되돌리는 가드.
+///
+/// 정상 경로는 `disarm()`으로 무장을 푼다. 그 사이에 패닉이 나면 `Drop`이
+/// 플래그만 내리고 `head`는 그대로 둔다 -- 안 놓은 구간을 다음 배출자가 다시
+/// 집어가는 쪽이, 놓은 줄 알고 건너뛰어 참조를 영영 묶어두는 쪽보다 낫다.
+struct Draining<'a> {
+    owner: &'a Retirement,
+    armed: bool,
+}
+
+impl<'a> Draining<'a> {
+    fn new(owner: &'a Retirement) -> Self {
+        Self { owner, armed: true }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Draining<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.owner
+                .queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .draining = false;
+        }
     }
 }
 
@@ -228,7 +261,7 @@ impl Retirement {
             spins += 1;
             if spins > 4 {
                 // 봉인 중인 슬롯에 걸렸다. `open`을 넘기는 쪽은 이 큐 뮤텍스를
-                // 쥔 채로 할당까지 할 수 있으므로(push_addrs), 몇 바퀴 돌고도
+                // 쥐고 있으므로, 몇 바퀴 돌고도
                 // 안 풀리면 그 스레드를 놓아준다.
                 std::thread::yield_now();
             } else {
@@ -314,31 +347,44 @@ impl Retirement {
                     return Progress::Released(0);
                 }
 
-                Some(Event::Release { to, .. }) => {
+                Some(Event::Release(to)) => {
                     let span = (q.head, *to);
                     q.draining = true;
                     span
                 }
             }
         };
+        // 여기서부터 `draining`이 서 있다. `release`는 FFI로 나가고 재진입한
+        // 콜백이 패닉할 수 있는데, 플래그가 선 채 남으면 이 인덱스는 영영 못
+        // 비우고 게이트도 안 열려 모든 검색이 `Busy`가 된다. 가드가 되돌린다.
+        let guard = Draining::new(self);
 
         self.release_span(elements, from, to);
 
-        let mut q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
-        q.draining = false;
-        q.head = to;
-        // 놓는 사이에 `retire`가 같은 칸에 더 붙였을 수 있다. 그러면 칸을 빼지
-        // 않고 시작만 옮긴다 -- 빼면 아직 안 놓은 주소를 잃는다.
-        match q.events.front_mut() {
-            Some(Event::Release { from, to: tail_to }) if *tail_to > to => *from = to,
-            _ => {
-                q.events.pop_front();
+        let more = {
+            let mut q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+            q.draining = false;
+            q.head = to;
+            // 놓는 사이에 `retire`가 같은 칸에 더 붙였을 수 있다. 그러면 칸을 빼지
+            // 않는다 -- 빼면 아직 안 놓은 주소를 잃는다.
+            match q.events.front() {
+                Some(Event::Release(tail_to)) if *tail_to > to => {}
+                _ => {
+                    q.events.pop_front();
+                }
             }
+            if q.reopen_if_room(self.cap) {
+                self.gate.notify_all();
+            }
+            !q.events.is_empty()
+        };
+        guard.disarm();
+
+        // `draining`에 막혀 물러난 배출자가 있을 수 있다. 플래그가 풀렸으니
+        // 다시 오라고 알린다 -- 안 그러면 그쪽은 다음 `TICK`까지 잔다.
+        if more {
+            self.ring();
         }
-        if q.reopen_if_room(self.cap) {
-            self.gate.notify_all();
-        }
-        drop(q);
 
         Progress::Released(to - from)
     }
@@ -372,14 +418,26 @@ impl Retirement {
     /// 하지 않는다. `release`는 큐 뮤텍스를 놓은 뒤에 부른다: 재진입한 unlink
     /// 콜백이 같은 뮤텍스를 다시 잡을 수 있어서다(drain_once와 같은 이유).
     pub(super) fn release_pending(&self, elements: &dyn Elements) {
-        let (from, to) = {
+        loop {
+            // `head`를 올리지 않은 채 읽는다. `release`가 재진입시킨 unlink
+            // 콜백이 같은 인덱스에 `retire`를 부를 수 있는데, 먼저 올려버리면
+            // 그 `retire`가 지금 읽는 중인 칸 위로 감아서 쓴다.
+            let (from, to) = {
+                let q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+                (q.head, q.tail)
+            };
+            if from == to {
+                break;
+            }
+            self.release_span(elements, from, to);
             let mut q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
-            let span = (q.head, q.tail);
-            q.events.clear();
-            q.head = q.tail;
-            span
-        };
-        self.release_span(elements, from, to);
+            q.head = to;
+        }
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .events
+            .clear();
     }
 
     /// 주소를 놓아줄 목록에 넣는다. 엔진을 건드리지 않는다.
@@ -401,6 +459,9 @@ impl Retirement {
         // 칸은 둘까지 필요하다 -- 배리어 하나와 새 `Release` 하나. 꼬리 합치기가
         // 되면 덜 쓰지만, 여기서는 넉넉하게 잡는다.
         if q.tail - q.head + addrs.len() > RING || q.events.len() + 2 > q.events.capacity() {
+            // 검색을 세워 배출이 앞서 나가게 한다. 자리가 없다고 조용히 버리기만
+            // 하면 그 압력이 아무 데도 전달되지 않는다.
+            q.gated = true;
             eprintln!(
                 "ArcVector: the retirement queue is full; {} item reference(s) stay \
                  pinned until this process ends",
@@ -446,8 +507,8 @@ impl Retirement {
         // 꼬리 합치기. 링은 `tail`에 이어 붙으므로 방금 쓴 것이 앞엣것과 연속이다
         // -- 복사도 새 칸도 없이 `to`만 올리면 된다.
         match q.events.back_mut() {
-            Some(Event::Release { to: tail_to, .. }) => *tail_to = to,
-            _ => q.events.push_back(Event::Release { from, to }),
+            Some(Event::Release(tail_to)) => *tail_to = to,
+            _ => q.events.push_back(Event::Release(to)),
         }
 
         q.gated |= q.events.len() >= self.cap;
@@ -489,7 +550,7 @@ impl Retirement {
             .iter()
             .map(|e| match e {
                 Event::Barrier(_) => 'B',
-                Event::Release { .. } => 'R',
+                Event::Release(_) => 'R',
             })
             .collect()
     }
@@ -606,6 +667,39 @@ mod tests {
         r.mark_draining();
         assert!(matches!(r.drain_once(&e), Progress::Blocked));
         assert!(e.freed().is_empty(), "다른 쪽이 놓는 중이면 손대지 않는다");
+    }
+
+    #[test]
+    fn a_panic_in_release_does_not_wedge_the_queue() {
+        struct Exploding;
+        impl Elements for Exploding {
+            fn id_at(&self, _addr: u64) -> Option<Arc<str>> {
+                None
+            }
+            fn release(&self, _addrs: &[u64]) {
+                panic!("release blew up");
+            }
+        }
+
+        let r = Retirement::new();
+        r.retire(&[0x10]);
+
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            r.drain_once(&Exploding);
+        }));
+        std::panic::set_hook(hook);
+        assert!(caught.is_err(), "패닉이 전파됐다");
+
+        // `draining`이 선 채 남으면 이 인덱스는 영영 못 비우고, 게이트도 안 열려
+        // 모든 검색이 끝내 `Busy`가 된다.
+        let e = FakeElements::default();
+        assert!(
+            matches!(r.drain_once(&e), Progress::Released(1)),
+            "가드가 되돌려서 다시 비울 수 있다"
+        );
+        assert_eq!(e.freed(), vec![0x10], "안 놓은 구간을 다시 집어갔다");
     }
 
     #[test]
