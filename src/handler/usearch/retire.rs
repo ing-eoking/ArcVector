@@ -9,22 +9,31 @@
 
 use crate::handler::usearch::held::Elements;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
 
-/// 비워진 주소 버퍼를 몇 개까지 쥐고 있을지.
+/// 놓아줄 주소를 담는 링의 크기.
 ///
-/// sweeper가 `Release`를 처리하고 나면 그 `Vec`은 비어 있지만 용량은 그대로다.
-/// 버리지 않고 돌려받으면 다음 `Release` 칸이 할당 없이 채워진다 -- retire는
-/// unlink 콜백에서 cache lock을 쥔 채 불리므로, 그 경로에서 `malloc`을 부르지
-/// 않는 것이 이 풀의 목적이다.
+/// 기동 시 한 번 잡고 다시는 자라지 않는다. `retire`는 unlink 콜백에서 엔진의
+/// cache lock을 쥔 채 불리므로, 그 경로에서 `malloc`을 부르지 않는 것이 목적이다.
 ///
-/// 정상 상태에서 도는 버퍼는 한두 개다. 상한이 있는 것은 sweeper가 막혔다
-/// 풀리면서 수백 개를 한꺼번에 돌려줄 때 그것을 전부 쥐고 있지 않기 위해서다.
-pub(super) const SPARE_MAX: usize = 8;
+/// 차는 것은 sweeper가 맨 앞 배리어에서 막혀 있는 동안 delete가 몰릴 때뿐이다.
+/// 넘치면 그 배치를 포기하고 로그를 남긴다 -- 예전 `try_reserve` 실패와 같은
+/// 처리다.
+pub(super) const RING: usize = 4096;
+
+/// 이벤트 칸을 `CAP`보다 이만큼 더 잡아둔다.
+///
+/// 게이트가 `CAP`에서 닫히면 새 검색이 안 붙으므로 그 뒤 retire는 빈 배리어를
+/// 봉인하고 `Release`는 꼬리에 합쳐진다. 칸이 더 느는 것은 게이트 확인을 이미
+/// 통과한 검색들 몫뿐이라, 이 여유면 실제로 닿지 않는다.
+const EVENT_MARGIN: usize = 256;
+
+/// `release`에 한 번에 넘기는 주소 수. 스택 버퍼라 힙을 안 쓴다.
+const RELEASE_CHUNK: usize = 64;
 
 /// 큐가 이만큼 차면 게이트를 닫는다. 고수위 표시이지 상한이 아니다.
 pub(super) const CAP: usize = 1024;
@@ -56,73 +65,34 @@ const COUNT: usize = !SEALED;
 enum Event {
     /// 이 슬롯의 배리어가 풀릴 때까지 sweeper가 선다.
     Barrier(usize),
-    /// 놓아줄 주소들.
-    Release(Vec<u64>),
+    /// 놓아줄 주소들이 링의 `[from, to)`에 있다. 위치는 단조 증가하고
+    /// `% RING`으로 칸을 고른다.
+    Release { from: usize, to: usize },
 }
 
 #[derive(Default)]
 struct Queue {
     events: VecDeque<Event>,
+    /// 링에서 아직 안 놓아준 구간의 시작. `drain_once`가 다 놓은 뒤에 올린다.
+    head: usize,
+    /// 링에 다음으로 쓸 위치. `retire`가 올린다.
+    tail: usize,
     gated: bool,
-    /// sweeper가 비워서 돌려준 주소 버퍼. `SPARE_MAX`개까지 쥔다.
-    spare: Vec<Vec<u64>>,
+    /// 누군가 뮤텍스를 놓고 `release`를 부르는 중이다.
+    ///
+    /// 그 구간의 칸은 아직 큐에 남아 있으므로, 이 표시가 없으면 두 번째 배출자가
+    /// 같은 칸을 집어 이중 해제를 낸다.
+    draining: bool,
 }
 
 impl Queue {
-    /// 비워진 버퍼를 풀에 돌려놓는다. 상한을 넘거나 용량이 없으면 그냥 버린다.
-    fn recycle(&mut self, mut buf: Vec<u64>) {
-        buf.clear();
-        if buf.capacity() == 0 || self.spare.len() >= SPARE_MAX {
-            return;
-        }
-        if self.spare.try_reserve(1).is_err() {
-            return;
-        }
-        self.spare.push(buf);
-    }
-
-    /// 자리가 났으면 게이트를 연다. 푸는 것은 `drain_once`가 한다.
+    /// 자리가 났으면 게이트를 연다. 푸는 것은 배출자가 한다.
     fn reopen_if_room(&mut self, cap: usize) -> bool {
         if self.gated && self.events.len() < cap {
             self.gated = false;
             return true;
         }
         false
-    }
-
-    /// 꼬리가 `Release`면 칸을 늘리지 않고 주소만 붙인다.
-    ///
-    /// 할당이 실패하면 그 배치를 포기한다. 아이템이 프로세스 끝까지 묶이지만,
-    /// 메모리 부족으로 데몬을 죽이는 것보다 낫다.
-    fn push_addrs(&mut self, addrs: &[u64]) {
-        if let Some(Event::Release(tail)) = self.events.back_mut()
-            && tail.try_reserve(addrs.len()).is_ok()
-        {
-            tail.extend_from_slice(addrs);
-            return;
-        }
-        // 새 칸이 필요하다. 돌려받은 버퍼가 있으면 그것을 쓴다 -- 이미 용량이
-        // 있으므로 정상 상태에서는 여기서 할당이 일어나지 않는다.
-        let mut owned = self.spare.pop().unwrap_or_default();
-        if owned.try_reserve(addrs.len()).is_err() || self.events.try_reserve(1).is_err() {
-            self.recycle(owned);
-            eprintln!(
-                "ArcVector: could not queue {} item reference(s) for release; \
-                 they stay pinned until this process ends",
-                addrs.len()
-            );
-            return;
-        }
-        owned.extend_from_slice(addrs);
-        self.events.push_back(Event::Release(owned));
-    }
-
-    fn push_barrier(&mut self, slot: usize) -> bool {
-        if self.events.try_reserve(1).is_err() {
-            return false;
-        }
-        self.events.push_back(Event::Barrier(slot));
-        true
     }
 }
 
@@ -179,6 +149,12 @@ const GATE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) struct Retirement {
     slots: Box<[AtomicUsize]>,
+    /// 놓아줄 주소의 링. 기동 시 한 번 잡고 다시 자라지 않는다.
+    ///
+    /// `AtomicU64`인 것은 배출자가 뮤텍스를 놓은 채 읽는 동안 `retire`가 다른
+    /// 구간에 쓰기 때문이다. 겹치지는 않는다 -- 배출자가 읽는 `[head, to)`는
+    /// `head`를 올리기 전이라 `retire`가 덮어쓰지 못한다.
+    addrs: Box<[AtomicU64]>,
     /// 지금 열린 슬롯 번호. retire만 쓰고 검색은 읽기만 한다.
     open: AtomicUsize,
     queue: Mutex<Queue>,
@@ -200,8 +176,12 @@ impl Retirement {
     fn with_cap_inner(cap: usize) -> Self {
         Self {
             slots: (0..POOL).map(|_| AtomicUsize::new(0)).collect(),
+            addrs: (0..RING).map(|_| AtomicU64::new(0)).collect(),
             open: AtomicUsize::new(0),
-            queue: Mutex::new(Queue::default()),
+            queue: Mutex::new(Queue {
+                events: VecDeque::with_capacity(cap + EVENT_MARGIN),
+                ..Queue::default()
+            }),
             gate: Condvar::new(),
             cap,
             bell: OnceLock::new(),
@@ -301,9 +281,15 @@ impl Retirement {
     ///
     /// `release`는 **뮤텍스를 놓은 뒤에** 부른다. `release` → `do_item_release`가
     /// unlink 콜백을 재진입시킬 수 있고, 그 콜백이 같은 뮤텍스를 다시 잡는다.
+    ///
+    /// 그 창 동안 칸은 큐에 남아 있으므로 `draining`으로 다른 배출자를 막는다.
+    /// 막지 않으면 둘이 같은 구간을 놓아 이중 해제가 난다.
     pub(super) fn drain_once(&self, elements: &dyn Elements) -> Progress {
-        let batch = {
+        let (from, to) = {
             let mut q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+            if q.draining {
+                return Progress::Blocked;
+            }
             match q.events.front() {
                 None => return Progress::Empty,
 
@@ -322,30 +308,50 @@ impl Retirement {
                     return Progress::Released(0);
                 }
 
-                Some(Event::Release(_)) => {
-                    let taken = match q.events.pop_front() {
-                        Some(Event::Release(addrs)) => addrs,
-                        _ => unreachable!("just matched a release"),
-                    };
-                    if q.reopen_if_room(self.cap) {
-                        self.gate.notify_all();
-                    }
-                    taken
+                Some(Event::Release { to, .. }) => {
+                    let span = (q.head, *to);
+                    q.draining = true;
+                    span
                 }
             }
         };
 
-        elements.release(&batch);
-        let freed = batch.len();
+        self.release_span(elements, from, to);
 
-        // 버퍼를 돌려준다. `release`가 끝난 뒤라 어떤 락도 쥐고 있지 않고, 여기서
-        // 다시 잡는 큐 뮤텍스 안에서는 엔진을 건드리지 않는다.
-        self.queue
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .recycle(batch);
+        let mut q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        q.draining = false;
+        q.head = to;
+        // 놓는 사이에 `retire`가 같은 칸에 더 붙였을 수 있다. 그러면 칸을 빼지
+        // 않고 시작만 옮긴다 -- 빼면 아직 안 놓은 주소를 잃는다.
+        match q.events.front_mut() {
+            Some(Event::Release { from, to: tail_to }) if *tail_to > to => *from = to,
+            _ => {
+                q.events.pop_front();
+            }
+        }
+        if q.reopen_if_room(self.cap) {
+            self.gate.notify_all();
+        }
+        drop(q);
 
-        Progress::Released(freed)
+        Progress::Released(to - from)
+    }
+
+    /// 링의 `[from, to)`를 놓아준다. **어떤 락도 쥐지 않은 채** 불려야 한다.
+    ///
+    /// `head`가 아직 `from`이라 `retire`가 이 구간을 덮어쓰지 못한다. 스택 버퍼로
+    /// 쪼개는 것은 힙을 안 쓰기 위해서다.
+    fn release_span(&self, elements: &dyn Elements, from: usize, to: usize) {
+        let mut chunk = [0u64; RELEASE_CHUNK];
+        let mut pos = from;
+        while pos < to {
+            let n = RELEASE_CHUNK.min(to - pos);
+            for (i, cell) in chunk[..n].iter_mut().enumerate() {
+                *cell = self.addrs[(pos + i) % RING].load(Ordering::Acquire);
+            }
+            elements.release(&chunk[..n]);
+            pos += n;
+        }
     }
 
     /// 큐에 남은 `Release`를 전부 즉시 놓아주고 큐를 비운다. `Barrier`는 버린다.
@@ -360,21 +366,14 @@ impl Retirement {
     /// 하지 않는다. `release`는 큐 뮤텍스를 놓은 뒤에 부른다: 재진입한 unlink
     /// 콜백이 같은 뮤텍스를 다시 잡을 수 있어서다(drain_once와 같은 이유).
     pub(super) fn release_pending(&self, elements: &dyn Elements) {
-        let batches: Vec<Vec<u64>> = {
+        let (from, to) = {
             let mut q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
-            q.events
-                .drain(..)
-                .filter_map(|event| match event {
-                    Event::Release(addrs) => Some(addrs),
-                    Event::Barrier(_) => None,
-                })
-                .collect()
+            let span = (q.head, q.tail);
+            q.events.clear();
+            q.head = q.tail;
+            span
         };
-        for addrs in batches {
-            if !addrs.is_empty() {
-                elements.release(&addrs);
-            }
-        }
+        self.release_span(elements, from, to);
     }
 
     /// 주소를 놓아줄 목록에 넣는다. 엔진을 건드리지 않는다.
@@ -390,6 +389,19 @@ impl Retirement {
             return;
         }
         let mut q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+
+        // 자리부터 본다. 봉인한 뒤에 포기하면 되돌릴 것이 늘어난다.
+        //
+        // 칸은 둘까지 필요하다 -- 배리어 하나와 새 `Release` 하나. 꼬리 합치기가
+        // 되면 덜 쓰지만, 여기서는 넉넉하게 잡는다.
+        if q.tail - q.head + addrs.len() > RING || q.events.len() + 2 > q.events.capacity() {
+            eprintln!(
+                "ArcVector: the retirement queue is full; {} item reference(s) stay \
+                 pinned until this process ends",
+                addrs.len()
+            );
+            return;
+        }
 
         let slot = self.open.load(Ordering::Acquire);
         // `seal()`을 단일 RMW로 두려고 이 확인은 별도의 `load`로 한다. 그 사이의
@@ -410,46 +422,47 @@ impl Retirement {
             // 물러나는 검색이 있을 수 있고, 그 `fetch_add`와 `fetch_sub` 사이에
             // 0을 덮어쓰면 뺄 때 언더플로가 난다. 플래그만 끈다.
             self.slots[slot].fetch_and(COUNT, Ordering::AcqRel);
-        } else if q.push_barrier(slot) {
+        } else {
             // 배리어가 큐에 들어갔을 때만 슬롯이 넘어간다. 그래야 살아 있는
             // 배리어 수가 큐 안의 배리어 수와 같아져 슬롯이 감기지 않는다.
+            q.events.push_back(Event::Barrier(slot));
             self.open.store((slot + 1) % POOL, Ordering::Release);
-        } else {
-            // 배리어를 못 넣었다. 그대로 주소를 넣으면 그것을 지켜줄 배리어가 없는
-            // 채로 큐에 들어간다 -- 붙어 있던 검색이 그 주소를 들고 있을 수 있다.
-            // 이 배치를 포기한다. 아이템이 묶이지만 해제 순서를 깨는 것보다 낫다.
-            self.slots[slot].fetch_and(COUNT, Ordering::AcqRel);
-            eprintln!(
-                "ArcVector: could not queue a barrier; {} item reference(s) stay \
-                 pinned until this process ends",
-                addrs.len()
-            );
-            return;
         }
 
-        q.push_addrs(addrs);
-        // `|=`다: `gated`를 끄는 것은 `reopen_if_room`뿐이어야 한다. 오늘은 이
-        // 줄이 계산하는 값이 항상 실제 길이와 일치해 `=`와 `|=`가 같지만, 그건
-        // "여기 말고는 아무도 `gated`를 세우지 않는다"는 먼 불변식에 기댄 것이라
-        // 방어적으로 or로 둔다.
+        // 주소를 링에 쓴다.
+        let from = q.tail;
+        for (i, addr) in addrs.iter().enumerate() {
+            self.addrs[(from + i) % RING].store(*addr, Ordering::Release);
+        }
+        let to = from + addrs.len();
+        q.tail = to;
+
+        // 꼬리 합치기. 링은 `tail`에 이어 붙으므로 방금 쓴 것이 앞엣것과 연속이다
+        // -- 복사도 새 칸도 없이 `to`만 올리면 된다.
+        match q.events.back_mut() {
+            Some(Event::Release { to: tail_to, .. }) => *tail_to = to,
+            _ => q.events.push_back(Event::Release { from, to }),
+        }
+
         q.gated |= q.events.len() >= self.cap;
         drop(q);
-
-        // Barrier든 Release든 뭔가 큐에 들어갔다는 뜻이니 sweeper를 깨운다.
-        // `GATE_TIMEOUT`이 sweeper의 `TICK`과 맞물려 있어서(retire.rs 상단) 이
-        // 종이 없으면 게이트가 막 닫힌 뒤 대기를 시작한 검색이 sweeper가
-        // `wait_timeout(TICK)`에 막 들어간 순간과 겹쳐 시간 초과로 `Busy`를 받을
-        // 수 있다.
         self.ring();
     }
 
+    /// 링에서 아직 안 놓아준 주소 수.
     #[cfg(test)]
-    pub(super) fn spare_len(&self) -> usize {
+    pub(super) fn pending_addrs(&self) -> usize {
+        let q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        q.tail - q.head
+    }
+
+    /// 배출이 진행 중인 것처럼 표시한다. `draining`이 실제로 막는지 보려고 쓴다.
+    #[cfg(test)]
+    pub(super) fn mark_draining(&self) {
         self.queue
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .spare
-            .len()
+            .draining = true;
     }
 
     #[cfg(test)]
@@ -470,7 +483,7 @@ impl Retirement {
             .iter()
             .map(|e| match e {
                 Event::Barrier(_) => 'B',
-                Event::Release(_) => 'R',
+                Event::Release { .. } => 'R',
             })
             .collect()
     }
@@ -551,38 +564,30 @@ mod tests {
     }
 
     #[test]
-    fn a_drained_buffer_comes_back_for_the_next_release() {
+    fn a_full_address_ring_drops_the_batch_rather_than_growing() {
         let r = Retirement::new();
-        let e = FakeElements::default();
+        let full: Vec<u64> = (0..RING as u64).collect();
 
-        r.retire(&[0x10]);
-        assert_eq!(r.spare_len(), 0, "아직 sweeper가 돌려준 것이 없다");
+        r.retire(&full);
+        assert_eq!(r.pending_addrs(), RING, "링을 정확히 채웠다");
+        assert_eq!(r.queue_len(), 1);
 
-        while matches!(r.drain_once(&e), Progress::Released(_)) {}
-        assert_eq!(r.spare_len(), 1, "비운 버퍼를 풀에 돌려준다");
-
-        r.retire(&[0x20]);
-        assert_eq!(r.spare_len(), 0, "다음 retire가 그 버퍼를 다시 쓴다");
+        r.retire(&[0xdead_beef]);
+        assert_eq!(r.pending_addrs(), RING, "넘치는 배치는 포기한다");
+        assert_eq!(r.queue_len(), 1, "칸도 안 늘어난다");
     }
 
     #[test]
-    fn the_spare_pool_does_not_hoard_after_a_burst() {
+    fn a_second_drainer_backs_off_while_one_is_releasing() {
         let r = Retirement::new();
         let e = FakeElements::default();
+        r.retire(&[0x10]);
 
-        // 배리어를 사이사이 끼워 Release 칸을 여러 개 만든다.
-        for addr in 0..(SPARE_MAX as u64 + 5) {
-            let hold = r.enter().unwrap();
-            r.retire(&[addr]);
-            drop(hold);
-        }
-        while !matches!(r.drain_once(&e), Progress::Empty) {}
-
-        assert!(
-            r.spare_len() <= SPARE_MAX,
-            "상한을 넘겨 쥐고 있다: {}",
-            r.spare_len()
-        );
+        // 첫 배출은 뮤텍스를 놓고 release를 부른다. 그 창에 다른 스레드가
+        // 같은 칸을 또 놓아주면 이중 해제다.
+        r.mark_draining();
+        assert!(matches!(r.drain_once(&e), Progress::Blocked));
+        assert!(e.freed().is_empty(), "다른 쪽이 놓는 중이면 손대지 않는다");
     }
 
     #[test]
