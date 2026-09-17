@@ -29,6 +29,12 @@ const MIN_CAPACITY: usize = 1024;
 
 const THREAD_SLOTS: usize = 64;
 
+/// 검색이 나가는 길에 큐에서 처리할 항목 수의 상한.
+///
+/// 이 비용은 요청 응답에 붙으므로 무제한이면 안 된다. 예전 `RECLAIM_BATCH`가
+/// 같은 이유로 있었다.
+const READER_DRAIN_BUDGET: usize = 8;
+
 pub type Accept<'a> = &'a dyn Fn(u64) -> bool;
 
 #[must_use = "an unnamed node is invisible; publish it or discard it"]
@@ -1040,7 +1046,7 @@ impl AnnIndex {
             )));
         }
 
-        let _reading = self.retirement.enter()?;
+        let reading = self.retirement.enter()?;
         let entered = self.epoch.load(Ordering::Acquire);
 
         let k = k.saturating_add(self.in_flight.load(Ordering::Relaxed));
@@ -1057,7 +1063,30 @@ impl AnnIndex {
         };
 
         let hits: Vec<(u64, f32)> = matches.keys.into_iter().zip(matches.distances).collect();
-        Ok(self.resolve(&hits, entered))
+        let answer = self.resolve(&hits, entered);
+
+        // 여기가 이 검색이 붙어 있던 배리어의 마지막이면, 그 뒤의 `Release`를
+        // 막고 있던 것이 방금 사라진 것이다. sweeper를 기다리지 않고 그 자리에서
+        // 놓아준다 -- 이 지점에서는 그래프 락도 `held` 락도 cache lock도 쥐고
+        // 있지 않다.
+        if reading.leave() {
+            self.drain_bounded();
+        }
+        Ok(answer)
+    }
+
+    /// 큐를 조금 비운다. **어떤 락도 쥐지 않은 채** 불려야 한다.
+    ///
+    /// 상한이 있는 것은 이 비용이 요청 응답 시간에 그대로 붙기 때문이다. 상한에
+    /// 걸리고도 남아 있으면 sweeper에게 넘긴다.
+    fn drain_bounded(&self) {
+        let mut budget = READER_DRAIN_BUDGET;
+        while budget > 0 && self.drain_retired() {
+            budget -= 1;
+        }
+        if budget == 0 {
+            self.retirement.ring();
+        }
     }
 }
 
@@ -1503,6 +1532,34 @@ mod tests {
         assert!(
             FAKE.id_at(old).is_some(),
             "실패 경로가 옛 주소를 즉시 놓아주었다. 큐를 거쳐야 한다"
+        );
+    }
+
+    #[test]
+    fn the_last_search_out_of_a_sealed_barrier_drains_on_its_way_out() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let doomed = add(&idx, "goes", &[1.0, 0.0, 0.0, 0.0]);
+        add(&idx, "stays", &[0.0, 1.0, 0.0, 0.0]);
+
+        // 순회 중에 삭제가 들어온다. 그러면 이 검색이 붙어 있는 배리어가 봉인되고,
+        // 이 검색이 그것을 0으로 만드는 마지막이 된다.
+        let deleted = std::cell::Cell::new(false);
+        let accept = |_key: u64| -> bool {
+            if !deleted.replace(true) {
+                remove(&idx, "goes");
+            }
+            true
+        };
+
+        let q = crate::handler::quant::encode(&[0.0, 1.0, 0.0, 0.0], idx.layout.quant);
+        let answered = idx.search(&q, 5, Some(&accept)).unwrap();
+        assert!(deleted.get(), "순회가 술어를 불렀다");
+        assert!(!answered.is_empty());
+
+        // sweeper는 돌지 않았다. 검색이 나가는 길에 직접 놓아준 것이다.
+        assert!(
+            FAKE.id_at(doomed).is_none(),
+            "마지막 검색이 나가는 길에 큐를 비웠어야 한다"
         );
     }
 

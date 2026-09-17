@@ -193,12 +193,18 @@ impl Retirement {
         let _ = self.bell.set(bell);
     }
 
+    /// 슬롯에서 떨어진다. 봉인된 배리어를 0으로 만들었으면 `true`.
+    fn detach(&self, slot: usize) -> bool {
+        let prev = self.slots[slot].fetch_sub(1, Ordering::AcqRel);
+        prev & COUNT == 1 && prev & SEALED != 0
+    }
+
     /// 종을 울린다. 봉인된 배리어를 0으로 만든 검색만 부른다.
     ///
     /// 알림 유실을 막는 것은 여기가 아니라 종 자체의 몫이다 -- sweeper가 기다리는
     /// 뮤텍스는 이 큐의 것이 아니라 sweeper 자신의 것이라, 여기서 큐 락을 거쳐봐야
     /// 아무것도 지켜주지 않는다. `sweep::wake`가 그 뮤텍스 안에서 플래그를 세운다.
-    fn ring(&self) {
+    pub(super) fn ring(&self) {
         let Some(bell) = self.bell.get() else { return };
         bell();
     }
@@ -501,10 +507,22 @@ pub(super) struct Reading<'a> {
     slot: usize,
 }
 
+impl<'a> Reading<'a> {
+    /// 검색이 끝났음을 알린다. 봉인된 배리어를 0으로 만들었으면 `true`.
+    ///
+    /// `true`를 받은 호출자는 큐를 조금 비우면 된다 -- sweeper를 기다리지 않고
+    /// 그 자리에서 메모리가 돌아간다. 그래서 `Drop`과 달리 종을 울리지 않는다.
+    /// 호출자가 비우다 상한에 걸리면 그때 울리면 된다.
+    pub(super) fn leave(self) -> bool {
+        let cleared = self.owner.detach(self.slot);
+        std::mem::forget(self);
+        cleared
+    }
+}
+
 impl Drop for Reading<'_> {
     fn drop(&mut self) {
-        let prev = self.owner.slots[self.slot].fetch_sub(1, Ordering::AcqRel);
-        if prev & COUNT == 1 && prev & SEALED != 0 {
+        if self.owner.detach(self.slot) {
             // 내가 마지막이고, 이 배리어는 큐에서 sweeper를 세우고 있다.
             self.owner.ring();
         }
@@ -1024,6 +1042,21 @@ mod tests {
             r.is_gated(),
             "retire()가 자기 계산만으로 이미 켜져 있던 게이트를 꺼서는 안 된다"
         );
+    }
+
+    #[test]
+    fn leaving_reports_only_when_it_cleared_a_sealed_barrier() {
+        let r = Retirement::new();
+
+        // 봉인 안 된 배리어 -- 아무도 안 기다리므로 알릴 것이 없다.
+        assert!(!r.enter().unwrap().leave(), "봉인 전이면 false");
+
+        let a = r.enter().unwrap();
+        let b = r.enter().unwrap();
+        r.retire(&[0x10]); // 봉인(2)
+
+        assert!(!a.leave(), "아직 b가 남았다");
+        assert!(b.leave(), "내가 마지막이다 -- 호출자가 비우면 된다");
     }
 
     #[test]
