@@ -1,6 +1,6 @@
 # 회수를 큐 순서로: 배리어가 언제 놓아도 되는지를 말한다
 
-Design record. Status: **proposed**.
+Design record. Status: **implemented**.
 
 [2026-09-14-arcvector-item-trigger-design.md](2026-09-14-arcvector-item-trigger-design.md)의
 §6(잠금 순서)를 이어받는다. 그 설계는 "`release`는 sweeper가 미뤄서 한다"까지 정했고,
@@ -95,7 +95,7 @@ Release(X)를 막는 것은 그 앞의 유한한 배리어들뿐이다.
 
 | 위치 | 판정 |
 |---|---|
-| `Drop for AnnIndex` [:152](../../../src/handler/usearch/index.rs) | **안전.** 검색은 `Arc<VectorIndex>`를 들고 도므로([access/mod.rs:23](../../../src/handler/access/mod.rs)) 리더가 있는 동안 `drop`이 불릴 수 없다. 이 보장 위에서 `held.take_all()`뿐 아니라 `retirement`에 아직 남은 `Release`도 여기서 곧장 놓아준다 — 큐를 통째로 버리면 이미 `held`에서 빠져 `Release`로만 남은 주소를 아무도 돌려주지 않는다 |
+| `Drop for AnnIndex` [:75](../../../src/handler/usearch/index.rs) | **안전.** 검색도 sweeper도 `Arc<VectorIndex>`를 들고 도므로([access/mod.rs:23](../../../src/handler/access/mod.rs), [sweep.rs](../../../src/handler/access/sweep.rs)의 `registry::indexes()`) 리더가 있는 동안에도, 배출이 도는 동안에도 `drop`이 불릴 수 없다. 이 보장 위에서 `held.take_all()`뿐 아니라 `retirement`에 아직 남은 `Release`도 여기서 곧장 놓아준다 — 큐를 통째로 버리면 이미 `held`에서 빠져 `Release`로만 남은 주소를 아무도 돌려주지 않는다 |
 | `unclaimed()` [:656](../../../src/handler/usearch/index.rs) | **안전, 그러나 이유가 다르다.** `add_unless_known`이 `held.is_known(addr)`로 이미 `held`에 있는 주소에 `Ok(false)`를 답하는 경로가 있어([vector.rs:84](../../../src/handler/cmd/vector.rs)), "`held`에 들어간 적이 없다"는 전제가 항상 성립하지는 않는다. 여기서 놓아주는 것은 그래프의 참조가 아니라 호출자가 `store.hold_kv`/`set_kv`로 미리 잡아 둔 **호출자 자신의 두 번째 참조**이고, 그래프가 든 참조는 그대로 남으므로 원소는 살아남는다 |
 | `insert_published()` 오류 경로 [:597](../../../src/handler/usearch/index.rs) | **위반.** §3.2 |
 
@@ -185,13 +185,27 @@ struct Reading<'a> {
 
 ```rust
 struct Retirement {
-    slots: [AtomicUsize; POOL],   // 배리어 하나 = 워드 하나
+    slots: Box<[AtomicUsize]>,    // 배리어 하나 = 워드 하나. POOL개
+    addrs: Box<[AtomicU64]>,      // 놓아줄 주소의 링. RING개 (§5.2)
     open: AtomicUsize,            // 지금 열린 슬롯 번호 (0..POOL)
     queue: Mutex<Queue>,
-    bell: Condvar,                // sweeper를 깨운다
     gate: Condvar,                // 대기 중인 검색을 푼다
+    cap: usize,                   // 게이트를 닫는 칸 수
+    bell: OnceLock<Arc<dyn Fn() + Send + Sync>>,   // sweeper를 깨운다 (§5.4)
+}
+
+struct Queue {
+    events: VecDeque<Event>,      // CAP + EVENT_MARGIN으로 한 번 잡고 안 자란다
+    head: usize,                  // 링에서 아직 안 놓아준 구간의 시작
+    tail: usize,                  // 링에 다음으로 쓸 위치
+    gated: bool,
+    draining: bool,               // 누가 뮤텍스를 놓고 release 중이다 (§5.3)
 }
 ```
+
+**셋 다 기동 시 한 번 잡고 다시 자라지 않는다.** `retire`는 unlink 콜백에서 cache lock을
+쥔 채 불리므로 그 경로에 `malloc`이 없어야 한다 — 전역 락 아래의 할당은 다른 워커를 전부
+세운다.
 
 ### 4.4 봉인은 한 워드 안에서 끝낸다
 
@@ -266,7 +280,7 @@ seal()이 0보다 크면    → 큐에 넣고, open을 다음 슬롯으로 넘�
 배리어 사이의 `Release`가 통과한다 — use-after-free다. 그래서 `retire()`에 `debug_assert`로
 tripwire를 둔다: 봉인하려는 슬롯이 이미 봉인돼 있으면 거기서 걸린다.
 
-## 5. 큐와 sweeper
+## 5. 큐와 배출
 
 ### 5.1 검색 진입과 종료
 
@@ -316,84 +330,134 @@ retire는 원래 큐 뮤텍스를 잡으므로 그 안에서 다 한다. 검색�
 ```rust
 fn retire(&self, addrs: &[u64]) {
     if addrs.is_empty() { return; }
-    let mut q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut q = self.queue.lock()...;
 
-    // open을 쓰는 것은 이 뮤텍스 아래뿐이다. 검색은 읽기만 한다
-    let slot = self.open.load(Ordering::Acquire);
-    if seal(&self.slots[slot]) > 0 {
-        self.open.store((slot + 1) % POOL, Ordering::Release);
-        q.push(Event::Barrier(slot));
+    // 자리부터 본다. 봉인한 뒤에 포기하면 되돌릴 것이 늘어난다.
+    // 칸은 둘까지 필요하다 -- 배리어 하나와 새 Release 하나.
+    if q.tail - q.head + addrs.len() > RING || q.events.len() + 2 > q.events.capacity() {
+        q.gated = true;              // 압력을 검색 쪽에 전달한다
+        eprintln!("...stay pinned until this process ends");
+        return;
+    }
+
+    let slot = self.open.load(Acquire);
+    if seal(&self.slots[slot]) == 0 {
+        self.slots[slot].fetch_and(COUNT, AcqRel);    // 봉인만 푼다. §4.5
     } else {
-        self.slots[slot].store(0, Ordering::Release);   // §4.5
+        q.events.push_back(Event::Barrier(slot));
+        self.open.store((slot + 1) % POOL, Release);
     }
 
+    // 주소를 링에 쓴다.
+    let from = q.tail;
+    for (i, addr) in addrs.iter().enumerate() {
+        self.addrs[(from + i) % RING].store(*addr, Release);
+    }
+    q.tail = from + addrs.len();
+
+    // 꼬리 합치기. 링은 tail에 이어 붙으므로 방금 쓴 것이 앞엣것과 연속이다 --
+    // 복사도 새 칸도 없이 끝 위치만 올리면 된다.
     match q.events.back_mut() {
-        // 꼬리가 Release면 칸을 늘리지 않고 주소만 붙인다
-        Some(Event::Release(v)) if v.try_reserve(addrs.len()).is_ok() => {
-            v.extend_from_slice(addrs)
-        }
-        _ => q.push_release(addrs),
+        Some(Event::Release(tail_to)) => *tail_to = q.tail,
+        _ => q.events.push_back(Event::Release(q.tail)),
     }
 
-    q.arm_gate_if_full();
+    q.gated |= q.events.len() >= self.cap;
     drop(q);
-    self.bell.notify_one();
+    self.ring();                     // 게이트를 닫았을 수 있다. §6.2
 }
 ```
 
-### 5.3 sweeper
+**주소는 `Vec`이 아니라 고정 링에 들어간다.** `Event::Release`는 그 링의 끝 위치만 들고,
+시작은 언제나 `head`다(칸끼리 이어져 있다). 그래서 `retire`에 할당이 하나도 없다.
+
+**봉인 해제가 `store(0)`이 아니라 `fetch_and(COUNT)`인 이유:** 봉인과 이 줄 사이에 붙으려다
+물러나는 검색이 있을 수 있고, 그 `fetch_add`와 `fetch_sub` 사이에 0을 덮어쓰면 뺄 때
+언더플로가 난다. 플래그만 끈다.
+
+### 5.3 배출 — sweeper와 검색 둘 다 한다
 
 ```rust
-fn drain(&self) {
-    loop {
-        let batch = {
-            let mut q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
-            match q.events.front() {
-                None => { self.bell.wait(q); continue; }
-
-                Some(Event::Barrier(slot)) => {
-                    let s = *slot;
-                    if self.slots[s].load(Ordering::Acquire) & COUNT > 0 {
-                        self.bell.wait(q);                   // 안 풀렸다
-                        continue;
-                    }
-                    self.slots[s].store(0, Ordering::Release);  // 재사용 준비
-                    q.events.pop_front();
-                    q.release_gate_if_room(&self.gate);
-                    continue;
+fn drain_once(&self, elements: &dyn Elements) -> Progress {
+    let (from, to) = {
+        let mut q = self.queue.lock()...;
+        if q.draining { return Progress::Blocked; }     // 다른 쪽이 놓는 중
+        match q.events.front() {
+            None => return Progress::Empty,
+            Some(Event::Barrier(slot)) => {
+                if self.slots[*slot].load(Acquire) & COUNT > 0 {
+                    return Progress::Blocked;            // 안 풀렸다
                 }
-
-                Some(Event::Release(_)) => {
-                    let Some(Event::Release(v)) = q.events.pop_front() else { unreachable!() };
-                    q.release_gate_if_room(&self.gate);
-                    v                                        // 뮤텍스를 놓고 나서
-                }
+                self.slots[*slot].fetch_and(COUNT, AcqRel);
+                q.events.pop_front();
+                return Progress::Released(0);
             }
-        };
-        self.elements.release(&batch);                       // 아무 락도 쥐지 않은 채
-    }
+            Some(Event::Release(to)) => { q.draining = true; (q.head, *to) }
+        }
+    };
+    let guard = Draining::new(self);      // 패닉해도 플래그를 되돌린다
+
+    self.release_span(elements, from, to);   // 락 없이. 스택 버퍼로 쪼갠다
+
+    let more = { /* q.draining = false; q.head = to; 칸 정리 */ };
+    guard.disarm();
+    if more { self.ring(); }              // 막혀 물러난 배출자를 다시 부른다
+    Progress::Released(to - from)
 }
 ```
 
-`release`가 **아무 락도 쥐지 않은 채** 불리는 것이 구조에서 나온다 — 배치를 지역 `Vec`으로
-꺼냈기 때문이다. `release` → `do_item_release`가 unlink 콜백을 재진입시켜도
-([index.rs:840](../../../src/handler/usearch/index.rs)) 그 콜백은 큐 뮤텍스를 새로 잡고
-자기 항목을 뒤에 붙일 뿐이다.
+**`head`는 다 놓은 뒤에 올린다.** 그 사이 `retire`의 자리 검사가 `[head, tail)`을 비어 있지
+않다고 보므로, 지금 읽는 구간 위로 감아서 쓰지 못한다. 이것이 링이 겹치지 않는 근거 전부다.
 
-### 5.4 종은 뮤텍스를 거쳐 울린다
+**`draining`이 필요한 이유:** `release`를 부르는 동안 칸은 큐에 남아 있다. 표시가 없으면 두
+번째 배출자가 같은 구간을 집어 **이중 해제**를 낸다. 그리고 `release`는 FFI로 나가 재진입한
+콜백을 부를 수 있으므로, 플래그는 반드시 RAII 가드로 되돌린다 — 선 채 남으면 그 인덱스는
+영영 못 비우고 게이트도 안 열려 모든 검색이 `Busy`가 된다.
+
+**놓는 사이에 `retire`가 같은 칸에 더 붙였으면** 칸을 빼지 않는다. 빼면 아직 안 놓은 주소를
+잃는다.
+
+#### 누가 부르나
+
+| | |
+|---|---|
+| **sweeper** | 매 바퀴. 종이 울리거나 `TICK`이 지나면 깬다 |
+| **검색** | 봉인된 배리어를 0으로 만든 마지막 검색이 나가는 길에 (`Reading::leave`가 알려준다). `READER_DRAIN_BUDGET`개까지만 — 이 비용이 요청 응답에 붙는다. 상한에 걸리면 종을 울려 나머지를 sweeper에게 넘긴다 |
+
+검색이 배출해도 되는 이유는 그 지점에서 그래프 락도 `held` 락도 cache lock도 쥐고 있지
+않기 때문이다. 금지된 것은 **retire한 스레드가 놓는 것**이다 — 그쪽은 unlink 콜백이라 cache
+lock을 쥐고 있다.
+
+### 5.4 종
 
 ```rust
-fn ring_bell(&self) {
-    let _q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
-    drop(_q);
-    self.bell.notify_one();
+bell: OnceLock<Arc<dyn Fn() + Send + Sync>>,   // sweep::wake를 담는다
+
+fn ring(&self) {
+    let Some(bell) = self.bell.get() else { return };
+    bell();
 }
 ```
 
-sweeper가 "안 풀렸다"를 확인하고 `wait`에 들어가기 전에 종이 울리면 그 알림이 사라진다.
-뮤텍스를 거치면 sweeper가 `wait`에 들어간 뒤에만 울린다.
+**알림 유실을 막는 것은 종이 아니라 sweeper 쪽이다.** 여기서 이 큐의 뮤텍스를 거쳐봐야
+아무것도 안 지킨다 — sweeper가 기다리는 뮤텍스는 자기 것이지 이 큐의 것이 아니다.
+`sweep::wake`가 **그 뮤텍스 안에서** `pending` 플래그를 세우고, sweeper는 기다릴지 정할 때
+그 플래그를 본다. 그래서 확인과 `wait` 사이에 울린 종이 사라지지 않는다.
 
-이 경로는 **봉인된 배리어당 한 번**이다. 검색 경로의 비용이 아니다(§5.1).
+종을 등록하는 것은 레지스트리 삽입 경로다(`AnnIndex::new`가 아니다). 울리면 sweeper의
+`LazyLock`이 강제되어 스레드가 뜨는데, 단위 테스트가 `AnnIndex`를 만들 때 그러면 안 된다.
+
+울리는 곳은 넷이다.
+
+| 누가 | 언제 |
+|---|---|
+| `Reading::drop` | 봉인된 배리어를 0으로 만들었을 때. 검색이 `?`로 일찍 빠지는 경로 |
+| `attach`의 물러남 | 같은 조건. 봉인된 슬롯에 붙으려다 물러나며 마지막을 치웠을 때 |
+| `retire` | 게이트를 닫았을 수 있으므로 매번 |
+| `drain_once` | 다 놓고도 큐에 남았을 때. `draining`에 막혀 물러난 배출자를 다시 부른다 |
+
+`Reading::leave`는 **울리지 않는다.** 호출자가 곧바로 직접 비우기 때문이고, 상한에 걸리면
+그때 호출자가 울린다(§5.3).
 
 ## 6. 캡과 밸브
 
@@ -430,7 +494,21 @@ sweeper가 **맨 앞 배리어에서 멈춘 동안에만** 쌓인다. 안 막혀
 
 검색 대기에는 타임아웃을 둔다. 만료되면 `SERVER_ERROR`로 답하고 데몬은 살아 있는다.
 
-### 6.3 주소 수는 캡을 걸지 않는다
+### 6.3 상수
+
+| | 값 | 무엇을 정하나 |
+|---|---|---|
+| `CAP` | 1024 | 칸이 이만큼이면 게이트를 닫는다. 고수위 |
+| `POOL` | `CAP + 2` | 배리어 슬롯 수 (§4.5) |
+| `RING` | 4096 | 놓아줄 주소를 담는 링. 넘치면 그 배치를 포기하고 게이트를 닫는다 |
+| `EVENT_MARGIN` | 256 | 칸을 `CAP`보다 이만큼 더 잡아둔다. 게이트가 닫힌 뒤에도 늘 수 있는 몫 |
+| `RELEASE_CHUNK` | 64 | `release`에 한 번에 넘기는 주소 수. 스택 버퍼라 힙을 안 쓴다 |
+| `READER_DRAIN_BUDGET` | 8 | 검색이 나가는 길에 처리할 칸 수의 상한 (§5.3) |
+| `GATE_TIMEOUT` | 2초 | 게이트 대기 상한. sweeper `TICK`의 두 배 — 같으면 종과 `wait_timeout` 진입이 겹쳤을 때 대기 중인 검색이 한 바퀴도 못 얻고 `Busy`를 받을 수 있다 |
+
+인덱스당 상주 메모리는 `slots` 8KB + `addrs` 32KB + `events` 약 30KB = **70KB 남짓**이다.
+
+### 6.4 주소 수는 캡을 걸지 않는다
 
 **엔진이 이미 속도를 제한하기 때문이다.**
 
@@ -452,7 +530,7 @@ sweeper가 **맨 앞 배리어에서 멈춘 동안에만** 쌓인다. 안 막혀
 되살아나면 그때 그 경로만 배치로 나눠 넣으면 되고, 그것은 이 설계를 바꾸지 않는다.
 
 한편 delete와 검색이 함께 계속 오는 경우는 retire마다 `[Barrier, Release]`가 붙으므로
-**주소 수가 칸 수에 자연히 묶인다.** 두 경우 모두 칸 수 캡 하나로 덮인다.
+**주소 수가 칸 수에 자연히 묶인다.** 두 경우 모두 칸 수 캡 하나로 덮인다. 링이 차는 것은 별개의 하드 상한이고, 닿으면 게이트를 닫아 압력을 검색 쪽에 전달한다(§6.2).
 
 ## 7. 잠금 순서
 
