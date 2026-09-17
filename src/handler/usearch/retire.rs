@@ -15,6 +15,17 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 
+/// 비워진 주소 버퍼를 몇 개까지 쥐고 있을지.
+///
+/// sweeper가 `Release`를 처리하고 나면 그 `Vec`은 비어 있지만 용량은 그대로다.
+/// 버리지 않고 돌려받으면 다음 `Release` 칸이 할당 없이 채워진다 -- retire는
+/// unlink 콜백에서 cache lock을 쥔 채 불리므로, 그 경로에서 `malloc`을 부르지
+/// 않는 것이 이 풀의 목적이다.
+///
+/// 정상 상태에서 도는 버퍼는 한두 개다. 상한이 있는 것은 sweeper가 막혔다
+/// 풀리면서 수백 개를 한꺼번에 돌려줄 때 그것을 전부 쥐고 있지 않기 위해서다.
+pub(super) const SPARE_MAX: usize = 8;
+
 /// 큐가 이만큼 차면 게이트를 닫는다. 고수위 표시이지 상한이 아니다.
 pub(super) const CAP: usize = 1024;
 
@@ -53,9 +64,23 @@ enum Event {
 struct Queue {
     events: VecDeque<Event>,
     gated: bool,
+    /// sweeper가 비워서 돌려준 주소 버퍼. `SPARE_MAX`개까지 쥔다.
+    spare: Vec<Vec<u64>>,
 }
 
 impl Queue {
+    /// 비워진 버퍼를 풀에 돌려놓는다. 상한을 넘거나 용량이 없으면 그냥 버린다.
+    fn recycle(&mut self, mut buf: Vec<u64>) {
+        buf.clear();
+        if buf.capacity() == 0 || self.spare.len() >= SPARE_MAX {
+            return;
+        }
+        if self.spare.try_reserve(1).is_err() {
+            return;
+        }
+        self.spare.push(buf);
+    }
+
     /// 자리가 났으면 게이트를 연다. 푸는 것은 `drain_once`가 한다.
     fn reopen_if_room(&mut self, cap: usize) -> bool {
         if self.gated && self.events.len() < cap {
@@ -76,8 +101,11 @@ impl Queue {
             tail.extend_from_slice(addrs);
             return;
         }
-        let mut owned = Vec::new();
-        if owned.try_reserve_exact(addrs.len()).is_err() || self.events.try_reserve(1).is_err() {
+        // 새 칸이 필요하다. 돌려받은 버퍼가 있으면 그것을 쓴다 -- 이미 용량이
+        // 있으므로 정상 상태에서는 여기서 할당이 일어나지 않는다.
+        let mut owned = self.spare.pop().unwrap_or_default();
+        if owned.try_reserve(addrs.len()).is_err() || self.events.try_reserve(1).is_err() {
+            self.recycle(owned);
             eprintln!(
                 "ArcVector: could not queue {} item reference(s) for release; \
                  they stay pinned until this process ends",
@@ -308,7 +336,16 @@ impl Retirement {
         };
 
         elements.release(&batch);
-        Progress::Released(batch.len())
+        let freed = batch.len();
+
+        // 버퍼를 돌려준다. `release`가 끝난 뒤라 어떤 락도 쥐고 있지 않고, 여기서
+        // 다시 잡는 큐 뮤텍스 안에서는 엔진을 건드리지 않는다.
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .recycle(batch);
+
+        Progress::Released(freed)
     }
 
     /// 큐에 남은 `Release`를 전부 즉시 놓아주고 큐를 비운다. `Barrier`는 버린다.
@@ -407,6 +444,15 @@ impl Retirement {
     }
 
     #[cfg(test)]
+    pub(super) fn spare_len(&self) -> usize {
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .spare
+            .len()
+    }
+
+    #[cfg(test)]
     pub(super) fn queue_len(&self) -> usize {
         self.queue
             .lock()
@@ -502,6 +548,41 @@ mod tests {
             "그 다음이 릴리스"
         );
         assert_eq!(e.freed(), vec![0x10]);
+    }
+
+    #[test]
+    fn a_drained_buffer_comes_back_for_the_next_release() {
+        let r = Retirement::new();
+        let e = FakeElements::default();
+
+        r.retire(&[0x10]);
+        assert_eq!(r.spare_len(), 0, "아직 sweeper가 돌려준 것이 없다");
+
+        while matches!(r.drain_once(&e), Progress::Released(_)) {}
+        assert_eq!(r.spare_len(), 1, "비운 버퍼를 풀에 돌려준다");
+
+        r.retire(&[0x20]);
+        assert_eq!(r.spare_len(), 0, "다음 retire가 그 버퍼를 다시 쓴다");
+    }
+
+    #[test]
+    fn the_spare_pool_does_not_hoard_after_a_burst() {
+        let r = Retirement::new();
+        let e = FakeElements::default();
+
+        // 배리어를 사이사이 끼워 Release 칸을 여러 개 만든다.
+        for addr in 0..(SPARE_MAX as u64 + 5) {
+            let hold = r.enter().unwrap();
+            r.retire(&[addr]);
+            drop(hold);
+        }
+        while !matches!(r.drain_once(&e), Progress::Empty) {}
+
+        assert!(
+            r.spare_len() <= SPARE_MAX,
+            "상한을 넘겨 쥐고 있다: {}",
+            r.spare_len()
+        );
     }
 
     #[test]
