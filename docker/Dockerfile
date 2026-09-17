@@ -37,10 +37,13 @@ ENV ARCVECTOR_MEMCACHED=/arcus/bin/memcached \
 WORKDIR /src
 
 # Compile the dependencies against a placeholder crate first, so editing sources
-# does not recompile usearch's C++ core. build.rs and the headers come along
-# because bindgen runs during this build too.
+# does not recompile usearch's C++ core. build.rs runs during this build too, so
+# it needs both the headers and the committed bindings it checks them against --
+# without bindings/ it panics with "engine_api.rs is missing" before any
+# dependency is built.
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY include ./include
+COPY bindings ./bindings
 RUN mkdir src && echo "" > src/lib.rs && cargo build --lib
 
 COPY src ./src
