@@ -61,7 +61,7 @@ fn state() -> MutexGuard<'static, State> {
 ///
 /// Freeing one returns every element it holds to the engine, which is work a
 /// request should not be made to wait through.
-pub(in crate::handler) fn retire(evicted: Option<Arc<VectorIndex>>) {
+pub(crate) fn retire(evicted: Option<Arc<VectorIndex>>) {
     let Some(index) = evicted else { return };
     let mut state = state();
     if state.retired.try_reserve(1).is_err() {
@@ -114,6 +114,13 @@ fn run() {
             last_round = Instant::now();
             for index in &indexes {
                 index.ann.retry_stuck();
+
+                // 복구를 못 맡긴 인덱스를 다시 맡긴다. 풀의 대기열이 가득 차
+                // 있었을 수 있는데, `BUILDING`으로 남으면 그 이름은 어떤 명령에도
+                // 안 보이므로 여기서 집어주지 않으면 영영 안 올라온다.
+                if index.state() == registry::BUILDING {
+                    crate::trigger::recover::submit(index);
+                }
             }
         }
     }

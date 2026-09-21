@@ -17,8 +17,14 @@
 use std::os::raw::c_void;
 use std::sync::Arc;
 
-use crate::handler::arcus::engine::Store;
+use crate::handler::access::sweep;
+use crate::handler::arcus::element::MetaRecord;
+use crate::handler::arcus::engine::{ItemElements, Store};
 use crate::handler::registry::{self, VectorIndex};
+use crate::handler::usearch::AnnIndex;
+use crate::handler::usearch::metric::Metric;
+use crate::trigger::pending::{self, Unlinked};
+use crate::trigger::recover;
 
 use crate::engine_api::{
     ENGINE_ERROR_CODE, ENGINE_ERROR_CODE_ENGINE_ENOMEM, ENGINE_EVENT_TYPE,
@@ -31,7 +37,6 @@ use crate::engine_api::{
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Decision {
     /// 받았다. 엔진은 아무것도 되돌리지 않는다.
-    #[allow(dead_code)] // 세 핸들러가 아직 안 붙었다.
     Took,
     /// 못 받았다. 엔진이 참조를 회수한다.
     Declined,
@@ -141,37 +146,133 @@ unsafe fn dispatch(event: Event, ev: &event_data_t) -> Decision {
     }
 }
 
-/// 키를 읽어 우리 인덱스를 찾는다. 우리 키가 아니거나 모르는 인덱스면 `None`.
-fn index_of(store: &Store, addr: u64) -> Option<Arc<VectorIndex>> {
+/// 아이템의 키를 읽어 어느 인덱스의 무엇인지 알아낸다.
+///
+/// 두 번째 값이 `true`면 그 인덱스의 **메타 레코드**다 -- id가 빈 키다. 메타를
+/// 벡터로 오해하면 본문이 벡터가 아니라 매번 거절하게 되고, 복제본에서는 인덱스가
+/// 생겨야 할 바로 그 순간을 놓친다.
+fn route(store: &Store, addr: u64) -> Option<(String, bool)> {
     if addr == 0 {
         return None;
     }
-    let name = store.with_item_at(addr, |key, _value| {
-        crate::trigger::key::parse(key).map(|p| p.index.to_owned())
-    })??;
-    registry::get(&name)
+    store.with_item_at(addr, |key, _value| {
+        crate::trigger::key::parse(key).map(|p| (p.index.to_owned(), p.id.is_empty()))
+    })?
 }
 
 /// 아이템이 링크됐다. 그 벡터를 그래프에 넣는다.
 ///
-/// 엔진이 우리 몫의 참조를 이미 잡아뒀다. 넣었으면 그대로 들고, 못 넣었으면
-/// 거절해서 엔진이 회수하게 한다.
+/// 엔진이 우리 몫의 참조를 이미 잡아뒀다. 인덱스를 아직 모르면 -- 복제본에서
+/// 메타보다 벡터가 먼저 도착한 경우다 -- 주소를 붙잡아 뒀다가 메타가 올 때
+/// 복구가 넣는다.
 fn on_link(store: &Store, addr: u64) -> Decision {
-    let Some(index) = index_of(store, addr) else {
+    let Some((name, is_meta)) = route(store, addr) else {
         return Decision::NotOurs;
     };
-    let layout = index.ann.layout;
+    if is_meta {
+        return on_meta(store, addr, &name);
+    }
 
-    let Some(Some(())) = store.with_item_at(addr, |_key, value| {
-        layout
-            .vector_of(value)
-            .map(|vector| index.ann.link_node(addr, vector))
-            .and_then(|r| r.ok())
-    }) else {
-        eprintln!("ArcVector: the graph would not take a linked item; the engine reclaims it");
-        return Decision::Declined;
+    let Some(index) = registry::get(&name) else {
+        if pending::push(&name, addr) {
+            return Decision::Took;
+        }
+        // LINK의 거절은 엔진이 보지 않으므로 여기서 참조를 돌려줄 길이 없다.
+        // 이 아이템이 빠질 때 `on_unlink`이 거절해서 그때 회수된다.
+        eprintln!(
+            "ArcVector: no room to hold '{name}' vectors until its metadata arrives; \
+             this one will be missing from the graph"
+        );
+        return Decision::NotOurs;
     };
+    link_into(store, &index, addr)
+}
+
+/// 주소 하나를 그래프에 넣는다.
+fn link_into(store: &Store, index: &VectorIndex, addr: u64) -> Decision {
+    let layout = index.ann.layout;
+    let took = store
+        .with_item_at(addr, |_key, value| {
+            layout
+                .vector_of(value)
+                .map(|vector| index.ann.link_node(addr, vector))
+        })
+        .flatten()
+        .is_some_and(|r| r.is_ok());
+
+    if took {
+        Decision::Took
+    } else {
+        eprintln!("ArcVector: the graph would not take a linked item; the engine reclaims it");
+        Decision::Declined
+    }
+}
+
+/// 인덱스의 메타 레코드가 링크됐다.
+///
+/// 이 노드의 `vcreate`가 쓴 것이면 레지스트리에 이미 있다 -- 그래프에 들어갈
+/// 것이 없으니 그대로 받는다. 없으면 복제나 persistence 재생으로 들어온 것이고,
+/// **그때가 이 인덱스가 이 프로세스에서 생기는 순간**이다. 복제본에는 `vcreate`가
+/// 오지 않으므로 이 경로 말고는 인덱스가 생길 길이 없다.
+///
+/// 여기서는 등록까지만 하고 보류된 벡터는 풀 스레드가 넣는다. 이 함수는 엔진의
+/// cache lock을 쥔 채 돌기 때문이다.
+fn on_meta(store: &Store, addr: u64, name: &str) -> Decision {
+    if registry::contains(name) {
+        return Decision::Took;
+    }
+
+    let Some(index) = build(store, addr, name) else {
+        return Decision::NotOurs;
+    };
+    let Ok((registered, previous)) = registry::put(index) else {
+        eprintln!("ArcVector: the index registry could not grow; '{name}' stays unknown");
+        return Decision::NotOurs;
+    };
+    sweep::retire(previous);
+
+    if !recover::submit(&registered) {
+        // 안전망은 sweeper다. 매 틱 `BUILDING`으로 남은 인덱스를 다시 맡긴다.
+        eprintln!("ArcVector: '{name}' waits for a free worker before it can recover");
+    }
     Decision::Took
+}
+
+/// 메타 본문으로 인덱스를 세운다. 아직 등록하지는 않는다.
+///
+/// `AnnIndex::new`가 usearch의 그래프를 잡으므로 cache lock 아래에서 도는
+/// 할당이다. 인덱스 하나당 한 번뿐이라 감수한다 -- 벡터를 넣는 쪽이 비싼
+/// 일이고, 그건 풀로 넘어간다.
+fn build(store: &Store, addr: u64, name: &str) -> Option<VectorIndex> {
+    let decoded = store
+        .with_item_at(addr, |_key, value| MetaRecord::decode(value).ok())
+        .flatten();
+    let Some((meta, layout)) = decoded else {
+        eprintln!("ArcVector: the metadata of '{name}' is unreadable; the index stays unknown");
+        return None;
+    };
+    let Some(metric) = Metric::parse(&meta.metric) else {
+        eprintln!(
+            "ArcVector: the metadata of '{name}' names metric '{}', which this build \
+             does not know",
+            meta.metric
+        );
+        return None;
+    };
+    match AnnIndex::new(
+        layout,
+        metric,
+        meta.connectivity,
+        meta.expansion_add,
+        meta.expansion_search,
+        Arc::new(ItemElements),
+    ) {
+        Ok(ann) => Some(VectorIndex::building(name.to_owned(), ann, meta.maxcount)),
+        Err(e) => {
+            eprintln!("ArcVector: could not build the graph for '{name}': {e}");
+            None
+        }
+    }
 }
 
 /// 아이템이 빠진다. 그래프에서 빼고, 참조를 sweeper에게 넘긴다.
@@ -180,8 +281,24 @@ fn on_link(store: &Store, addr: u64) -> Decision {
 /// 그때는 인덱스를 잠그고 거절한다. 잠금이 **진행 중인 역참조가 끝나기를 기다린
 /// 뒤에** 돌아오므로, 엔진이 그 자리에서 해제해도 읽고 있는 검색이 없다.
 fn on_unlink(store: &Store, addr: u64) -> Decision {
-    let Some(index) = index_of(store, addr) else {
+    let Some((name, _is_meta)) = route(store, addr) else {
         return Decision::NotOurs;
+    };
+
+    match pending::unlink(&name, addr) {
+        // 그래프에 들어간 적이 없다. 거절하면 엔진이 참조를 회수한다.
+        Unlinked::NeverLinked => return Decision::Declined,
+        // 복구가 넣는 중이다. 받아두면 그쪽이 노드를 빼고 참조를 돌려준다.
+        Unlinked::Recovering => return Decision::Took,
+        Unlinked::NotWaiting => {}
+    }
+
+    let Some(index) = registry::get(&name) else {
+        // 인덱스가 레지스트리를 떠났다 -- `vdrop`이 메타를 지우고 프리픽스를
+        // flush하는 중이다. 그 그래프는 이미 버려졌고 아무도 이 주소를 놓아주지
+        // 않으므로, 거절해서 엔진이 회수하게 한다. 이것이 없으면 드롭된 인덱스의
+        // 아이템이 프로세스 끝까지 붙잡힌다.
+        return Decision::Declined;
     };
 
     index.ann.unlink_at(addr);
@@ -198,17 +315,49 @@ fn on_unlink(store: &Store, addr: u64) -> Decision {
 /// **그래프를 먼저 옮긴다.** 엔진이 해시테이블을 바꾸기 전에 새 주소를 가리켜야,
 /// 그 사이의 조회가 사라질 주소를 안 따라간다.
 ///
-/// 옮긴 뒤 old를 큐에 넣는다. 못 넣으면 그래프에서 노드를 빼고 거절한다 --
-/// 거절하면 엔진이 `INCR(new)`를 하지 않으므로, 그대로 두면 우리 것이 아닌
-/// 포인터를 그래프가 들게 된다.
+/// REPLACE에서 거절은 "new를 못 받았다"가 아니라 **"old의 참조를 도로 가져가라"**
+/// 하나뿐이다 -- 엔진은 `ret`과 무관하게 `INCR(new)`를 하고, `ret`이 실패일 때만
+/// `DECR(old)`를 한다.
 fn on_replace(store: &Store, old: u64, new: u64) -> Decision {
-    let Some(index) = index_of(store, old) else {
+    let Some((name, is_meta)) = route(store, old) else {
         return Decision::NotOurs;
     };
 
+    if is_meta {
+        // 메타는 그래프에 노드가 없다. 아직 모르는 인덱스면 새 본문으로 세우고,
+        // 어느 쪽이든 old의 참조만 엔진에 돌려주면 된다.
+        if !registry::contains(&name) {
+            on_meta(store, new, &name);
+        }
+        return Decision::Declined;
+    }
+
+    let waiting = pending::unlink(&name, old);
+
+    let Some(index) = registry::get(&name) else {
+        // 메타가 아직 안 왔다. new를 old의 자리에 붙잡아 둔다.
+        if !pending::push(&name, new) {
+            eprintln!("ArcVector: no room to hold a replaced '{name}' vector; it is dropped");
+        }
+        return Decision::Declined;
+    };
+
+    if waiting != Unlinked::NotWaiting {
+        // old는 그래프에 들어간 적이 없다. new만 정상 경로로 넣는다. 못 넣으면
+        // `link_into`가 로그를 남기고, new의 참조는 그 아이템이 빠질 때
+        // `on_unlink`이 거절해서 회수된다.
+        link_into(store, &index, new);
+        return match waiting {
+            // 복구가 old를 들고 있다. 그쪽이 빼고 돌려준다.
+            Unlinked::Recovering => Decision::Took,
+            // 아무도 안 들고 있다. 엔진이 회수한다.
+            _ => Decision::Declined,
+        };
+    }
+
     if !index.ann.rename_node(old, new) {
         // 그래프가 old를 갖고 있지 않았다. 새로 넣는 것과 같다.
-        return on_link(store, new);
+        return link_into(store, &index, new);
     }
 
     if index.ann.retire_one(old) {

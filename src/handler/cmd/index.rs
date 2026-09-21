@@ -52,6 +52,9 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
 
     match store.add_meta(name, &meta, layout) {
         Ok(()) => {
+            // 이 이름으로 먼저 도착해 기다리던 벡터가 있으면 여기서 그래프에
+            // 넣는다. 보통은 없어서 곧장 지나간다.
+            crate::trigger::recover::adopt(&registered);
             registered.publish();
             registered.mark_serving();
             if previous.is_some() {
@@ -161,9 +164,11 @@ pub fn vstats() -> Result<Reply> {
          STAT vectors {vectors}\r\n\
          STAT index_held_bytes {held_bytes}\r\n\
          STAT index_used_bytes {used_bytes}\r\n\
-         STAT attr_bytes_per_vector {}\r\n",
+         STAT attr_bytes_per_vector {}\r\n\
+         STAT vectors_awaiting_metadata {}\r\n",
         indexes.len(),
         element::ATTR_BYTES,
+        crate::trigger::pending::held(),
     );
     out.push_str(&per_index);
     out.push_str("END\r\n");

@@ -322,6 +322,34 @@ impl Client {
         let _ = self.stream.set_read_timeout(previous);
     }
 
+    /// Reads the payload of a single-key `get`, byte for byte.
+    ///
+    /// The bodies this crate stores are binary -- a length header, the
+    /// attribute bytes, then the packed vector -- so a test that replays one
+    /// cannot go through `String`.
+    pub fn get_value(&mut self, key: &str) -> Option<Vec<u8>> {
+        self.write(&format!("get {key}\r\n"));
+        let reply = self.read_raw();
+        let head = reply.windows(2).position(|w| w == b"\r\n")?;
+        let header = std::str::from_utf8(&reply[..head]).ok()?;
+        let len: usize = header.rsplit(' ').next()?.parse().ok()?;
+        let from = head + 2;
+        reply.get(from..from + len).map(<[u8]>::to_vec)
+    }
+
+    /// Writes a body verbatim with a plain `set`, bypassing this crate's
+    /// commands. Replaying an item the way replication delivers it.
+    pub fn set_value(&mut self, key: &str, body: &[u8]) -> String {
+        let mut raw = format!("set {key} 0 0 {}\r\n", body.len()).into_bytes();
+        raw.extend_from_slice(body);
+        raw.extend_from_slice(b"\r\n");
+        self.stream
+            .write_all(&raw)
+            .expect("the connection accepts writes");
+        self.stream.flush().expect("the connection flushes");
+        String::from_utf8_lossy(&self.read_raw()).into_owned()
+    }
+
     fn write(&mut self, raw: &str) {
         self.stream
             .write_all(raw.as_bytes())
@@ -330,13 +358,17 @@ impl Client {
     }
 
     fn read_reply(&mut self) -> String {
-        let mut reply = String::new();
+        String::from_utf8_lossy(&self.read_raw()).into_owned()
+    }
+
+    fn read_raw(&mut self) -> Vec<u8> {
+        let mut reply = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
             match self.stream.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    reply.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    reply.extend_from_slice(&buf[..n]);
                     if is_complete(&reply) {
                         break;
                     }
@@ -348,11 +380,12 @@ impl Client {
     }
 }
 
-fn is_complete(reply: &str) -> bool {
-    if TERMINATORS.iter().any(|t| reply.ends_with(t)) {
+fn is_complete(reply: &[u8]) -> bool {
+    if TERMINATORS.iter().any(|t| reply.ends_with(t.as_bytes())) {
         return true;
     }
-    let Some(last) = reply
+    let text = String::from_utf8_lossy(reply);
+    let Some(last) = text
         .strip_suffix("\r\n")
         .and_then(|s| s.rsplit("\r\n").next())
     else {

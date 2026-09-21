@@ -3,7 +3,7 @@ pub mod quant;
 pub mod registry;
 pub mod usearch;
 
-mod access;
+pub(crate) mod access;
 mod cmd;
 
 use std::os::raw::c_void;

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, TryReserveError};
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
 use crate::handler::access::sweep;
@@ -29,6 +29,9 @@ pub struct VectorIndex {
     state: AtomicU8,
 
     published: AtomicU64,
+
+    /// 복구가 이미 맡겨졌다. 두 번 맡기는 것을 막는 표다.
+    recovering: AtomicBool,
 }
 
 impl VectorIndex {
@@ -53,6 +56,7 @@ impl VectorIndex {
             maxcount,
             state: AtomicU8::new(state),
             published: AtomicU64::new(0),
+            recovering: AtomicBool::new(false),
         }
     }
 
@@ -84,7 +88,22 @@ impl VectorIndex {
     /// There is no ownership token any more: an index is in this registry
     /// because the trigger callback saw its metadata item linked, and no other
     /// process can have put it there.
-    pub(in crate::handler) fn mark_serving(&self) {
+    /// 복구 표를 끊는다. 이미 누가 끊었으면 `false`.
+    ///
+    /// 맡기는 쪽과 sweeper의 안전망이 동시에 같은 인덱스를 집을 수 있어서,
+    /// 일감을 큐에 넣기 **전에** 여기서 하나만 통과시킨다.
+    pub(crate) fn claim_recovery(&self) -> bool {
+        self.recovering
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// 표를 돌려준다. 복구가 끝났거나 맡기지 못했을 때 부른다.
+    pub(crate) fn release_recovery(&self) {
+        self.recovering.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn mark_serving(&self) {
         self.state.store(SERVING, Ordering::Release);
     }
 
@@ -120,6 +139,7 @@ pub fn put(
     index: VectorIndex,
 ) -> Result<(Arc<VectorIndex>, Option<Arc<VectorIndex>>), TryReserveError> {
     sweep::ensure_sweeper();
+    crate::handler::access::pool::ensure_pool();
     index.ann.set_bell();
     let mut reg = write();
     reg.try_reserve(1)?;

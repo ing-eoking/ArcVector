@@ -499,3 +499,52 @@ fn attr_json_must_arrive_as_one_argument() {
 
     client.send(&format!("vdrop {ix}"));
 }
+
+#[test]
+fn a_replica_builds_its_index_when_the_metadata_lands_after_the_vectors() {
+    // A replica never sees `vcreate`. It sees items, and a vector can arrive
+    // before the metadata that says what the index is -- so the link callback
+    // has to hold the vector until the metadata turns up and the graph exists.
+    //
+    // Replaying the two items by hand in that order is the only way to produce
+    // it from one server: it is exactly what replication delivers.
+    session!(_server, client);
+    let src = index_name("replicasrc");
+    let dst = index_name("replicadst");
+
+    client.send(&format!("vcreate {src} 2 METRIC l2"));
+    assert_reply(&client.vadd(&src, "a", 2, "1.0 0.0"), "STORED\r\n");
+
+    let meta = client
+        .get_value(&format!("arcus_event{{{src}}}:"))
+        .expect("the index metadata is an item a client can read");
+    let vector = client
+        .get_value(&format!("arcus_event{{{src}}}:a"))
+        .expect("a vector is an item a client can read");
+
+    // The vector first, with nothing registered under this name.
+    assert_reply(
+        &client.set_value(&format!("arcus_event{{{dst}}}:a"), &vector),
+        "STORED\r\n",
+    );
+    assert_contains(&client.vsim(&dst, 1, 2, "1.0 0.0"), "CLIENT_ERROR");
+
+    // Now the metadata. The index appears and adopts what was waiting.
+    assert_reply(
+        &client.set_value(&format!("arcus_event{{{dst}}}:"), &meta),
+        "STORED\r\n",
+    );
+
+    let mut found = String::new();
+    for _ in 0..100 {
+        found = client.vsim(&dst, 1, 2, "1.0 0.0");
+        if found.contains("VALUE a") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_contains(&found, "VALUE a 1");
+
+    client.send(&format!("vdrop {src}"));
+    client.send(&format!("vdrop {dst}"));
+}

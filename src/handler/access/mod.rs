@@ -1,3 +1,4 @@
+pub(crate) mod pool;
 pub mod sweep;
 
 use std::sync::Arc;
