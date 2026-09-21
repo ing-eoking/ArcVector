@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::handler::access::pool::{self, Job};
 use crate::handler::arcus::engine::Store;
 use crate::handler::registry::VectorIndex;
-use crate::trigger::pending;
+use crate::trigger::waiting;
 
 /// 복구를 풀에 맡긴다. 이미 맡겨져 있거나 대기열이 가득 차면 `false`.
 ///
@@ -53,7 +53,7 @@ pub fn adopt(index: &Arc<VectorIndex>) {
     let Some(store) = Store::background() else {
         // vtable이 없으면 아이템을 읽을 수 없다. 붙잡고 있어봐야 넣을 길이
         // 없으니 목록을 버린다 -- 참조는 각 아이템이 빠질 때 회수된다.
-        pending::forget(name);
+        waiting::forget(name);
         eprintln!("ArcVector: no engine vtable; '{name}' comes up with an empty graph");
         return;
     };
@@ -62,7 +62,7 @@ pub fn adopt(index: &Arc<VectorIndex>) {
     let mut linked = 0usize;
     let mut lost = 0usize;
 
-    while let Some(addr) = pending::claim(name, &mut cursor) {
+    while let Some(addr) = waiting::claim(name, &mut cursor) {
         // `Claimed`인 동안에는 unlink 콜백이 이 주소를 놓아주지 않는다
         // (`pending`의 표를 보라). 그래서 배리어 없이 역참조해도 된다.
         let took = store
@@ -77,7 +77,7 @@ pub fn adopt(index: &Arc<VectorIndex>) {
         // 넣고 **나서** 슬롯을 확인한다. 순서가 반대면 확인과 삽입 사이에 창이
         // 남는다. 실패했더라도 반드시 불러야 한다 -- 슬롯을 `Claimed`로 둔 채
         // 넘어가면 이 주소를 누가 놓아줘야 하는지가 정해지지 않는다.
-        let kept = pending::finish(name, addr);
+        let kept = waiting::finish(name, addr);
 
         match (took, kept) {
             // 그래프에 들어갔다. 이제부터는 평소 경로가 맡는다.
@@ -100,7 +100,7 @@ pub fn adopt(index: &Arc<VectorIndex>) {
         }
     }
 
-    let incomplete = pending::forget(name);
+    let incomplete = waiting::forget(name);
 
     // 기다린 것이 없었으면 조용히 지나간다 -- `vcreate`마다 한 줄씩 찍힐 자리다.
     if incomplete {

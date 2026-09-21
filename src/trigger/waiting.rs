@@ -1,5 +1,10 @@
 //! 메타가 아직 안 온 인덱스의 벡터를 붙잡아 두는 곳.
 //!
+//! **sweeper의 큐와는 관계가 없다.** 여기 있는 주소는 아직 어느 그래프에도
+//! 들어가지 않은 것들이고, 놓아줄 주소를 모아두는 `retire.rs`의 링과는 반대
+//! 방향이다 -- 저쪽은 그래프에서 빠져 엔진에 돌려줄 것을, 이쪽은 그래프에
+//! 들어갈 자리를 기다리는 것을 담는다.
+//!
 //! 복제본에는 `vcreate`가 오지 않는다. 오는 것은 아이템뿐이고, 벡터
 //! `arcus_event{idx}:<id>`가 메타 `arcus_event{idx}:`보다 먼저 도착할 수 있다.
 //! 레지스트리에 인덱스가 없다고 그 링크를 흘려보내면 그 벡터는 나중에 메타가
@@ -60,7 +65,8 @@ struct Waiting {
 #[derive(Default)]
 struct Store {
     by_index: HashMap<String, Waiting>,
-    held: usize,
+    /// 모든 인덱스를 통틀어 붙잡고 있는 주소 수. `MAX`를 재는 자리다.
+    count: usize,
 }
 
 static PENDING: LazyLock<Mutex<Store>> = LazyLock::new(|| Mutex::new(Store::default()));
@@ -83,13 +89,13 @@ pub(crate) enum Unlinked {
 /// 주소를 붙잡아 둔다. 자리가 없으면 `false`.
 pub(crate) fn push(index: &str, addr: u64) -> bool {
     let mut store = store();
-    if store.held >= MAX {
+    if store.count >= MAX {
         if let Some(waiting) = store.by_index.get_mut(index) {
             waiting.incomplete = true;
         }
         return false;
     }
-    store.held += 1;
+    store.count += 1;
     let waiting = store.by_index.entry(index.to_owned()).or_default();
     waiting.order.push(addr);
     waiting.state.insert(addr, Slot::Pending);
@@ -163,20 +169,20 @@ pub(crate) fn forget(index: &str) -> bool {
     let Some(waiting) = store.by_index.remove(index) else {
         return false;
     };
-    store.held = store.held.saturating_sub(waiting.order.len());
+    store.count = store.count.saturating_sub(waiting.order.len());
     waiting.incomplete
 }
 
-/// 아직 붙잡고 있는 주소 수. 진단용.
-pub(crate) fn held() -> usize {
-    store().held
+/// 아직 붙잡고 있는 주소 수. `vstats`가 이것을 보고한다.
+pub(crate) fn count() -> usize {
+    store().count
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 이 모듈의 시험은 전역 목록 하나를 공유한다. `held()`는 이름별이 아니라
+    /// 이 모듈의 시험은 전역 목록 하나를 공유한다. `count()`는 이름별이 아니라
     /// 전체 수라, 병렬로 돌면 서로의 `push`를 세어 엉뚱한 곳에서 터진다.
     static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
@@ -266,12 +272,12 @@ mod tests {
     fn forgetting_gives_the_room_back() {
         let ix = "pending-room";
         let _alone = alone(ix);
-        let before = held();
+        let before = count();
         push(ix, 0x10);
         push(ix, 0x20);
-        assert_eq!(held(), before + 2);
+        assert_eq!(count(), before + 2);
 
         assert!(!forget(ix), "흘려보낸 것이 없었다");
-        assert_eq!(held(), before, "자리를 돌려주지 않으면 상한이 새어나간다");
+        assert_eq!(count(), before, "자리를 돌려주지 않으면 상한이 새어나간다");
     }
 }

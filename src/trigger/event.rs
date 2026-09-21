@@ -23,7 +23,7 @@ use crate::handler::arcus::engine::{ItemElements, Store};
 use crate::handler::registry::{self, VectorIndex};
 use crate::handler::usearch::AnnIndex;
 use crate::handler::usearch::metric::Metric;
-use crate::trigger::pending::{self, Unlinked};
+use crate::trigger::waiting::{self, Unlinked};
 use crate::trigger::recover;
 
 use crate::engine_api::{
@@ -174,7 +174,7 @@ fn on_link(store: &Store, addr: u64) -> Decision {
     }
 
     let Some(index) = registry::get(&name) else {
-        if pending::push(&name, addr) {
+        if waiting::push(&name, addr) {
             return Decision::Took;
         }
         // LINK의 거절은 엔진이 보지 않으므로 여기서 참조를 돌려줄 길이 없다.
@@ -285,7 +285,7 @@ fn on_unlink(store: &Store, addr: u64) -> Decision {
         return Decision::NotOurs;
     };
 
-    match pending::unlink(&name, addr) {
+    match waiting::unlink(&name, addr) {
         // 그래프에 들어간 적이 없다. 거절하면 엔진이 참조를 회수한다.
         Unlinked::NeverLinked => return Decision::Declined,
         // 복구가 넣는 중이다. 받아두면 그쪽이 노드를 빼고 참조를 돌려준다.
@@ -332,11 +332,11 @@ fn on_replace(store: &Store, old: u64, new: u64) -> Decision {
         return Decision::Declined;
     }
 
-    let waiting = pending::unlink(&name, old);
+    let waiting = waiting::unlink(&name, old);
 
     let Some(index) = registry::get(&name) else {
         // 메타가 아직 안 왔다. new를 old의 자리에 붙잡아 둔다.
-        if !pending::push(&name, new) {
+        if !waiting::push(&name, new) {
             eprintln!("ArcVector: no room to hold a replaced '{name}' vector; it is dropped");
         }
         return Decision::Declined;

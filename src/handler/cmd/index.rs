@@ -168,7 +168,7 @@ pub fn vstats() -> Result<Reply> {
          STAT vectors_awaiting_metadata {}\r\n",
         indexes.len(),
         element::ATTR_BYTES,
-        crate::trigger::pending::held(),
+        crate::trigger::waiting::count(),
     );
     out.push_str(&per_index);
     out.push_str("END\r\n");
