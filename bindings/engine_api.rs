@@ -166,7 +166,7 @@ pub const MEMCACHED_VISIBILITY_H: u32 = 1;
 pub const POWER_SMALLEST: u32 = 1;
 pub const POWER_LARGEST: u32 = 200;
 pub const MAX_SLAB_CLASSES: u32 = 201;
-pub const MAX_ENGINE_EVENT_TYPE: u32 = 7;
+pub const MAX_ENGINE_EVENT_TYPE: u32 = 6;
 pub const MEMCACHED_VBUCKET_H: u32 = 1;
 pub const NUM_VBUCKETS: u32 = 65536;
 pub const CMD_SET_VBUCKET: u32 = 131;
@@ -574,6 +574,18 @@ pub struct rpaddr_t {
 pub struct auth_data_t {
     pub username: *const ::std::os::raw::c_char,
     pub config: *const ::std::os::raw::c_char,
+}
+pub const event_type_t_EVENT_LINK: event_type_t = 0;
+pub const event_type_t_EVENT_UNLINK: event_type_t = 1;
+pub const event_type_t_EVENT_REPLACE: event_type_t = 2;
+pub type event_type_t = ::std::os::raw::c_uint;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct event_data_t {
+    pub type_: event_type_t,
+    pub ret: *mut ENGINE_ERROR_CODE,
+    pub new_it: *mut item,
+    pub old_it: *mut item,
 }
 pub type SERVER_HANDLE_V1 = server_handle_v1_t;
 pub const protocol_binary_magic_PROTOCOL_BINARY_REQ: protocol_binary_magic = 128;
@@ -1677,9 +1689,7 @@ pub const ENGINE_EVENT_TYPE_ON_SWITCH_CONN: ENGINE_EVENT_TYPE = 3;
 #[doc = "< Changed log level"]
 pub const ENGINE_EVENT_TYPE_ON_LOG_LEVEL: ENGINE_EVENT_TYPE = 4;
 #[doc = "< An event item was linked"]
-pub const ENGINE_EVENT_TYPE_ON_EV_ITEM_LINK: ENGINE_EVENT_TYPE = 5;
-#[doc = "< An event item was unlinked"]
-pub const ENGINE_EVENT_TYPE_ON_EV_ITEM_UNLINK: ENGINE_EVENT_TYPE = 6;
+pub const ENGINE_EVENT_TYPE_ON_EVENT_ITEM: ENGINE_EVENT_TYPE = 5;
 #[doc = " Event types for callbacks to the engine indicating state\n changes in the server."]
 pub type ENGINE_EVENT_TYPE = ::std::os::raw::c_uint;
 #[doc = " Callback for server events.\n\n @param cookie The cookie provided by the frontend\n @param type the type of event\n @param event_data additional event-specific data.\n @param cb_data data as registered"]

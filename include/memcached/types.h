@@ -471,6 +471,20 @@ extern "C" {
         const char *config;
     } auth_data_t;
 
+    /* Event types for item lifecycle events */
+    typedef enum {
+        EVENT_LINK,
+        EVENT_UNLINK,
+        EVENT_REPLACE,
+    } event_type_t;
+
+    typedef struct {
+        event_type_t type;
+        ENGINE_ERROR_CODE *ret;
+        item *new_it;
+        item *old_it;
+    } event_data_t;
+
     /* Forward declaration of the server handle -- to be filled in later */
     typedef struct server_handle_v1_t SERVER_HANDLE_V1;
 #ifdef __cplusplus
