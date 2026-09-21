@@ -103,6 +103,15 @@ impl VectorIndex {
         self.recovering.store(false, Ordering::Release);
     }
 
+    /// 명령이 더는 이 인덱스를 못 보게 한다. 레지스트리에는 그대로 남는다.
+    ///
+    /// `vdrop`이 프리픽스를 flush하기 전에 부른다. 빼버리면 접근은 막히지만
+    /// 그 뒤에 오는 unlink 콜백이 그래프에 물어볼 곳을 잃어서, 자기가 들고
+    /// 있는 아이템을 못 알아본다(`trigger::event`의 표).
+    pub(in crate::handler) fn mark_draining(&self) {
+        self.state.store(DRAINING, Ordering::Release);
+    }
+
     pub(crate) fn mark_serving(&self) {
         self.state.store(SERVING, Ordering::Release);
     }
@@ -129,6 +138,14 @@ fn write() -> std::sync::RwLockWriteGuard<'static, HashMap<String, Arc<VectorInd
 
 pub fn get(name: &str) -> Option<Arc<VectorIndex>> {
     read().get(name).cloned()
+}
+
+/// 명령이 볼 수 있는 인덱스.
+///
+/// 세우는 중(`BUILDING`)이거나 비워지는 중(`DRAINING`)이면 없는 것과 같다.
+/// `get`은 그래도 찾아준다 -- 트리거 콜백은 그 사이에도 그래프에 물어봐야 한다.
+pub fn serving(name: &str) -> Option<Arc<VectorIndex>> {
+    get(name).filter(|index| index.state() == SERVING)
 }
 
 pub fn contains(name: &str) -> bool {
@@ -268,6 +285,26 @@ mod tests {
         let made = index(name);
         made.mark_state(BUILDING);
         made
+    }
+
+    #[test]
+    fn a_draining_index_answers_no_command_but_still_answers_the_callback() {
+        // `vdrop`은 flush하기 전에 이것을 건다. 명령은 더 못 보지만, flush가
+        // 푸는 unlink 콜백은 그래프에 "이 주소를 내가 들고 있었나"를 물어봐야
+        // 하므로 레지스트리에는 남아 있어야 한다.
+        let name = "registry-test-draining";
+        let (registered, _) = put(index(name)).expect("claim the name");
+        registered.publish();
+        assert!(serving(name).is_some());
+
+        registered.mark_draining();
+
+        assert!(serving(name).is_none(), "명령에는 없는 이름이어야 한다");
+        assert!(
+            get(name).is_some(),
+            "콜백이 물어볼 곳까지 사라지면 그 인덱스의 아이템이 전부 붙잡힌다"
+        );
+        remove(name);
     }
 
     #[test]

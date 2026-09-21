@@ -21,9 +21,7 @@ use crate::handler::registry::{self, VectorIndex};
 /// keeping it in the signature means the storage layer can come back into this
 /// decision without touching them again.
 pub(super) fn resolve(_store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
-    registry::get(name)
-        .filter(|index| index.state() != registry::BUILDING)
-        .ok_or(Error::NoSuchIndex)
+    registry::serving(name).ok_or(Error::NoSuchIndex)
 }
 
 /// 읽는 쪽만 잠금을 본다.

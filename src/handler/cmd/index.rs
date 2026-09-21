@@ -92,21 +92,24 @@ fn already_there(store: &Store, name: &str) -> Result<Reply> {
 }
 
 pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {
-    // The flush goes first, and the registry entry goes last.
+    // Stop serving the name first, so nothing reaches a graph that is being
+    // taken apart -- but stay in the registry until the flush is done.
     //
-    // Each vector the flush unlinks fires the unlink callback, and that
-    // callback decides whether this crate is holding the item by asking the
-    // graph (`trigger::event`). Removing the index first takes that answer
-    // away: the callback finds no index, reads it as "we never took this one",
-    // and every vector of a dropped index stays pinned for the life of the
-    // process -- usearch cannot enumerate its keys, so nothing else can find
-    // them either.
+    // Those two are not the same thing, and the difference is what the unlink
+    // callback needs. Each vector the flush unlinks fires that callback, and
+    // it decides whether this crate is holding the item by asking the graph
+    // (`trigger::event`). Removing the entry outright takes the question away:
+    // the callback finds no index, reads it as "we never took this one", and
+    // every vector of a dropped index stays pinned for the life of the process
+    // -- usearch cannot enumerate its keys, so nothing else can find them.
     //
     // The flush is not a promise that every vector is gone. It stamps the
     // prefix and walks part of the LRU, leaving the rest to go when touched;
-    // those late ones do land on a name nothing has registered, and those leak.
-    // Going in this order is what keeps that to the stragglers instead of all
-    // of them.
+    // those late ones do arrive after the entry is gone, and those leak. This
+    // order keeps that to the stragglers instead of all of them.
+    if let Some(index) = registry::get(name) {
+        index.mark_draining();
+    }
     let flushed = store.flush_prefix(&crate::trigger::key::index_prefix(name));
 
     let had_meta = match store.delete_kv(&crate::trigger::key::meta_key(name)) {
