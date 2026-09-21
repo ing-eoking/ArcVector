@@ -104,6 +104,9 @@ fn run() {
             if drain_bounded(|| index.ann.drain_retired()) {
                 state().pending = true;
             }
+            // 비웠으면 다시 조회를 받는다. 잠긴 동안 그 인덱스는 통째로
+            // `SERVER_ERROR`이므로 늦게 풀 이유가 없다.
+            index.ann.resume_if_drained();
         }
 
         // 종을 울려줄 주체가 없는 일만 틱 주기로 남긴다.
