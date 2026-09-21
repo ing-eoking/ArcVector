@@ -120,5 +120,10 @@ pub extern "C" fn memcached_extensions_initialize(
             return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
         }
     }
+
+    // 아이템 수명 이벤트를 받는다. 여기는 getopt 루프 안이라 엔진 초기화보다
+    // 앞이고, 그래서 persistence 복구가 만드는 link도 놓치지 않는다.
+    crate::trigger::event::install();
+
     EXTENSION_ERROR_CODE_EXTENSION_SUCCESS
 }

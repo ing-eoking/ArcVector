@@ -9,4 +9,5 @@
 //! This replaces the delta channel described in
 //! `docs/superpowers/specs/2026-09-04-arcvector-index-replication-design.md`.
 
+pub mod event;
 pub mod key;
