@@ -350,6 +350,18 @@ impl AnnIndex {
         })
     }
 
+    /// 밀린 것을 충분히 비웠으면 잠금을 푼다. sweeper가 매 바퀴 부른다.
+    ///
+    /// 잠긴 인덱스는 조회를 전부 거절하고 있으므로, 푸는 것이 늦으면 그만큼
+    /// 오래 못 쓴다. 반대로 자리가 하나 나자마자 풀면 다음 삭제에 바로 다시
+    /// 막히므로, 점유율이 눈에 띄게 내려간 뒤에 받는다.
+    pub fn resume_if_drained(&self) {
+        if self.halt.is_halted() && self.retirement.drained_enough() {
+            eprintln!("ArcVector: the retirement backlog has drained; taking reads again");
+            self.halt.resume();
+        }
+    }
+
     /// 아이템 역참조를 시작한다. 잠겨 있으면 `None`.
     ///
     /// 가드가 살아 있는 동안 `halt()`가 돌아오지 않으므로, 엔진이 그 아이템을
@@ -692,7 +704,7 @@ impl AnnIndex {
             )));
         }
 
-        let reading = self.retirement.enter()?;
+        let reading = self.retirement.enter();
 
         let matches = {
             let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
@@ -906,6 +918,30 @@ mod tests {
     }
 
     #[test]
+    fn a_halted_index_comes_back_once_the_sweeper_has_drained_it() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
+
+        // 콜백이 겪는 상황을 그대로 만든다: 큐를 자리가 없을 때까지 채운다.
+        let mut fake = 0x1000_0000u64;
+        while idx.retire_one(fake) {
+            fake += 1;
+        }
+        idx.halt_for_overflow();
+        assert!(search(&idx, &[1.0, 0.0, 0.0, 0.0], 5).is_empty(), "잠겼다");
+
+        // 가득 찬 채로 풀면 다음 삭제에 곧바로 다시 막힌다.
+        idx.resume_if_drained();
+        assert!(idx.is_halted(), "비우기 전에는 계속 잠겨 있다");
+
+        while idx.drain_retired() {}
+        idx.resume_if_drained();
+
+        assert!(!idx.is_halted(), "비웠으면 다시 받는다");
+        assert_eq!(search(&idx, &[1.0, 0.0, 0.0, 0.0], 5), vec!["a"]);
+    }
+
+    #[test]
     fn linking_a_node_makes_it_findable_by_its_address() {
         let idx = build(4, Quant::F32, Metric::L2, 2);
         let coords = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], idx.layout.quant);
@@ -988,7 +1024,7 @@ mod tests {
         let idx = build(4, Quant::F32, Metric::L2, 2);
         let addr = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
 
-        let reading = idx.retirement.enter().unwrap();
+        let reading = idx.retirement.enter();
         assert!(remove(&idx, "a"), "그래프에서 뺐다");
 
         while idx.drain_retired() {}
@@ -1008,7 +1044,7 @@ mod tests {
         let addr = add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
 
         assert!(remove(&idx, "a"));
-        let late = idx.retirement.enter().unwrap();
+        let late = idx.retirement.enter();
 
         while idx.drain_retired() {}
         assert!(

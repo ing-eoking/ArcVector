@@ -10,10 +10,7 @@
 use crate::handler::usearch::held::Elements;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
-use std::time::Duration;
-
-use crate::error::{Error, Result};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// 놓아줄 주소를 담는 링의 크기.
 ///
@@ -37,6 +34,9 @@ const RELEASE_CHUNK: usize = 64;
 
 /// 큐가 이만큼 차면 게이트를 닫는다. 고수위 표시이지 상한이 아니다.
 pub(super) const CAP: usize = 1024;
+
+/// 잠금을 풀어도 되는 점유율(%). 가득 찬 지점에서 걸고 여기서 푼다.
+const RESUME_AT: usize = 90;
 
 /// 배리어 슬롯 수.
 ///
@@ -78,7 +78,6 @@ struct Queue {
     head: usize,
     /// 링에 다음으로 쓸 위치. `retire`가 올린다.
     tail: usize,
-    gated: bool,
     /// 누군가 뮤텍스를 놓고 `release`를 부르는 중이다.
     ///
     /// 그 구간의 칸은 아직 큐에 남아 있으므로, 이 표시가 없으면 두 번째 배출자가
@@ -86,16 +85,7 @@ struct Queue {
     draining: bool,
 }
 
-impl Queue {
-    /// 자리가 났으면 게이트를 연다. 푸는 것은 배출자가 한다.
-    fn reopen_if_room(&mut self, cap: usize) -> bool {
-        if self.gated && self.events.len() < cap {
-            self.gated = false;
-            return true;
-        }
-        false
-    }
-}
+impl Queue {}
 
 /// `draining`을 반드시 되돌리는 가드.
 ///
@@ -171,15 +161,6 @@ pub(super) enum Progress {
     Empty,
 }
 
-/// 게이트가 닫혀 있을 때 검색이 기다리는 시간. 넘으면 거절한다.
-///
-/// sweeper의 `TICK`(`sweep.rs`, 1초)의 두 배다. `retire()`가 게이트를 닫을 때마다
-/// 이제 종을 울리므로(아래) 보통은 그걸로 sweeper가 바로 깨지만, 이 값이 `TICK`과
-/// 같으면 그 종과 sweeper가 `wait_timeout(TICK)`에 막 들어가는 순간이 겹쳤을 때
-/// 대기 중인 검색이 sweeper의 다음 바퀴를 한 번도 못 얻고 시간 초과로 `Busy`를
-/// 받을 수 있었다. 두 배로 두면 종이 어떻게 엇갈리든 최소 한 바퀴는 보장된다.
-const GATE_TIMEOUT: Duration = Duration::from_secs(2);
-
 pub(super) struct Retirement {
     slots: Box<[AtomicUsize]>,
     /// 놓아줄 주소의 링. 기동 시 한 번 잡고 다시 자라지 않는다.
@@ -191,19 +172,12 @@ pub(super) struct Retirement {
     /// 지금 열린 슬롯 번호. retire만 쓰고 검색은 읽기만 한다.
     open: AtomicUsize,
     queue: Mutex<Queue>,
-    gate: Condvar,
-    cap: usize,
     bell: OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Retirement {
     pub(super) fn new() -> Self {
         Self::with_cap_inner(CAP)
-    }
-
-    #[cfg(test)]
-    pub(super) fn with_cap(cap: usize) -> Self {
-        Self::with_cap_inner(cap)
     }
 
     fn with_cap_inner(cap: usize) -> Self {
@@ -215,8 +189,6 @@ impl Retirement {
                 events: VecDeque::with_capacity(cap + EVENT_MARGIN),
                 ..Queue::default()
             }),
-            gate: Condvar::new(),
-            cap,
             bell: OnceLock::new(),
         }
     }
@@ -246,55 +218,21 @@ impl Retirement {
     ///
     /// 봉인 중이면 물러났다가 `open`을 다시 읽는다. 물러나는 것은 `held`를 읽기
     /// 전이므로 그 검색은 아무 주소도 보지 못했다.
-    pub(super) fn enter(&self) -> Result<Reading<'_>> {
-        self.enter_deadline(GATE_TIMEOUT)
-    }
-
-    pub(super) fn enter_deadline(&self, timeout: Duration) -> Result<Reading<'_>> {
-        self.wait_for_gate(timeout)?;
-        let mut spins = 0u32;
+    /// 검색 하나를 지금 열린 배리어에 붙인다.
+    ///
+    /// 더는 기다리지 않는다. 밀린 것이 감당이 안 되면 `Halt`가 인덱스를 통째로
+    /// 잠그고, 그 판정은 `access::for_read`가 명령 입구에서 한다.
+    pub(super) fn enter(&self) -> Reading<'_> {
         loop {
             let slot = self.open.load(Ordering::Acquire);
             if attach(self, &self.slots[slot]) {
-                return Ok(Reading { owner: self, slot });
+                return Reading { owner: self, slot };
             }
-            spins += 1;
-            if spins > 4 {
-                // 봉인 중인 슬롯에 걸렸다. `open`을 넘기는 쪽은 이 큐 뮤텍스를
-                // 쥐고 있으므로, 몇 바퀴 돌고도
-                // 안 풀리면 그 스레드를 놓아준다.
-                std::thread::yield_now();
-            } else {
-                std::hint::spin_loop();
-            }
+            std::thread::yield_now();
         }
-    }
-
-    /// 게이트가 열릴 때까지 기다린다. 기다리는 동안 이 검색은 어떤 배리어에도
-    /// 붙어 있지 않으므로, 진행 중인 검색들이 끝나 큐가 빠지는 것을 막지 않는다.
-    fn wait_for_gate(&self, timeout: Duration) -> Result<()> {
-        let q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
-        if !q.gated {
-            return Ok(());
-        }
-        let (q, wait) = self
-            .gate
-            .wait_timeout_while(q, timeout, |q| q.gated)
-            .unwrap_or_else(PoisonError::into_inner);
-        if wait.timed_out() && q.gated {
-            return Err(Error::Busy);
-        }
-        Ok(())
     }
 
     #[cfg(test)]
-    pub(super) fn is_gated(&self) -> bool {
-        self.queue
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .gated
-    }
-
     #[cfg(test)]
     pub(super) fn open_slot(&self) -> usize {
         self.open.load(Ordering::Acquire)
@@ -314,6 +252,16 @@ impl Retirement {
         let live = seal(&self.slots[slot]);
         self.open.store((slot + 1) % POOL, Ordering::Release);
         live
+    }
+
+    /// 밀린 것을 충분히 비웠나. 양쪽 점유율이 모두 `RESUME_AT`% 아래여야 한다.
+    ///
+    /// 히스테리시스다. 자리가 하나 나자마자 풀면 다음 삭제에 바로 다시 막혀
+    /// 경계에서 퍼덕인다.
+    pub(super) fn drained_enough(&self) -> bool {
+        let q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        (q.tail - q.head) * 100 < RING * RESUME_AT
+            && q.events.len() * 100 < q.events.capacity() * RESUME_AT
     }
 
     /// 큐의 머리 하나를 처리한다.
@@ -341,9 +289,6 @@ impl Retirement {
                     // 덮어써 그 `-1`에서 언더플로가 난다.
                     self.slots[slot].fetch_and(COUNT, Ordering::AcqRel);
                     q.events.pop_front();
-                    if q.reopen_if_room(self.cap) {
-                        self.gate.notify_all();
-                    }
                     return Progress::Released(0);
                 }
 
@@ -372,9 +317,6 @@ impl Retirement {
                 _ => {
                     q.events.pop_front();
                 }
-            }
-            if q.reopen_if_room(self.cap) {
-                self.gate.notify_all();
             }
             !q.events.is_empty()
         };
@@ -465,7 +407,6 @@ impl Retirement {
         if q.tail - q.head + addrs.len() > RING || q.events.len() + 2 > q.events.capacity() {
             // 검색을 세워 배출이 앞서 나가게 한다. 자리가 없다고 조용히 버리기만
             // 하면 그 압력이 아무 데도 전달되지 않는다.
-            q.gated = true;
             return false;
         }
 
@@ -510,7 +451,6 @@ impl Retirement {
             _ => q.events.push_back(Event::Release(to)),
         }
 
-        q.gated |= q.events.len() >= self.cap;
         drop(q);
         self.ring();
         true
@@ -624,7 +564,7 @@ mod tests {
         let r = Retirement::new();
         let e = FakeElements::default();
 
-        let reading = r.enter().unwrap();
+        let reading = r.enter();
         r.retire(&[0x10]);
 
         assert!(matches!(r.drain_once(&e), Progress::Blocked));
@@ -703,6 +643,27 @@ mod tests {
     }
 
     #[test]
+    fn a_full_queue_has_not_drained_enough() {
+        let r = Retirement::new();
+        let full: Vec<u64> = (0..RING as u64).collect();
+        r.retire(&full);
+
+        assert!(!r.drained_enough(), "가득 찼는데 풀면 곧바로 또 막힌다");
+    }
+
+    #[test]
+    fn draining_past_the_mark_says_so() {
+        let r = Retirement::new();
+        let e = FakeElements::default();
+        let full: Vec<u64> = (0..RING as u64).collect();
+        r.retire(&full);
+        assert!(!r.drained_enough());
+
+        while !matches!(r.drain_once(&e), Progress::Empty) {}
+        assert!(r.drained_enough(), "다 비웠으면 다시 받아도 된다");
+    }
+
+    #[test]
     fn an_empty_queue_reports_empty() {
         let r = Retirement::new();
         let e = FakeElements::default();
@@ -714,7 +675,7 @@ mod tests {
         let r = Retirement::new();
         let e = FakeElements::default();
 
-        let reading = r.enter().unwrap();
+        let reading = r.enter();
         let slot = r.open_slot();
         r.retire(&[0x10]);
         drop(reading);
@@ -737,12 +698,12 @@ mod tests {
         let e = FakeElements::default();
 
         // 먼저 붙은 검색이 첫 배리어를 만든다.
-        let first = r.enter().unwrap();
+        let first = r.enter();
         r.retire(&[0x10]);
 
         // 이 검색은 0x10이 held에서 빠진 뒤에 시작했으므로 그 주소에 닿을 수 없고,
         // 그래서 두 번째 배리어에 붙는다 -- Rel(0x10) 뒤에.
-        let late = r.enter().unwrap();
+        let late = r.enter();
         r.retire(&[0x20]);
         assert_eq!(r.queue_shape(), vec!['B', 'R', 'B', 'R']);
 
@@ -772,7 +733,7 @@ mod tests {
         let slot = r.open_slot();
         assert_eq!(r.slot_count(slot), 0);
 
-        let reading = r.enter().unwrap();
+        let reading = r.enter();
         assert_eq!(r.slot_count(slot), 1, "검색이 붙었다");
 
         drop(reading);
@@ -784,8 +745,8 @@ mod tests {
         let r = Retirement::new();
         let slot = r.open_slot();
 
-        let a = r.enter().unwrap();
-        let b = r.enter().unwrap();
+        let a = r.enter();
+        let b = r.enter();
         assert_eq!(r.slot_count(slot), 2);
 
         drop(a);
@@ -797,8 +758,8 @@ mod tests {
     #[test]
     fn sealing_returns_the_count_at_that_moment() {
         let r = Retirement::new();
-        let a = r.enter().unwrap();
-        let b = r.enter().unwrap();
+        let a = r.enter();
+        let b = r.enter();
 
         assert_eq!(r.seal_open(), 2, "봉인 순간의 카운트를 정확히 돌려준다");
         drop(a);
@@ -810,10 +771,10 @@ mod tests {
         let r = Retirement::new();
         let first = r.open_slot();
 
-        let held_open = r.enter().unwrap(); // 봉인이 0을 돌려주지 않도록 하나 붙여둔다
+        let held_open = r.enter(); // 봉인이 0을 돌려주지 않도록 하나 붙여둔다
         assert_eq!(r.seal_open(), 1);
 
-        let late = r.enter().unwrap();
+        let late = r.enter();
         assert_ne!(
             r.open_slot(),
             first,
@@ -839,7 +800,7 @@ mod tests {
         let r = Retirement::new();
         let slot = r.open_slot();
 
-        let holder = r.enter().unwrap(); // 먼저 붙은 검색 하나
+        let holder = r.enter(); // 먼저 붙은 검색 하나
         assert_eq!(seal(&r.slots[slot]), 1, "봉인 순간의 카운트");
 
         // 봉인된 칸에 붙으려는 검색은 물러난다. enter()로는 이 경로를 못 밟는다 --
@@ -898,7 +859,7 @@ mod tests {
     fn a_retire_with_a_search_attached_queues_a_barrier_first() {
         let r = Retirement::new();
         let slot = r.open_slot();
-        let reading = r.enter().unwrap();
+        let reading = r.enter();
 
         r.retire(&[0x10]);
 
@@ -920,14 +881,14 @@ mod tests {
         // 봉인과 push가 한 덩어리가 아니면 [B, B, R, R]처럼 배리어가 붙어 나오고,
         // 그러면 두 번째 배리어 뒤의 릴리스를 첫 배리어가 안 막게 된다.
         let r = Arc::new(Retirement::new());
-        let _reading = r.enter().unwrap(); // 모든 retire가 배리어를 만들도록 하나 붙여둔다
+        let _reading = r.enter(); // 모든 retire가 배리어를 만들도록 하나 붙여둔다
 
         std::thread::scope(|s| {
             for t in 0..4u64 {
                 let r = Arc::clone(&r);
                 s.spawn(move || {
                     for i in 0..50u64 {
-                        let _hold = r.enter().unwrap();
+                        let _hold = r.enter();
                         r.retire(&[t * 1000 + i]);
                     }
                 });
@@ -943,9 +904,9 @@ mod tests {
     #[test]
     fn a_search_that_starts_after_a_retire_joins_the_next_barrier() {
         let r = Retirement::new();
-        let first = r.enter().unwrap();
+        let first = r.enter();
         r.retire(&[0x10]);
-        let second = r.enter().unwrap();
+        let second = r.enter();
 
         r.retire(&[0x20]);
 
@@ -959,41 +920,6 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_closes_when_the_queue_reaches_the_cap() {
-        let r = Retirement::with_cap(2);
-        let a = r.enter().unwrap();
-        r.retire(&[0x10]); // [B, R]  = 2칸
-        assert!(r.is_gated(), "캡에 닿으면 게이트가 닫힌다");
-        drop(a);
-    }
-
-    #[test]
-    fn a_drained_queue_opens_the_gate_again() {
-        let r = Retirement::with_cap(2);
-        let e = FakeElements::default();
-        let a = r.enter().unwrap();
-        r.retire(&[0x10]);
-        assert!(r.is_gated());
-
-        drop(a);
-        while !matches!(r.drain_once(&e), Progress::Empty) {}
-        assert!(!r.is_gated(), "큐가 빠지면 게이트가 열린다");
-    }
-
-    #[test]
-    fn a_gated_search_gives_up_rather_than_waiting_forever() {
-        let r = Retirement::with_cap(2);
-        let a = r.enter().unwrap();
-        r.retire(&[0x10]);
-        assert!(r.is_gated());
-
-        // a가 끝나지 않으므로 큐가 빠지지 않는다. 대기는 타임아웃으로 끝난다.
-        let refused = r.enter_deadline(std::time::Duration::from_millis(50));
-        assert!(matches!(refused, Err(crate::error::Error::Busy)));
-        drop(a);
-    }
-
-    #[test]
     fn the_last_search_of_a_sealed_barrier_rings_the_bell() {
         use std::sync::atomic::AtomicUsize as Counter;
 
@@ -1004,8 +930,8 @@ mod tests {
             seen.fetch_add(1, Ordering::Relaxed);
         }));
 
-        let a = r.enter().unwrap();
-        let b = r.enter().unwrap();
+        let a = r.enter();
+        let b = r.enter();
         r.retire(&[0x10]); // 봉인(2). retire() 자신도 이제 한 번 울린다 (아래 별도 테스트)
 
         let after_retire = rings.load(Ordering::Relaxed);
@@ -1106,7 +1032,7 @@ mod tests {
         }));
 
         let slot = r.open_slot();
-        let holder = r.enter().unwrap(); // 진짜 리더 하나가 이 배리어를 붙잡고 있다
+        let holder = r.enter(); // 진짜 리더 하나가 이 배리어를 붙잡고 있다
         assert_eq!(seal(&r.slots[slot]), 1);
 
         assert!(!attach(&r, &r.slots[slot]), "봉인돼 있으면 붙지 못한다");
@@ -1120,33 +1046,14 @@ mod tests {
     }
 
     #[test]
-    fn gated_is_or_ed_not_overwritten() {
-        // MINOR 5: `q.gated = ...`가 아니라 `|=`여야 한다. `gated`가 (미래의
-        // 다른 이유로) 이미 켜져 있는데 이 호출의 큐 길이만 보고 그대로
-        // 대입하면, 대기 중인 검색을 깨우지도 않고 게이트를 꺼 버릴 수 있다.
-        let r = Retirement::with_cap(1024);
-        {
-            let mut q = r.queue.lock().unwrap_or_else(PoisonError::into_inner);
-            q.gated = true;
-        }
-
-        r.retire(&[0x10]); // 캡(1024)에는 한참 못 미치는 길이
-
-        assert!(
-            r.is_gated(),
-            "retire()가 자기 계산만으로 이미 켜져 있던 게이트를 꺼서는 안 된다"
-        );
-    }
-
-    #[test]
     fn leaving_reports_only_when_it_cleared_a_sealed_barrier() {
         let r = Retirement::new();
 
         // 봉인 안 된 배리어 -- 아무도 안 기다리므로 알릴 것이 없다.
-        assert!(!r.enter().unwrap().leave(), "봉인 전이면 false");
+        assert!(!r.enter().leave(), "봉인 전이면 false");
 
-        let a = r.enter().unwrap();
-        let b = r.enter().unwrap();
+        let a = r.enter();
+        let b = r.enter();
         r.retire(&[0x10]); // 봉인(2)
 
         assert!(!a.leave(), "아직 b가 남았다");
@@ -1164,7 +1071,7 @@ mod tests {
             seen.fetch_add(1, Ordering::Relaxed);
         }));
 
-        drop(r.enter().unwrap());
+        drop(r.enter());
         assert_eq!(
             rings.load(Ordering::Relaxed),
             0,
