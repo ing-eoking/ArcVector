@@ -777,6 +777,27 @@ impl AnnIndex {
             .set_bell(std::sync::Arc::new(crate::handler::access::sweep::wake));
     }
 
+    /// 주소 하나를 sweeper의 목록에 넣는다. 자리가 없으면 `false`.
+    ///
+    /// **`held`에서 뺀 뒤에 부른다** -- 그래야 이 뒤에 시작한 검색이 그 주소에
+    /// 닿지 못한다.
+    pub fn retire_one(&self, addr: u64) -> bool {
+        self.retirement.retire(&[addr])
+    }
+
+    /// 큐에 못 넣어 그래프가 저장소와 어긋났다. 인덱스를 잠근다.
+    ///
+    /// **진행 중인 역참조가 끝나기를 기다리고 돌아온다.** 그래서 이 함수가
+    /// 돌아온 뒤에는 엔진이 그 아이템을 해제해도 읽고 있는 검색이 없다. 기다리는
+    /// 것은 역참조 하나뿐이라 cache lock 아래에서도 짧다.
+    pub fn halt_for_overflow(&self) {
+        eprintln!(
+            "ArcVector: the retirement queue is full; halting this index until the \
+             sweeper works the backlog down"
+        );
+        self.halt.halt();
+    }
+
     /// 아이템이 링크됐다. 그 주소를 키로 그래프에 넣는다.
     ///
     /// 엔진이 이미 우리 몫의 참조를 잡아뒀으므로, 넣는 데 성공하면 그대로 들고

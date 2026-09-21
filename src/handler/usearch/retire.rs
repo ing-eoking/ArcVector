@@ -448,9 +448,13 @@ impl Retirement {
     /// 봉인과 push가 한 덩어리인 것은 retire 둘이 겹칠 때 순서가 뒤집히지 않게
     /// 하기 위해서다. `[B(b1), R(y), B(b), R(x)]`가 되면 b에 붙은 검색이 y를 들고
     /// 있을 수 있는데 `R(y)`를 막지 못한다.
-    pub(super) fn retire(&self, addrs: &[u64]) {
+    /// 주소를 놓아줄 목록에 넣는다. 자리가 없으면 `false`.
+    ///
+    /// 호출자는 `false`를 받으면 그 주소를 잃은 것이다 -- 콜백에서 왔다면
+    /// 거절해서 엔진이 회수하게 하고, 아니면 로그를 남기는 수밖에 없다.
+    pub(super) fn retire(&self, addrs: &[u64]) -> bool {
         if addrs.is_empty() {
-            return;
+            return true;
         }
         let mut q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
 
@@ -462,12 +466,7 @@ impl Retirement {
             // 검색을 세워 배출이 앞서 나가게 한다. 자리가 없다고 조용히 버리기만
             // 하면 그 압력이 아무 데도 전달되지 않는다.
             q.gated = true;
-            eprintln!(
-                "ArcVector: the retirement queue is full; {} item reference(s) stay \
-                 pinned until this process ends",
-                addrs.len()
-            );
-            return;
+            return false;
         }
 
         let slot = self.open.load(Ordering::Acquire);
@@ -514,6 +513,7 @@ impl Retirement {
         q.gated |= q.events.len() >= self.cap;
         drop(q);
         self.ring();
+        true
     }
 
     /// 링에서 아직 안 놓아준 주소 수.

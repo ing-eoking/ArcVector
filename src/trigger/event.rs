@@ -15,6 +15,10 @@
 //! 전부 `cache_lock`을 다시 잡아 그 자리에서 데드락이다.
 
 use std::os::raw::c_void;
+use std::sync::Arc;
+
+use crate::handler::arcus::engine::Store;
+use crate::handler::registry::{self, VectorIndex};
 
 use crate::engine_api::{
     ENGINE_ERROR_CODE, ENGINE_ERROR_CODE_ENGINE_ENOMEM, ENGINE_EVENT_TYPE,
@@ -125,8 +129,95 @@ unsafe extern "C" fn on_item_event(
 ///
 /// `ev`의 아이템 포인터는 엔진이 살려둔 것이고 이 호출 동안 유효하다.
 unsafe fn dispatch(event: Event, ev: &event_data_t) -> Decision {
-    let _ = (event, ev);
-    Decision::NotOurs
+    let Some(store) = crate::handler::arcus::engine::Store::background() else {
+        // vtable이 아직 없다. 등록된 인덱스도 없으니 받을 것도 없다.
+        return Decision::NotOurs;
+    };
+
+    match event {
+        Event::Link => on_link(&store, ev.new_it as u64),
+        Event::Unlink => on_unlink(&store, ev.old_it as u64),
+        Event::Replace => on_replace(&store, ev.old_it as u64, ev.new_it as u64),
+    }
+}
+
+/// 키를 읽어 우리 인덱스를 찾는다. 우리 키가 아니거나 모르는 인덱스면 `None`.
+fn index_of(store: &Store, addr: u64) -> Option<Arc<VectorIndex>> {
+    if addr == 0 {
+        return None;
+    }
+    let name = store.with_item_at(addr, |key, _value| {
+        crate::trigger::key::parse(key).map(|p| p.index.to_owned())
+    })??;
+    registry::get(&name)
+}
+
+/// 아이템이 링크됐다. 그 벡터를 그래프에 넣는다.
+///
+/// 엔진이 우리 몫의 참조를 이미 잡아뒀다. 넣었으면 그대로 들고, 못 넣었으면
+/// 거절해서 엔진이 회수하게 한다.
+fn on_link(store: &Store, addr: u64) -> Decision {
+    let Some(index) = index_of(store, addr) else {
+        return Decision::NotOurs;
+    };
+    let layout = index.ann.layout;
+
+    let Some(Some(())) = store.with_item_at(addr, |_key, value| {
+        layout
+            .vector_of(value)
+            .map(|vector| index.ann.link_node(addr, vector))
+            .and_then(|r| r.ok())
+    }) else {
+        eprintln!("ArcVector: the graph would not take a linked item; the engine reclaims it");
+        return Decision::Declined;
+    };
+    Decision::Took
+}
+
+/// 아이템이 빠진다. 그래프에서 빼고, 참조를 sweeper에게 넘긴다.
+///
+/// 큐에 못 넣으면 그 주소를 잃는다 -- 그래프와 저장소가 어긋난 채로 남는다.
+/// 그때는 인덱스를 잠그고 거절한다. 잠금이 **진행 중인 역참조가 끝나기를 기다린
+/// 뒤에** 돌아오므로, 엔진이 그 자리에서 해제해도 읽고 있는 검색이 없다.
+fn on_unlink(store: &Store, addr: u64) -> Decision {
+    let Some(index) = index_of(store, addr) else {
+        return Decision::NotOurs;
+    };
+
+    index.ann.unlink_at(addr);
+    if index.ann.retire_one(addr) {
+        return Decision::Took;
+    }
+
+    index.ann.halt_for_overflow();
+    Decision::Declined
+}
+
+/// 아이템이 새것으로 교체된다.
+///
+/// **그래프를 먼저 옮긴다.** 엔진이 해시테이블을 바꾸기 전에 새 주소를 가리켜야,
+/// 그 사이의 조회가 사라질 주소를 안 따라간다.
+///
+/// 옮긴 뒤 old를 큐에 넣는다. 못 넣으면 그래프에서 노드를 빼고 거절한다 --
+/// 거절하면 엔진이 `INCR(new)`를 하지 않으므로, 그대로 두면 우리 것이 아닌
+/// 포인터를 그래프가 들게 된다.
+fn on_replace(store: &Store, old: u64, new: u64) -> Decision {
+    let Some(index) = index_of(store, old) else {
+        return Decision::NotOurs;
+    };
+
+    if !index.ann.rename_node(old, new) {
+        // 그래프가 old를 갖고 있지 않았다. 새로 넣는 것과 같다.
+        return on_link(store, new);
+    }
+
+    if index.ann.retire_one(old) {
+        return Decision::Took;
+    }
+
+    index.ann.unlink_at(new);
+    index.ann.halt_for_overflow();
+    Decision::Declined
 }
 
 #[cfg(test)]
