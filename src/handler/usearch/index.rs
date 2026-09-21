@@ -224,11 +224,15 @@ impl Shards {
         }
     }
 
-    /// Only assertions ask this; the paths that act on a key ask holding()
-    /// and keep the shard they were handed.
-    #[cfg(test)]
+    /// 이 키를 실제로 담고 있는 샤드가 있나.
+    ///
+    /// `holding()`으로 물으면 안 된다 -- 그쪽은 샤드가 하나일 때 담고 있는지
+    /// 확인하지 않고 그 샤드를 돌려주므로, 없는 키에도 `Some`을 답한다. 키를
+    /// 가지고 무언가 하려는 쪽에는 그래도 되지만(뒤이은 `remove`/`rename`이 0을
+    /// 답한다) 존재를 묻는 데에는 못 쓴다.
+    #[allow(dead_code)] // HeldSet이 빠지면 resolve()가 이걸 묻는다.
     fn contains(&self, key: u64) -> bool {
-        self.holding(key).is_some()
+        self.shards.iter().any(|shard| shard.contains(key))
     }
 
     fn rename(&self, from: u64, to: u64) -> Result<usize> {
@@ -771,6 +775,49 @@ impl AnnIndex {
     pub fn set_bell(&self) {
         self.retirement
             .set_bell(std::sync::Arc::new(crate::handler::access::sweep::wake));
+    }
+
+    /// 아이템이 링크됐다. 그 주소를 키로 그래프에 넣는다.
+    ///
+    /// 엔진이 이미 우리 몫의 참조를 잡아뒀으므로, 넣는 데 성공하면 그대로 들고
+    /// 있으면 된다. 실패하면 호출자가 거절해서 엔진이 회수하게 한다.
+    ///
+    /// **엔진의 cache lock 아래에서 불린다.** `ensure_capacity`가 usearch의
+    /// 그래프를 늘릴 수 있고 삽입 자체도 탐색을 수반하므로, 이 함수가 도는 동안
+    /// 데몬 전체가 선다. 큐를 없앤 대가이고 설계로는 피할 수 없다.
+    pub fn link_node(&self, addr: u64, vector: &[u8]) -> Result<()> {
+        self.check_vector(vector)?;
+        self.ensure_capacity(self.live() + 1)?;
+        let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        self.typed_add(&index, addr, vector)
+    }
+
+    /// 아이템이 빠진다. 그래프에서 노드를 뺀다.
+    ///
+    /// 뺀 뒤에 그 주소를 놓아줄 사람이 필요하다 -- 호출자가 큐에 넣거나, 못
+    /// 넣으면 거절해서 엔진에게 넘긴다.
+    pub fn unlink_at(&self, addr: u64) -> bool {
+        self.unlink_node(addr)
+    }
+
+    /// 아이템이 새것으로 교체된다. 그래프를 `new`로 옮긴다.
+    ///
+    /// **언제나 이것이 먼저다.** 엔진이 해시테이블을 바꾸기 전에 그래프가 새
+    /// 주소를 가리켜야, 그 사이의 조회가 사라질 주소를 안 따라간다.
+    pub fn rename_node(&self, old: u64, new: u64) -> bool {
+        let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        match index.rename(old, new) {
+            Ok(1) => true,
+            Ok(0) => false,
+            Ok(count) => {
+                eprintln!("ArcVector: renaming a node moved {count} keys, not one");
+                false
+            }
+            Err(e) => {
+                eprintln!("ArcVector: could not rename a node: {e}");
+                false
+            }
+        }
     }
 
     fn drop_node(&self, key: u64) -> bool {
@@ -1371,6 +1418,56 @@ mod tests {
             "the retry took the node out, so the element went back"
         );
         assert!(idx.stuck.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn linking_a_node_makes_it_findable_by_its_address() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let coords = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], idx.layout.quant);
+        let addr = FAKE.link(&idx, "a");
+
+        idx.link_node(addr, &coords).expect("그래프가 받는다");
+
+        let index = idx.inner.read().unwrap();
+        assert!(index.contains(addr), "주소가 키로 들어갔다");
+    }
+
+    #[test]
+    fn unlinking_takes_the_node_out() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let coords = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], idx.layout.quant);
+        let addr = FAKE.link(&idx, "a");
+        idx.link_node(addr, &coords).unwrap();
+
+        idx.unlink_at(addr);
+        assert!(
+            !idx.inner.read().unwrap().contains(addr),
+            "그래프에 더는 없다"
+        );
+    }
+
+    #[test]
+    fn renaming_moves_the_node_to_the_new_address() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        let coords = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], idx.layout.quant);
+        let old = FAKE.link(&idx, "a");
+        idx.link_node(old, &coords).unwrap();
+        let new = FAKE.link(&idx, "a2");
+
+        assert!(idx.rename_node(old, new));
+
+        let index = idx.inner.read().unwrap();
+        assert!(!index.contains(old), "옛 주소는 빠졌다");
+        assert!(index.contains(new), "새 주소가 섰다");
+    }
+
+    #[test]
+    fn renaming_an_address_the_graph_never_had_reports_it() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        assert!(
+            !idx.rename_node(0xdead_beef, 0xfeed_face),
+            "없던 것을 옮겼다고 답하면 안 된다"
+        );
     }
 
     #[test]
