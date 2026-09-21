@@ -30,16 +30,23 @@
 //! `Dropped`가 돼 있으면 방금 넣은 노드를 도로 뺀다. 넣고 나서 확인하는 순서라
 //! 빠지는 창이 없다.
 
+//! # 왜 개수 상한이 없나
+//!
+//! 여기 적힌 주소 하나하나는 우리가 참조를 쥐고 있는 아이템이다. 엔진의
+//! eviction 루프는 `refcount > 0`인 아이템을 건너뛰므로(`item_base.c`), 그
+//! 아이템은 우리가 놓아줄 때까지 메모리에 남는다.
+//!
+//! 그래서 개수 상한은 자기가 막겠다는 것을 못 막는다. 상한에 걸려 주소를
+//! 버려도 **아이템은 그대로 붙잡혀 있다** -- LINK의 거절을 엔진이 보지 않으니
+//! 참조를 돌려줄 길이 그 자리에는 없다. 버리는 것은 56바이트짜리 장부 한 줄
+//! 뿐이고, 그 대가로 그 인덱스는 저장소보다 영영 모자란 그래프로 올라와
+//! 재동기화를 요구하게 된다. 아끼는 것에 비해 잃는 것이 크다.
+//!
+//! 진짜 한계는 할당기다. `try_reserve`로 물어보고 안 되면 그때 물러난다 --
+//! 임의의 숫자를 정해두는 것보다 정확하고, 데몬을 죽이지 않는다.
+
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
-
-/// 모든 인덱스를 통틀어 붙잡아 둘 수 있는 주소 수.
-///
-/// 정상적으로는 거의 비어 있다. 메타는 `vcreate`가 벡터보다 **먼저** 쓰므로
-/// 복제도 재생도 그 순서로 도착하고, 여기 쌓이는 것은 그 사이의 창뿐이다.
-/// 이 수에 닿는다는 것은 메타가 영영 안 오는 키가 있다는 뜻이라, 상한은
-/// 메모리를 지키는 쪽으로만 잡는다.
-const MAX: usize = 65_536;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Slot {
@@ -58,14 +65,14 @@ struct Waiting {
     /// 도착 순서. 복구가 이 순서로 훑는다.
     order: Vec<u64>,
     state: HashMap<u64, Slot>,
-    /// 자리가 없어 흘려보낸 주소가 있다.
+    /// 할당기가 거절해 흘려보낸 주소가 있다.
     incomplete: bool,
 }
 
 #[derive(Default)]
 struct Store {
     by_index: HashMap<String, Waiting>,
-    /// 모든 인덱스를 통틀어 붙잡고 있는 주소 수. `MAX`를 재는 자리다.
+    /// 모든 인덱스를 통틀어 붙잡고 있는 주소 수. `vstats`가 보고한다.
     count: usize,
 }
 
@@ -86,20 +93,28 @@ pub(crate) enum Unlinked {
     NotWaiting,
 }
 
-/// 주소를 붙잡아 둔다. 자리가 없으면 `false`.
+/// 주소를 붙잡아 둔다. 할당기가 거절하면 `false`.
 pub(crate) fn push(index: &str, addr: u64) -> bool {
     let mut store = store();
-    if store.count >= MAX {
-        if let Some(waiting) = store.by_index.get_mut(index) {
-            waiting.incomplete = true;
-        }
+    if store.by_index.try_reserve(1).is_err() {
         return false;
     }
-    store.count += 1;
-    let waiting = store.by_index.entry(index.to_owned()).or_default();
-    waiting.order.push(addr);
-    waiting.state.insert(addr, Slot::Pending);
-    true
+    let held = {
+        let waiting = store.by_index.entry(index.to_owned()).or_default();
+        if waiting.order.try_reserve(1).is_err() || waiting.state.try_reserve(1).is_err() {
+            // 이 이름은 이제 저장소보다 모자라다. 복구가 끝날 때 그렇게 알린다.
+            waiting.incomplete = true;
+            false
+        } else {
+            waiting.order.push(addr);
+            waiting.state.insert(addr, Slot::Pending);
+            true
+        }
+    };
+    if held {
+        store.count += 1;
+    }
+    held
 }
 
 /// `cursor`부터 아직 `Pending`인 주소 하나를 집어 `Claimed`로 바꾼다.
@@ -159,7 +174,7 @@ pub(crate) fn unlink(index: &str, addr: u64) -> Unlinked {
     }
 }
 
-/// 이 인덱스의 목록을 버린다. 자리가 없어 흘려보낸 것이 있었으면 `true`.
+/// 이 인덱스의 목록을 버린다. 흘려보낸 것이 있었으면 `true`.
 ///
 /// 복구가 끝나고 부른다. 이 시점에는 인덱스가 이미 레지스트리에 있어서 새로
 /// 들어오는 링크가 여기로 오지 않는다 -- 링크 콜백은 전부 엔진의 cache lock

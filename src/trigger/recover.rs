@@ -105,9 +105,9 @@ pub fn adopt(index: &Arc<VectorIndex>) {
     // 기다린 것이 없었으면 조용히 지나간다 -- `vcreate`마다 한 줄씩 찍힐 자리다.
     if incomplete {
         eprintln!(
-            "ArcVector: '{name}' adopted {linked} vectors, but some were turned away \
-             while it waited for its metadata -- the graph is short of the store and \
-             this index needs a resync"
+            "ArcVector: '{name}' adopted {linked} vectors, but the allocator refused \
+             others while it waited for its metadata -- the graph is short of the \
+             store and this index needs a resync"
         );
     } else if linked > 0 || lost > 0 {
         eprintln!("ArcVector: '{name}' adopted {linked} vectors that arrived before it");
