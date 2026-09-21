@@ -20,9 +20,17 @@ use crate::handler::registry::{self, VectorIndex};
 /// keeping it in the signature means the storage layer can come back into this
 /// decision without touching them again.
 pub(super) fn resolve(_store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
-    registry::get(name)
+    let index = registry::get(name)
         .filter(|index| index.state() != registry::BUILDING)
-        .ok_or(Error::NoSuchIndex)
+        .ok_or(Error::NoSuchIndex)?;
+
+    // 잠긴 인덱스는 그래프가 저장소와 어긋나 있다. 그 상태로 답하면 지워진
+    // 벡터를 내놓거나 우리 것이 아닌 포인터를 읽는다. sweeper가 밀린 것을
+    // 비우면 풀린다.
+    if index.ann.is_halted() {
+        return Err(Error::Busy);
+    }
+    Ok(index)
 }
 
 pub(super) fn for_read(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {

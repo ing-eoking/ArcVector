@@ -1,3 +1,4 @@
+pub mod halt;
 pub mod held;
 pub mod index;
 pub mod metric;

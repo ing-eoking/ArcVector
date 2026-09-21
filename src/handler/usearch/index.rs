@@ -8,6 +8,7 @@ use super::metric::Metric;
 use crate::error::Error;
 use crate::handler::arcus::element::Layout;
 use crate::handler::quant::Quant;
+use crate::handler::usearch::halt::Halt;
 use crate::handler::usearch::retire::{Progress, Retirement};
 
 type Result<T> = std::result::Result<T, Error>;
@@ -346,6 +347,8 @@ pub struct AnnIndex {
     in_flight: AtomicUsize,
 
     rebuilding: AtomicBool,
+    /// 큐에 못 넣어 그래프가 저장소와 어긋났을 때 이 인덱스를 잠근다.
+    halt: Halt,
 
     #[cfg(test)]
     identity: usize,
@@ -410,11 +413,17 @@ impl AnnIndex {
             epoch: AtomicU64::new(0),
             held: RwLock::new(HeldSet::default()),
             rebuilding: AtomicBool::new(false),
+            halt: Halt::new(),
             #[cfg(test)]
             identity: NEXT_IDENTITY.fetch_add(1, Ordering::Relaxed),
             stuck: std::sync::Mutex::new(Vec::new()),
             retirement: Retirement::new(),
         })
+    }
+
+    /// 이 인덱스가 잠겨 있나. 모든 명령의 입구가 이것을 본다.
+    pub fn is_halted(&self) -> bool {
+        self.halt.is_halted()
     }
 
     pub fn len(&self) -> usize {
