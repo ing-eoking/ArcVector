@@ -524,3 +524,34 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod meta_tests {
+    use super::*;
+
+    fn record() -> MetaRecord {
+        MetaRecord {
+            metric: "l2".to_owned(),
+            connectivity: 16,
+            expansion_add: 128,
+            expansion_search: 64,
+            maxcount: 50_000,
+        }
+    }
+
+    #[test]
+    fn the_metadata_decodes_with_the_terminator_the_store_adds() {
+        // `Store::add_meta` ends the body with CRLF because the daemon asserts
+        // on it when a client `get`s the key. Decoding has to survive that or
+        // an index cannot be read back.
+        let layout = Layout::new(4, Quant::F32);
+        let mut body = record().encode(layout);
+        body.extend_from_slice(b"\r\n");
+
+        let (meta, decoded) = MetaRecord::decode(&body).expect("the stored shape decodes");
+        assert_eq!(meta.metric, "l2");
+        assert_eq!(meta.connectivity, 16);
+        assert_eq!(meta.maxcount, 50_000);
+        assert_eq!(decoded.dim, 4);
+    }
+}

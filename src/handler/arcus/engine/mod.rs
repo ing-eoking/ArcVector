@@ -152,9 +152,17 @@ impl Store {
         meta: &crate::handler::arcus::element::MetaRecord,
         layout: crate::handler::arcus::element::Layout,
     ) -> Result<(), StoreError> {
+        // The daemon hands an item's body to a client verbatim and asserts on
+        // the trailing CRLF when it does (`process_get_single`). This key is
+        // reachable from the ASCII protocol, so a plain `get` on it would abort
+        // the daemon if the body did not end the way every other item's does.
+        // `vadd` already terminates its bodies; this one has to as well.
+        let mut body = meta.encode(layout);
+        body.extend_from_slice(b"\r\n");
+
         // `add_kv` keeps the reference `allocate` took. Nothing holds metadata
         // the way the graph holds a vector, so it goes straight back.
-        let addr = self.add_kv(&crate::trigger::key::meta_key(index), &meta.encode(layout))?;
+        let addr = self.add_kv(&crate::trigger::key::meta_key(index), &body)?;
         self.release_items(&[addr]);
         Ok(())
     }
