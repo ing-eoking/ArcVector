@@ -116,10 +116,14 @@ pub(crate) fn claim(index: &str, cursor: &mut usize) -> Option<u64> {
 ///
 /// `false`면 넣는 사이에 unlink가 지나갔다는 뜻이라, 부른 쪽이 노드를 도로 빼고
 /// 참조를 돌려줘야 한다.
+///
+/// 목록이 통째로 사라졌으면 `true`다. 알 수 없을 때 한쪽으로만 틀려야 한다면
+/// 새는 쪽이다 -- 아이템이 아직 링크돼 있으면 그 unlink가 참조를 돌려주고,
+/// 여기서 넘겨짚어 놓아주면 그때 한 번 더 놓아 이중 해제가 된다.
 pub(crate) fn finish(index: &str, addr: u64) -> bool {
     let mut store = store();
     let Some(waiting) = store.by_index.get_mut(index) else {
-        return false;
+        return true;
     };
     match waiting.state.get(&addr) {
         Some(Slot::Claimed) => {
@@ -172,14 +176,20 @@ pub(crate) fn held() -> usize {
 mod tests {
     use super::*;
 
-    fn fresh(name: &str) {
+    /// 이 모듈의 시험은 전역 목록 하나를 공유한다. `held()`는 이름별이 아니라
+    /// 전체 수라, 병렬로 돌면 서로의 `push`를 세어 엉뚱한 곳에서 터진다.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    fn alone(name: &str) -> MutexGuard<'static, ()> {
+        let guard = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
         forget(name);
+        guard
     }
 
     #[test]
     fn a_vector_that_arrives_before_its_metadata_is_kept() {
         let ix = "pending-kept";
-        fresh(ix);
+        let _alone = alone(ix);
         assert!(push(ix, 0x10));
         assert!(push(ix, 0x20));
 
@@ -193,7 +203,7 @@ mod tests {
     #[test]
     fn unlinking_before_anyone_claims_it_hands_the_reference_back() {
         let ix = "pending-early-unlink";
-        fresh(ix);
+        let _alone = alone(ix);
         push(ix, 0x10);
 
         assert_eq!(unlink(ix, 0x10), Unlinked::NeverLinked);
@@ -210,7 +220,7 @@ mod tests {
     #[test]
     fn unlinking_while_recovery_holds_it_leaves_the_cleanup_to_recovery() {
         let ix = "pending-late-unlink";
-        fresh(ix);
+        let _alone = alone(ix);
         push(ix, 0x10);
         let mut cursor = 0;
         assert_eq!(claim(ix, &mut cursor), Some(0x10));
@@ -228,7 +238,7 @@ mod tests {
     #[test]
     fn a_vector_already_in_the_graph_falls_through_to_the_usual_path() {
         let ix = "pending-done";
-        fresh(ix);
+        let _alone = alone(ix);
         push(ix, 0x10);
         let mut cursor = 0;
         claim(ix, &mut cursor);
@@ -239,14 +249,23 @@ mod tests {
     }
 
     #[test]
+    fn finishing_against_a_list_that_is_gone_leaves_the_address_alone() {
+        let _alone = alone("pending-vanished");
+        // 놓아주라고 답하면 -- 아이템이 아직 링크돼 있는데 -- 그 unlink가 한 번
+        // 더 놓아 이중 해제가 된다. 모를 때는 새는 쪽으로 틀린다.
+        assert!(finish("pending-vanished", 0x10));
+    }
+
+    #[test]
     fn a_name_nobody_is_waiting_on_is_not_ours_to_answer_for() {
+        let _alone = alone("pending-unknown");
         assert_eq!(unlink("pending-unknown", 0x10), Unlinked::NotWaiting);
     }
 
     #[test]
     fn forgetting_gives_the_room_back() {
         let ix = "pending-room";
-        fresh(ix);
+        let _alone = alone(ix);
         let before = held();
         push(ix, 0x10);
         push(ix, 0x20);

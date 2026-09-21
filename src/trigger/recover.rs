@@ -75,17 +75,29 @@ pub fn adopt(index: &Arc<VectorIndex>) {
             .flatten()
             .is_some_and(|r| r.is_ok());
 
-        // 넣고 **나서** 확인한다. 넣는 사이에 unlink가 지나갔으면 도로 뺀다.
-        // 순서가 반대면 확인과 삽입 사이에 창이 남는다.
-        if took && pending::finish(name, addr) {
-            linked += 1;
-            continue;
-        }
+        // 넣고 **나서** 슬롯을 확인한다. 순서가 반대면 확인과 삽입 사이에 창이
+        // 남는다. 실패했더라도 반드시 불러야 한다 -- 슬롯을 `Claimed`로 둔 채
+        // 넘어가면 이 주소를 누가 놓아줘야 하는지가 정해지지 않는다.
+        let kept = pending::finish(name, addr);
 
-        lost += 1;
-        index.ann.unlink_at(addr);
-        if !index.ann.retire_one(addr) {
-            index.ann.halt_for_overflow();
+        match (took, kept) {
+            // 그래프에 들어갔다. 이제부터는 평소 경로가 맡는다.
+            (true, true) => linked += 1,
+
+            // 넣는 사이에 unlink가 지나갔다. 그쪽은 `Took`으로 답하고 물러났으니
+            // 참조를 돌려줄 사람은 여기뿐이다.
+            (_, false) => {
+                lost += 1;
+                index.ann.unlink_at(addr);
+                if !index.ann.retire_one(addr) {
+                    index.ann.halt_for_overflow();
+                }
+            }
+
+            // 못 넣었지만 아이템은 저장소에 그대로 링크돼 있다. **여기서
+            // 놓아주면 안 된다** -- 그 아이템이 빠질 때 `on_unlink`이 한 번 더
+            // 놓아 이중 해제가 된다. 링크 때 거절한 벡터와 같은 처지로 둔다.
+            (false, true) => lost += 1,
         }
     }
 
