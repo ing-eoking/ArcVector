@@ -350,6 +350,14 @@ impl AnnIndex {
         })
     }
 
+    /// 아이템 역참조를 시작한다. 잠겨 있으면 `None`.
+    ///
+    /// 가드가 살아 있는 동안 `halt()`가 돌아오지 않으므로, 엔진이 그 아이템을
+    /// 해제하지 않는다. 필터가 순회 중에 쓴다.
+    pub fn touch_for_deref(&self) -> Option<crate::handler::usearch::halt::Touching<'_>> {
+        self.halt.touch()
+    }
+
     /// 이 인덱스가 잠겨 있나. 모든 명령의 입구가 이것을 본다.
     pub fn is_halted(&self) -> bool {
         self.halt.is_halted()
@@ -631,6 +639,12 @@ impl AnnIndex {
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         hits.iter()
             .filter_map(|(key, distance)| {
+                // 확인과 역참조를 한 가드 안에 둔다. 콜백이 거절하면 엔진이 그
+                // 자리에서 아이템을 해제하는데, 가드가 살아 있는 동안에는
+                // `halt()`가 돌아오지 않으므로 그 해제가 시작되지 않는다.
+                // 인덱스가 이미 잠겼으면 답을 포기한다 -- 그게 도는 검색까지
+                // 끊는다는 뜻이다.
+                let _touching = self.halt.touch()?;
                 if !index.contains(*key) {
                     return None;
                 }
@@ -874,6 +888,21 @@ mod tests {
             let hits = search(&idx, &[1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0], 1);
             assert_eq!(hits, vec!["x"], "quant {q:?}");
         }
+    }
+
+    #[test]
+    fn a_halted_index_answers_nothing_even_mid_search() {
+        let idx = build(4, Quant::F32, Metric::L2, 2);
+        add(&idx, "a", &[1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(search(&idx, &[1.0, 0.0, 0.0, 0.0], 5), vec!["a"]);
+
+        // 큐에 못 넣어 잠긴 상태. resolve의 가드가 막아 hit이 하나도 안 나온다 --
+        // 엔진이 아이템을 해제해도 역참조하지 않는다는 뜻이다.
+        idx.halt_for_overflow();
+        assert!(
+            search(&idx, &[1.0, 0.0, 0.0, 0.0], 5).is_empty(),
+            "잠긴 인덱스는 도는 검색도 답을 내지 않는다"
+        );
     }
 
     #[test]

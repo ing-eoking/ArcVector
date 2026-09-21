@@ -52,6 +52,11 @@ fn similar(
             return true;
         };
 
+        // 순회 중 방문하는 노드마다 엔진 메모리를 따라간다. 콜백이 거절하면
+        // 엔진이 그 자리에서 해제하므로, 가드 없이 읽으면 해제된 메모리를 본다.
+        let Some(_touching) = index.ann.touch_for_deref() else {
+            return false;
+        };
         let Some(passed) = store.with_item_at(key, |_key, value| {
             layout.attr_of(value).ok().and_then(|attr| {
                 filter

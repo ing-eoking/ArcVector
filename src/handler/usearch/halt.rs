@@ -14,8 +14,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const HALTED: usize = 1 << (usize::BITS - 1);
 
 /// 나머지 비트. 지금 아이템을 역참조하고 있는 수.
-// 트리거 핸들러(잠금)와 역참조 지점(가드), sweeper(해제)가 아직 안 붙었다.
-#[allow(dead_code)]
 const COUNT: usize = !HALTED;
 
 /// 잠금 비트와 진행 중인 역참조 수를 **한 워드에** 담는다.
@@ -38,8 +36,7 @@ impl Halt {
     ///
     /// 돌려받은 가드가 살아 있는 동안 `halt()`는 돌아오지 않는다. 즉 가드를 쥔
     /// 채로는 엔진이 그 아이템을 해제하지 않는다.
-    #[allow(dead_code)] // 역참조 지점이 아직 안 붙었다.
-    pub(crate) fn touch(&self) -> Option<Touching<'_>> {
+    pub fn touch(&self) -> Option<Touching<'_>> {
         let prev = self.state.fetch_add(1, Ordering::AcqRel);
         if prev & HALTED != 0 {
             self.state.fetch_sub(1, Ordering::AcqRel);
@@ -53,7 +50,6 @@ impl Halt {
     /// 기다리는 것은 역참조 하나뿐이라 짧다 -- 포인터를 따라가 128바이트를 읽는
     /// 시간이다. 검색 한 건이 아니다. 그래서 cache lock을 쥔 콜백에서 불러도
     /// 데몬이 서지 않는다.
-    #[allow(dead_code)] // 트리거 핸들러가 아직 안 붙었다.
     pub(crate) fn halt(&self) {
         self.state.fetch_or(HALTED, Ordering::AcqRel);
         while self.state.load(Ordering::Acquire) & COUNT > 0 {
@@ -79,8 +75,7 @@ impl Halt {
 
 /// 역참조 하나가 진행 중임을 표시하는 가드.
 #[must_use = "the dereference is only protected while this is alive"]
-#[allow(dead_code)] // 역참조 지점이 아직 안 붙었다.
-pub(crate) struct Touching<'a>(&'a Halt);
+pub struct Touching<'a>(&'a Halt);
 
 impl Drop for Touching<'_> {
     fn drop(&mut self) {
