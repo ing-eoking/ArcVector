@@ -103,9 +103,10 @@ fn similar(
                 Err(StoreError::KeyGone) => continue,
 
                 Err(StoreError::CorruptElement) => {
-                    index.ann.forget_unreadable(key);
+                    // 그래프에서 빼지 않는다. 이 아이템이 실제로 사라질 때
+                    // unlink 이벤트가 오고, 그때 콜백이 노드를 뺀다.
                     eprintln!(
-                        "ArcVector: element '{id}' of index '{}' is unreadable; dropped from the graph",
+                        "ArcVector: element '{id}' of index '{}' is unreadable",
                         index.name
                     );
                     return Err(StoreError::CorruptElement.into());

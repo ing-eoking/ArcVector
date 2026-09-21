@@ -1,7 +1,8 @@
 # Running the tests
 
 ```sh
-make test
+docker build -f docker/Dockerfile -t arcvector-test .
+docker run --rm arcvector-test
 ```
 
 That is the whole thing: it builds the image and runs **all** the tests, unit and
@@ -34,9 +35,13 @@ docker build -t arcus-local /path/to/arcus-memcached
 ## On the host
 
 ```sh
-make unit     # unit tests only; no server involved
-make lint     # fmt --check and clippy -D warnings
+cargo test --lib                                              # no server involved
+cargo fmt --check
+cargo clippy --all-targets --features integration -- -D warnings
 ```
+
+`clippy` takes `--features integration` so the integration target is type-checked
+here too, even though a plain `cargo test` does not build it.
 
 The integration target sits behind the `integration` feature, so a plain
 `cargo test` does not build it and reports nothing about it. That is deliberate:

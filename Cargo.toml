@@ -13,13 +13,16 @@ crate-type = ["cdylib", "rlib"]
 #
 # There are no feature flags for that any more. Which members
 # `engine_interface_v1` has is decided by the server's own `config.h`, and that
-# file is vendored beside the headers it configures (`include/config.h`), where
-# `build.rs` hands it to clang exactly as the server's own build does. Copy a
-# server tree's `config.h` and `include/memcached` in, retranslate, and the
-# bindings match that server -- including any ENABLE_* flag added to arcus after
-# this was written.
+# file is vendored in the layout the server itself uses -- `config.h` and
+# `config_static.h` at the top, the headers they configure under
+# `include/memcached` -- where `build.rs` hands it to clang exactly as the
+# server's own build does. Copy a server tree's `config.h` and
+# `include/memcached` in, retranslate, and the bindings match that server --
+# including any ENABLE_* flag added to arcus after this was written.
 #
-#   make sync-headers TREE=<path to the server tree>
+#   cp <tree>/config.h <tree>/config_static.h .
+#   cp <tree>/include/memcached/*.h include/memcached/
+#   cargo build --features regen-bindings
 
 # --- Bindings ----------------------------------------------------------------
 #
@@ -27,10 +30,13 @@ crate-type = ["cdylib", "rlib"]
 # plain `cargo build` copies it and never runs bindgen. That is what keeps
 # libclang, and so LLVM, out of an ordinary build entirely.
 #
-# Turn this on to translate the headers again: after copying a server tree's
-# `config.h` and `include/memcached` in, or to build against a tree named by
-# ARCVECTOR_ENGINE_INCLUDE. It needs libclang, and it writes its output back
-# over the committed copy so the two cannot drift. `build.rs` also records a
+# Turn this on to translate the headers again, after copying a server tree's
+# `config.h`, `config_static.h` and `include/memcached` in. There is no way to
+# point the build at headers outside the crate: a build that read them from
+# elsewhere would either contradict the committed copy or quietly overwrite it,
+# so following a different server means vendoring it here, where the crate's own
+# files then say which server it is for. It needs libclang, and it writes its
+# output back over the committed copy so the two cannot drift. `build.rs` also records a
 # fingerprint of what it read, and refuses a later build whose headers no longer
 # match it.
 regen-bindings = ["dep:bindgen"]

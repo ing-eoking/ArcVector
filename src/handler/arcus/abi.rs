@@ -104,8 +104,9 @@ pub fn report_mismatch(symptom: &str) {
              ArcVector: arcus has no single vtable layout and nothing at runtime\n\
              ArcVector: identifies one, so the bindings must be generated from the\n\
              ArcVector: server's own headers and configure flags:\n\
-             ArcVector:   ARCVECTOR_ENGINE_INCLUDE=<tree>/include \\\n\
-             ArcVector:   cargo build --features regen-bindings,replication\n\
+             ArcVector:   cp <tree>/config.h <tree>/config_static.h . \\\n\
+             ArcVector:   cp <tree>/include/memcached/*.h include/memcached/ \\\n\
+             ArcVector:   cargo build --features regen-bindings\n\
              ArcVector: see docs/내부구조.md §11.",
             built_for(),
         );
@@ -131,8 +132,9 @@ pub unsafe fn verify(server: *const SERVER_HANDLE_V1, vt: &engine_interface_v1) 
                      ArcVector: the vtable is called by offset and the two trees do not\n\
                      ArcVector: agree on it, so every engine call would land on the wrong\n\
                      ArcVector: function. Rebuild against this server's headers:\n\
-                     ArcVector:   ARCVECTOR_ENGINE_INCLUDE=<tree>/include \\\n\
-                     ArcVector:   cargo build --features regen-bindings,replication\n\
+                     ArcVector:   cp <tree>/config.h <tree>/config_static.h . \\\n\
+                     ArcVector:   cp <tree>/include/memcached/*.h include/memcached/ \\\n\
+                     ArcVector:   cargo build --features regen-bindings\n\
                      ArcVector: see docs/내부구조.md §11.",
                     fingerprint(version.as_deref()),
                     env!("ARCVECTOR_ABI_TREE"),
@@ -158,8 +160,9 @@ pub unsafe fn verify(server: *const SERVER_HANDLE_V1, vt: &engine_interface_v1) 
              ArcVector: arcus has no single vtable layout, and nothing at runtime\n\
              ArcVector: identifies one, so the bindings must be generated against\n\
              ArcVector: the server's own headers and configure flags:\n\
-             ArcVector:   ARCVECTOR_ENGINE_INCLUDE=<tree>/include \\\n\
-             ArcVector:   cargo build --features regen-bindings,replication\n\
+             ArcVector:   cp <tree>/config.h <tree>/config_static.h . \\\n\
+             ArcVector:   cp <tree>/include/memcached/*.h include/memcached/ \\\n\
+             ArcVector:   cargo build --features regen-bindings\n\
              ArcVector: see docs/내부구조.md §11.",
             fingerprint(version.as_deref()),
             absent.join(", "),

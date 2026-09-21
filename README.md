@@ -36,8 +36,11 @@ VSIM KEY docs 5 v1
 
 ```sh
 cargo build --release        # -> target/release/libarcusv.{so,dylib}
-make test                    # full suite, in a container with a real server
-make unit                    # unit tests only, on the host
+cargo test --lib             # unit tests only, on the host
+
+# full suite, in a container with a real server
+docker build -f docker/Dockerfile -t arcvector-test .
+docker run --rm arcvector-test
 ```
 
 `build.rs` runs bindgen over the vendored arcus headers in `include/`, so libclang
@@ -58,8 +61,14 @@ cargo build --release                          # a server built without it
 ```
 
 `replication` turns `cluster-aware` on with it; the opposite pairing is not a
-server that exists. `ARCVECTOR_ENGINE_INCLUDE` points at a different header tree.
-If you have the server's source, its `config.h` lists exactly which flags to pass.
+server that exists. To follow a different server, vendor its headers in and
+retranslate — there is no build flag that reads them from somewhere else:
+
+```sh
+cp <tree>/config.h <tree>/config_static.h .
+cp <tree>/include/memcached/*.h include/memcached/
+cargo build --features regen-bindings
+```
 
 A wrong pairing is refused at load time, with the rebuild command in the log,
 rather than crashing the server. See [docs/내부구조.md §11](docs/내부구조.md).

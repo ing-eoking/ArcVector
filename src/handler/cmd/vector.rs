@@ -6,7 +6,6 @@ use crate::handler::arcus::element::Layout;
 use crate::handler::arcus::engine::{Store, StoreError};
 use crate::handler::quant;
 use crate::handler::registry;
-use crate::handler::usearch::{PublishError, Published};
 
 pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
     let Add {
@@ -55,41 +54,12 @@ pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
     // other item's does.
     body[layout.element_len()..].copy_from_slice(b"\r\n");
 
-    let staged = index.ann.stage(&quantized)?;
-
-    match index.ann.insert_published(
-        staged,
-        || store.hold_kv(&vkey).ok(),
-        || store.set_kv(&vkey, &body),
-    ) {
-        Ok(Published::Indexed) => Ok(Reply::Stored),
-        Ok(Published::Unindexed(addr)) => {
-            index_it(&index, name, addr, quantized);
-            Ok(Reply::Stored)
-        }
-        Err(PublishError::Store(e)) => store_failed(name, stamp, e),
-
-        Err(PublishError::Mapping(e)) => Err(e),
-    }
-}
-
-fn index_it(
-    index: &std::sync::Arc<crate::handler::registry::VectorIndex>,
-    name: &str,
-    addr: u64,
-    vector: Vec<u8>,
-) {
-    match index.ann.add_unless_known(addr, || Ok(Some(vector))) {
-        Ok(true) => {}
-        Ok(false) => index.ann.unclaimed(addr),
-        Err(e) => {
-            eprintln!(
-                "ArcVector: '{name}' stored an element its graph would not take ({e}); \
-                 dropping the graph so the next read rebuilds it from the Map"
-            );
-            index.ann.unclaimed(addr);
-            registry::remove_observed(name, index);
-        }
+    // 그래프는 건드리지 않는다. 이 쓰기가 엔진의 link(또는 replace) 이벤트를
+    // 부르고, 그 콜백이 노드를 넣는다 -- 복제본과 복구가 거치는 경로와 같다.
+    // 같은 id를 다시 쓰는 것은 갱신이라 거절하지 않는다.
+    match store.set_kv(&vkey, &body) {
+        Ok(_) => Ok(Reply::Stored),
+        Err(e) => store_failed(name, stamp, e),
     }
 }
 
@@ -151,13 +121,9 @@ pub fn vgetattr(store: &Store, name: &str, id: &str) -> Result<Reply> {
         Err(StoreError::ElemGone) => Ok(Reply::NotFound),
 
         Err(StoreError::CorruptElement) => {
-            if let Ok(addr) = store.hold_kv(&crate::trigger::key::vector_key(name, id)) {
-                index.ann.forget_unreadable(addr);
-                store.release_items(&[addr]);
-            }
-            eprintln!(
-                "ArcVector: element '{id}' of index '{name}' is unreadable; dropped from the graph"
-            );
+            // 그래프에서 빼지 않는다. 이 아이템이 실제로 사라질 때 unlink
+            // 이벤트가 오고, 그때 콜백이 노드를 뺀다.
+            eprintln!("ArcVector: element '{id}' of index '{name}' is unreadable");
             Err(StoreError::CorruptElement.into())
         }
 
@@ -176,103 +142,56 @@ pub fn vsetattr(store: &Store, name: &str, id: &str, attr: &[u8]) -> Result<Repl
     let layout = index.ann.layout;
     let vkey = crate::trigger::key::vector_key(name, id);
 
-    let mut gone = false;
-    let mut kept_vector: Option<Vec<u8>> = None;
-    let settled = index.ann.update_published(
-        || {
-            let addr = match store.hold_kv(&vkey) {
-                Ok(addr) => addr,
-                Err(StoreError::KeyGone) => {
-                    gone = true;
-                    return None;
-                }
-                Err(_) => return None,
-            };
-            let body = store.with_item_at(addr, |_key, value| value.to_vec());
-            // The lookup's own reference has done its job; the graph keeps the
-            // one it already holds.
-            store.release_items(&[addr]);
-            body.map(|body| (addr, body))
-        },
-        |value| {
-            if value.len() < layout.element_len() {
-                return Err(StoreError::CorruptElement);
-            }
-            kept_vector = layout.vector_of(&value).map(<[u8]>::to_vec);
-
-            let mut body = vec![0u8; layout.stored_len()];
-            body[..layout.element_len()].copy_from_slice(&value[..layout.element_len()]);
-            layout
-                .set_attr(&mut body[..layout.element_len()], attr)
-                .map_err(|_| StoreError::CorruptElement)?;
-            body[layout.element_len()..].copy_from_slice(b"\r\n");
-
-            store.set_kv(&vkey, &body)
-        },
-    );
-
-    if gone {
-        map_is_gone(name, stamp);
-        return Ok(Reply::NotFound);
-    }
-    match settled {
-        Ok(Some(Published::Indexed)) => Ok(Reply::Stored),
-        Ok(Some(Published::Unindexed(addr))) => {
-            match kept_vector {
-                Some(vector) => index_it(&index, name, addr, vector),
-                None => {
-                    index.ann.unclaimed(addr);
-                    registry::remove_observed(name, &index);
-                }
-            }
-            Ok(Reply::Stored)
+    // 지금 값을 읽어 attr만 갈아 끼우고 다시 쓴다. 그래프는 건드리지 않는다 --
+    // 이 쓰기가 엔진의 replace 이벤트를 부르고, 그 콜백이 노드를 새 주소로 옮긴다.
+    let addr = match store.hold_kv(&vkey) {
+        Ok(addr) => addr,
+        Err(StoreError::KeyGone) => {
+            map_is_gone(name, stamp);
+            return Ok(Reply::NotFound);
         }
-        Ok(None) => Ok(Reply::NotFound),
-        Err(PublishError::Store(StoreError::ElemGone)) => Ok(Reply::NotFound),
-        Err(PublishError::Store(StoreError::KeyGone)) => {
+        Err(e) => return Err(e.into()),
+    };
+    let value = store.with_item_at(addr, |_key, value| value.to_vec());
+    store.release_items(&[addr]);
+
+    let Some(value) = value else {
+        return Ok(Reply::NotFound);
+    };
+    if value.len() < layout.element_len() {
+        return Err(StoreError::CorruptElement.into());
+    }
+
+    let mut body = vec![0u8; layout.stored_len()];
+    body[..layout.element_len()].copy_from_slice(&value[..layout.element_len()]);
+    layout
+        .set_attr(&mut body[..layout.element_len()], attr)
+        .map_err(|_| StoreError::CorruptElement)?;
+    body[layout.element_len()..].copy_from_slice(b"\r\n");
+
+    match store.set_kv(&vkey, &body) {
+        Ok(_) => Ok(Reply::Stored),
+        Err(StoreError::KeyGone) => {
             map_is_gone(name, stamp);
             Ok(Reply::NotFound)
         }
-        Err(PublishError::Store(e)) => Err(e.into()),
-        Err(PublishError::Mapping(e)) => Err(e),
+        Err(e) => Err(e.into()),
     }
 }
 
 pub fn vdel(store: &Store, name: &str, id: &str) -> Result<Reply> {
-    let index = for_write(store, name)?;
+    let _index = for_write(store, name)?;
     let stamp = registry::now();
-
     let vkey = crate::trigger::key::vector_key(name, id);
-    let mut map_gone = false;
 
-    // A second reference, taken only to learn the address the graph is holding.
-    // The one the graph owns is what `remove_published` retires; this extra one
-    // goes back below, from this request thread, where no lock is held.
-    let looked_up = match store.hold_kv(&vkey) {
-        Ok(addr) => Some(addr),
+    // 그래프는 건드리지 않는다. 이 삭제가 엔진의 unlink 이벤트를 부르고, 그
+    // 콜백이 노드를 빼고 참조를 sweeper에게 넘긴다.
+    match store.delete_kv(&vkey) {
+        Ok(()) => Ok(Reply::Deleted),
         Err(StoreError::KeyGone) => {
-            map_gone = true;
-            None
+            map_is_gone(name, stamp);
+            Ok(Reply::NotFound)
         }
-        Err(e) => return Err(e.into()),
-    };
-
-    let removed = index.ann.remove_published(|| match looked_up {
-        Some(addr) => store.delete_kv(&vkey).map(|()| Some(addr)),
-        None => Ok(None),
-    });
-
-    if let Some(addr) = looked_up {
-        store.release_items(&[addr]);
-    }
-    if map_gone {
-        map_is_gone(name, stamp);
-    }
-    match removed {
-        Ok(Some(_)) => Ok(Reply::Deleted),
-        Ok(None) => Ok(Reply::NotFound),
-        Err(PublishError::Store(e)) => Err(e.into()),
-
-        Err(PublishError::Mapping(e)) => Err(e),
+        Err(e) => Err(e.into()),
     }
 }

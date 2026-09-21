@@ -40,8 +40,10 @@ WORKDIR /src
 # does not recompile usearch's C++ core. build.rs runs during this build too, so
 # it needs both the headers and the committed bindings it checks them against --
 # without bindings/ it panics with "engine_api.rs is missing" before any
-# dependency is built.
-COPY Cargo.toml Cargo.lock build.rs ./
+# dependency is built. config.h and config_static.h are part of what it
+# fingerprints, so they have to come across with include/ or the check fails
+# here on headers that never moved.
+COPY Cargo.toml Cargo.lock build.rs config.h config_static.h ./
 COPY include ./include
 COPY bindings ./bindings
 RUN mkdir src && echo "" > src/lib.rs && cargo build --lib
