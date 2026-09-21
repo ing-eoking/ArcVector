@@ -390,11 +390,6 @@ impl AnnIndex {
         self.len() == 0
     }
 
-    /// 주소 장부가 없어졌으므로 0이다. `vstats`의 항목은 남겨둔다.
-    pub fn addr_set_bytes(&self) -> usize {
-        0
-    }
-
     pub fn held_bytes(&self) -> usize {
         self.inner
             .read()

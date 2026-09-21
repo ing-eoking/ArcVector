@@ -130,19 +130,16 @@ pub fn vstats() -> Result<Reply> {
     let indexes = registry::snapshot();
 
     let mut vectors = 0usize;
-    let mut addr_set_bytes = 0usize;
     let mut held_bytes = 0usize;
     let mut used_bytes = 0usize;
     let mut per_index = String::new();
     for index in &indexes {
-        let (count, addrs, held, used) = (
+        let (count, held, used) = (
             index.ann.len(),
-            index.ann.addr_set_bytes(),
             index.ann.held_bytes(),
             index.ann.used_bytes(),
         );
         vectors += count;
-        addr_set_bytes += addrs;
         held_bytes += held;
         used_bytes += used;
 
@@ -150,7 +147,6 @@ pub fn vstats() -> Result<Reply> {
         let _ = write!(
             per_index,
             "STAT {name}:vectors {count}\r\n\
-             STAT {name}:addr_set_bytes {addrs}\r\n\
              STAT {name}:index_held_bytes {held}\r\n\
              STAT {name}:index_used_bytes {used}\r\n\
              STAT {name}:reserved {}\r\n",
@@ -163,7 +159,6 @@ pub fn vstats() -> Result<Reply> {
         out,
         "STAT indexes {}\r\n\
          STAT vectors {vectors}\r\n\
-         STAT addr_set_bytes {addr_set_bytes}\r\n\
          STAT index_held_bytes {held_bytes}\r\n\
          STAT index_used_bytes {used_bytes}\r\n\
          STAT attr_bytes_per_vector {}\r\n",

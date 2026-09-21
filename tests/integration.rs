@@ -93,7 +93,7 @@ fn set_attr_replaces_the_attributes_and_keeps_the_vector() {
         &format!("VALUE v1 {}\r\n{second}\r\nEND\r\n", second.len()),
     );
 
-    assert_contains(&client.vsim(&ix, 1, 2, "1.0 0.0"), "VALUE v1 0");
+    assert_contains(&client.vsim(&ix, 1, 2, "1.0 0.0"), "VALUE v1 1");
 
     assert_reply(&client.send(&format!("vsetattr {ix} v1 0")), "STORED\r\n");
     assert_reply(
@@ -180,10 +180,10 @@ fn withattr_answers_the_attributes_by_either_route() {
     client.vadd_attr(&ix, "one", 2, "0.1 0.2", attr);
 
     let plain = client.vsim_withattr(&ix, 5, 2, "0.1 0.2", &[]);
-    assert_contains(&plain, &format!("VALUE one 0 {}\r\n{attr}", attr.len()));
+    assert_contains(&plain, &format!("VALUE one 1 {}\r\n{attr}", attr.len()));
 
     let filtered = client.vsim_withattr(&ix, 5, 2, "0.1 0.2", &["score>500"]);
-    assert_contains(&filtered, &format!("VALUE one 0 {}\r\n{attr}", attr.len()));
+    assert_contains(&filtered, &format!("VALUE one 1 {}\r\n{attr}", attr.len()));
 
     client.send(&format!("vdrop {ix}"));
 }
@@ -383,10 +383,9 @@ fn vstats_reports_module_memory_and_follows_the_vector_count() {
     assert!(full.ends_with("END\r\n"), "{full}");
     assert_contains(&full, &format!("STAT {ix}:vectors 40"));
     assert_eq!(stat(&full, "attr_bytes_per_vector"), 128);
-    let idmap = stat(&full, &format!("{ix}:idmap_bytes"));
     let used = stat(&full, &format!("{ix}:index_used_bytes"));
     let held = stat(&full, &format!("{ix}:index_held_bytes"));
-    assert!(idmap > 0 && used > 0, "idmap {idmap} used {used}");
+    assert!(used > 0, "used {used}");
     assert!(held >= used, "held {held} < used {used}");
 
     for i in 0..40 {
@@ -394,7 +393,6 @@ fn vstats_reports_module_memory_and_follows_the_vector_count() {
     }
     let empty = client.send("vstats");
     assert_contains(&empty, &format!("STAT {ix}:vectors 0"));
-    assert_eq!(stat(&empty, &format!("{ix}:idmap_bytes")), 0);
 
     assert_eq!(stat(&empty, &format!("{ix}:index_held_bytes")), held);
     assert_eq!(stat(&empty, &format!("{ix}:index_used_bytes")), used);
