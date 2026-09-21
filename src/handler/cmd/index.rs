@@ -92,11 +92,23 @@ fn already_there(store: &Store, name: &str) -> Result<Reply> {
 }
 
 pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {
-    // The metadata goes first: deleting it fires the unlink callback, which
-    // releases the graph outright. The flush only promises the vectors stop
-    // being visible -- it stamps the prefix and walks part of the LRU, leaving
-    // the rest to expire when touched -- so it cannot be relied on to end the
-    // graph. Late vector callbacks then land on a name nothing has registered.
+    // The flush goes first, and the registry entry goes last.
+    //
+    // Each vector the flush unlinks fires the unlink callback, and that
+    // callback decides whether this crate is holding the item by asking the
+    // graph (`trigger::event`). Removing the index first takes that answer
+    // away: the callback finds no index, reads it as "we never took this one",
+    // and every vector of a dropped index stays pinned for the life of the
+    // process -- usearch cannot enumerate its keys, so nothing else can find
+    // them either.
+    //
+    // The flush is not a promise that every vector is gone. It stamps the
+    // prefix and walks part of the LRU, leaving the rest to go when touched;
+    // those late ones do land on a name nothing has registered, and those leak.
+    // Going in this order is what keeps that to the stragglers instead of all
+    // of them.
+    let flushed = store.flush_prefix(&crate::trigger::key::index_prefix(name));
+
     let had_meta = match store.delete_kv(&crate::trigger::key::meta_key(name)) {
         Ok(()) => true,
         Err(StoreError::KeyGone) => false,
@@ -104,7 +116,7 @@ pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {
     };
     let known = registry::remove(name);
 
-    if had_meta && let Err(e) = store.flush_prefix(&crate::trigger::key::index_prefix(name)) {
+    if had_meta && let Err(e) = flushed {
         eprintln!("ArcVector: '{name}' was dropped, but its vectors were not flushed ({e})");
     }
 

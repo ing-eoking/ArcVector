@@ -79,24 +79,22 @@ pub fn adopt(index: &Arc<VectorIndex>) {
         // 넘어가면 이 주소를 누가 놓아줘야 하는지가 정해지지 않는다.
         let kept = waiting::finish(name, addr);
 
-        match (took, kept) {
-            // 그래프에 들어갔다. 이제부터는 평소 경로가 맡는다.
-            (true, true) => linked += 1,
+        // 들어갔으면 평소 경로가 맡는다. 그 밖에는 전부 여기서 놓아준다.
+        //
+        // 못 넣은 경우도 그렇다. 그 주소는 링크 때 `Took`으로 답해 붙잡아 둔
+        // 것이라 참조가 우리 것인데, 그래프에 노드가 없으니 나중에 그 아이템이
+        // 빠질 때 `on_unlink`은 "우리 것이 아니다"로 읽는다. 여기서 안 놓으면
+        // 아무도 안 놓는다. 아직 링크된 아이템을 놓아주는 것은 안전하다 --
+        // `do_item_release`는 링크된 것을 해제하지 않고 LRU로 되돌린다.
+        if took && kept {
+            linked += 1;
+            continue;
+        }
 
-            // 넣는 사이에 unlink가 지나갔다. 그쪽은 `Took`으로 답하고 물러났으니
-            // 참조를 돌려줄 사람은 여기뿐이다.
-            (_, false) => {
-                lost += 1;
-                index.ann.unlink_at(addr);
-                if !index.ann.retire_one(addr) {
-                    index.ann.halt_for_overflow();
-                }
-            }
-
-            // 못 넣었지만 아이템은 저장소에 그대로 링크돼 있다. **여기서
-            // 놓아주면 안 된다** -- 그 아이템이 빠질 때 `on_unlink`이 한 번 더
-            // 놓아 이중 해제가 된다. 링크 때 거절한 벡터와 같은 처지로 둔다.
-            (false, true) => lost += 1,
+        lost += 1;
+        index.ann.unlink_at(addr);
+        if !index.ann.retire_one(addr) {
+            index.ann.halt_for_overflow();
         }
     }
 

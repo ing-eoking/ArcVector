@@ -548,3 +548,36 @@ fn a_replica_builds_its_index_when_the_metadata_lands_after_the_vectors() {
     client.send(&format!("vdrop {src}"));
     client.send(&format!("vdrop {dst}"));
 }
+
+#[test]
+fn a_body_the_graph_cannot_read_leaves_the_reference_accounting_straight() {
+    // The engine hands over a reference at link only when the callback accepts,
+    // and takes one back at unlink when it declines. So the two answers have to
+    // agree about one item: declining a vector the graph refused would mean the
+    // later unlink releases a reference that was never given.
+    //
+    // A short body under a well-formed vector key is the way to make the graph
+    // refuse one without touching anything else.
+    session!(_server, client);
+    let ix = index_name("shortbody");
+    client.send(&format!("vcreate {ix} 2 METRIC l2"));
+    assert_reply(&client.vadd(&ix, "good", 2, "1.0 0.0"), "STORED\r\n");
+
+    let bad = format!("arcus_event{{{ix}}}:bad");
+    assert_reply(&client.set_value(&bad, b"short"), "STORED\r\n");
+
+    // The store has it, the graph does not, and the search still answers.
+    assert_contains(&client.send(&format!("get {bad}")), "VALUE");
+    assert_contains(&client.vsim(&ix, 5, 2, "1.0 0.0"), "VALUE good 1");
+
+    assert_reply(&client.send(&format!("delete {bad}")), "DELETED\r\n");
+
+    // Whatever the unlink did with that reference, the index and the daemon are
+    // still standing and still counting right.
+    assert_reply(&client.vadd(&ix, "next", 2, "0.0 1.0"), "STORED\r\n");
+    let hits = client.vsim(&ix, 5, 2, "1.0 0.0");
+    assert_contains(&hits, "QUERY 0 2");
+    assert_contains(&hits, "VALUE good 1");
+
+    client.send(&format!("vdrop {ix}"));
+}

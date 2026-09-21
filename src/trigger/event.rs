@@ -3,11 +3,35 @@
 //! 세 경우가 한 콜백으로 온다. `event_data_t`가 어느 경우인지와, 우리 답을 담을
 //! 자리와, 관련된 아이템 포인터를 들고 온다.
 //!
-//! | | 엔진이 콜백 전에 | `ret`의 뜻 | 우리가 거절하면 |
-//! |---|---|---|---|
-//! | LINK | `INCR(new)` | new를 받았나 | (지금 EE는 안 봄) |
-//! | UNLINK | — | old를 계속 들 건가 | `DECR(old)` |
-//! | REPLACE | — | new를 받았나 | `DECR(old)` |
+//! | | 우리가 받으면 | 우리가 거절하면 |
+//! |---|---|---|
+//! | LINK | `INCR(new)` | **아무것도 안 준다** |
+//! | UNLINK | 우리가 놓아준다 | `DECR(old)` |
+//! | REPLACE | `INCR(new)` | `INCR(new)` + `DECR(old)` |
+//!
+//! # 지켜야 하는 하나
+//!
+//! **우리가 LINK에서 받았다고 답한 아이템의 참조가, 들고 있는 것의 전부다.**
+//! 거절하면 엔진은 참조를 주지 않는다.
+//!
+//! 그래서 넣지 못하면 거기서 끝낸다. 메모리가 없어 그래프에 못 넣든, 붙잡아 둘
+//! 자리가 없든, 거절하고 손을 뗀다 -- 아이템은 저장소에 남지만 우리 것이 아니고,
+//! 엔진이 평소처럼 evict한다. 들고 있지도 않은 것을 나중에 놓아주면 아직 쓰는
+//! 아이템이 먼저 해제되고, 들고 있는 것을 안 놓아주면 프로세스가 끝날 때까지
+//! 붙잡힌다.
+//!
+//! 그러려면 unlink에서 "이걸 내가 들고 있나"에 답할 수 있어야 한다. 장부를 따로
+//! 두지 않고 이미 있는 것으로 답한다:
+//!
+//! | 무엇 | 들고 있나 | 무엇을 보고 아나 |
+//! |---|---|---|
+//! | 보류 중인 벡터 | 예 | `waiting`에 있다 |
+//! | 등록된 인덱스의 메타 | 예 | 등록돼 있다는 것이 곧 링크에서 받았다는 뜻 |
+//! | 그래프에 있던 벡터 | 예 | `unlink_at`이 `true` |
+//! | 그 밖 | 아니오 | 링크에서 거절했다 |
+//!
+//! 마지막 줄이 참이려면 `vdrop`이 프리픽스를 flush한 **뒤에** 레지스트리에서
+//! 빼야 한다. 먼저 빼면 그 벡터들의 unlink가 그래프에 물어볼 곳을 잃는다.
 //!
 //! **이 함수는 엔진의 `cache_lock`을 쥔 채 불린다.** 아이템을 링크한 그 스레드에서
 //! 온다 -- 클라이언트 쓰기면 워커, 복제본이면 복제 적용 스레드, 기동 시면 복구
@@ -167,7 +191,10 @@ fn route(store: &Store, addr: u64) -> Option<(String, bool)> {
 /// 복구가 넣는다.
 fn on_link(store: &Store, addr: u64) -> Decision {
     let Some((name, is_meta)) = route(store, addr) else {
-        return Decision::NotOurs;
+        // `ITEM_WITH_EVENT`는 키 앞 열한 바이트만 보고 서므로 우리 모양이 아닌
+        // 키도 여기까지 온다. 받아두면 그 아이템의 unlink는 우리 것이 아니라고
+        // 답할 테고, 참조는 프로세스가 끝날 때까지 남는다.
+        return Decision::Declined;
     };
     if is_meta {
         return on_meta(store, addr, &name);
@@ -183,7 +210,7 @@ fn on_link(store: &Store, addr: u64) -> Decision {
             "ArcVector: no room to hold '{name}' vectors until its metadata arrives; \
              this one will be missing from the graph"
         );
-        return Decision::NotOurs;
+        return Decision::Declined;
     };
     link_into(store, &index, addr)
 }
@@ -203,7 +230,12 @@ fn link_into(store: &Store, index: &VectorIndex, addr: u64) -> Decision {
     if took {
         Decision::Took
     } else {
-        eprintln!("ArcVector: the graph would not take a linked item; the engine reclaims it");
+        // 여기서 끝낸다. 참조를 안 받으므로 이 아이템은 우리 것이 아니고,
+        // unlink는 그래프에 노드가 없는 것을 보고 놓아주지 않는다.
+        eprintln!(
+            "ArcVector: the graph would not take a linked item; it stays in the \
+             store, out of this index"
+        );
         Decision::Declined
     }
 }
@@ -223,11 +255,11 @@ fn on_meta(store: &Store, addr: u64, name: &str) -> Decision {
     }
 
     let Some(index) = build(store, addr, name) else {
-        return Decision::NotOurs;
+        return Decision::Declined;
     };
     let Ok((registered, previous)) = registry::put(index) else {
         eprintln!("ArcVector: the index registry could not grow; '{name}' stays unknown");
-        return Decision::NotOurs;
+        return Decision::Declined;
     };
     sweep::retire(previous);
 
@@ -275,18 +307,16 @@ fn build(store: &Store, addr: u64, name: &str) -> Option<VectorIndex> {
     }
 }
 
-/// 아이템이 빠진다. 그래프에서 빼고, 참조를 sweeper에게 넘긴다.
+/// 아이템이 빠진다. 우리가 들고 있는 것이면 놓아준다.
 ///
-/// 큐에 못 넣으면 그 주소를 잃는다 -- 그래프와 저장소가 어긋난 채로 남는다.
-/// 그때는 인덱스를 잠그고 거절한다. 잠금이 **진행 중인 역참조가 끝나기를 기다린
-/// 뒤에** 돌아오므로, 엔진이 그 자리에서 해제해도 읽고 있는 검색이 없다.
+/// 무엇을 들고 있는지는 이 모듈 머리의 표가 답한다.
 fn on_unlink(store: &Store, addr: u64) -> Decision {
-    let Some((name, _is_meta)) = route(store, addr) else {
+    let Some((name, is_meta)) = route(store, addr) else {
         return Decision::NotOurs;
     };
 
     match waiting::unlink(&name, addr) {
-        // 그래프에 들어간 적이 없다. 거절하면 엔진이 참조를 회수한다.
+        // 그래프에 들어간 적은 없지만 참조는 우리 것이다. 거절하면 엔진이 회수한다.
         Unlinked::NeverLinked => return Decision::Declined,
         // 복구가 넣는 중이다. 받아두면 그쪽이 노드를 빼고 참조를 돌려준다.
         Unlinked::Recovering => return Decision::Took,
@@ -294,14 +324,25 @@ fn on_unlink(store: &Store, addr: u64) -> Decision {
     }
 
     let Some(index) = registry::get(&name) else {
-        // 인덱스가 레지스트리를 떠났다 -- `vdrop`이 메타를 지우고 프리픽스를
-        // flush하는 중이다. 그 그래프는 이미 버려졌고 아무도 이 주소를 놓아주지
-        // 않으므로, 거절해서 엔진이 회수하게 한다. 이것이 없으면 드롭된 인덱스의
-        // 아이템이 프로세스 끝까지 붙잡힌다.
-        return Decision::Declined;
+        // 이 이름으로 등록된 인덱스가 없다. 링크 때 거절했거나 -- 메타를 못
+        // 읽었거나 붙잡아 둘 자리가 없었거나 -- 애초에 받은 적이 없다는 뜻이라,
+        // 놓아줄 참조가 없다. `vdrop`이 flush를 먼저 하는 것이 이 줄을 참으로
+        // 만든다.
+        return Decision::NotOurs;
     };
 
-    index.ann.unlink_at(addr);
+    if is_meta {
+        // 인덱스가 등록돼 있다는 것이 이 메타를 링크에서 받았다는 뜻이다.
+        // 그래프에 노드가 없으니 큐를 거칠 이유도 없다 -- 아무도 이 주소를
+        // 역참조하지 않으므로 엔진이 그 자리에서 회수해도 된다.
+        return Decision::Declined;
+    }
+
+    if !index.ann.unlink_at(addr) {
+        // 그래프에 없었다. 링크 때 그래프가 안 받은 벡터라 참조도 받지 않았다.
+        return Decision::NotOurs;
+    }
+
     if index.ann.retire_one(addr) {
         return Decision::Took;
     }
@@ -324,12 +365,13 @@ fn on_replace(store: &Store, old: u64, new: u64) -> Decision {
     };
 
     if is_meta {
-        // 메타는 그래프에 노드가 없다. 아직 모르는 인덱스면 새 본문으로 세우고,
-        // 어느 쪽이든 old의 참조만 엔진에 돌려주면 된다.
-        if !registry::contains(&name) {
-            on_meta(store, new, &name);
+        // 메타는 그래프에 노드가 없다. old를 들고 있었나는 그 인덱스가 등록돼
+        // 있었나와 같다.
+        if registry::contains(&name) {
+            return Decision::Declined;
         }
-        return Decision::Declined;
+        on_meta(store, new, &name);
+        return Decision::NotOurs;
     }
 
     let waiting = waiting::unlink(&name, old);
@@ -356,8 +398,11 @@ fn on_replace(store: &Store, old: u64, new: u64) -> Decision {
     }
 
     if !index.ann.rename_node(old, new) {
-        // 그래프가 old를 갖고 있지 않았다. 새로 넣는 것과 같다.
-        return link_into(store, &index, new);
+        // 그래프가 old를 갖고 있지 않았다 -- 링크 때 안 받은 벡터라 참조도 없다.
+        // new만 새로 넣는다. `INCR(new)`는 우리 답과 무관하게 이미 일어났으므로
+        // 여기서 거절하면 없는 old의 참조를 회수하라는 말이 된다.
+        link_into(store, &index, new);
+        return Decision::NotOurs;
     }
 
     if index.ann.retire_one(old) {
