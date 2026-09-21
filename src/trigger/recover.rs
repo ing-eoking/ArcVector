@@ -53,9 +53,8 @@ pub fn adopt(index: &Arc<VectorIndex>) {
     let Some(store) = Store::background() else {
         // vtable이 없으면 아이템을 읽을 수 없다. 붙잡고 있어봐야 넣을 길이
         // 없으니 목록을 버린다 -- 참조는 각 아이템이 빠질 때 회수된다.
-        if pending::forget(name) || pending::held() > 0 {
-            eprintln!("ArcVector: no engine vtable; '{name}' comes up with an empty graph");
-        }
+        pending::forget(name);
+        eprintln!("ArcVector: no engine vtable; '{name}' comes up with an empty graph");
         return;
     };
 
