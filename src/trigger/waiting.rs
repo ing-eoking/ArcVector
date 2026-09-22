@@ -60,11 +60,21 @@ enum Slot {
     Done,
 }
 
+/// 한 슬롯. 주소는 `order`의 어느 칸에 있는지까지 안다.
+///
+/// 칸 번호를 들고 있는 것은 replace 때문이다. 자리를 찾아 그 자리에서 바꿔
+/// 끼우면 목록이 자라지 않고, 자라지 않으면 실패할 일도 없다.
+#[derive(Clone, Copy)]
+struct Entry {
+    slot: Slot,
+    at: usize,
+}
+
 #[derive(Default)]
 struct Waiting {
     /// 도착 순서. 복구가 이 순서로 훑는다.
     order: Vec<u64>,
-    state: HashMap<u64, Slot>,
+    state: HashMap<u64, Entry>,
     /// 할당기가 거절해 흘려보낸 주소가 있다.
     incomplete: bool,
 }
@@ -80,6 +90,20 @@ static PENDING: LazyLock<Mutex<Store>> = LazyLock::new(|| Mutex::new(Store::defa
 
 fn store() -> MutexGuard<'static, Store> {
     PENDING.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// replace 콜백이 무엇을 해야 하는지.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Replaced {
+    /// new가 old의 자리를 그대로 물려받았다. 복구가 new를 집어간다.
+    ///
+    /// old의 참조는 아직 우리 것이고 그래프에는 없으므로, 거절해서 엔진이
+    /// 회수하게 한다.
+    Swapped,
+    /// 복구가 old를 넣는 중이다. 뒷정리는 그쪽 몫이고, new는 따로 잡아둔다.
+    Recovering,
+    /// old가 여기 없다. 평소 경로가 맡는다.
+    NotWaiting,
 }
 
 /// unlink 콜백이 무엇을 해야 하는지.
@@ -106,8 +130,9 @@ pub(crate) fn push(index: &str, addr: u64) -> bool {
             waiting.incomplete = true;
             false
         } else {
+            let at = waiting.order.len();
             waiting.order.push(addr);
-            waiting.state.insert(addr, Slot::Pending);
+            waiting.state.insert(addr, Entry { slot: Slot::Pending, at });
             true
         }
     };
@@ -125,12 +150,45 @@ pub(crate) fn claim(index: &str, cursor: &mut usize) -> Option<u64> {
     let waiting = store.by_index.get_mut(index)?;
     while let Some(&addr) = waiting.order.get(*cursor) {
         *cursor += 1;
-        if waiting.state.get(&addr) == Some(&Slot::Pending) {
-            waiting.state.insert(addr, Slot::Claimed);
+        if let Some(entry) = waiting.state.get_mut(&addr)
+            && entry.slot == Slot::Pending
+        {
+            entry.slot = Slot::Claimed;
             return Some(addr);
         }
     }
     None
+}
+
+/// 보류 중인 주소가 새것으로 교체됐다.
+///
+/// **자리를 그대로 물려받는다.** old를 빼고 new를 덧붙이면 목록이 replace마다
+/// 자라고, 자라다 할당기에 거절당하면 그 벡터는 그래프에서 빠진다. 크기가 안
+/// 변하는 연산이니 자랄 이유가 없고, 그래서 이 경로는 실패하지 않는다.
+pub(crate) fn replace(index: &str, old: u64, new: u64) -> Replaced {
+    let mut store = store();
+    let Some(waiting) = store.by_index.get_mut(index) else {
+        return Replaced::NotWaiting;
+    };
+    let Some(entry) = waiting.state.get(&old).copied() else {
+        return Replaced::NotWaiting;
+    };
+
+    match entry.slot {
+        Slot::Pending => {
+            waiting.state.remove(&old);
+            waiting.order[entry.at] = new;
+            waiting.state.insert(new, entry);
+            Replaced::Swapped
+        }
+        Slot::Claimed => {
+            // 복구가 old를 역참조하고 있다. 자리를 빼앗으면 그쪽이 넣고 나서
+            // 볼 표가 없어진다. 묘비를 찍어 되돌리게 하고 new는 따로 잡는다.
+            waiting.state.insert(old, Entry { slot: Slot::Dropped, ..entry });
+            Replaced::Recovering
+        }
+        _ => Replaced::NotWaiting,
+    }
 }
 
 /// 그래프에 넣고 나서 부른다. 그대로 둬도 되면 `true`.
@@ -146,9 +204,9 @@ pub(crate) fn finish(index: &str, addr: u64) -> bool {
     let Some(waiting) = store.by_index.get_mut(index) else {
         return true;
     };
-    match waiting.state.get(&addr) {
-        Some(Slot::Claimed) => {
-            waiting.state.insert(addr, Slot::Done);
+    match waiting.state.get_mut(&addr) {
+        Some(entry) if entry.slot == Slot::Claimed => {
+            entry.slot = Slot::Done;
             true
         }
         _ => false,
@@ -161,13 +219,13 @@ pub(crate) fn unlink(index: &str, addr: u64) -> Unlinked {
     let Some(waiting) = store.by_index.get_mut(index) else {
         return Unlinked::NotWaiting;
     };
-    match waiting.state.get(&addr) {
-        Some(Slot::Pending) => {
-            waiting.state.insert(addr, Slot::Dropped);
+    match waiting.state.get_mut(&addr) {
+        Some(entry) if entry.slot == Slot::Pending => {
+            entry.slot = Slot::Dropped;
             Unlinked::NeverLinked
         }
-        Some(Slot::Claimed) => {
-            waiting.state.insert(addr, Slot::Dropped);
+        Some(entry) if entry.slot == Slot::Claimed => {
+            entry.slot = Slot::Dropped;
             Unlinked::Recovering
         }
         _ => Unlinked::NotWaiting,
@@ -275,6 +333,47 @@ mod tests {
         // 놓아주라고 답하면 -- 아이템이 아직 링크돼 있는데 -- 그 unlink가 한 번
         // 더 놓아 이중 해제가 된다. 모를 때는 새는 쪽으로 틀린다.
         assert!(finish("pending-vanished", 0x10));
+    }
+
+    #[test]
+    fn replacing_a_waiting_vector_takes_over_its_place() {
+        // 자리를 물려받지 않고 덧붙이면 목록이 replace마다 자라고, 자라다
+        // 할당기에 거절당하면 그 벡터가 그래프에서 빠진다. 크기가 안 변하는
+        // 연산이므로 자랄 이유가 없다.
+        let ix = "waiting-replace";
+        let _alone = alone(ix);
+        push(ix, 0x10);
+        let before = count();
+
+        assert_eq!(replace(ix, 0x10, 0x20), Replaced::Swapped);
+        assert_eq!(count(), before, "자리를 물려받았으니 더 잡지 않는다");
+
+        let mut cursor = 0;
+        assert_eq!(claim(ix, &mut cursor), Some(0x20), "복구는 새 주소를 집는다");
+        assert_eq!(claim(ix, &mut cursor), None, "옛 주소는 남아 있지 않다");
+        forget(ix);
+    }
+
+    #[test]
+    fn replacing_one_recovery_holds_leaves_it_to_recovery() {
+        let ix = "waiting-replace-claimed";
+        let _alone = alone(ix);
+        push(ix, 0x10);
+        let mut cursor = 0;
+        assert_eq!(claim(ix, &mut cursor), Some(0x10));
+
+        // 복구가 역참조하는 중이다. 자리를 빼앗으면 그쪽이 넣고 나서 볼 표가
+        // 없어진다.
+        assert_eq!(replace(ix, 0x10, 0x20), Replaced::Recovering);
+        assert!(!finish(ix, 0x10), "복구가 도로 빼야 한다는 답을 받는다");
+        forget(ix);
+    }
+
+    #[test]
+    fn replacing_something_nobody_is_waiting_on_is_not_ours() {
+        let ix = "waiting-replace-unknown";
+        let _alone = alone(ix);
+        assert_eq!(replace(ix, 0x10, 0x20), Replaced::NotWaiting);
     }
 
     #[test]

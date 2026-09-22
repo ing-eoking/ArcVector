@@ -56,7 +56,7 @@ use crate::handler::arcus::engine::{ItemElements, Store};
 use crate::handler::registry::{self, VectorIndex};
 use crate::handler::usearch::AnnIndex;
 use crate::handler::usearch::metric::Metric;
-use crate::trigger::waiting::{self, Unlinked};
+use crate::trigger::waiting::{self, Replaced, Unlinked};
 use crate::trigger::recover;
 
 use crate::engine_api::{
@@ -381,7 +381,21 @@ fn on_replace(store: &Store, old: u64, new: u64) -> Decision {
         return Decision::NotOurs;
     }
 
-    let waiting = waiting::unlink(&name, old);
+    // 보류 중인 벡터가 교체됐다. 자리를 그대로 물려받으므로 목록이 자라지 않고,
+    // 그래서 이 경로는 자리가 없어 실패할 일이 없다.
+    match waiting::replace(&name, old, new) {
+        // new가 old의 자리에 들어갔다. 복구가 집어간다. old는 그래프에 없으니
+        // 거절해서 엔진이 회수하게 한다.
+        Replaced::Swapped => return Decision::Declined,
+        // 복구가 old를 넣는 중이다. 그쪽이 빼고 돌려주고, new는 따로 잡아둔다.
+        Replaced::Recovering => {
+            if !waiting::push(&name, new) {
+                eprintln!("ArcVector: no room to hold a replaced '{name}' vector; it is dropped");
+            }
+            return Decision::Took;
+        }
+        Replaced::NotWaiting => {}
+    }
 
     // old를 들고 있는 그래프가 살아 있는 인덱스가 아닐 수 있다 -- `vdrop`한 뒤
     // 그 키를 다시 쓰면 옛 그래프가 old를, 새 인덱스가 new를 맡는다.
@@ -406,25 +420,13 @@ fn on_replace(store: &Store, old: u64, new: u64) -> Decision {
     }
 
     let Some(index) = registry::get(&name) else {
-        // 메타가 아직 안 왔다. new를 old의 자리에 붙잡아 둔다.
+        // 이 이름으로 아는 인덱스가 없고 보류 목록에도 없다. old는 링크 때
+        // 거절한 것이라 돌려줄 참조가 없고, new는 메타를 기다리게 둔다.
         if !waiting::push(&name, new) {
             eprintln!("ArcVector: no room to hold a replaced '{name}' vector; it is dropped");
         }
-        return Decision::Declined;
+        return Decision::NotOurs;
     };
-
-    if waiting != Unlinked::NotWaiting {
-        // old는 그래프에 들어간 적이 없다. new만 정상 경로로 넣는다. 못 넣으면
-        // `link_into`가 로그를 남기고, new의 참조는 그 아이템이 빠질 때
-        // `on_unlink`이 거절해서 회수된다.
-        link_into(store, &index, new);
-        return match waiting {
-            // 복구가 old를 들고 있다. 그쪽이 빼고 돌려준다.
-            Unlinked::Recovering => Decision::Took,
-            // 아무도 안 들고 있다. 엔진이 회수한다.
-            _ => Decision::Declined,
-        };
-    }
 
     if !index.ann.rename_node(old, new) {
         // 그래프가 old를 갖고 있지 않았다 -- 링크 때 안 받은 벡터라 참조도 없다.
