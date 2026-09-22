@@ -91,34 +91,35 @@ fn already_there(store: &Store, name: &str) -> Result<Reply> {
 }
 
 pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {
-    // Stop serving the name first, so nothing reaches a graph that is being
-    // taken apart -- but stay in the registry until the flush is done.
-    //
-    // Those two are not the same thing, and the difference is what the unlink
-    // callback needs. Each vector the flush unlinks fires that callback, and
-    // it decides whether this crate is holding the item by asking the graph
-    // (`trigger::event`). Removing the entry outright takes the question away:
-    // the callback finds no index, reads it as "we never took this one", and
-    // every vector of a dropped index stays pinned for the life of the process
-    // -- usearch cannot enumerate its keys, so nothing else can find them.
-    //
-    // The flush is not a promise that every vector is gone. It stamps the
-    // prefix and walks part of the LRU, leaving the rest to go when touched;
-    // those late ones do arrive after the entry is gone, and those leak. This
-    // order keeps that to the stragglers instead of all of them.
-    if let Some(index) = registry::get(name) {
-        index.mark_draining();
-    }
-    let flushed = store.flush_prefix(&crate::trigger::key::index_prefix(name));
+    // 살아 있는 엔트리만 센다. 앞서 드롭돼 비워지는 중인 그래프는 `known`에
+    // 잡히지만, 그건 이미 없는 인덱스다 -- 두 번째 `vdrop`은 `NOT_FOUND`다.
+    let known = registry::contains(name);
 
+    // 1. The metadata item goes first.
+    //
+    // Unlinking it fires the unlink callback, and that callback is what takes
+    // the index out of the registry -- here and on a replica alike, because a
+    // replica never sees this command, only the replicated delete. From the
+    // moment it returns, nothing can reach the index.
+    //
+    // The graph is not freed with it. It still holds the reference to every
+    // vector that is still linked, and `registry::holding` is how the unlinks
+    // below find it again.
     let had_meta = match store.delete_kv(&crate::trigger::key::meta_key(name)) {
         Ok(()) => true,
         Err(StoreError::KeyGone) => false,
         Err(e) => return Err(e.into()),
     };
-    let known = registry::remove(name);
+    // With no metadata there was no callback, so the entry is still there.
+    registry::remove(name);
 
-    if had_meta && let Err(e) = flushed {
+    // 2. Then the vectors, in bulk.
+    //
+    // The flush does not unlink them all. It stamps the prefix and walks each
+    // LRU as far as the first item older than the stamp, leaving the rest to be
+    // invalidated when something touches them. Those late unlinks are why the
+    // graph has to outlive this call.
+    if had_meta && let Err(e) = store.flush_prefix(&crate::trigger::key::index_prefix(name)) {
         eprintln!("ArcVector: '{name}' was dropped, but its vectors were not flushed ({e})");
     }
 
