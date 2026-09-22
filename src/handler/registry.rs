@@ -128,6 +128,19 @@ impl VectorIndex {
 static INDICES: LazyLock<RwLock<HashMap<String, Arc<VectorIndex>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// `vdrop`한 인덱스. 아직 버리지 않는다.
+///
+/// `flush`는 프리픽스의 아이템을 그 자리에서 다 빼지 않는다 -- LRU를 훑다가
+/// 방금 건드린 것 너머에서 멈추고, 나머지는 누가 손댈 때 무효화된다
+/// (`items.c`). 그 늦은 unlink가 올 때 콜백은 "이 주소를 내가 받았나"를 답해야
+/// 하는데, usearch에는 키를 열거하는 방법이 없어서 그래프를 버리면 그 질문에
+/// 답할 길이 사라진다. 장부를 따로 두는 대신 그래프를 남겨둔다.
+///
+/// 그래프가 비면 sweeper가 버린다. 그때까지 남아 있는 것은 그동안 실제로
+/// 참조를 쥐고 있기 때문이라, 이 목록의 크기는 정확한 값이다.
+static DROPPED: LazyLock<RwLock<Vec<Arc<VectorIndex>>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+
 fn read() -> std::sync::RwLockReadGuard<'static, HashMap<String, Arc<VectorIndex>>> {
     INDICES.read().unwrap_or_else(PoisonError::into_inner)
 }
@@ -144,6 +157,53 @@ pub fn get(name: &str) -> Option<Arc<VectorIndex>> {
 ///
 /// 세우는 중(`BUILDING`)이거나 비워지는 중(`DRAINING`)이면 없는 것과 같다.
 /// `get`은 그래도 찾아준다 -- 트리거 콜백은 그 사이에도 그래프에 물어봐야 한다.
+/// 이 주소를 들고 있는 그래프. 버려지는 중인 것까지 본다.
+///
+/// 주소는 그래프 하나에만 있으므로 답은 유일하다. 같은 이름으로 새 인덱스가
+/// 생긴 뒤에도 옛 그래프가 자기 몫을 정확히 답한다.
+pub fn holding(name: &str, addr: u64) -> Option<Arc<VectorIndex>> {
+    if let Some(index) = get(name)
+        && index.ann.holds(addr)
+    {
+        return Some(index);
+    }
+    DROPPED
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|index| index.name == name && index.ann.holds(addr))
+        .cloned()
+}
+
+/// 이 이름을 살아 있는 것이든 비워지는 중이든 알고 있나.
+pub fn known(name: &str) -> bool {
+    contains(name)
+        || DROPPED
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|index| index.name == name)
+}
+
+/// 살아 있는 인덱스와 비워지는 중인 그래프를 모두. sweeper가 훑는 목록이다.
+pub fn all() -> Vec<Arc<VectorIndex>> {
+    let mut all = indexes().unwrap_or_default();
+    all.extend(
+        DROPPED
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned(),
+    );
+    all
+}
+
+/// 다 비운 그래프를 버린다. sweeper가 매 틱 부른다.
+pub fn reap_drained() {
+    let mut dropped = DROPPED.write().unwrap_or_else(PoisonError::into_inner);
+    dropped.retain(|index| !index.ann.is_empty());
+}
+
 pub fn serving(name: &str) -> Option<Arc<VectorIndex>> {
     get(name).filter(|index| index.state() == SERVING)
 }
@@ -183,7 +243,7 @@ pub fn unput(ours: &VectorIndex, previous: Option<Arc<VectorIndex>>) {
         None => {
             let evicted = reg.remove(name);
             drop(reg);
-            sweep::retire(evicted);
+            keep_until_empty(evicted);
         }
     }
 }
@@ -197,7 +257,7 @@ pub fn remove_if_stale(name: &str, stamp: u64) -> bool {
             }
             let evicted = reg.remove(name);
             drop(reg);
-            sweep::retire(evicted);
+            keep_until_empty(evicted);
             true
         }
         None => false,
@@ -221,8 +281,21 @@ pub fn insert_or_get(index: VectorIndex) -> Result<(Arc<VectorIndex>, bool), Try
 pub fn remove(name: &str) -> bool {
     let evicted = write().remove(name);
     let had = evicted.is_some();
-    sweep::retire(evicted);
+    keep_until_empty(evicted);
     had
+}
+
+/// 레지스트리를 떠난 그래프를 비워질 때까지 들고 있는다.
+///
+/// 버리면 안 된다. 이 그래프는 아직 자기가 쥔 아이템들의 참조를 들고 있고,
+/// 그것들이 언제 빠질지는 `flush`가 아니라 누가 건드리느냐가 정한다. 그때
+/// 콜백이 "이 주소를 내가 받았나"를 물어볼 곳이 여기다.
+pub fn keep_until_empty(index: Option<Arc<VectorIndex>>) {
+    let Some(index) = index else { return };
+    let mut dropped = DROPPED.write().unwrap_or_else(PoisonError::into_inner);
+    if dropped.try_reserve(1).is_ok() {
+        dropped.push(index);
+    }
 }
 
 pub fn remove_observed(name: &str, observed: &VectorIndex) -> bool {
@@ -231,7 +304,7 @@ pub fn remove_observed(name: &str, observed: &VectorIndex) -> bool {
         Some(current) if std::ptr::eq(Arc::as_ptr(current), observed) => {
             let evicted = reg.remove(name);
             drop(reg);
-            sweep::retire(evicted);
+            keep_until_empty(evicted);
             true
         }
         _ => false,

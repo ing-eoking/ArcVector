@@ -3,7 +3,6 @@ use std::fmt::Write as _;
 use crate::command::request::Create;
 use crate::error::{Error, Reply, Result};
 use crate::handler::access::resolve;
-use crate::handler::access::sweep;
 use crate::handler::arcus::element::{self, Layout, MetaRecord};
 use crate::handler::arcus::engine::{self, Store, StoreError};
 use crate::handler::quant::Quant;
@@ -61,7 +60,7 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
                 eprintln!(
                     "ArcVector: index '{name}' had no metadata; released the graph it stood on"
                 );
-                sweep::retire(previous);
+                registry::keep_until_empty(previous);
             }
             Ok(Reply::Created)
         }

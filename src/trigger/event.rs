@@ -28,11 +28,20 @@
 //! | 보류 중인 벡터 | 예 | `waiting`에 있다 |
 //! | 등록된 인덱스의 메타 | 예 | 등록돼 있다는 것이 곧 링크에서 받았다는 뜻 |
 //! | 그래프에 있던 벡터 | 예 | `unlink_at`이 `true` |
-//! | 그 밖 | 아니오 | 링크에서 거절했다 |
+//! | 아는 인덱스인데 그래프에 없음 | 아니오 | 링크에서 거절했다 |
+//! | 모르는 인덱스 | 예로 본다 | 아래 |
 //!
-//! 마지막 줄이 참이려면 `vdrop`이 flush하는 동안 인덱스가 레지스트리에 남아
-//! 있어야 한다. 접근은 `DRAINING`으로 막고 레지스트리에서 빼는 것은 flush 뒤로
-//! 미룬다 -- 먼저 빼면 그 벡터들의 unlink가 그래프에 물어볼 곳을 잃는다.
+//! 마지막 줄만 추정이다. `vdrop`한 인덱스의 벡터는 대부분 그 자리에서 빠지지
+//! 않는다 -- `flush`는 LRU를 `oldest_live`보다 오래된 첫 아이템에서 멈추고
+//! 나머지는 누가 건드릴 때 무효화된다(`items.c`). 그때는 레지스트리에 그 이름이
+//! 없으니 물어볼 그래프도 없는데, 거기서 "내 것 아니다"로 답하면 한동안 놀던
+//! 인덱스를 드롭할 때마다 그 아이템 전부가 프로세스 끝까지 묶인다.
+//!
+//! 그래서 모르는 인덱스의 것은 우리 것으로 보고 놓아준다. 틀리는 경우는 링크
+//! 때 거절한 아이템이 인덱스가 사라진 뒤에 빠질 때뿐이고, 링크에서 거절하는 것은
+//! 할당기가 거절했거나 클라이언트가 `arcus_event{...}:` 키를 손으로 잘못 써넣은
+//! 경우뿐이다. `ITEM_REFCOUNT_DECR`에 0 검사가 없으므로 그때는 셈이 어긋난다 --
+//! 정상 동작에서는 닿지 않는 자리이고, 매 `vdrop`의 누수와 바꾼 것이다.
 //!
 //! **이 함수는 엔진의 `cache_lock`을 쥔 채 불린다.** 아이템을 링크한 그 스레드에서
 //! 온다 -- 클라이언트 쓰기면 워커, 복제본이면 복제 적용 스레드, 기동 시면 복구
@@ -42,7 +51,6 @@
 use std::os::raw::c_void;
 use std::sync::Arc;
 
-use crate::handler::access::sweep;
 use crate::handler::arcus::element::MetaRecord;
 use crate::handler::arcus::engine::{ItemElements, Store};
 use crate::handler::registry::{self, VectorIndex};
@@ -262,7 +270,7 @@ fn on_meta(store: &Store, addr: u64, name: &str) -> Decision {
         eprintln!("ArcVector: the index registry could not grow; '{name}' stays unknown");
         return Decision::Declined;
     };
-    sweep::retire(previous);
+    registry::keep_until_empty(previous);
 
     if !recover::submit(&registered) {
         // 안전망은 sweeper다. 매 틱 `BUILDING`으로 남은 인덱스를 다시 맡긴다.
@@ -324,26 +332,24 @@ fn on_unlink(store: &Store, addr: u64) -> Decision {
         Unlinked::NotWaiting => {}
     }
 
-    let Some(index) = registry::get(&name) else {
-        // 이 이름으로 등록된 인덱스가 없다. 링크 때 거절했거나 -- 메타를 못
-        // 읽었거나 붙잡아 둘 자리가 없었거나 -- 애초에 받은 적이 없다는 뜻이라,
-        // 놓아줄 참조가 없다. `vdrop`이 flush를 먼저 하는 것이 이 줄을 참으로
-        // 만든다.
+    if is_meta {
+        // 메타는 그래프에 노드가 없으니 주소로는 못 찾는다. 그 이름을 안다는
+        // 것이 곧 이 메타를 링크에서 받았다는 뜻이다. 아무도 이 주소를
+        // 역참조하지 않으므로 큐를 거칠 것 없이 엔진이 그 자리에서 회수해도 된다.
+        return if registry::known(&name) {
+            Decision::Declined
+        } else {
+            Decision::NotOurs
+        };
+    }
+
+    let Some(index) = registry::holding(&name, addr) else {
+        // 어느 그래프도 이 주소를 갖고 있지 않다. 링크 때 거절했다는 뜻이라
+        // 놓아줄 참조가 없다 -- 없는 것을 큐에 넣으면 안 받은 참조를 놓는다.
         return Decision::NotOurs;
     };
 
-    if is_meta {
-        // 인덱스가 등록돼 있다는 것이 이 메타를 링크에서 받았다는 뜻이다.
-        // 그래프에 노드가 없으니 큐를 거칠 이유도 없다 -- 아무도 이 주소를
-        // 역참조하지 않으므로 엔진이 그 자리에서 회수해도 된다.
-        return Decision::Declined;
-    }
-
-    if !index.ann.unlink_at(addr) {
-        // 그래프에 없었다. 링크 때 그래프가 안 받은 벡터라 참조도 받지 않았다.
-        return Decision::NotOurs;
-    }
-
+    index.ann.unlink_at(addr);
     if index.ann.retire_one(addr) {
         return Decision::Took;
     }
@@ -366,9 +372,9 @@ fn on_replace(store: &Store, old: u64, new: u64) -> Decision {
     };
 
     if is_meta {
-        // 메타는 그래프에 노드가 없다. old를 들고 있었나는 그 인덱스가 등록돼
-        // 있었나와 같다.
-        if registry::contains(&name) {
+        // 메타는 그래프에 노드가 없다. old를 들고 있었나는 그 이름을 아는가와
+        // 같다.
+        if registry::known(&name) {
             return Decision::Declined;
         }
         on_meta(store, new, &name);
@@ -376,6 +382,28 @@ fn on_replace(store: &Store, old: u64, new: u64) -> Decision {
     }
 
     let waiting = waiting::unlink(&name, old);
+
+    // old를 들고 있는 그래프가 살아 있는 인덱스가 아닐 수 있다 -- `vdrop`한 뒤
+    // 그 키를 다시 쓰면 옛 그래프가 old를, 새 인덱스가 new를 맡는다.
+    if let Some(holder) = registry::holding(&name, old)
+        && !registry::get(&name).is_some_and(|live| std::ptr::eq(Arc::as_ptr(&live), Arc::as_ptr(&holder)))
+    {
+        holder.ann.unlink_at(old);
+        let gave_back = holder.ann.retire_one(old);
+        if !gave_back {
+            holder.ann.halt_for_overflow();
+        }
+        if let Some(live) = registry::get(&name) {
+            link_into(store, &live, new);
+        } else if !waiting::push(&name, new) {
+            eprintln!("ArcVector: no room to hold a replaced '{name}' vector; it is dropped");
+        }
+        return if gave_back {
+            Decision::Took
+        } else {
+            Decision::Declined
+        };
+    }
 
     let Some(index) = registry::get(&name) else {
         // 메타가 아직 안 왔다. new를 old의 자리에 붙잡아 둔다.

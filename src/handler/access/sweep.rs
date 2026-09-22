@@ -1,7 +1,7 @@
-use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::handler::registry::{self, VectorIndex};
+use crate::handler::registry;
 
 const TICK: Duration = Duration::from_secs(1);
 
@@ -20,7 +20,6 @@ struct Sweeper {
 
 #[derive(Default)]
 struct State {
-    retired: Vec<Arc<VectorIndex>>,
     /// 종이 울렸다. 훑을 것이 있다는 표시.
     ///
     /// 뮤텍스 안에서 세우는 것이 요점이다. 밖에서 `notify_one`만 하면 sweeper가
@@ -57,28 +56,12 @@ fn state() -> MutexGuard<'static, State> {
     SWEEPER.state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Hands a graph no longer in the registry to the sweeper to drop.
-///
-/// Freeing one returns every element it holds to the engine, which is work a
-/// request should not be made to wait through.
-pub(crate) fn retire(evicted: Option<Arc<VectorIndex>>) {
-    let Some(index) = evicted else { return };
-    let mut state = state();
-    if state.retired.try_reserve(1).is_err() {
-        drop(state);
-        drop(index);
-        return;
-    }
-    state.retired.push(index);
-    SWEEPER.wake.notify_one();
-}
-
 fn run() {
     let mut last_round = Instant::now();
     loop {
-        let retired = {
+        {
             let mut state = state();
-            if state.retired.is_empty() && !state.pending {
+            if !state.pending {
                 state = SWEEPER
                     .wake
                     .wait_timeout(state, TICK)
@@ -88,12 +71,10 @@ fn run() {
             // 훑기 전에 내린다. 훑는 도중에 울린 종은 플래그를 다시 세우므로
             // 다음 바퀴가 집어간다 -- 헛도는 경우는 있어도 빠뜨리지 않는다.
             state.pending = false;
-            std::mem::take(&mut state.retired)
-        };
+        }
 
-        drop(retired);
-
-        let indexes = registry::indexes().unwrap_or_default();
+        // 버려지는 중인 그래프도 훑는다. 그쪽에도 놓아줄 주소가 쌓인다.
+        let indexes = registry::all();
 
         // 종이 울렸든 틱이 왔든, 놓아줄 것은 매 바퀴 놓아준다.
         //
@@ -122,6 +103,10 @@ fn run() {
                     crate::trigger::recover::submit(index);
                 }
             }
+
+            // 다 비운 그래프를 버린다. 비었다는 것은 그 인덱스의 아이템을
+            // 하나도 안 쥐고 있다는 뜻이라, 더 답해줄 것이 없다.
+            registry::reap_drained();
         }
     }
 }

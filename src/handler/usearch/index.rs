@@ -386,6 +386,15 @@ impl AnnIndex {
             .size()
     }
 
+    /// 이 그래프가 그 주소를 들고 있나. unlink 콜백이 "내가 받은 것인가"를
+    /// 이것으로 답한다.
+    pub fn holds(&self, addr: u64) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(addr)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
