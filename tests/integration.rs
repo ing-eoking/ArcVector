@@ -318,7 +318,31 @@ fn an_incompatible_metric_and_quantization_are_refused() {
 }
 
 #[test]
+#[ignore = "needs -I below 256K, which corrupts the engine's heap -- see the comment"]
 fn a_vector_over_the_server_item_limit_is_refused() {
+    // Ignored because the only configuration that can reach the refusal is one
+    // the engine cannot survive.
+    //
+    // `slabs.c` gives slab class 0 -- the one the small-memory manager carves
+    // every item out of -- a chunk size of `SM_BLOCK_SIZE` (256K), then sets
+    //
+    //     p->perslab = config->item_size_max / p->size;
+    //
+    // With `-I` under 256K that division is 0, so `do_slabs_newslab` computes
+    // `len = 0` and calls `malloc(0)`, which returns a valid non-null pointer.
+    // The zero-byte block is then registered as a 256K page and the SM manager
+    // writes a block header and a tail at `blck + 262144` into it. The heap is
+    // corrupt from there on, and the daemon dies somewhere unrelated -- freeing
+    // a Vec, spawning a thread, an Arc refcount at address 0x2.
+    //
+    // Reproduced with a stock server and no extension: 3/3 dead at -I 20k,
+    // 128k; 0/3 at 256k, 1m. The boundary is exactly SM_BLOCK_SIZE.
+    //
+    // The refusal this test wants needs an item over `item_size_max`, and the
+    // largest one `vadd` can carry is bounded by the 16384-byte transport limit
+    // on the coordinate line -- about 32K. So there is no safe `-I` that also
+    // reaches the refusal. Un-ignore once the engine handles `-I` under 256K.
+
     // A vector is an item now, so the ceiling is the server's item size (-I),
     // not `max_element_bytes`. The engine does not report that number through
     // get_config, so it is the engine that enforces it: `allocate` answers
@@ -581,3 +605,4 @@ fn a_body_the_graph_cannot_read_leaves_the_reference_accounting_straight() {
 
     client.send(&format!("vdrop {ix}"));
 }
+
