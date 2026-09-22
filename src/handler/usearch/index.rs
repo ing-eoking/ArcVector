@@ -3,7 +3,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use ::usearch::{Index, IndexOptions, ScalarKind, VectorType, b1x8, f16, ffi::Matches};
 
-use super::held::{self, Elements};
+use super::held::Elements;
 use super::metric::Metric;
 use crate::error::Error;
 use crate::handler::arcus::element::Layout;
@@ -715,9 +715,7 @@ impl AnnIndex {
             match accept {
                 None => self.unfiltered(&index, query, k),
 
-                Some(matches) => self.matches(&index, query, k, |key| {
-                    !held::is_staged(key) && matches(key)
-                }),
+                Some(matches) => self.matches(&index, query, k, matches),
             }?
         };
 

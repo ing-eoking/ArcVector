@@ -381,6 +381,44 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_graph_still_answers_for_the_items_it_holds() {
+        // `flush`는 프리픽스의 아이템을 그 자리에서 다 빼지 않는다. 늦게 빠지는
+        // 것들의 unlink 콜백은 "이 주소를 내가 받았나"를 물어야 하는데, 그래프를
+        // 버리면 그 질문이 답을 잃는다 -- 그러면 그 인덱스의 아이템이 전부
+        // 프로세스 끝까지 묶인다.
+        let name = "registry-test-dropped-graph";
+        let addr = 0x4000;
+
+        let (registered, _) = put(index(name)).expect("claim the name");
+        registered.publish();
+        registered
+            .ann
+            .link_node(addr, &[0u8; 16])
+            .expect("the graph takes it");
+
+        assert!(remove(name));
+        assert!(serving(name).is_none(), "명령에는 더 보이지 않는다");
+        assert!(get(name).is_none(), "레지스트리에서도 빠졌다");
+
+        let holder = holding(name, addr).expect("그래도 그 주소는 답을 찾아야 한다");
+        assert!(holder.ann.holds(addr));
+        assert!(known(name), "비워지는 중인 이름도 아는 이름이다");
+
+        // 다 빠지면 더 답해줄 것이 없다.
+        holder.ann.unlink_at(addr);
+        reap_drained();
+        assert!(holding(name, addr).is_none());
+        assert!(!known(name));
+    }
+
+    #[test]
+    fn an_address_no_graph_holds_has_no_answer() {
+        // 링크 때 거절한 주소다. 여기서 인덱스를 찾아주면 받은 적 없는 참조를
+        // 놓아주게 된다.
+        assert!(holding("registry-test-unheld", 0x9000).is_none());
+    }
+
+    #[test]
     fn a_verdict_older_than_the_entry_releases_nothing() {
         let name = "registry-test-late-verdict";
         let stamp = now();
