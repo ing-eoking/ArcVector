@@ -100,6 +100,21 @@ pub unsafe fn store_conn_state(cookie: *const c_void, data: *mut c_void) -> bool
     }
 }
 
+/// 연결에 매달린 것을 **지우지 않고** 본다.
+///
+/// `block` 훅이 "이 연결이 답을 기다리는 중인가"를 묻는 자리라 필요하다 --
+/// 가져가 버리면 뒤이어 깨어날 콜백이 답할 것을 잃는다.
+pub unsafe fn peek_conn_state(cookie: *const c_void) -> *mut c_void {
+    let core = core();
+    if core.is_null() {
+        return std::ptr::null_mut();
+    }
+    match unsafe { (*core).get_engine_specific } {
+        Some(get) => unsafe { get(cookie) },
+        None => std::ptr::null_mut(),
+    }
+}
+
 pub unsafe fn take_conn_state(cookie: *const c_void) -> *mut c_void {
     let core = core();
     if core.is_null() {

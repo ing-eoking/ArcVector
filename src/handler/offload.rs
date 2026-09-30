@@ -29,10 +29,10 @@
 //! 있다. 그래서 `notify_io_complete`이 깨울 때까지 conn은 살아 있고, 그 주소를
 //! 표에 들고 있는 것이 안전하다.
 
-use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+
+use crate::conn_state::{self, ConnState};
 
 use crate::command::Request;
 use crate::command::filter::Filter;
@@ -151,66 +151,61 @@ impl Work {
     }
 }
 
-/// 답을 기다리는 연결 하나.
-struct Pending {
+/// 연결 하나가 답을 기다리는 상태.
+///
+/// 연결의 슬롯에 매달린다(`conn_state`). 전역 표를 두지 않는 것은 그럴 이유가
+/// 없어서다 -- 이것을 만지는 `execute`·`block`·`wake`·`abort`가 전부 그
+/// 연결의 워커 스레드에서 돌고, 슬롯은 그 연결만의 것이다.
+pub struct Waiting {
     handler: ResponseHandler,
     done: Receiver<Done>,
 }
 
-static WAITING: LazyLock<Mutex<HashMap<usize, Pending>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn waiting() -> MutexGuard<'static, HashMap<usize, Pending>> {
-    WAITING.lock().unwrap_or_else(PoisonError::into_inner)
+/// 제출이 어떻게 됐나.
+enum Submitted {
+    /// 풀이 받아 갔다. 답은 나중에 온다.
+    Handed,
+    /// 대기열이 가득 찼다. 호출자가 그 자리에서 처리하면 된다 -- 넘기지
+    /// 못했다고 명령이 실패할 이유는 없다.
+    Rejected(Task),
+    /// 풀은 받아 갔는데 답을 받을 자리를 못 만들었다. 다시 돌릴 수는 없다.
+    Lost,
 }
 
-/// 명령을 풀에 넘긴다.
-///
-/// 못 넘기면 일감을 돌려주므로 호출자가 그 자리에서 처리하면 된다 -- 대기열이
-/// 가득 찼다고 명령이 실패할 이유는 없다.
-pub(crate) fn submit(
-    cookie: *const c_void,
-    handler: ResponseHandler,
-    task: Task,
-) -> std::result::Result<(), Task> {
-    let key = cookie as usize;
+/// 명령을 풀에 넘기고, 답을 받을 자리를 연결에 매단다.
+fn submit(cookie: *const c_void, handler: ResponseHandler, task: Task) -> Submitted {
     // 하나짜리 채널. 한 연결이 한 번에 한 명령이라 그 이상 필요 없고, 미리
     // 잡아두므로 풀 스레드가 보낼 때 할당하지 않는다.
     let (tx, rx) = sync_channel(1);
 
-    {
-        let mut waiting = waiting();
-        if waiting.contains_key(&key) {
-            // 이 연결은 이미 답을 기다리는 중이다. 프로토콜상 있을 수 없는데,
-            // 덮어쓰면 앞의 것을 영영 못 깨우므로 여기서 처리하게 돌려준다.
-            return Err(task);
-        }
-        if waiting.try_reserve(1).is_err() {
-            return Err(task);
-        }
+    // **제출보다 먼저.** 이것이 세워져야 코어가 연결을 루프에서 뺀다.
+    unsafe { server::waitfor_io_complete(cookie) };
 
-        // **제출보다 먼저.** 이것이 세워져야 코어가 연결을 루프에서 뺀다.
-        unsafe { server::waitfor_io_complete(cookie) };
-
-        let work = Work {
-            task,
-            cookie: key,
-            done: tx,
-        };
-        match pool::try_submit(Job::Offload(work)) {
-            None => {
-                waiting.insert(key, Pending { handler, done: rx });
-                Ok(())
+    let work = Work {
+        task,
+        cookie: cookie as usize,
+        done: tx,
+    };
+    let work = match pool::try_submit(Job::Offload(work)) {
+        None => {
+            if unsafe { conn_state::put(cookie, ConnState::Waiting(Waiting { handler, done: rx })) }
+            {
+                return Submitted::Handed;
             }
-            Some(Job::Offload(work)) => {
-                // 못 넘겼다. 세워둔 대기를 도로 거둔다 -- 안 그러면 이 연결은
-                // 오지 않을 notify를 기다린다.
-                unsafe { server::notify_io_complete(cookie, 0) };
-                Err(work.task)
-            }
-            Some(_) => unreachable!("try_submit hands back the job it was given"),
+            // 매달 자리가 없다. 풀은 이미 받아 갔으므로 결과는 채널에 남고,
+            // 아무도 받지 않으면 `Done`이 그대로 버려진다 -- `PreparedAdd`가
+            // 자리표와 아이템을 그때 거둔다.
+            unsafe { server::notify_io_complete(cookie, 0) };
+            return Submitted::Lost;
         }
-    }
+        Some(Job::Offload(work)) => work,
+        Some(_) => unreachable!("try_submit hands back the job it was given"),
+    };
+
+    // 못 넘겼다. 세워둔 대기를 도로 거둔다 -- 안 그러면 이 연결은 오지 않을
+    // notify를 기다린다.
+    unsafe { server::notify_io_complete(cookie, 0) };
+    Submitted::Rejected(work.task)
 }
 
 /// `execute`가 명령 하나를 여기 맡긴다.
@@ -232,9 +227,10 @@ pub(crate) unsafe fn begin(
         return Some(match cmd::vadd_allocate(&store, spec, bytes) {
             Err(e) => Err(e),
             Ok(plan) => match submit(cookie, handler, Task::adding(plan)) {
-                Ok(()) => return None,
+                Submitted::Handed => return None,
                 // 대기열이 가득 찼다. 자리표까지 이 스레드에서 넣는다.
-                Err(task) => unsafe { run_here(task, cookie) },
+                Submitted::Rejected(task) => unsafe { run_here(task, cookie) },
+                Submitted::Lost => Err(Error::Store(StoreError::Unavailable)),
             },
         });
     }
@@ -243,29 +239,16 @@ pub(crate) unsafe fn begin(
         // 가벼운 명령은 그 자리에서. 넘기는 값이 일보다 비싸다.
         Err(request) => Some(unsafe { crate::handler::run(cookie, request) }),
         Ok(task) => match submit(cookie, handler, task) {
-            Ok(()) => None,
-            Err(task) => Some(unsafe { run_here(task, cookie) }),
+            Submitted::Handed => None,
+            Submitted::Rejected(task) => Some(unsafe { run_here(task, cookie) }),
+            Submitted::Lost => Some(Err(Error::Store(StoreError::Unavailable))),
         },
     }
 }
 
 /// 이 연결이 답을 기다리는 중인가. `block` 훅이 묻는다.
-pub(crate) fn is_waiting(cookie: *const c_void) -> bool {
-    waiting().contains_key(&(cookie as usize))
-}
-
-/// 기다리던 것을 거둔다. 깨어난 워커와 `abort`가 부른다.
-fn take(cookie: *const c_void) -> Option<Pending> {
-    waiting().remove(&(cookie as usize))
-}
-
-/// 연결이 사라졌다. 들고 있던 것을 버린다.
-///
-/// 풀이 아직 돌고 있을 수 있는데, 그쪽은 채널에 넣고 `notify_io_complete`을
-/// 부를 뿐이다. 받는 쪽이 없으면 `send`가 조용히 실패하고, notify는 코어가
-/// 닫힌 연결을 알아보고 넘긴다.
-pub(crate) fn forget(cookie: *const c_void) {
-    drop(take(cookie));
+pub(crate) unsafe fn is_waiting(cookie: *const c_void) -> bool {
+    unsafe { conn_state::is_waiting(cookie) }
 }
 
 /// **`conn_waking`에서, 워커 스레드에서 돈다.**
@@ -273,7 +256,7 @@ pub(crate) fn forget(cookie: *const c_void) {
 /// 풀 결과를 회수하고, 엔진에 쓸 것이 남았으면 여기서 쓴다. 그다음
 /// `response_handler`로 응답 문자열을 만든다.
 pub(crate) unsafe fn wake(cookie: *const c_void) {
-    let Some(pending) = take(cookie) else {
+    let Some(pending) = (unsafe { conn_state::take_waiting(cookie) }) else {
         // 코어가 콜백을 들고 있는 한 여기까지 오는데, 그 사이 `abort`가
         // 거둬갔다면 답할 것이 없다.
         return;

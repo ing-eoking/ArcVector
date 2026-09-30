@@ -12,6 +12,7 @@ pub mod engine_api {
 }
 
 pub mod command;
+mod conn_state;
 pub mod error;
 pub mod handler;
 pub mod server;
@@ -99,7 +100,7 @@ unsafe extern "C" fn block_vector_cmd(
     _cmd_cookie: *const c_void,
     cookie: *const c_void,
 ) -> BlockResult {
-    if !offload::is_waiting(cookie) {
+    if !unsafe { offload::is_waiting(cookie) } {
         return None;
     }
     // The core stores this and calls it as an `EVENT_CALLBACK`, with the four
@@ -128,10 +129,10 @@ unsafe extern "C" fn wake_vector_cmd(
 }
 
 unsafe extern "C" fn abort_vector_cmd(_cmd_cookie: *const c_void, cookie: *const c_void) {
-    drop(unsafe { nread::take_body(cookie) });
-    // 답을 기다리던 중이었다면 그 자리도 비운다. 풀이 아직 돌고 있어도
-    // 보낼 곳이 없어질 뿐이고, 코어는 닫힌 연결의 notify를 알아서 버린다.
-    offload::forget(cookie);
+    // 본문이든 기다리던 답이든, 이 연결이 들고 있던 것을 버린다. 풀이 아직
+    // 돌고 있어도 보낼 곳이 없어질 뿐이고, 코어는 닫힌 연결의 notify를
+    // 알아서 버린다.
+    drop(unsafe { conn_state::take(cookie) });
 }
 
 unsafe extern "C" fn get_name_vector(_cmd_cookie: *const c_void) -> *const c_char {

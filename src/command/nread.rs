@@ -1,8 +1,8 @@
 use std::os::raw::{c_char, c_void};
 
 use super::request::Body;
+use crate::conn_state::{self, ConnState};
 use crate::error::Error;
-use crate::server;
 
 #[derive(Debug)]
 pub struct Pending {
@@ -47,30 +47,22 @@ pub unsafe fn expect_body(
     ndata: *mut usize,
     ptr_out: *mut *mut c_char,
 ) {
-    drop(unsafe { take_body(cookie) });
-
-    let mut state = Box::new(Pending::new(request, body_len));
+    let mut state = Pending::new(request, body_len);
+    // 엔진이 여기에 본문을 써넣는다. `Vec`의 버퍼는 힙에 따로 있으므로,
+    // `Pending`이 `ConnState` 안으로 들어가도 이 주소는 그대로다.
     let len = state.buffer.len();
     let ptr = state.buffer.as_mut_ptr().cast::<c_char>();
 
-    unsafe {
-        let raw = Box::into_raw(state);
-        if !server::store_conn_state(cookie, raw.cast::<c_void>()) {
-            drop(Box::from_raw(raw));
-            return;
+    if unsafe { conn_state::put(cookie, ConnState::Body(state)) } {
+        unsafe {
+            *ndata = len;
+            *ptr_out = ptr;
         }
-        *ndata = len;
-        *ptr_out = ptr;
     }
 }
 
-pub unsafe fn take_body(cookie: *const c_void) -> Option<Box<Pending>> {
-    let data = unsafe { server::take_conn_state(cookie) };
-    if data.is_null() {
-        return None;
-    }
-
-    Some(unsafe { Box::from_raw(data.cast::<Pending>()) })
+pub unsafe fn take_body(cookie: *const c_void) -> Option<Pending> {
+    unsafe { conn_state::take_body(cookie) }
 }
 
 #[cfg(test)]
