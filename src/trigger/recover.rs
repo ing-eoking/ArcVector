@@ -31,6 +31,29 @@ pub fn submit(index: &Arc<VectorIndex>) -> bool {
     false
 }
 
+/// 이미 서빙 중인 인덱스의 보류 목록을 비운다.
+///
+/// 링크 콜백이 cache lock을 쥔 채로는 HNSW 삽입을 할 수 없어 주소만 적어
+/// 두는데, 그것을 집어가는 자리가 여기다. `submit`과 달리 인덱스 상태를
+/// 건드리지 않는다 -- 이미 서빙 중이니 올릴 것이 없다.
+pub fn submit_adopt(index: &Arc<VectorIndex>) -> bool {
+    if !index.claim_recovery() {
+        // 이미 누가 비우는 중이다. 그쪽이 우리 것까지 가져간다.
+        return true;
+    }
+    if pool::submit(Job::Adopt(Arc::clone(index))) {
+        return true;
+    }
+    index.release_recovery();
+    false
+}
+
+/// 풀 스레드가 부른다. 보류된 것만 넣고 끝낸다.
+pub(crate) fn adopt_work(index: &Arc<VectorIndex>) {
+    adopt(index);
+    index.release_recovery();
+}
+
 /// 풀 스레드가 부른다. 보류된 벡터를 넣고 인덱스를 서빙으로 올린다.
 pub(crate) fn work(index: &Arc<VectorIndex>) {
     adopt(index);

@@ -17,9 +17,14 @@ use crate::handler::registry::VectorIndex;
 /// 스레드 수.
 ///
 /// 복구는 인덱스 하나당 하나의 순차 작업이라 이 수가 곧 동시에 복구할 수 있는
-/// 인덱스 수다. 워커 스레드와 CPU를 다투는 것을 최소로 하려고 작게 잡는다 --
-/// 복구는 드물고, 도는 동안에도 그 인덱스는 아직 조회를 받지 않는다.
-const WORKERS: usize = 2;
+/// 인덱스 수다. 인덱스가 많은 노드가 기동하거나 복제를 따라잡을 때 그 전부가
+/// 한 줄로 서지 않도록 넉넉히 잡는다.
+///
+/// 노는 동안에는 전부 condvar에서 자고 있어 CPU를 쓰지 않는다. 값이 드러나는
+/// 때는 실제로 그만큼의 인덱스가 동시에 복구될 때이고, 그때는 memcached 워커와
+/// CPU를 다툰다 -- 복구 중인 인덱스는 아직 조회를 받지 않으므로 그 대가로 각
+/// 인덱스가 더 빨리 서빙에 올라온다.
+const WORKERS: usize = 32;
 
 /// 대기열 길이. 미리 잡아두고 자라지 않는다.
 ///
@@ -30,6 +35,10 @@ const QUEUE: usize = 256;
 pub(crate) enum Job {
     /// 메타가 도착했다. 보류된 벡터를 그래프에 넣고 서빙으로 올린다.
     Recover(Arc<VectorIndex>),
+    /// 서빙 중인 인덱스의 보류 목록을 비운다. 링크 콜백이 맡긴다.
+    Adopt(Arc<VectorIndex>),
+    /// 연결 하나가 답을 기다리는 명령. 끝나면 코어를 깨운다.
+    Offload(crate::handler::offload::Work),
 }
 
 struct Pool {
@@ -71,14 +80,24 @@ fn queue() -> MutexGuard<'static, VecDeque<Job>> {
 /// 으로 남아 영영 안 보인다. sweeper가 매 틱 `BUILDING`을 다시 맡기는 것이 그
 /// 안전망이다.
 pub(crate) fn submit(job: Job) -> bool {
+    try_submit(job).is_none()
+}
+
+/// [`submit`], but hands the job back when the queue is full.
+///
+/// A caller that can do the work itself needs the job returned rather than
+/// dropped -- an offloaded command carries the only channel its connection
+/// will ever be answered through, so losing it would park that connection
+/// forever.
+pub(crate) fn try_submit(job: Job) -> Option<Job> {
     let mut queue = queue();
     if queue.len() >= QUEUE {
-        return false;
+        return Some(job);
     }
     queue.push_back(job);
     drop(queue);
     POOL.wake.notify_one();
-    true
+    None
 }
 
 fn run() {
@@ -89,11 +108,16 @@ fn run() {
                 if let Some(job) = queue.pop_front() {
                     break job;
                 }
-                queue = POOL.wake.wait(queue).unwrap_or_else(PoisonError::into_inner);
+                queue = POOL
+                    .wake
+                    .wait(queue)
+                    .unwrap_or_else(PoisonError::into_inner);
             }
         };
         match job {
             Job::Recover(index) => crate::trigger::recover::work(&index),
+            Job::Adopt(index) => crate::trigger::recover::adopt_work(&index),
+            Job::Offload(work) => work.run(),
         }
     }
 }

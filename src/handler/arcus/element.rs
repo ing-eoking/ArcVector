@@ -1,12 +1,18 @@
 use crate::handler::quant::Quant;
 
-const HEADER_LEN: usize = 2;
+/// 값 앞머리의 attr 길이 한 바이트.
+///
+/// attr은 이 바이트가 말하는 만큼만 차지한다. 예전에는 128바이트를 늘 잡아
+/// 두었는데, 대부분의 벡터가 짧은 attr을 쓰거나 아예 안 써서 그만큼이 통째로
+/// 낭비였다.
+const ATTR_LEN_BYTES: usize = 1;
 
 pub const META_FIELD: &str = "AV META";
 
-pub const ATTR_OFFSET: usize = HEADER_LEN;
+pub const ATTR_OFFSET: usize = ATTR_LEN_BYTES;
 
-pub const ATTR_BYTES: usize = 128;
+/// 한 바이트로 셀 수 있는 최대치.
+pub const ATTR_BYTES: usize = 255;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CodecError {
@@ -46,8 +52,6 @@ pub struct Layout {
 }
 
 impl Layout {
-    pub const VECTOR_OFFSET: usize = HEADER_LEN + ATTR_BYTES;
-
     pub const fn new(dim: usize, quant: Quant) -> Self {
         Self { dim, quant }
     }
@@ -58,27 +62,40 @@ impl Layout {
 
     pub const STORED_TERMINATOR: usize = 2;
 
-    /// Header, attributes, then the vector.
+    /// 이 attr 길이에서 벡터가 시작하는 자리.
+    ///
+    /// 아이템마다 다르다 -- 그것이 가변 길이 형식의 요점이고, 그래서 읽는
+    /// 쪽은 언제나 첫 바이트를 먼저 봐야 한다.
+    pub const fn vector_offset(attr_len: usize) -> usize {
+        ATTR_LEN_BYTES + attr_len
+    }
+
+    /// 길이 바이트, attr, 벡터.
     ///
     /// The vector is always here now. It used to be left out of a build that
     /// could not rebuild a graph from storage, because nothing would ever read
     /// it back -- but it is what arcus carries to a replica, and the trigger
     /// callback reads it straight out of the item, so it is the only copy that
     /// reaches another node.
-    pub const fn element_len(&self) -> usize {
-        Self::VECTOR_OFFSET + self.vector_bytes()
+    pub const fn element_len(&self, attr_len: usize) -> usize {
+        Self::vector_offset(attr_len) + self.vector_bytes()
     }
 
-    pub const fn stored_len(&self) -> usize {
-        self.element_len() + Self::STORED_TERMINATOR
+    pub const fn stored_len(&self, attr_len: usize) -> usize {
+        self.element_len(attr_len) + Self::STORED_TERMINATOR
     }
 
-    pub const fn full_stored_len(&self) -> usize {
-        Self::VECTOR_OFFSET + self.vector_bytes() + Self::STORED_TERMINATOR
+    /// attr을 끝까지 채웠을 때의 크기.
+    ///
+    /// 크기 한도 검사가 이것을 쓴다. 지금 attr이 짧아도 나중에 `vsetattr`이
+    /// 255바이트까지 늘릴 수 있으므로, 그때 못 쓰게 되는 것보다 처음부터
+    /// 넉넉히 재는 편이 낫다.
+    pub const fn max_stored_len(&self) -> usize {
+        self.stored_len(ATTR_BYTES)
     }
 
     pub const fn max_dim_for(quant: Quant, max_element_bytes: usize) -> usize {
-        let overhead = Self::VECTOR_OFFSET + Self::STORED_TERMINATOR;
+        let overhead = Self::vector_offset(ATTR_BYTES) + Self::STORED_TERMINATOR;
         if max_element_bytes <= overhead {
             return 0;
         }
@@ -86,24 +103,15 @@ impl Layout {
     }
 
     pub fn encode(&self, vector: &[u8], attr: &[u8]) -> Result<Vec<u8>, CodecError> {
-        if vector.len() != self.vector_bytes() {
-            return Err(CodecError::VectorLenMismatch {
-                need: self.vector_bytes(),
-                got: vector.len(),
-            });
-        }
-        if attr.len() > ATTR_BYTES {
-            return Err(CodecError::AttrTooLarge {
-                limit: ATTR_BYTES,
-                got: attr.len(),
-            });
-        }
-
-        let mut buf = vec![0u8; self.element_len()];
+        let mut buf = vec![0u8; self.element_len(attr.len())];
         self.write(&mut buf, vector, attr)?;
         Ok(buf)
     }
 
+    /// 길이 바이트, attr, 벡터를 차례로 쓴다.
+    ///
+    /// `buf`는 정확히 `element_len(attr.len())` 이어야 한다. 남는 자리를 0으로
+    /// 채우던 예전 형식과 달리, 이제 버퍼 크기가 곧 내용의 크기다.
     pub fn write(&self, buf: &mut [u8], vector: &[u8], attr: &[u8]) -> Result<(), CodecError> {
         if vector.len() != self.vector_bytes() {
             return Err(CodecError::VectorLenMismatch {
@@ -117,62 +125,47 @@ impl Layout {
                 got: attr.len(),
             });
         }
-        if buf.len() != self.element_len() {
+        let need = self.element_len(attr.len());
+        if buf.len() != need {
             return Err(CodecError::Truncated {
-                need: self.element_len(),
+                need,
                 got: buf.len(),
             });
         }
-        buf[0..2].copy_from_slice(&(attr.len() as u16).to_le_bytes());
 
-        buf[ATTR_OFFSET..Self::VECTOR_OFFSET].fill(0);
-        buf[ATTR_OFFSET..ATTR_OFFSET + attr.len()].copy_from_slice(attr);
-        buf[Self::VECTOR_OFFSET..].copy_from_slice(vector);
+        buf[0] = attr.len() as u8;
+        let vector_at = Self::vector_offset(attr.len());
+        buf[ATTR_OFFSET..vector_at].copy_from_slice(attr);
+        buf[vector_at..].copy_from_slice(vector);
         Ok(())
     }
 
     pub fn decode<'a>(&self, buf: &'a [u8]) -> Result<Element<'a>, CodecError> {
         let head = parse_header(buf)?;
-        let need = self.element_len();
+        let need = self.element_len(head.attr_len);
         if buf.len() < need {
             return Err(CodecError::Truncated {
                 need,
                 got: buf.len(),
             });
         }
+        let vector_at = Self::vector_offset(head.attr_len);
         Ok(Element {
-            attr: &buf[ATTR_OFFSET..ATTR_OFFSET + head.attr_len],
-            vector: &buf[Self::VECTOR_OFFSET..need],
+            attr: &buf[ATTR_OFFSET..vector_at],
+            vector: &buf[vector_at..need],
         })
     }
 
     pub fn vector_of<'a>(&self, buf: &'a [u8]) -> Option<&'a [u8]> {
-        let need = self.element_len();
-        (buf.len() >= need).then(|| &buf[Self::VECTOR_OFFSET..need])
-    }
-
-    pub fn set_attr(&self, buf: &mut [u8], attr: &[u8]) -> Result<(), CodecError> {
-        if attr.len() > ATTR_BYTES {
-            return Err(CodecError::AttrTooLarge {
-                limit: ATTR_BYTES,
-                got: attr.len(),
-            });
-        }
-        if buf.len() < Self::VECTOR_OFFSET {
-            return Err(CodecError::Truncated {
-                need: Self::VECTOR_OFFSET,
-                got: buf.len(),
-            });
-        }
-        buf[0..HEADER_LEN].copy_from_slice(&(attr.len() as u16).to_le_bytes());
-        buf[ATTR_OFFSET..Self::VECTOR_OFFSET].fill(0);
-        buf[ATTR_OFFSET..ATTR_OFFSET + attr.len()].copy_from_slice(attr);
-        Ok(())
+        let head = parse_header(buf).ok()?;
+        let need = self.element_len(head.attr_len);
+        let vector_at = Self::vector_offset(head.attr_len);
+        (buf.len() >= need).then(|| &buf[vector_at..need])
     }
 
     pub fn attr_of<'a>(&self, buf: &'a [u8]) -> Result<&'a [u8], CodecError> {
         let head = parse_header(buf)?;
-        let end = ATTR_OFFSET + head.attr_len;
+        let end = Self::vector_offset(head.attr_len);
         if buf.len() < end {
             return Err(CodecError::Truncated {
                 need: end,
@@ -189,17 +182,17 @@ struct Header {
 }
 
 fn parse_header(buf: &[u8]) -> Result<Header, CodecError> {
-    if buf.len() < HEADER_LEN {
+    if buf.len() < ATTR_LEN_BYTES {
         return Err(CodecError::Truncated {
-            need: HEADER_LEN,
+            need: ATTR_LEN_BYTES,
             got: buf.len(),
         });
     }
-    let attr_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-    if attr_len > ATTR_BYTES {
-        return Err(CodecError::LayoutMismatch);
-    }
-    Ok(Header { attr_len })
+    // 한 바이트라 `ATTR_BYTES`를 넘길 수가 없다 -- 예전 2바이트 형식에 있던
+    // 범위 검사가 형식 자체로 사라졌다.
+    Ok(Header {
+        attr_len: buf[0] as usize,
+    })
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -306,15 +299,20 @@ mod tests {
     }
 
     #[test]
-    fn the_vector_offset_is_a_constant() {
-        assert_eq!(ATTR_OFFSET, 2);
-        assert_eq!(Layout::VECTOR_OFFSET, 130);
+    fn the_vector_offset_follows_the_attr_length() {
+        assert_eq!(ATTR_OFFSET, 1);
+        assert_eq!(Layout::vector_offset(0), 1);
+        assert_eq!(Layout::vector_offset(ATTR_BYTES), 256);
 
         for dim in [1usize, 128, 4096] {
             for q in [Quant::F32, Quant::F16, Quant::I8, Quant::B1] {
                 let l = Layout::new(dim, q);
-                assert_eq!(l.element_len(), 130 + l.vector_bytes());
-                assert_eq!(l.full_stored_len(), 132 + l.vector_bytes());
+                // attr이 없으면 길이 바이트 하나뿐이다. 예전 형식은 여기서도
+                // 130바이트를 잡았다.
+                assert_eq!(l.element_len(0), 1 + l.vector_bytes());
+                assert_eq!(l.stored_len(0), 3 + l.vector_bytes());
+                assert_eq!(l.element_len(7), 8 + l.vector_bytes());
+                assert_eq!(l.max_stored_len(), 258 + l.vector_bytes());
             }
         }
     }
@@ -335,11 +333,11 @@ mod tests {
         let l = Layout::new(4, Quant::F32);
         let vector = encode(&[1.0, 2.0, 3.0, 4.0], Quant::F32);
         let bare = l.encode(&vector, b"{}").expect("encodes");
-        assert_eq!(bare.len(), l.element_len());
+        assert_eq!(bare.len(), l.element_len(2));
 
         let mut terminated = bare.clone();
         terminated.extend_from_slice(b"\r\n");
-        assert_eq!(terminated.len(), l.stored_len());
+        assert_eq!(terminated.len(), l.stored_len(2));
 
         let from_bare = l.decode(&bare).expect("old shape decodes");
         let from_terminated = l.decode(&terminated).expect("new shape decodes");
@@ -362,12 +360,14 @@ mod tests {
         let attr = br#"{"cat":"tech"}"#;
 
         let buf = l.encode(&vector, attr).unwrap();
-        assert_eq!(buf.len(), l.element_len());
+        assert_eq!(buf.len(), l.element_len(attr.len()));
 
         let e = l.decode(&buf).unwrap();
         assert_eq!(e.attr, attr);
         {
-            assert_eq!(buf.len(), 130 + 4);
+            // 길이 바이트 하나 + attr 14 + 벡터 4. 예전 형식은 attr이 얼마든
+            // 130 + 4 였다.
+            assert_eq!(buf.len(), 1 + attr.len() + 4);
             assert_eq!(e.vector, &vector[..]);
         }
     }
@@ -385,11 +385,9 @@ mod tests {
         let l = layout();
         let buf = l.encode(&[9, 9, 9, 9], b"{}").unwrap();
 
-        assert!(
-            buf[ATTR_OFFSET + 2..Layout::VECTOR_OFFSET]
-                .iter()
-                .all(|b| *b == 0)
-        );
+        // 남는 자리가 없다. attr 바로 뒤가 곧 벡터다.
+        assert_eq!(buf.len(), l.element_len(2));
+        assert_eq!(&buf[Layout::vector_offset(2)..], &[9, 9, 9, 9]);
     }
 
     #[test]
@@ -442,14 +440,18 @@ mod tests {
     }
 
     #[test]
-    fn an_attr_length_over_the_region_is_rejected() {
+    fn an_attr_length_cannot_overflow_its_own_byte() {
+        // 예전 형식은 길이가 2바이트라 영역보다 큰 값을 적을 수 있었고, 그래서
+        // `LayoutMismatch` 검사가 있었다. 한 바이트로는 `ATTR_BYTES`를 넘는
+        // 값을 쓸 수가 없다 -- 그 오류가 형식 자체로 사라졌다.
         let l = layout();
         let good = l.encode(&[0, 0, 0, 0], b"{}").unwrap();
 
         let mut bad = good.clone();
-        bad[0..2].copy_from_slice(&(ATTR_BYTES as u16 + 1).to_le_bytes());
-        assert_eq!(l.decode(&bad), Err(CodecError::LayoutMismatch));
-        assert_eq!(l.attr_of(&bad), Err(CodecError::LayoutMismatch));
+        bad[0] = u8::MAX;
+        assert_eq!(parse_header(&bad).unwrap().attr_len, ATTR_BYTES);
+        // 버퍼가 그만큼 길지 않으니 잘렸다고 답한다.
+        assert!(matches!(l.attr_of(&bad), Err(CodecError::Truncated { .. })));
     }
 
     #[test]
@@ -459,32 +461,27 @@ mod tests {
         assert_eq!(
             l.decode(&good[..good.len() - 1]),
             Err(CodecError::Truncated {
-                need: l.element_len(),
-                got: l.element_len() - 1
+                need: l.element_len(2),
+                got: l.element_len(2) - 1
             })
         );
 
+        // 길이 바이트 하나가 머리의 전부다. 빈 버퍼만이 짧을 수 있다.
         assert_eq!(
-            parse_header(&good[..1]),
+            parse_header(&[]),
             Err(CodecError::Truncated {
-                need: HEADER_LEN,
-                got: 1
+                need: ATTR_LEN_BYTES,
+                got: 0
             })
         );
-        assert_eq!(
-            parse_header(&good[..HEADER_LEN - 1]),
-            Err(CodecError::Truncated {
-                need: HEADER_LEN,
-                got: HEADER_LEN - 1
-            })
-        );
+        assert_eq!(parse_header(&good[..1]).unwrap().attr_len, 2);
     }
 
     #[test]
     fn attr_of_survives_a_truncated_vector_tail() {
         let l = layout();
         let good = l.encode(&[0, 0, 0, 0], b"{}").unwrap();
-        let short = &good[..Layout::VECTOR_OFFSET];
+        let short = &good[..Layout::vector_offset(2)];
         assert_eq!(l.attr_of(short).unwrap(), b"{}");
 
         assert!(l.decode(short).is_err());
@@ -494,31 +491,48 @@ mod tests {
     fn max_dim_for_is_the_exact_ceiling() {
         let limit = 16 * 1024;
 
-        assert_eq!(Layout::max_dim_for(Quant::F32, limit), 4063);
-        assert_eq!(Layout::max_dim_for(Quant::F16, limit), 8126);
-        assert_eq!(Layout::max_dim_for(Quant::I8, limit), 16252);
-        assert_eq!(Layout::max_dim_for(Quant::B1, limit), 130_016);
+        // 최악의 attr(255바이트)을 가정한 여유다.
+        let overhead = Layout::vector_offset(ATTR_BYTES) + Layout::STORED_TERMINATOR;
+        assert_eq!(
+            Layout::max_dim_for(Quant::F32, limit),
+            (limit - overhead) / 4
+        );
+        assert_eq!(
+            Layout::max_dim_for(Quant::F16, limit),
+            (limit - overhead) / 2
+        );
+        assert_eq!(Layout::max_dim_for(Quant::I8, limit), limit - overhead);
+        assert_eq!(
+            Layout::max_dim_for(Quant::B1, limit),
+            (limit - overhead) * 8
+        );
 
         for q in [Quant::F32, Quant::F16, Quant::I8, Quant::B1] {
             let d = Layout::max_dim_for(q, limit);
-            assert!(Layout::new(d, q).full_stored_len() <= limit, "{q:?}");
-            assert!(Layout::new(d + 1, q).full_stored_len() > limit, "{q:?}");
+            assert!(Layout::new(d, q).max_stored_len() <= limit, "{q:?}");
+            assert!(Layout::new(d + 1, q).max_stored_len() > limit, "{q:?}");
         }
     }
 
     #[test]
     fn max_dim_for_handles_a_budget_below_the_fixed_overhead() {
         assert_eq!(Layout::max_dim_for(Quant::I8, 16), 0);
-        assert_eq!(Layout::max_dim_for(Quant::I8, Layout::VECTOR_OFFSET), 0);
+        assert_eq!(
+            Layout::max_dim_for(Quant::I8, Layout::vector_offset(ATTR_BYTES)),
+            0
+        );
 
         assert_eq!(
-            Layout::max_dim_for(Quant::I8, Layout::VECTOR_OFFSET + Layout::STORED_TERMINATOR),
+            Layout::max_dim_for(
+                Quant::I8,
+                Layout::vector_offset(ATTR_BYTES) + Layout::STORED_TERMINATOR
+            ),
             0
         );
         assert_eq!(
             Layout::max_dim_for(
                 Quant::I8,
-                Layout::VECTOR_OFFSET + Layout::STORED_TERMINATOR + 1
+                Layout::vector_offset(ATTR_BYTES) + Layout::STORED_TERMINATOR + 1
             ),
             1
         );

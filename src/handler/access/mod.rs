@@ -4,23 +4,37 @@ pub mod sweep;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::handler::arcus::engine::Store;
+use crate::handler::arcus::engine::{Store, StoreError};
 use crate::handler::registry::{self, VectorIndex};
 
-/// The registry is the whole answer.
+/// The registry answers, once the engine has had a chance to disagree.
 ///
-/// An index exists in this process exactly when its metadata item has been
-/// linked and the trigger callback registered it -- by `vcreate` on this node,
-/// by arcus replicating the item in, or by the persistence log replaying it at
-/// startup. All three reach `do_item_link`, so there is nothing left for a
-/// command to read back from the engine: no ownership token to compare against
-/// a Map, and no cold graph to rebuild, because what a search sees is what the
-/// callback put there.
+/// An index exists in this process when its metadata item has been linked and
+/// the trigger callback registered it -- by `vcreate` on this node, by arcus
+/// replicating the item in, or by the persistence log replaying it at startup.
+/// All three reach `do_item_link`, so for anything that *removes* an index the
+/// callback is the whole answer and there is nothing to read back.
 ///
-/// That is why this takes a `Store` it does not use. Every caller has one, and
-/// keeping it in the signature means the storage layer can come back into this
-/// decision without touching them again.
-pub(super) fn resolve(_store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
+/// Three removals never reach `do_item_unlink` on their own, though. A
+/// `flush_all`, a prefix invalidated under the index, and a plain expiry all
+/// leave the metadata item linked and merely doomed: `do_item_isvalid` would
+/// refuse it, but nobody runs that until somebody asks for the key. Until then
+/// the registry would go on serving an index the server considers gone.
+///
+/// So ask. [`Store::touch_kv`] is a `get` and an immediate release, which
+/// makes the engine run `do_item_isvalid` and unlink the item right there if
+/// it fails -- and that unlink comes back as the `EVENT_UNLINK` that drops the
+/// index from the registry, before the lookup below runs. One cache-lock round
+/// trip per command, against a search that takes thousands.
+///
+/// That is what the `Store` in this signature was being kept for.
+pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
+    // `KeyGone` is the answer here, not a failure: the metadata is gone, so the
+    // index is. Any other error means the engine could not be asked at all --
+    // fall through to the registry rather than refuse a command over it.
+    if let Err(StoreError::KeyGone) = store.touch_kv(&crate::trigger::key::meta_key(name)) {
+        return Err(Error::NoSuchIndex);
+    }
     registry::serving(name).ok_or(Error::NoSuchIndex)
 }
 

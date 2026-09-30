@@ -30,7 +30,7 @@ fn an_index_is_created_once_and_listed() {
 
     let listed = client.send("vlist");
     assert_contains(&listed, &format!("INDEX {ix} dim=2 quant=f32 metric=l2"));
-    assert_contains(&listed, "attrbytes=128 count=0");
+    assert_contains(&listed, "attrbytes=255 count=0");
 
     assert_reply(&client.send(&format!("vdrop {ix}")), "DROPPED\r\n");
     assert_reply(&client.send(&format!("vdrop {ix}")), "NOT_FOUND\r\n");
@@ -287,7 +287,7 @@ fn a_malformed_attr_is_refused_and_the_connection_survives() {
     let reply = client.vadd_attr(&ix, "v", 2, "0.1 0.2", "[]");
     assert_contains(&reply, "CLIENT_ERROR");
 
-    let big = format!(r#"{{"k":"{}"}}"#, "x".repeat(200));
+    let big = format!(r#"{{"k":"{}"}}"#, "x".repeat(250));
     let reply = client.vadd_attr(&ix, "v", 2, "0.1 0.2", &big);
     assert_contains(&reply, "CLIENT_ERROR");
 
@@ -406,7 +406,7 @@ fn vstats_reports_module_memory_and_follows_the_vector_count() {
     let full = client.send("vstats");
     assert!(full.ends_with("END\r\n"), "{full}");
     assert_contains(&full, &format!("STAT {ix}:vectors 40"));
-    assert_eq!(stat(&full, "attr_bytes_per_vector"), 128);
+    assert_eq!(stat(&full, "attr_bytes_per_vector"), 255);
     let used = stat(&full, &format!("{ix}:index_used_bytes"));
     let held = stat(&full, &format!("{ix}:index_held_bytes"));
     assert!(used > 0, "used {used}");
@@ -510,7 +510,7 @@ fn attr_json_must_arrive_as_one_argument() {
             .collect::<Vec<_>>()
             .join(",")
     );
-    assert!(full.len() <= 128, "{} bytes", full.len());
+    assert!(full.len() <= 255, "{} bytes", full.len());
     assert_eq!(
         client
             .send_body(
@@ -532,16 +532,21 @@ fn a_replica_builds_its_index_when_the_metadata_lands_after_the_vectors() {
     //
     // Replaying the two items by hand in that order is the only way to produce
     // it from one server: it is exactly what replication delivers.
-    session!(_server, client);
+    let server = Server::start();
+    let mut client = server.connect();
+    // The metadata's id has a space in it, which the ascii tokeniser would
+    // split. Moving that item by hand takes the binary protocol, where a key
+    // is a length and bytes.
+    let mut binary = server.connect_binary();
     let src = index_name("replicasrc");
     let dst = index_name("replicadst");
 
     client.send(&format!("vcreate {src} 2 METRIC l2"));
     assert_reply(&client.vadd(&src, "a", 2, "1.0 0.0"), "STORED\r\n");
 
-    let meta = client
-        .get_value(&format!("arcus_event{{{src}}}:"))
-        .expect("the index metadata is an item a client can read");
+    let meta = binary
+        .get(&format!("arcus_event{{{src}}}: meta"))
+        .expect("the index metadata is an item that can be read back");
     let vector = client
         .get_value(&format!("arcus_event{{{src}}}:a"))
         .expect("a vector is an item a client can read");
@@ -554,9 +559,9 @@ fn a_replica_builds_its_index_when_the_metadata_lands_after_the_vectors() {
     assert_contains(&client.vsim(&dst, 1, 2, "1.0 0.0"), "CLIENT_ERROR");
 
     // Now the metadata. The index appears and adopts what was waiting.
-    assert_reply(
-        &client.set_value(&format!("arcus_event{{{dst}}}:"), &meta),
-        "STORED\r\n",
+    assert!(
+        binary.set(&format!("arcus_event{{{dst}}}: meta"), &meta),
+        "the metadata item is storable under its own key"
     );
 
     let mut found = String::new();
@@ -606,3 +611,280 @@ fn a_body_the_graph_cannot_read_leaves_the_reference_accounting_straight() {
     client.send(&format!("vdrop {ix}"));
 }
 
+#[test]
+fn an_expired_vector_drops_out_of_a_search() {
+    // Expiry is lazy: `do_item_get` is what notices, and nothing gets a vector
+    // by key during a search, so the item stays linked and the graph goes on
+    // holding it. Without a check on the traversal, `vsim` answers with a
+    // vector the server would refuse to hand over.
+    session!(_server, client);
+    let ix = index_name("expiring");
+
+    client.send(&format!("vcreate {ix} 2 METRIC l2"));
+    assert_reply(&client.vadd(&ix, "lives", 2, "1.0 0.0"), "STORED\r\n");
+    assert_reply(&client.vadd(&ix, "dies", 2, "0.9 0.0"), "STORED\r\n");
+
+    // `vadd` takes no expiry, so rewrite the item itself with one. The replace
+    // hands the graph the new item, which is the one that will expire.
+    let body = client
+        .get_value(&format!("arcus_event{{{ix}}}:dies"))
+        .expect("a vector is an item a client can read");
+    assert_reply(
+        &client.set_value_exptime(&format!("arcus_event{{{ix}}}:dies"), 1, &body),
+        "STORED\r\n",
+    );
+
+    // Both are still there while the expiry is in the future.
+    let before = client.vsim(&ix, 2, 2, "1.0 0.0");
+    assert_contains(&before, "VALUE lives");
+    assert_contains(&before, "VALUE dies");
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Nothing has touched the key, so the item is still linked and still in the
+    // graph -- the traversal is the only thing that can leave it out.
+    let after = client.vsim(&ix, 2, 2, "1.0 0.0");
+    assert_contains(&after, "VALUE lives");
+    assert!(
+        !after.contains("VALUE dies"),
+        "an expired vector came back from vsim: {after:?}"
+    );
+
+    client.send(&format!("vdrop {ix}"));
+}
+
+#[test]
+fn a_flush_takes_the_index_with_it() {
+    // `flush_all` stamps `oldest_live` and then walks each LRU from the newest
+    // item, unlinking as it goes -- but it stops at the first item older than
+    // the stamp and leaves the rest merely doomed (`items.c`, do_item_flush_expired).
+    // `do_item_isvalid` would refuse those, but nothing runs it until somebody
+    // asks for the key, so the metadata item stays linked, no unlink callback
+    // fires, and the registry would go on serving an index the server considers
+    // gone.
+    //
+    // Asking for the metadata at the command's entrance is what runs it.
+    session!(_server, client);
+    let ix = index_name("flushed");
+
+    client.send(&format!("vcreate {ix} 2 METRIC l2"));
+    assert_reply(&client.vadd(&ix, "a", 2, "1.0 0.0"), "STORED\r\n");
+    assert_contains(&client.vsim(&ix, 1, 2, "1.0 0.0"), "VALUE a");
+
+    // Load-bearing. `oldest_live` is set to one second ago, so items touched
+    // since then are unlinked on the spot and the trigger callback cleans up
+    // without anyone's help -- which is every item in a test that flushes the
+    // moment it writes. Letting them age past the stamp is what puts the
+    // metadata in the lazy case this test is about: flushed, still linked, and
+    // invisible until something asks.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    assert_contains(&client.send("flush_all"), "OK");
+
+    // Every command that names an index goes through the same lookup.
+    assert_contains(&client.vsim(&ix, 1, 2, "1.0 0.0"), "CLIENT_ERROR");
+    assert_contains(&client.send(&format!("VSIM KEY {ix} 1 a")), "CLIENT_ERROR");
+    assert_contains(&client.send(&format!("vgetattr {ix} a")), "CLIENT_ERROR");
+    assert_contains(
+        &client.send(&format!("vsetattr {ix} a {{}}")),
+        "CLIENT_ERROR",
+    );
+    assert_contains(&client.send(&format!("vdel {ix} a")), "CLIENT_ERROR");
+    assert_contains(&client.vadd(&ix, "b", 2, "0.5 0.5"), "CLIENT_ERROR");
+
+    // And the name is free again: `vcreate` builds a new index, not `EXISTS`.
+    assert_reply(
+        &client.send(&format!("vcreate {ix} 2 METRIC l2")),
+        "CREATED\r\n",
+    );
+    client.send(&format!("vdrop {ix}"));
+}
+#[test]
+fn a_search_reaps_the_expired_vectors_it_walks_over() {
+    // Leaving an expired vector out of the answer is only half of it. The graph
+    // still holds the node, and this crate still holds the reference the link
+    // callback handed over -- so the item cannot even be evicted. Nothing else
+    // will notice: expiry is lazy, and nobody gets a vector by key.
+    //
+    // So the search does it. Asking the engine for the key is what runs
+    // `do_item_isvalid`, and the unlink that follows comes back as the
+    // `EVENT_UNLINK` that takes the node out and gives the reference back --
+    // the same path a `vdel` takes, with no separate accounting of its own.
+    session!(_server, client);
+    let ix = index_name("reaped");
+
+    let vectors = |client: &mut common::Client| -> String {
+        let body = client.send("vstats");
+        body.lines()
+            .find_map(|l| {
+                l.trim_end()
+                    .strip_prefix(&format!("STAT {ix}:vectors "))
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| panic!("no vector count in:\n{body}"))
+    };
+
+    client.send(&format!("vcreate {ix} 2 METRIC l2"));
+    assert_reply(&client.vadd(&ix, "lives", 2, "1.0 0.0"), "STORED\r\n");
+    assert_reply(&client.vadd(&ix, "dies", 2, "0.9 0.0"), "STORED\r\n");
+    assert_eq!(vectors(&mut client), "2");
+
+    let body = client
+        .get_value(&format!("arcus_event{{{ix}}}:dies"))
+        .expect("a vector is an item a client can read");
+    assert_reply(
+        &client.set_value_exptime(&format!("arcus_event{{{ix}}}:dies"), 1, &body),
+        "STORED\r\n",
+    );
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Expired, but nothing has asked for it, so it is still linked and still a
+    // node in the graph.
+    assert_eq!(vectors(&mut client), "2");
+
+    let hit = client.vsim(&ix, 2, 2, "1.0 0.0");
+    assert_contains(&hit, "VALUE lives");
+    assert!(!hit.contains("VALUE dies"), "{hit}");
+
+    // The search hands the key to the sweeper and answers; the cleanup is the
+    // sweeper's next round. Waiting for it is the point -- asserting straight
+    // after the reply would pass or fail on how long a `vstats` round trip
+    // happened to take.
+    let mut waited = 0;
+    while vectors(&mut client) != "1" && waited < 50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        waited += 1;
+    }
+    assert_eq!(
+        vectors(&mut client),
+        "1",
+        "the sweeper never took the expired vector out of the graph"
+    );
+
+    // The node leaving the graph is only half of it. The item has to be
+    // unlinked too -- that is what `on_unlink` runs on, and so what gives the
+    // reference back. An expired item still in the store would mean the search
+    // dropped the node on its own and kept the reference forever.
+    assert!(
+        client
+            .get_value(&format!("arcus_event{{{ix}}}:dies"))
+            .is_none(),
+        "the expired item is still linked, so nothing released its reference"
+    );
+
+    // And the live one is untouched by the reaping.
+    assert_contains(&client.vsim(&ix, 1, 2, "1.0 0.0"), "VALUE lives");
+    assert!(
+        client
+            .get_value(&format!("arcus_event{{{ix}}}:lives"))
+            .is_some(),
+        "the reaping took a live vector with it"
+    );
+
+    client.send(&format!("vdrop {ix}"));
+}
+
+#[test]
+fn repeated_searches_drain_more_expired_vectors_than_one_batch_holds() {
+    // One search reaps at most `REAP_BATCH` of them, so a graph that has been
+    // sitting on more than that takes several. This is the case where a
+    // reference is most likely to be released twice or not at all, because the
+    // same traversal walks over nodes an earlier one already unlinked.
+    session!(_server, client);
+    let ix = index_name("drain");
+    const LIVE: usize = 1;
+    const DOOMED: usize = 80;
+
+    let vectors = |client: &mut common::Client| -> usize {
+        let body = client.send("vstats");
+        body.lines()
+            .find_map(|l| {
+                l.trim_end()
+                    .strip_prefix(&format!("STAT {ix}:vectors "))?
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or_else(|| panic!("no vector count in:\n{body}"))
+    };
+
+    client.send(&format!("vcreate {ix} 2 METRIC l2 MAXCOUNT 1000"));
+    assert_reply(&client.vadd(&ix, "lives", 2, "1.0 0.0"), "STORED\r\n");
+    for i in 0..DOOMED {
+        let id = format!("d{i}");
+        assert_reply(
+            &client.vadd(&ix, &id, 2, &format!("0.9 {}", i as f32 / 1000.0)),
+            "STORED\r\n",
+        );
+        let body = client
+            .get_value(&format!("arcus_event{{{ix}}}:{id}"))
+            .expect("a vector is an item a client can read");
+        assert_reply(
+            &client.set_value_exptime(&format!("arcus_event{{{ix}}}:{id}"), 1, &body),
+            "STORED\r\n",
+        );
+    }
+    assert_eq!(vectors(&mut client), LIVE + DOOMED);
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert_eq!(
+        vectors(&mut client),
+        LIVE + DOOMED,
+        "nothing has asked for them, so they are all still linked"
+    );
+
+    // Each search takes a bite and leaves it to the sweeper. None of them may
+    // answer with an expired vector.
+    let mut rounds = 0;
+    loop {
+        let before = vectors(&mut client);
+        if before == LIVE {
+            break;
+        }
+
+        let hit = client.vsim(&ix, 5, 2, "1.0 0.0");
+        assert_contains(&hit, "VALUE lives");
+        assert!(
+            !hit.contains("VALUE d"),
+            "an expired vector came back: {hit}"
+        );
+        rounds += 1;
+
+        // Wait for the sweeper to work this search's batch off before asking
+        // for another. Without it the loop would spin on a count that has not
+        // moved yet and call that progress.
+        let mut waited = 0;
+        while vectors(&mut client) == before && waited < 50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            waited += 1;
+        }
+        assert!(
+            vectors(&mut client) < before,
+            "the sweeper stopped draining at {before}"
+        );
+        assert!(rounds < 60, "the searches stopped draining at {before}");
+    }
+
+    // DOOMED is above `REAP_BATCH`, so no single search could have taken them
+    // all -- which is the point of the cap and the reason this test is here.
+    assert!(
+        rounds >= 2,
+        "one search drained {DOOMED} expired vectors; the batch cap did not hold"
+    );
+    eprintln!("drained {DOOMED} expired vectors in {rounds} searches");
+
+    // The live one survived every round, in the store and in the graph.
+    assert_eq!(vectors(&mut client), LIVE);
+    assert_contains(&client.vsim(&ix, 5, 2, "1.0 0.0"), "VALUE lives");
+    assert!(
+        client
+            .get_value(&format!("arcus_event{{{ix}}}:lives"))
+            .is_some()
+    );
+
+    // The index still takes writes: the accounting it kept is still usable.
+    assert_reply(&client.vadd(&ix, "after", 2, "0.0 1.0"), "STORED\r\n");
+    assert_eq!(vectors(&mut client), LIVE + 1);
+
+    client.send(&format!("vdrop {ix}"));
+}

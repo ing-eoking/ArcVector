@@ -535,10 +535,10 @@ mod tests {
                 .contains("expected ATTR")
         );
         assert!(
-            attr_of("vadd docs v1 16 4 ATTR 129 {}")
+            attr_of("vadd docs v1 16 4 ATTR 256 {}")
                 .unwrap_err()
                 .to_string()
-                .contains("over the 128-byte limit")
+                .contains("over the 255-byte limit")
         );
         assert!(
             attr_of("vadd docs v1 16 4 ATTR 99 {}")
@@ -557,9 +557,9 @@ mod tests {
 
     #[test]
     fn an_attr_exactly_at_the_limit_is_accepted() {
-        let json = format!(r#"{{"k":"{}"}}"#, "x".repeat(120));
+        let json = format!(r#"{{"k":"{}"}}"#, "x".repeat(247));
         assert_eq!(json.len(), ATTR_BYTES);
-        assert!(attr_of(&format!("vadd docs v1 16 4 ATTR 128 {json}")).is_ok());
+        assert!(attr_of(&format!("vadd docs v1 16 4 ATTR 255 {json}")).is_ok());
     }
 
     #[test]

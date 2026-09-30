@@ -5,7 +5,27 @@ use super::Store;
 use super::error::{Result, StoreError, as_int, check};
 use crate::engine_api::{
     ENGINE_STORE_OPERATION_OPERATION_ADD, ENGINE_STORE_OPERATION_OPERATION_SET, item, item_info,
+    rel_time_t,
 };
+
+/// Whether an item's `exptime` says it is already gone, as of `now`.
+///
+/// The comparison `do_item_isvalid` makes, and deliberately only that one. The
+/// engine also refuses an item whose prefix was invalidated and one older than
+/// `oldest_live` after a `flush_all`, but both of those are answered by asking
+/// the engine for the item, not by reading a field off it -- so a caller that
+/// wants the whole verdict calls `get`, and this is for the callers that are
+/// already holding the item and cannot afford to.
+///
+/// `0` means no expiry, and a sticky item carries `rel_time_t::MAX`, which no
+/// real `now` reaches. Neither needs a branch of its own.
+///
+/// A `now` of `0` -- what [`crate::server::current_time`] gives back when the
+/// server API is out of reach -- expires nothing. Leaving an expired vector in
+/// a result is a smaller wrong than dropping a live one.
+pub fn is_expired(exptime: rel_time_t, now: rel_time_t) -> bool {
+    exptime != 0 && exptime <= now
+}
 
 impl Store {
     /// Reads a top-level key.
@@ -101,9 +121,28 @@ impl Store {
     }
 
     fn store_kv(&self, key: &str, value: &[u8], operation: u32) -> Result<u64> {
+        let addr = self.allocate_kv(key, value)?;
+        self.link_allocated(addr, operation)?;
+        Ok(addr)
+    }
+
+    /// Asks the engine for an item and fills it, **without linking it**.
+    ///
+    /// Splitting the write in two is what lets the graph be built before the
+    /// item is visible: the address is settled here, so the node can be staged
+    /// at `addr | STAGED` while nothing can reach the item yet, and
+    /// [`Store::link_allocated`] later turns that into a rename rather than an
+    /// insert. The expensive half then happens with no lock held at all.
+    ///
+    /// On success the caller owns the reference and must hand it to
+    /// `link_allocated` or [`Store::discard_allocated`].
+    ///
+    /// **Worker thread only.** `allocate` runs the engine's write hooks, and
+    /// replication hangs per-thread state off them.
+    pub fn allocate_kv(&self, key: &str, value: &[u8]) -> Result<u64> {
         let vt = self.vtable();
-        let (Some(allocate), Some(store), Some(release), Some(info_of)) =
-            (vt.allocate, vt.store, vt.release, vt.get_item_info)
+        let (Some(allocate), Some(release), Some(info_of)) =
+            (vt.allocate, vt.release, vt.get_item_info)
         else {
             return Err(StoreError::Unavailable);
         };
@@ -141,6 +180,22 @@ impl Store {
                 value.len(),
             );
         }
+        Ok(it as u64)
+    }
+
+    /// Links an item [`Store::allocate_kv`] prepared.
+    ///
+    /// This is the call that fires the link event, so it is also the call that
+    /// turns a staged node into a real one. The reference goes with it either
+    /// way: on failure the item is released here.
+    ///
+    /// **Worker thread only**, for the same reason as `allocate_kv`.
+    pub fn link_allocated(&self, addr: u64, operation: u32) -> Result<()> {
+        let vt = self.vtable();
+        let (Some(store), Some(release)) = (vt.store, vt.release) else {
+            return Err(StoreError::Unavailable);
+        };
+        let it = addr as *mut item;
 
         let mut cas: u64 = 0;
         let code = unsafe {
@@ -157,7 +212,20 @@ impl Store {
             unsafe { release(self.handle(), self.cookie, it) };
             return Err(err);
         }
-        Ok(it as u64)
+        Ok(())
+    }
+
+    /// Gives back an item that was allocated but never linked.
+    ///
+    /// Nothing ever saw it, so this is a plain release -- no unlink event
+    /// follows and no graph node is involved.
+    pub fn discard_allocated(&self, addr: u64) {
+        if let Some(release) = self.vtable().release {
+            let it = addr as *mut item;
+            if !it.is_null() {
+                unsafe { release(self.handle(), self.cookie, it) };
+            }
+        }
     }
 
     /// Reads an item's key and value in place, taking no lock and no reference.
@@ -171,6 +239,51 @@ impl Store {
     /// hook handed over, or one from [`Store::hold_kv`]. Nothing here takes one,
     /// so the borrow is only valid for the duration of `f`.
     pub fn with_item_at<T>(&self, addr: u64, f: impl FnOnce(&[u8], &[u8]) -> T) -> Option<T> {
+        self.with_item_info(addr, |_exptime, key, value| f(key, value))
+    }
+
+    /// [`Store::with_item_at`], with the verdict on the item's expiry handed to
+    /// the closure alongside its key and value.
+    ///
+    /// Expired items are not simply hidden: the caller still gets the key, which
+    /// is the only thing that lets a search note one down for cleaning up later.
+    /// An address would not do -- it stops meaning anything the moment the graph
+    /// lets go of the node -- and the key is right here, in the header the
+    /// expiry was read from.
+    ///
+    /// The whole thing costs nothing over the plain read: `get_item_info` fills
+    /// `exptime` whether or not anyone looks at it, and the field is in the same
+    /// 64-byte `hash_item` header the key and value pointers come from. There is
+    /// no second dereference and no lock.
+    ///
+    /// It is a narrower verdict than the engine's, all the same. `flush_all` and
+    /// an invalidated prefix leave `exptime` untouched and are caught only by
+    /// [`Store::get_kv`] or [`Store::touch_kv`], which let `do_item_isvalid`
+    /// answer in full. Use this where an item is already in hand and the cache
+    /// lock is not affordable; use those at a command's entrance, once.
+    ///
+    /// Take `now` from [`crate::server::current_time`] once per command, never
+    /// per item.
+    pub fn with_item_as_of<T>(
+        &self,
+        addr: u64,
+        now: rel_time_t,
+        f: impl FnOnce(bool, &[u8], &[u8]) -> T,
+    ) -> Option<T> {
+        self.with_item_info(addr, |exptime, key, value| {
+            f(is_expired(exptime, now), key, value)
+        })
+    }
+
+    /// Reads an item's header in place and hands the closure what it holds.
+    ///
+    /// The one place the `item_info` dance is written down; the two readers
+    /// above differ only in what they do with `exptime`.
+    fn with_item_info<T>(
+        &self,
+        addr: u64,
+        f: impl FnOnce(rel_time_t, &[u8], &[u8]) -> T,
+    ) -> Option<T> {
         let info_of = self.vtable().get_item_info?;
         let it = addr as *mut item;
         if it.is_null() {
@@ -187,7 +300,28 @@ impl Store {
         let key = unsafe { std::slice::from_raw_parts(info.key.cast::<u8>(), info.nkey as usize) };
         let value =
             unsafe { std::slice::from_raw_parts(info.value.cast::<u8>(), info.nbytes as usize) };
-        Some(f(key, value))
+        Some(f(info.exptime, key, value))
+    }
+
+    /// Asks the engine for a key and gives the reference straight back.
+    ///
+    /// Taken for the side effect, not the value. `get` runs `do_item_isvalid`,
+    /// and an item that fails it is unlinked **there**, inside the engine --
+    /// which is what turns a lazily expired item, one flushed by `flush_all`,
+    /// or one under an invalidated prefix into an `EVENT_UNLINK` this crate
+    /// hears. Nothing else makes those three visible: they leave the item
+    /// linked and its `exptime` untouched until somebody asks.
+    ///
+    /// So this is how a command entrance says "is this index still real". It
+    /// copies no value -- the meta record can be large and nobody here wants
+    /// it.
+    ///
+    /// Takes the cache lock twice, so it belongs at a command's entrance, once
+    /// per command, and never inside a traversal.
+    pub fn touch_kv(&self, key: &str) -> Result<()> {
+        let addr = self.hold_kv(key)?;
+        self.release_items(&[addr]);
+        Ok(())
     }
 
     /// Fetches a key and **keeps** the reference `get` took, handing back the
@@ -280,5 +414,50 @@ impl Store {
             )
         };
         check(code)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_expired;
+    use crate::engine_api::rel_time_t;
+
+    /// arcus의 스티키 아이템. `IS_STICKY_EXPTIME`이 보는 그 값이다.
+    const STICKY: rel_time_t = rel_time_t::MAX;
+
+    #[test]
+    fn exptime_zero_never_expires() {
+        assert!(!is_expired(0, 0));
+        assert!(!is_expired(0, rel_time_t::MAX - 1));
+    }
+
+    #[test]
+    fn a_sticky_item_never_expires() {
+        assert!(!is_expired(STICKY, 1_000_000));
+    }
+
+    #[test]
+    fn an_exptime_in_the_past_is_expired() {
+        assert!(is_expired(100, 200));
+    }
+
+    #[test]
+    fn an_exptime_in_the_future_is_not() {
+        assert!(!is_expired(300, 200));
+    }
+
+    #[test]
+    fn the_boundary_counts_as_expired() {
+        // `do_item_isvalid`가 `exptime <= current_time`으로 본다. 같은 초에
+        // 만료된 것을 살아 있다고 답하면 엔진과 판정이 갈린다.
+        assert!(is_expired(200, 200));
+    }
+
+    #[test]
+    fn a_now_of_zero_expires_nothing() {
+        // `get_current_time`을 못 구했을 때의 값. 판정할 수 없으면 거르지
+        // 않는다 -- 살아 있는 벡터를 검색에서 빼는 편이 더 나쁘다.
+        assert!(!is_expired(100, 0));
+        assert!(!is_expired(STICKY, 0));
     }
 }

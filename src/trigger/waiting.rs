@@ -117,6 +117,17 @@ pub(crate) enum Unlinked {
     NotWaiting,
 }
 
+/// 이 이름으로 집어가길 기다리는 주소가 있나.
+///
+/// sweeper가 매 틱 묻는다. 링크 콜백이 풀에 넘기지 못했을 때 그 주소들이
+/// 영영 그래프 밖에 남지 않게 하는 안전망이다.
+pub(crate) fn pending(index: &str) -> bool {
+    store()
+        .by_index
+        .get(index)
+        .is_some_and(|waiting| !waiting.order.is_empty())
+}
+
 /// 주소를 붙잡아 둔다. 할당기가 거절하면 `false`.
 pub(crate) fn push(index: &str, addr: u64) -> bool {
     let mut store = store();
@@ -132,7 +143,13 @@ pub(crate) fn push(index: &str, addr: u64) -> bool {
         } else {
             let at = waiting.order.len();
             waiting.order.push(addr);
-            waiting.state.insert(addr, Entry { slot: Slot::Pending, at });
+            waiting.state.insert(
+                addr,
+                Entry {
+                    slot: Slot::Pending,
+                    at,
+                },
+            );
             true
         }
     };
@@ -184,7 +201,13 @@ pub(crate) fn replace(index: &str, old: u64, new: u64) -> Replaced {
         Slot::Claimed => {
             // 복구가 old를 역참조하고 있다. 자리를 빼앗으면 그쪽이 넣고 나서
             // 볼 표가 없어진다. 묘비를 찍어 되돌리게 하고 new는 따로 잡는다.
-            waiting.state.insert(old, Entry { slot: Slot::Dropped, ..entry });
+            waiting.state.insert(
+                old,
+                Entry {
+                    slot: Slot::Dropped,
+                    ..entry
+                },
+            );
             Replaced::Recovering
         }
         _ => Replaced::NotWaiting,
@@ -349,7 +372,11 @@ mod tests {
         assert_eq!(count(), before, "자리를 물려받았으니 더 잡지 않는다");
 
         let mut cursor = 0;
-        assert_eq!(claim(ix, &mut cursor), Some(0x20), "복구는 새 주소를 집는다");
+        assert_eq!(
+            claim(ix, &mut cursor),
+            Some(0x20),
+            "복구는 새 주소를 집는다"
+        );
         assert_eq!(claim(ix, &mut cursor), None, "옛 주소는 남아 있지 않다");
         forget(ix);
     }

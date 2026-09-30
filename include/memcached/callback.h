@@ -18,7 +18,7 @@ extern "C" {
         ON_AUTH           = 2,  /**< A connection was authenticated. */
         ON_SWITCH_CONN    = 3,  /**< Processing a different connection on this thread. */
         ON_LOG_LEVEL      = 4,  /**< Changed log level */
-        ON_EVENT_ITEM     = 5,  /**< An event item was linked */
+        ON_EVENT_ITEM     = 5,  /**< An event item is linking or unlinking */
     } ENGINE_EVENT_TYPE;
 
     #define MAX_ENGINE_EVENT_TYPE 6

@@ -49,13 +49,16 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         }
     };
 
+    // 이 이름으로 먼저 도착해 기다리던 벡터가 있으면 여기서 그래프에 넣는다.
+    // 보통은 없어서 곧장 지나간다. 메타를 쓰기 **전**에 하는 것은, 링크 콜백이
+    // 곧바로 이 인덱스를 서빙으로 올리기 때문이다 -- 그 뒤에 넣으면 반쯤 찬
+    // 그래프가 잠깐 조회에 보인다.
+    crate::trigger::recover::adopt(&registered);
+
     match store.add_meta(name, &meta, layout) {
         Ok(()) => {
-            // 이 이름으로 먼저 도착해 기다리던 벡터가 있으면 여기서 그래프에
-            // 넣는다. 보통은 없어서 곧장 지나간다.
-            crate::trigger::recover::adopt(&registered);
-            registered.publish();
-            registered.mark_serving();
+            // 서빙으로 올리는 것은 `on_meta`가 한다. 복제본에는 `vcreate`가
+            // 오지 않아 콜백이 유일한 길이므로, 마스터도 같은 길을 타게 둔다.
             if previous.is_some() {
                 eprintln!(
                     "ArcVector: index '{name}' had no metadata; released the graph it stood on"
@@ -133,13 +136,13 @@ pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {
 fn check_dimension_fits(store: &Store, layout: Layout, quant: Quant) -> Result<()> {
     let limit = store.max_item_size() as usize;
 
-    if layout.full_stored_len() <= limit {
+    if layout.max_stored_len() <= limit {
         return Ok(());
     }
     Err(Error::bad_request(format!(
         "element would be {} bytes, over max_item_size {limit} \
          (max dimension is {} for quant {quant})",
-        layout.full_stored_len(),
+        layout.max_stored_len(),
         Layout::max_dim_for(quant, limit),
     )))
 }

@@ -35,9 +35,29 @@ pub fn vector_key(index: &str, id: &str) -> String {
     format!("{PREFIX}{{{index}}}:{id}")
 }
 
-/// The key an index's metadata lives at -- a vector key with an empty id.
+/// The id an index's metadata lives under.
+///
+/// The space is what makes it safe. A client's id arrives as one ASCII
+/// protocol token, and the tokeniser splits on spaces -- so no `vadd` can ever
+/// name this id, and no vector can land on the metadata's key. An id of
+/// `meta` with no space would collide with the first client that stores a
+/// vector called `meta`, and an empty id, which is what this used to be, reads
+/// as a typo at every call site that handles one.
+///
+/// Nothing outside this crate needs to address the key: every reader goes
+/// through the engine, which takes a key as a pointer and a length and never
+/// tokenises it.
+pub const META_ID: &str = " meta";
+
+/// The key an index's metadata lives at.
 pub fn meta_key(index: &str) -> String {
-    vector_key(index, "")
+    vector_key(index, META_ID)
+}
+
+/// Whether a parsed key names an index's metadata rather than one of its
+/// vectors.
+pub fn is_meta(id: &str) -> bool {
+    id == META_ID
 }
 
 /// The prefix the daemon derives from any of this index's keys: everything
@@ -87,13 +107,25 @@ mod tests {
     }
 
     #[test]
-    fn a_meta_key_parses_with_an_empty_id() {
+    fn a_meta_key_parses_back_to_the_metadata_id() {
         let key = meta_key("photos");
-        assert_eq!(key, "arcus_event{photos}:");
+        assert_eq!(key, "arcus_event{photos}: meta");
 
         let parsed = parse(key.as_bytes()).expect("parses");
         assert_eq!(parsed.index, "photos");
-        assert_eq!(parsed.id, "");
+        assert_eq!(parsed.id, META_ID);
+        assert!(is_meta(parsed.id));
+    }
+
+    #[test]
+    fn no_id_a_client_can_send_is_the_metadata_id() {
+        // 클라이언트의 id는 ASCII 토큰 하나로 도착하고, 토큰화는 공백에서
+        // 쪼개진다. 그래서 공백이 든 id는 `vadd`로 만들 수가 없다 -- 그것이
+        // 메타 키가 벡터와 부딪히지 않는 이유 전부다.
+        assert!(META_ID.contains(' '));
+        for id in ["meta", "", "v42", "meta ", "arcus_event"] {
+            assert!(!is_meta(id), "'{id}'가 메타로 잡히면 안 된다");
+        }
     }
 
     #[test]

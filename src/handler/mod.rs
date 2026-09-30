@@ -4,7 +4,8 @@ pub mod registry;
 pub mod usearch;
 
 pub(crate) mod access;
-mod cmd;
+pub(crate) mod cmd;
+pub(crate) mod offload;
 
 use std::os::raw::c_void;
 

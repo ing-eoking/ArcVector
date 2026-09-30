@@ -196,6 +196,90 @@ impl Server {
             .expect("the read timeout is settable");
         Client { stream }
     }
+
+    /// A connection that speaks the binary protocol.
+    ///
+    /// The one way a test can address a key the ascii protocol cannot spell.
+    /// An index's metadata lives under an id with a space in it, which the
+    /// ascii tokeniser would split -- that is exactly why no client `vadd` can
+    /// collide with it. The binary protocol takes a key as a length and bytes,
+    /// so it has no such trouble.
+    ///
+    /// A separate connection, because the server picks a protocol per
+    /// connection from the first byte it sees (`negotiating_prot`).
+    pub fn connect_binary(&self) -> BinaryClient {
+        let stream = UnixStream::connect(&self.socket).expect("the server is listening");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("the read timeout is settable");
+        BinaryClient { stream }
+    }
+}
+
+/// Just enough of the binary protocol to move one item around.
+pub struct BinaryClient {
+    stream: UnixStream,
+}
+
+impl BinaryClient {
+    const MAGIC_REQUEST: u8 = 0x80;
+    const OP_GET: u8 = 0x00;
+    const OP_SET: u8 = 0x01;
+
+    pub fn get(&mut self, key: &str) -> Option<Vec<u8>> {
+        self.request(Self::OP_GET, key, &[], &[]);
+        let (status, body, extlen) = self.response();
+        // 4 bytes of flags come before the value.
+        (status == 0).then(|| body[extlen..].to_vec())
+    }
+
+    pub fn set(&mut self, key: &str, value: &[u8]) -> bool {
+        // extras: flags then expiry, both zero.
+        self.request(Self::OP_SET, key, &[0u8; 8], value);
+        self.response().0 == 0
+    }
+
+    fn request(&mut self, opcode: u8, key: &str, extras: &[u8], value: &[u8]) {
+        let key = key.as_bytes();
+        let total = extras.len() + key.len() + value.len();
+
+        let mut out = Vec::with_capacity(24 + total);
+        out.push(Self::MAGIC_REQUEST);
+        out.push(opcode);
+        out.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        out.push(extras.len() as u8);
+        out.push(0); // datatype
+        out.extend_from_slice(&0u16.to_be_bytes()); // vbucket
+        out.extend_from_slice(&(total as u32).to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes()); // opaque
+        out.extend_from_slice(&0u64.to_be_bytes()); // cas
+        out.extend_from_slice(extras);
+        out.extend_from_slice(key);
+        out.extend_from_slice(value);
+
+        self.stream
+            .write_all(&out)
+            .expect("the connection accepts writes");
+        self.stream.flush().expect("the connection flushes");
+    }
+
+    /// `(status, body, extlen)`.
+    fn response(&mut self) -> (u16, Vec<u8>, usize) {
+        let mut header = [0u8; 24];
+        self.stream
+            .read_exact(&mut header)
+            .expect("the server answers with a binary header");
+
+        let extlen = header[4] as usize;
+        let status = u16::from_be_bytes([header[6], header[7]]);
+        let bodylen = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
+
+        let mut body = vec![0u8; bodylen];
+        self.stream
+            .read_exact(&mut body)
+            .expect("the server answers with the body it declared");
+        (status, body, extlen)
+    }
 }
 
 impl Drop for Server {
@@ -340,7 +424,15 @@ impl Client {
     /// Writes a body verbatim with a plain `set`, bypassing this crate's
     /// commands. Replaying an item the way replication delivers it.
     pub fn set_value(&mut self, key: &str, body: &[u8]) -> String {
-        let mut raw = format!("set {key} 0 0 {}\r\n", body.len()).into_bytes();
+        self.set_value_exptime(key, 0, body)
+    }
+
+    /// [`Client::set_value`] with an expiry, for the one thing this crate's own
+    /// commands cannot express: a *vector* that expires. `vcreate` takes an
+    /// `EXPTIME` for the index, `vadd` takes none, so a test that wants an
+    /// expired vector has to write the item itself.
+    pub fn set_value_exptime(&mut self, key: &str, exptime: u32, body: &[u8]) -> String {
+        let mut raw = format!("set {key} 0 {exptime} {}\r\n", body.len()).into_bytes();
         raw.extend_from_slice(body);
         raw.extend_from_slice(b"\r\n");
         self.stream

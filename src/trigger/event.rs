@@ -56,8 +56,8 @@ use crate::handler::arcus::engine::{ItemElements, Store};
 use crate::handler::registry::{self, VectorIndex};
 use crate::handler::usearch::AnnIndex;
 use crate::handler::usearch::metric::Metric;
-use crate::trigger::waiting::{self, Replaced, Unlinked};
 use crate::trigger::recover;
+use crate::trigger::waiting::{self, Replaced, Unlinked};
 
 use crate::engine_api::{
     ENGINE_ERROR_CODE, ENGINE_ERROR_CODE_ENGINE_ENOMEM, ENGINE_EVENT_TYPE,
@@ -189,7 +189,8 @@ fn route(store: &Store, addr: u64) -> Option<(String, bool)> {
         return None;
     }
     store.with_item_at(addr, |key, _value| {
-        crate::trigger::key::parse(key).map(|p| (p.index.to_owned(), p.id.is_empty()))
+        crate::trigger::key::parse(key)
+            .map(|p| (p.index.to_owned(), crate::trigger::key::is_meta(p.id)))
     })?
 }
 
@@ -221,32 +222,42 @@ fn on_link(store: &Store, addr: u64) -> Decision {
         );
         return Decision::Declined;
     };
-    link_into(store, &index, addr)
+    link_into(&index, addr)
 }
 
-/// 주소 하나를 그래프에 넣는다.
-fn link_into(store: &Store, index: &VectorIndex, addr: u64) -> Decision {
-    let layout = index.ann.layout;
-    let took = store
-        .with_item_at(addr, |_key, value| {
-            layout
-                .vector_of(value)
-                .map(|vector| index.ann.link_node(addr, vector))
-        })
-        .flatten()
-        .is_some_and(|r| r.is_ok());
+/// 주소 하나를 인덱스에 들인다.
+///
+/// **여기서 HNSW에 삽입하지 않는다.** 이 함수는 엔진의 cache lock을 쥔 채
+/// 불리고, 삽입은 `vadd`의 유일한 무거운 일이다 -- 여기서 돌리면 그동안 데몬
+/// 전체가 선다. 두 길로 나뉜다.
+///
+/// * `vadd`가 온 길이면 자리표가 이미 그래프에 있다. 키만 제자리로 옮긴다.
+/// * 복제나 복구로 들어온 아이템이면 자리표가 없다. 주소만 적어 두고 풀에
+///   넘긴다 -- 복제본이 따라잡는 동안 데몬이 서지 않게 하는 것이 요점이다.
+fn link_into(index: &Arc<VectorIndex>, addr: u64) -> Decision {
+    if index.ann.unstage(addr) {
+        return Decision::Took;
+    }
 
-    if took {
-        Decision::Took
-    } else {
-        // 여기서 끝낸다. 참조를 안 받으므로 이 아이템은 우리 것이 아니고,
+    if !waiting::push(&index.name, addr) {
+        // 적어 둘 자리가 없다. 참조를 안 받으므로 이 아이템은 우리 것이 아니고,
         // unlink는 그래프에 노드가 없는 것을 보고 놓아주지 않는다.
         eprintln!(
-            "ArcVector: the graph would not take a linked item; it stays in the \
-             store, out of this index"
+            "ArcVector: no room to hold a linked '{}' vector; it stays in the \
+             store, out of this index",
+            index.name
         );
-        Decision::Declined
+        return Decision::Declined;
     }
+
+    if !recover::submit_adopt(index) {
+        // 풀이 못 받았다. 목록에 남아 있고 sweeper가 매 틱 다시 맡긴다.
+        eprintln!(
+            "ArcVector: '{}' waits for a free worker before this vector is indexed",
+            index.name
+        );
+    }
+    Decision::Took
 }
 
 /// 인덱스의 메타 레코드가 링크됐다.
@@ -259,7 +270,11 @@ fn link_into(store: &Store, index: &VectorIndex, addr: u64) -> Decision {
 /// 여기서는 등록까지만 하고 보류된 벡터는 풀 스레드가 넣는다. 이 함수는 엔진의
 /// cache lock을 쥔 채 돌기 때문이다.
 fn on_meta(store: &Store, addr: u64, name: &str) -> Decision {
-    if registry::contains(name) {
+    // `vcreate`가 세워 둔 인덱스다 -- 그래프도 등록도 이미 끝났고, 남은 것은
+    // 서빙으로 올리는 일뿐이다. 플래그 둘이라 cache lock 아래에서 해도 짧다.
+    if let Some(index) = registry::get(name) {
+        index.publish();
+        index.mark_serving();
         return Decision::Took;
     }
 
@@ -409,7 +424,8 @@ fn on_replace(store: &Store, old: u64, new: u64) -> Decision {
     // old를 들고 있는 그래프가 살아 있는 인덱스가 아닐 수 있다 -- `vdrop`한 뒤
     // 그 키를 다시 쓰면 옛 그래프가 old를, 새 인덱스가 new를 맡는다.
     if let Some(holder) = registry::holding(&name, old)
-        && !registry::get(&name).is_some_and(|live| std::ptr::eq(Arc::as_ptr(&live), Arc::as_ptr(&holder)))
+        && !registry::get(&name)
+            .is_some_and(|live| std::ptr::eq(Arc::as_ptr(&live), Arc::as_ptr(&holder)))
     {
         holder.ann.unlink_at(old);
         let gave_back = holder.ann.retire_one(old);
@@ -417,7 +433,7 @@ fn on_replace(store: &Store, old: u64, new: u64) -> Decision {
             holder.ann.halt_for_overflow();
         }
         if let Some(live) = registry::get(&name) {
-            link_into(store, &live, new);
+            link_into(&live, new);
         } else if !waiting::push(&name, new) {
             eprintln!("ArcVector: no room to hold a replaced '{name}' vector; it is dropped");
         }
@@ -437,11 +453,27 @@ fn on_replace(store: &Store, old: u64, new: u64) -> Decision {
         return Decision::NotOurs;
     };
 
+    // 새 아이템의 자리표가 준비돼 있으면 그것이 **새 벡터**다. 그것을 앉히고
+    // 옛 노드를 뺀다.
+    //
+    // `rename_node(old, new)`로 끝내면 주소만 바뀌고 그래프는 옛 벡터를 계속
+    // 들고 있다 -- 같은 id를 덮어써도 검색은 옛 좌표로 답하게 된다.
+    if index.ann.unstage(new) {
+        index.ann.unlink_at(old);
+        return if index.ann.retire_one(old) {
+            Decision::Took
+        } else {
+            index.ann.halt_for_overflow();
+            Decision::Declined
+        };
+    }
+
+    // 자리표가 없다 -- 복제나 복구로 들어온 교체다. 옛 노드를 새 주소로 옮긴다.
     if !index.ann.rename_node(old, new) {
         // 그래프가 old를 갖고 있지 않았다 -- 링크 때 안 받은 벡터라 참조도 없다.
         // new만 새로 넣는다. `INCR(new)`는 우리 답과 무관하게 이미 일어났으므로
         // 여기서 거절하면 없는 old의 참조를 회수하라는 말이 된다.
-        link_into(store, &index, new);
+        link_into(&index, new);
         return Decision::NotOurs;
     }
 

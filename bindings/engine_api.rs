@@ -1688,7 +1688,7 @@ pub const ENGINE_EVENT_TYPE_ON_AUTH: ENGINE_EVENT_TYPE = 2;
 pub const ENGINE_EVENT_TYPE_ON_SWITCH_CONN: ENGINE_EVENT_TYPE = 3;
 #[doc = "< Changed log level"]
 pub const ENGINE_EVENT_TYPE_ON_LOG_LEVEL: ENGINE_EVENT_TYPE = 4;
-#[doc = "< An event item was linked"]
+#[doc = "< An event item is linking or unlinking"]
 pub const ENGINE_EVENT_TYPE_ON_EVENT_ITEM: ENGINE_EVENT_TYPE = 5;
 #[doc = " Event types for callbacks to the engine indicating state\n changes in the server."]
 pub type ENGINE_EVENT_TYPE = ::std::os::raw::c_uint;
@@ -1821,6 +1821,18 @@ pub struct extension_ascii_protocol_descriptor {
                 ) -> bool,
             >,
         ) -> bool,
+    >,
+    #[doc = " Did the handler take this command away to answer later?\n\n Asked right after execute() returned true, for the same connection.\n NULL means the answer is already in the response buffer and the\n command is done -- which is what every handler did before this\n existed, so leaving this member NULL keeps the old behaviour.\n\n Anything else is the function the core calls once the handler says\n the answer is ready, by way of notify_io_complete(). Until then the\n connection waits in conn_waking, out of the event loop.\n\n @param cmd_cookie cookie registered with the command\n @param cookie identifying the client connection"]
+    pub block: ::std::option::Option<
+        unsafe extern "C" fn(
+            cmd_cookie: *const ::std::os::raw::c_void,
+            cookie: *const ::std::os::raw::c_void,
+        ) -> ::std::option::Option<
+            unsafe extern "C" fn(
+                cmd_cookie: *const ::std::os::raw::c_void,
+                cookie: *const ::std::os::raw::c_void,
+            ),
+        >,
     >,
     #[doc = " abort the command.\n\n @param cmd_cookie cookie registered with the command\n @param cookie identifying the client connection"]
     pub abort: ::std::option::Option<

@@ -11,5 +11,5 @@
 
 pub mod event;
 pub mod key;
-pub mod waiting;
 pub mod recover;
+pub mod waiting;

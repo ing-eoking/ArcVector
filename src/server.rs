@@ -1,7 +1,7 @@
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::OnceLock;
 
-use crate::engine_api::{SERVER_CORE_API, SERVER_HANDLE_V1};
+use crate::engine_api::{ENGINE_ERROR_CODE, SERVER_CORE_API, SERVER_HANDLE_V1, rel_time_t};
 use crate::error::{Reply, Result};
 
 static GET_SERVER_API: OnceLock<unsafe extern "C" fn() -> *mut SERVER_HANDLE_V1> = OnceLock::new();
@@ -24,6 +24,63 @@ fn core() -> *const SERVER_CORE_API {
     }
 
     unsafe { (*server).core }
+}
+
+/// The server's clock, in the same units an item's `exptime` is written in.
+///
+/// Both are `rel_time_t` -- seconds since the process started -- so an item is
+/// expired exactly when its `exptime` has fallen behind this. Nothing here
+/// converts to or from wall time; that is `realtime`'s job, and only a caller
+/// setting an expiry needs it.
+///
+/// `0` when the server API is out of reach, which
+/// [`crate::handler::arcus::engine::is_expired`] reads as "expire nothing".
+/// Callers take this **once** per command rather than per item: a search that
+/// asked twice could accept a vector early in its traversal and reject the same
+/// one later, and the extra indirect call would land in the hottest loop there
+/// is.
+pub fn current_time() -> rel_time_t {
+    let core = core();
+    if core.is_null() {
+        return 0;
+    }
+
+    match unsafe { (*core).get_current_time } {
+        Some(now) => unsafe { now() },
+        None => 0,
+    }
+}
+
+/// Tells the core this connection has one more answer outstanding.
+///
+/// **Called before the work is handed to the pool, never after.** The core
+/// only takes a connection out of the event loop when this count is above
+/// zero, so a pool thread that finished first would otherwise leave the
+/// connection parked with nothing left to wake it.
+pub unsafe fn waitfor_io_complete(cookie: *const c_void) {
+    let core = core();
+    if core.is_null() {
+        return;
+    }
+    if let Some(waitfor) = unsafe { (*core).waitfor_io_complete } {
+        unsafe { waitfor(cookie) };
+    }
+}
+
+/// One outstanding answer is ready.
+///
+/// The core puts the connection back on its thread's pending list and drives
+/// the state machine from `conn_waking`, which is where our callback runs.
+/// Safe to call on a connection that has gone away: the core checks for that
+/// under the thread lock.
+pub unsafe fn notify_io_complete(cookie: *const c_void, status: ENGINE_ERROR_CODE) {
+    let core = core();
+    if core.is_null() {
+        return;
+    }
+    if let Some(notify) = unsafe { (*core).notify_io_complete } {
+        unsafe { notify(cookie, status) };
+    }
 }
 
 pub unsafe fn store_conn_state(cookie: *const c_void, data: *mut c_void) -> bool {

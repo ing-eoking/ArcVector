@@ -129,8 +129,7 @@ static INDICES: LazyLock<RwLock<HashMap<String, Arc<VectorIndex>>>> =
 ///
 /// 그래프가 비면 sweeper가 버린다. 그때까지 남아 있는 것은 그동안 실제로
 /// 참조를 쥐고 있기 때문이라, 이 목록의 크기는 정확한 값이다.
-static DROPPED: LazyLock<RwLock<Vec<Arc<VectorIndex>>>> =
-    LazyLock::new(|| RwLock::new(Vec::new()));
+static DROPPED: LazyLock<RwLock<Vec<Arc<VectorIndex>>>> = LazyLock::new(|| RwLock::new(Vec::new()));
 
 fn read() -> std::sync::RwLockReadGuard<'static, HashMap<String, Arc<VectorIndex>>> {
     INDICES.read().unwrap_or_else(PoisonError::into_inner)

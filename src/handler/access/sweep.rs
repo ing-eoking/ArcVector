@@ -13,6 +13,13 @@ const TICK: Duration = Duration::from_secs(1);
 /// 다른 모든 인덱스의 `retry_stuck()`이 이 루프 뒤에서 기다린다.
 const RECLAIM_BATCH: usize = 64;
 
+/// 훑기를 기다리는 만료 키의 상한.
+///
+/// 넘치면 버린다. 놓친 키의 벡터는 그래프에 그대로 남아 있으니 다음 검색이 그
+/// 노드를 다시 밟을 때 또 올라온다 -- 여기서 무한정 받아주면 검색이 만드는
+/// 만큼 데몬의 메모리가 늘어난다.
+const REAP_QUEUE: usize = 1024;
+
 struct Sweeper {
     state: Mutex<State>,
     wake: Condvar,
@@ -25,6 +32,14 @@ struct State {
     /// 뮤텍스 안에서 세우는 것이 요점이다. 밖에서 `notify_one`만 하면 sweeper가
     /// "일 없음"을 확인하고 `wait`에 들어가기 전에 울린 알림이 사라진다.
     pending: bool,
+
+    /// 검색이 밟고 지나간 만료 벡터의 키.
+    ///
+    /// **주소가 아니라 키다.** 여기 올라온 뒤 훑기가 집어 가기까지 한 틱이
+    /// 비는데, 그 사이에 `vdel`이나 다른 무엇이 같은 아이템을 unlink하고 참조를
+    /// 반납해 버릴 수 있다. 주소를 들고 있었다면 그때부터 해제된 메모리를
+    /// 가리킨다. 키는 낡아도 `get`이 없다고 답할 뿐이다.
+    expired: Vec<String>,
 }
 
 static SWEEPER: LazyLock<Sweeper> = LazyLock::new(|| {
@@ -50,6 +65,76 @@ pub(in crate::handler) fn ensure_sweeper() {
 pub(in crate::handler) fn wake() {
     state().pending = true;
     SWEEPER.wake.notify_one();
+}
+
+/// 만료로 보이는 키를 훑기에 넘긴다.
+///
+/// 검색이 순회 중에 적어 둔 것을, 순회가 끝난 뒤에 넘긴다. **묻는 일은 여기서
+/// 하지 않는다** -- 키 하나마다 `get`과 `release`로 cache lock을 두 번 잡으므로,
+/// 조회 스레드가 그것을 떠안지 않도록 훑기로 옮긴 것이다.
+///
+/// 자리가 없으면 넘친 만큼 버린다. 빠뜨려도 그 벡터는 그래프에 남아 있고, 다음
+/// 검색이 같은 노드를 밟으면 다시 올라온다.
+pub(in crate::handler) fn reap_later(keys: Vec<String>) {
+    {
+        let mut state = state();
+        if !enqueue_bounded(&mut state.expired, keys) {
+            return;
+        }
+        state.pending = true;
+    }
+    SWEEPER.wake.notify_one();
+}
+
+/// 큐에 자리가 있는 만큼만 받아 넣고, 넘친 것은 버린다. 하나라도 들어갔으면
+/// `true` -- 아무것도 안 들어갔는데 종을 울려 봐야 헛바퀴다.
+///
+/// 전역 상태에서 떼어 둔 것은 이 경계만 따로 시험하기 위해서다.
+fn enqueue_bounded(queue: &mut Vec<String>, mut keys: Vec<String>) -> bool {
+    let room = REAP_QUEUE.saturating_sub(queue.len());
+    if room == 0 {
+        return false;
+    }
+    keys.truncate(room);
+    if keys.is_empty() || queue.try_reserve(keys.len()).is_err() {
+        return false;
+    }
+    queue.append(&mut keys);
+    true
+}
+
+/// 한 바퀴가 물어볼 몫을 큐 앞에서 떼어 낸다.
+fn take_batch(queue: &mut Vec<String>) -> Vec<String> {
+    let n = RECLAIM_BATCH.min(queue.len());
+    queue.drain(..n).collect()
+}
+
+/// 넘겨받은 키를 엔진에 물어본다. 묻는 것이 곧 정리다.
+///
+/// `get`이 `do_item_isvalid`를 돌리고, 거기서 나는 `do_item_unlink`가
+/// `EVENT_UNLINK`로 돌아와 `on_unlink`이 노드를 빼고 참조를 반납한다. `vdel`이
+/// 지나가는 그 길이라 여기에 따로 셈할 것이 없다.
+///
+/// 살아 있는 것으로 밝혀지면 `get`이 그냥 돌려주고 끝난다. 이미 사라졌으면
+/// 없다고 답한다. 둘 다 이 함수가 할 일이 없다는 뜻이다.
+///
+/// 남았으면 `true`를 돌려 다음 바퀴가 `TICK`을 기다리지 않게 한다.
+fn reap_round() -> bool {
+    let batch = take_batch(&mut state().expired);
+    if batch.is_empty() {
+        return false;
+    }
+
+    // 엔진에 닿지 못하면 이번 바퀴는 거른다. 키는 이미 큐에서 뺐지만 그
+    // 벡터들은 그래프에 그대로라 다음 검색이 다시 올려준다.
+    let Some(store) = crate::handler::arcus::engine::Store::background() else {
+        return false;
+    };
+    for key in &batch {
+        let _ = store.touch_kv(key);
+    }
+
+    !state().expired.is_empty()
 }
 
 fn state() -> MutexGuard<'static, State> {
@@ -90,6 +175,13 @@ fn run() {
             index.ann.resume_if_drained();
         }
 
+        // 검색이 두고 간 만료 키를 물어본다. 놓아주는 일보다 뒤에 둔다 --
+        // 이쪽이 일으키는 unlink가 위 큐에 새 주소를 밀어 넣으므로, 먼저 비워
+        // 두는 편이 한 바퀴에 더 흘러간다.
+        if reap_round() {
+            state().pending = true;
+        }
+
         // 종을 울려줄 주체가 없는 일만 틱 주기로 남긴다.
         if last_round.elapsed() >= TICK {
             last_round = Instant::now();
@@ -101,6 +193,11 @@ fn run() {
                 // 안 보이므로 여기서 집어주지 않으면 영영 안 올라온다.
                 if index.state() == registry::BUILDING {
                     crate::trigger::recover::submit(index);
+                } else if crate::trigger::waiting::pending(&index.name) {
+                    // 링크 콜백이 적어 두고 풀에 넘기지 못한 주소들. 서빙
+                    // 중인 인덱스는 복구가 다시 맡아주지 않으므로, 여기가
+                    // 그것들이 그래프에 들어가는 마지막 길이다.
+                    crate::trigger::recover::submit_adopt(index);
                 }
             }
 
@@ -144,6 +241,51 @@ mod tests {
             "한도에 걸린 것을 보고해야 다음 바퀴가 바로 이어받는다"
         );
         assert_eq!(calls.get(), RECLAIM_BATCH, "정확히 한도에서 멈춘다");
+    }
+
+    fn keys(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("k{i}")).collect()
+    }
+
+    #[test]
+    fn the_expired_queue_takes_what_fits_and_drops_the_rest() {
+        let mut queue = Vec::new();
+        assert!(enqueue_bounded(&mut queue, keys(REAP_QUEUE - 1)));
+        assert_eq!(queue.len(), REAP_QUEUE - 1);
+
+        // 넘치는 만큼만 잘라 받는다. 못 받은 벡터는 그래프에 남아 있으니 다음
+        // 검색이 다시 올려준다 -- 여기서 무한정 받으면 데몬 메모리가 검색을
+        // 따라 늘어난다.
+        assert!(enqueue_bounded(&mut queue, keys(10)));
+        assert_eq!(queue.len(), REAP_QUEUE, "상한을 넘겨 받지 않는다");
+
+        assert!(
+            !enqueue_bounded(&mut queue, keys(1)),
+            "가득 찼으면 안 받았다고 답해야 종을 헛울리지 않는다"
+        );
+        assert_eq!(queue.len(), REAP_QUEUE);
+    }
+
+    #[test]
+    fn an_empty_handoff_is_not_worth_a_bell() {
+        let mut queue = Vec::new();
+        assert!(!enqueue_bounded(&mut queue, Vec::new()));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn a_round_takes_at_most_one_batch_and_leaves_the_rest_in_order() {
+        let mut queue = keys(RECLAIM_BATCH + 3);
+
+        let first = take_batch(&mut queue);
+        assert_eq!(first.len(), RECLAIM_BATCH);
+        assert_eq!(first[0], "k0", "큐 앞에서 뗀다");
+        assert_eq!(queue.len(), 3, "남은 것은 다음 바퀴 몫이다");
+
+        let second = take_batch(&mut queue);
+        assert_eq!(second, keys(RECLAIM_BATCH + 3)[RECLAIM_BATCH..]);
+        assert!(queue.is_empty());
+        assert!(take_batch(&mut queue).is_empty());
     }
 
     #[test]
