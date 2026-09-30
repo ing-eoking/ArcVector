@@ -11,7 +11,18 @@ use crate::{ATTR_BYTES, Metric};
 
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
 
-pub const MAX_RESULTS: usize = i32::MAX as usize;
+/// 한 질의가 돌려줄 수 있는 결과의 최대 개수.
+///
+/// **할당 방어다.** usearch의 Rust 바인딩이 요청한 개수만큼 결과 배열을 만들어
+/// 0으로 채운 뒤 찾은 만큼으로 줄인다(`rust/lib.cpp`의 `search_`) -- 요청한
+/// 개수가 곧 할당이라, 21억을 받으면 질의 하나가 24GB를 잡으라고 시킨다.
+/// 10,000이면 120KB다.
+///
+/// 넘으면 조용히 자르지 않고 거절한다. 잘라서 주면 클라이언트는 그것이 전부인
+/// 줄 안다.
+///
+/// 인덱스에 담기는 벡터 수와는 무관하다. 그쪽에는 상한이 없다.
+pub const MAX_RESULTS: usize = 10_000;
 
 #[derive(Debug)]
 pub enum Parsed<'a> {
