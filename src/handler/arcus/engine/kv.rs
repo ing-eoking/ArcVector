@@ -121,7 +121,7 @@ impl Store {
     }
 
     fn store_kv(&self, key: &str, value: &[u8], operation: u32) -> Result<u64> {
-        let addr = self.allocate_kv(key, value)?;
+        let addr = self.allocate_kv(key, value, 0)?;
         self.link_allocated(addr, operation)?;
         Ok(addr)
     }
@@ -139,7 +139,7 @@ impl Store {
     ///
     /// **Worker thread only.** `allocate` runs the engine's write hooks, and
     /// replication hangs per-thread state off them.
-    pub fn allocate_kv(&self, key: &str, value: &[u8]) -> Result<u64> {
+    pub fn allocate_kv(&self, key: &str, value: &[u8], exptime: u32) -> Result<u64> {
         let vt = self.vtable();
         let (Some(allocate), Some(release), Some(info_of)) =
             (vt.allocate, vt.release, vt.get_item_info)
@@ -157,7 +157,7 @@ impl Store {
                 key.len(),
                 value.len(),
                 0, // flags
-                0, // exptime: never
+                exptime,
                 0, // cas
             )
         };

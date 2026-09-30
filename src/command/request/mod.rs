@@ -34,7 +34,7 @@ pub fn body_refused(len: usize) -> Error {
 pub enum Cmd {
     VCreate,
     VAdd,
-    VSim,
+    VSearch,
     VGetAttr,
     VSetAttr,
     VDel,
@@ -48,7 +48,7 @@ impl Cmd {
         const NAMES: [(&str, Cmd); 9] = [
             ("vcreate", Cmd::VCreate),
             ("vadd", Cmd::VAdd),
-            ("vsim", Cmd::VSim),
+            ("vsearch", Cmd::VSearch),
             ("vgetattr", Cmd::VGetAttr),
             ("vsetattr", Cmd::VSetAttr),
             ("vdel", Cmd::VDel),
@@ -90,8 +90,6 @@ pub struct Create<'a> {
     pub connectivity: usize,
     pub expansion_add: usize,
     pub expansion_search: usize,
-    pub maxcount: Option<u32>,
-    pub exptime: Option<u32>,
 }
 
 impl Create<'_> {
@@ -104,8 +102,6 @@ impl Create<'_> {
             connectivity: 0,
             expansion_add: 0,
             expansion_search: 0,
-            maxcount: None,
-            exptime: None,
         }
     }
 }
@@ -154,9 +150,10 @@ pub enum Line<'a> {
 #[derive(Debug)]
 pub struct Add {
     pub index: String,
-    pub id: String,
+    pub vkey: String,
 
-    pub dim: usize,
+    /// 이 벡터 하나의 만료 시간(초). 0이면 만료되지 않는다.
+    pub exptime: u32,
     pub attr: Vec<u8>,
 }
 
@@ -164,7 +161,6 @@ pub struct Add {
 pub struct Sim {
     pub index: String,
     pub k: usize,
-    pub dim: usize,
     pub filter: Option<Filter>,
     pub with_attr: bool,
 }

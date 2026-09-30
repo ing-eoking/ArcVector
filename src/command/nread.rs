@@ -73,8 +73,8 @@ mod tests {
     fn add() -> Body {
         Body::Add(Add {
             index: "docs".into(),
-            id: "v1".into(),
-            dim: 2,
+            vkey: "v1".into(),
+            exptime: 0,
             attr: br#"{"a":1}"#.to_vec(),
         })
     }

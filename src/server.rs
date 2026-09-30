@@ -57,6 +57,26 @@ pub fn current_time() -> rel_time_t {
 /// only takes a connection out of the event loop when this count is above
 /// zero, so a pool thread that finished first would otherwise leave the
 /// connection parked with nothing left to wake it.
+/// 클라이언트가 말한 만료 시각을 서버의 시계로 옮긴다.
+///
+/// 프로토콜의 `exptime`은 "몇 초 뒤"(작은 값)이거나 유닉스 시각(큰 값)이고,
+/// 0은 만료 없음이다. 아이템이 들고 있는 `rel_time_t`는 프로세스 시작 기준
+/// 초라 둘이 다르다 -- 변환하지 않고 넘기면 `1`이 "기동 1초 후", 즉 이미
+/// 지나간 시각이 된다.
+pub fn realtime(exptime: u32) -> rel_time_t {
+    if exptime == 0 {
+        return 0;
+    }
+    let core = core();
+    if core.is_null() {
+        return 0;
+    }
+    match unsafe { (*core).realtime } {
+        Some(convert) => unsafe { convert(i64::from(exptime)) },
+        None => 0,
+    }
+}
+
 pub unsafe fn waitfor_io_complete(cookie: *const c_void) {
     let core = core();
     if core.is_null() {
@@ -165,7 +185,7 @@ impl Responder {
     pub fn reply(&self, outcome: Result<Reply>) {
         match outcome {
             Ok(reply) => self.send(reply.as_str()),
-            Err(e) => self.send(&format!("{} {e}\r\n", e.blame().prefix())),
+            Err(e) => self.send(&e.wire()),
         }
     }
 }

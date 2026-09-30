@@ -30,7 +30,9 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         std::sync::Arc::new(engine::ItemElements),
     )?;
 
-    let maxcount = spec.maxcount.unwrap_or(DEFAULT_MAXCOUNT);
+    // 인덱스 크기 상한은 이제 명령으로 못 정한다. 그래도 천장은 있어야
+    // 한다 -- 없으면 한 인덱스가 데몬 메모리를 끝까지 먹는다.
+    let maxcount = DEFAULT_MAXCOUNT;
     let meta = MetaRecord {
         metric: metric.as_str().to_owned(),
         connectivity: spec.connectivity,
@@ -88,9 +90,15 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
 /// and the graph is what counts against it.
 const DEFAULT_MAXCOUNT: u32 = 50_000;
 
+/// `add`가 거절했다 -- 그 키에 이미 무언가 있다.
+///
+/// 우리가 아는 인덱스면 `EXISTS`다. 아니면 그 자리에 우리 것이 아닌 아이템이
+/// 있다는 뜻이라 `TYPE_MISMATCH`로 답한다.
 fn already_there(store: &Store, name: &str) -> Result<Reply> {
-    resolve(store, name)?;
-    Ok(Reply::Exists)
+    match resolve(store, name) {
+        Ok(_) => Ok(Reply::Exists),
+        Err(_) => Ok(Reply::TypeMismatch),
+    }
 }
 
 pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {

@@ -65,29 +65,24 @@ pub enum AddPlan {
 pub fn vadd_allocate(store: &Store, spec: &Add, body: &[u8]) -> Result<AddPlan> {
     let Add {
         index: name,
-        id,
-        dim,
+        vkey,
+        exptime,
         attr,
     } = spec;
     let attr = attr.as_slice();
 
-    let vector = coords(body, *dim, "vector")?;
-
     let index = for_write(store, name)?;
-    if *dim != index.ann.layout.dim {
-        return Err(Error::bad_request(format!(
-            "index {name} has dimension {}, got {dim}",
-            index.ann.layout.dim
-        )));
-    }
     let layout = index.ann.layout;
+    // 차원은 인덱스가 정한다. 명령은 본문 길이만 말하고, 좌표 개수가 그와
+    // 맞는지는 여기서 본다.
+    let vector = coords(body, layout.dim, "vector")?;
 
     check_attr(attr)?;
     check_still_fits(store, layout)?;
 
     let stamp = registry::now();
     let quantized = quant::encode(&vector, layout.quant);
-    let vkey = crate::trigger::key::vector_key(name, id);
+    let vkey = crate::trigger::key::vector_key(name, vkey);
 
     // A Map enforced `maxcount` as an attribute; separate items have nothing to
     // count against each other, so the graph is the count and this is the gate.
@@ -103,7 +98,9 @@ pub fn vadd_allocate(store: &Store, spec: &Add, body: &[u8]) -> Result<AddPlan> 
 
     let item = build_body(layout, &quantized, attr)?;
 
-    let addr = store.allocate_kv(&vkey, &item)?;
+    // 클라이언트의 초를 엔진의 시계로 옮긴다. 그대로 넘기면 기동 기준 상대
+    // 시각으로 읽혀 대부분 이미 지난 값이 된다.
+    let addr = store.allocate_kv(&vkey, &item, crate::server::realtime(*exptime))?;
 
     Ok(AddPlan::Write(PreparedAdd {
         name: name.to_string(),
@@ -155,55 +152,13 @@ pub fn vadd_commit(store: &Store, plan: AddPlan) -> Result<Reply> {
     }
 }
 
+/// 세 단계를 한 스레드에서 이어 한다.
+///
+/// 풀에 못 넘겼을 때 쓰인다. 워커 스레드이므로 엔진 쓰기도 여기서 해도 된다.
 pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
-    let Add {
-        index: name,
-        id,
-        dim,
-        attr,
-    } = spec;
-    let attr = attr.as_slice();
-
-    let vector = coords(body, *dim, "vector")?;
-
-    let index = for_write(store, name)?;
-    if *dim != index.ann.layout.dim {
-        return Err(Error::bad_request(format!(
-            "index {name} has dimension {}, got {dim}",
-            index.ann.layout.dim
-        )));
-    }
-    let layout = index.ann.layout;
-
-    check_attr(attr)?;
-    check_still_fits(store, layout)?;
-
-    let stamp = registry::now();
-    let quantized = quant::encode(&vector, layout.quant);
-
-    let vkey = crate::trigger::key::vector_key(name, id);
-
-    // A Map enforced `maxcount` as an attribute; separate items have nothing to
-    // count against each other, so the graph is the count and this is the gate.
-    // An id already stored is an update and must not be refused -- it does not
-    // grow the index -- so the existence check runs only once the limit is hit.
-    if index.ann.len() >= index.maxcount as usize {
-        match store.hold_kv(&vkey) {
-            Ok(addr) => store.release_items(&[addr]),
-            Err(StoreError::KeyGone) => return Ok(Reply::Overflowed),
-            Err(e) => return Err(e.into()),
-        }
-    }
-
-    let body = build_body(layout, &quantized, attr)?;
-
-    // 그래프는 건드리지 않는다. 이 쓰기가 엔진의 link(또는 replace) 이벤트를
-    // 부르고, 그 콜백이 노드를 넣는다 -- 복제본과 복구가 거치는 경로와 같다.
-    // 같은 id를 다시 쓰는 것은 갱신이라 거절하지 않는다.
-    match store.set_kv(&vkey, &body) {
-        Ok(_) => Ok(Reply::Stored),
-        Err(e) => store_failed(name, stamp, e),
-    }
+    let mut plan = vadd_allocate(store, spec, body)?;
+    vadd_stage(&mut plan)?;
+    vadd_commit(store, plan)
 }
 
 fn store_failed(name: &str, stamp: u64, e: StoreError) -> Result<Reply> {
@@ -267,11 +222,9 @@ pub fn vgetattr(store: &Store, name: &str, id: &str) -> Result<Reply> {
                 .map_err(|_| StoreError::CorruptElement)
         }) {
         Ok(attr) => {
+            // attr은 공백 없는 JSON 한 덩어리라 길이를 앞세울 필요가 없다.
             let json = String::from_utf8_lossy(&attr);
-            Ok(Reply::Body(format!(
-                "VALUE {id} {}\r\n{json}\r\nEND\r\n",
-                json.len()
-            )))
+            Ok(Reply::Body(format!("ATTR {id}={json}\r\nEND\r\n")))
         }
         Err(StoreError::ElemGone) => Ok(Reply::NotFound),
 
@@ -339,9 +292,11 @@ pub fn vdel(store: &Store, name: &str, id: &str) -> Result<Reply> {
     // 콜백이 노드를 빼고 참조를 sweeper에게 넘긴다.
     match store.delete_kv(&vkey) {
         Ok(()) => Ok(Reply::Deleted),
+        // 인덱스는 있다 -- `for_write`가 방금 확인했다. 없는 것은 이 이름의
+        // 벡터뿐이다.
         Err(StoreError::KeyGone) => {
             map_is_gone(name, stamp);
-            Ok(Reply::NotFound)
+            Ok(Reply::NotFoundVector)
         }
         Err(e) => Err(e.into()),
     }

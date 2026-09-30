@@ -49,10 +49,7 @@ fn a_vector_round_trips_through_the_engine() {
     );
 
     let got = client.send(&format!("vgetattr {ix} v1"));
-    assert_reply(
-        &got,
-        &format!("VALUE v1 {}\r\n{attr}\r\nEND\r\n", attr.len()),
-    );
+    assert_reply(&got, &format!("ATTR v1={attr}\r\nEND\r\n"));
 
     assert_contains(&client.send("vlist"), "count=1");
     assert_reply(&client.send(&format!("vdel {ix} v1")), "DELETED\r\n");
@@ -69,7 +66,7 @@ fn attributes_are_optional_and_come_back_empty() {
     assert_reply(&client.vadd(&ix, "v1", 2, "0.1 0.2"), "STORED\r\n");
     assert_reply(
         &client.send(&format!("vgetattr {ix} v1")),
-        "VALUE v1 0\r\n\r\nEND\r\n",
+        "ATTR v1=\r\nEND\r\n",
     );
     client.send(&format!("vdrop {ix}"));
 }
@@ -85,24 +82,29 @@ fn set_attr_replaces_the_attributes_and_keeps_the_vector() {
 
     let second = r#"{"cat":"news","n":2}"#;
     assert_reply(
-        &client.send(&format!("vsetattr {ix} v1 {} {second}", second.len())),
+        &client.send(&format!("vsetattr {ix} v1 {second}")),
         "STORED\r\n",
     );
     assert_reply(
         &client.send(&format!("vgetattr {ix} v1")),
-        &format!("VALUE v1 {}\r\n{second}\r\nEND\r\n", second.len()),
+        &format!("ATTR v1={second}\r\nEND\r\n"),
     );
 
-    assert_contains(&client.vsim(&ix, 1, 2, "1.0 0.0"), "VALUE v1 1");
+    assert_contains(&client.vsim(&ix, 1, 2, "1.0 0.0"), "v1 1");
 
-    assert_reply(&client.send(&format!("vsetattr {ix} v1 0")), "STORED\r\n");
+    // 길이를 받지 않으므로 "비운다"를 따로 말할 수 없다. 빈 객체를 쓰는 것이
+    // 가장 가까운 표현이고, 그러면 attr은 `{}` 두 바이트가 된다.
+    assert_reply(
+        &client.send(&format!("vsetattr {ix} v1 {{}}")),
+        "STORED\r\n",
+    );
     assert_reply(
         &client.send(&format!("vgetattr {ix} v1")),
-        "VALUE v1 0\r\n\r\nEND\r\n",
+        "ATTR v1={}\r\nEND\r\n",
     );
 
     assert_reply(
-        &client.send(&format!("vsetattr {ix} nobody 2 {{}}")),
+        &client.send(&format!("vsetattr {ix} nobody {{}}")),
         "NOT_FOUND\r\n",
     );
     client.send(&format!("vdrop {ix}"));
@@ -117,9 +119,9 @@ fn search_ranks_by_distance() {
     client.vadd(&ix, "far", 2, "9.0 9.0");
 
     let hits = client.vsim(&ix, 2, 2, "0.1 0.2");
-    assert_contains(&hits, "QUERY 0 2");
-    let near_at = hits.find("VALUE near").expect("near is present");
-    let far_at = hits.find("VALUE far").expect("far is present");
+    assert_contains(&hits, "VECTORS 2");
+    let near_at = hits.find("near").expect("near is present");
+    let far_at = hits.find("far").expect("far is present");
     assert!(
         near_at < far_at,
         "the closer vector must rank first:\n{hits}"
@@ -137,12 +139,11 @@ fn a_batch_of_queries_returns_one_group_each() {
     client.vadd(&ix, "b", 2, "9.0 9.0");
 
     let hits = client.vsim(&ix, 1, 2, "0.1 0.2 9.0 9.0");
-    assert_contains(&hits, "QUERY 0 1");
-    assert_contains(&hits, "QUERY 1 1");
-    let first = hits.split("QUERY 1").next().unwrap();
-    assert_contains(first, "VALUE a");
-    let second = hits.split("QUERY 1").nth(1).unwrap();
-    assert_contains(second, "VALUE b");
+    // 질의마다 블록이 하나씩. 헤더에 질의 번호는 더 이상 없다.
+    assert_eq!(hits.matches("VECTORS 1").count(), 2, "{hits}");
+    let mut blocks = hits.split("VECTORS 1").skip(1);
+    assert_contains(blocks.next().unwrap(), "a");
+    assert_contains(blocks.next().unwrap(), "b");
     client.send(&format!("vdrop {ix}"));
 }
 
@@ -158,15 +159,12 @@ fn a_filter_restricts_results_by_attribute() {
     }
 
     let hits = client.vsim_filter(&ix, 5, 2, "0.1 0.2", &["score>500"]);
-    assert_contains(&hits, "QUERY 0 1");
-    assert_contains(&hits, "VALUE high");
-    assert!(
-        !hits.contains("VALUE low"),
-        "the filter must exclude it:\n{hits}"
-    );
+    assert_contains(&hits, "VECTORS 1");
+    assert_contains(&hits, "high");
+    assert!(!hits.contains("low"), "the filter must exclude it:\n{hits}");
 
     let none = client.vsim_filter(&ix, 5, 2, "0.1 0.2", &["score>9999"]);
-    assert_contains(&none, "QUERY 0 0");
+    assert_contains(&none, "VECTORS 0");
     client.send(&format!("vdrop {ix}"));
 }
 
@@ -180,10 +178,10 @@ fn withattr_answers_the_attributes_by_either_route() {
     client.vadd_attr(&ix, "one", 2, "0.1 0.2", attr);
 
     let plain = client.vsim_withattr(&ix, 5, 2, "0.1 0.2", &[]);
-    assert_contains(&plain, &format!("VALUE one 1 {}\r\n{attr}", attr.len()));
+    assert_contains(&plain, &format!("one 1 {attr}"));
 
     let filtered = client.vsim_withattr(&ix, 5, 2, "0.1 0.2", &["score>500"]);
-    assert_contains(&filtered, &format!("VALUE one 1 {}\r\n{attr}", attr.len()));
+    assert_contains(&filtered, &format!("one 1 {attr}"));
 
     client.send(&format!("vdrop {ix}"));
 }
@@ -196,15 +194,15 @@ fn search_by_key_uses_the_stored_vector() {
     client.vadd(&ix, "anchor", 2, "0.1 0.2");
     client.vadd(&ix, "other", 2, "0.2 0.3");
 
-    let hits = client.send(&format!("VSIM KEY {ix} 2 anchor"));
-    assert_contains(&hits, "QUERY 0 2");
+    let hits = client.send(&format!("vsearch key {ix} anchor 2"));
+    assert_contains(&hits, "VECTORS 2");
     assert!(
-        hits.find("VALUE anchor").unwrap() < hits.find("VALUE other").unwrap(),
+        hits.find("anchor").unwrap() < hits.find("other").unwrap(),
         "{hits}"
     );
 
     assert_reply(
-        &client.send(&format!("VSIM KEY {ix} 2 missing")),
+        &client.send(&format!("vsearch key {ix} missing 2")),
         "NOT_FOUND\r\n",
     );
     client.send(&format!("vdrop {ix}"));
@@ -229,7 +227,7 @@ fn quantizations_all_survive_a_round_trip_through_the_engine() {
             "STORED\r\n",
         );
         let hits = client.vsim(&ix, 1, 4, "1.0 1.0 -1.0 -1.0");
-        assert_contains(&hits, "VALUE v1");
+        assert_contains(&hits, "v1");
         client.send(&format!("vdrop {ix}"));
     }
 }
@@ -256,9 +254,11 @@ fn a_coordinate_count_that_disagrees_with_the_dimension_is_named() {
     let ix = index_name("dim");
     client.send(&format!("vcreate {ix} 2"));
 
-    let reply = client.vadd(&ix, "v", 3, "0.1 0.2");
+    // 차원은 인덱스가 정하므로 명령이 말하지 않는다. 좌표 개수가 그 차원의
+    // 배수가 아니면 거기서 걸린다.
+    let reply = client.vadd(&ix, "v", 3, "0.1 0.2 0.3");
     assert_contains(&reply, "CLIENT_ERROR");
-    assert_contains(&reply, "3-dimension");
+    assert_contains(&reply, "2-dimension");
     assert_contains(&client.send("vlist"), "count=0");
     client.send(&format!("vdrop {ix}"));
 }
@@ -271,7 +271,7 @@ fn a_dimension_that_disagrees_with_the_index_is_named() {
 
     let reply = client.vadd(&ix, "v", 3, "0.1 0.2 0.3");
     assert_contains(&reply, "CLIENT_ERROR");
-    assert_contains(&reply, "has dimension 2");
+    assert_contains(&reply, "2-dimension");
     client.send(&format!("vdrop {ix}"));
 }
 
@@ -299,10 +299,13 @@ fn a_malformed_attr_is_refused_and_the_connection_survives() {
 fn operating_on_a_missing_index_is_a_client_error() {
     session!(_server, client);
     let ix = index_name("absent");
-    assert_contains(&client.send(&format!("vgetattr {ix} v1")), "CLIENT_ERROR");
-    assert_contains(&client.send(&format!("vdel {ix} v1")), "CLIENT_ERROR");
-    assert_contains(&client.send(&format!("VSIM KEY {ix} 1 v1")), "CLIENT_ERROR");
-    assert_contains(&client.vadd(&ix, "v1", 2, "0.1 0.2"), "CLIENT_ERROR");
+    assert_reply(&client.send(&format!("vgetattr {ix} v1")), "NOT_FOUND\r\n");
+    assert_reply(&client.send(&format!("vdel {ix} v1")), "NOT_FOUND\r\n");
+    assert_reply(
+        &client.send(&format!("vsearch key {ix} v1 1")),
+        "NOT_FOUND\r\n",
+    );
+    assert_reply(&client.vadd(&ix, "v1", 2, "0.1 0.2"), "NOT_FOUND\r\n");
 }
 
 #[test]
@@ -369,21 +372,6 @@ fn a_vector_over_the_server_item_limit_is_refused() {
 }
 
 #[test]
-fn maxcount_stops_inserts_at_the_limit() {
-    session!(_server, client);
-    let ix = index_name("maxcount");
-    client.send(&format!("vcreate {ix} 2 MAXCOUNT 2"));
-
-    for id in ["a", "b"] {
-        assert_reply(&client.vadd(&ix, id, 2, "0.1 0.2"), "STORED\r\n");
-    }
-    assert_reply(&client.vadd(&ix, "c", 2, "0.1 0.2"), "OVERFLOWED\r\n");
-
-    assert_reply(&client.vadd(&ix, "a", 2, "0.3 0.4"), "STORED\r\n");
-    client.send(&format!("vdrop {ix}"));
-}
-
-#[test]
 fn vstats_reports_module_memory_and_follows_the_vector_count() {
     session!(_server, client);
     let ix = index_name("stats");
@@ -443,7 +431,7 @@ fn many_connections_search_the_same_index_at_once() {
                 for _ in 0..20 {
                     let hits = client.vsim(&ix, 5, 4, &format!("{t}.0 1.0 2.0 3.0"));
                     assert!(
-                        hits.contains("QUERY 0 5") && hits.ends_with("END\r\n"),
+                        hits.contains("VECTORS 5") && hits.ends_with("END\r\n"),
                         "thread {t} got: {hits}"
                     );
                 }
@@ -469,7 +457,7 @@ fn an_index_answers_after_its_metadata_and_vectors_round_trip() {
     // keep answering over the new layout.
     assert_reply(
         &client.send(&format!("vgetattr {ix} v1")),
-        "VALUE v1 0\r\n\r\nEND\r\n",
+        "ATTR v1=\r\nEND\r\n",
     );
     assert_contains(&client.send("vlist"), &format!("INDEX {ix} dim=2"));
     assert_contains(&client.send("vlist"), "count=1");
@@ -483,10 +471,7 @@ fn attr_json_must_arrive_as_one_argument() {
     client.send(&format!("vcreate {ix} 2"));
 
     let spaced = r#"{"cat": "tech"}"#;
-    let reply = client.send_body(
-        &format!("vadd {ix} v1 3 2 ATTR {} {spaced}", spaced.len()),
-        "1 0",
-    );
+    let reply = client.send_body(&format!("vadd {ix} v1 3 2 attr {spaced}"), "1 0");
     assert!(
         reply.contains("no spaces"),
         "a spaced ATTR must name the reason: {reply}"
@@ -495,10 +480,7 @@ fn attr_json_must_arrive_as_one_argument() {
     let tight = r#"{"cat":"tech"}"#;
     assert_eq!(
         client
-            .send_body(
-                &format!("vadd {ix} v1 3 2 ATTR {} {tight}", tight.len()),
-                "1 0"
-            )
+            .send_body(&format!("vadd {ix} v1 3 2 attr {tight}"), "1 0")
             .trim_end(),
         "STORED"
     );
@@ -513,10 +495,7 @@ fn attr_json_must_arrive_as_one_argument() {
     assert!(full.len() <= 255, "{} bytes", full.len());
     assert_eq!(
         client
-            .send_body(
-                &format!("vadd {ix} v2 3 2 ATTR {} {full}", full.len()),
-                "1 0"
-            )
+            .send_body(&format!("vadd {ix} v2 3 2 attr {full}"), "1 0")
             .trim_end(),
         "STORED"
     );
@@ -556,7 +535,7 @@ fn a_replica_builds_its_index_when_the_metadata_lands_after_the_vectors() {
         &client.set_value(&format!("arcus_event{{{dst}}}:a"), &vector),
         "STORED\r\n",
     );
-    assert_contains(&client.vsim(&dst, 1, 2, "1.0 0.0"), "CLIENT_ERROR");
+    assert_reply(&client.vsim(&dst, 1, 2, "1.0 0.0"), "NOT_FOUND\r\n");
 
     // Now the metadata. The index appears and adopts what was waiting.
     assert!(
@@ -567,12 +546,12 @@ fn a_replica_builds_its_index_when_the_metadata_lands_after_the_vectors() {
     let mut found = String::new();
     for _ in 0..100 {
         found = client.vsim(&dst, 1, 2, "1.0 0.0");
-        if found.contains("VALUE a") {
+        if found.contains("a") {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert_contains(&found, "VALUE a 1");
+    assert_contains(&found, "a 1");
 
     client.send(&format!("vdrop {src}"));
     client.send(&format!("vdrop {dst}"));
@@ -597,7 +576,7 @@ fn a_body_the_graph_cannot_read_leaves_the_reference_accounting_straight() {
 
     // The store has it, the graph does not, and the search still answers.
     assert_contains(&client.send(&format!("get {bad}")), "VALUE");
-    assert_contains(&client.vsim(&ix, 5, 2, "1.0 0.0"), "VALUE good 1");
+    assert_contains(&client.vsim(&ix, 5, 2, "1.0 0.0"), "good 1");
 
     assert_reply(&client.send(&format!("delete {bad}")), "DELETED\r\n");
 
@@ -605,8 +584,8 @@ fn a_body_the_graph_cannot_read_leaves_the_reference_accounting_straight() {
     // still standing and still counting right.
     assert_reply(&client.vadd(&ix, "next", 2, "0.0 1.0"), "STORED\r\n");
     let hits = client.vsim(&ix, 5, 2, "1.0 0.0");
-    assert_contains(&hits, "QUERY 0 2");
-    assert_contains(&hits, "VALUE good 1");
+    assert_contains(&hits, "VECTORS 2");
+    assert_contains(&hits, "good 1");
 
     client.send(&format!("vdrop {ix}"));
 }
@@ -636,17 +615,17 @@ fn an_expired_vector_drops_out_of_a_search() {
 
     // Both are still there while the expiry is in the future.
     let before = client.vsim(&ix, 2, 2, "1.0 0.0");
-    assert_contains(&before, "VALUE lives");
-    assert_contains(&before, "VALUE dies");
+    assert_contains(&before, "lives");
+    assert_contains(&before, "dies");
 
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     // Nothing has touched the key, so the item is still linked and still in the
     // graph -- the traversal is the only thing that can leave it out.
     let after = client.vsim(&ix, 2, 2, "1.0 0.0");
-    assert_contains(&after, "VALUE lives");
+    assert_contains(&after, "lives");
     assert!(
-        !after.contains("VALUE dies"),
+        !after.contains("dies"),
         "an expired vector came back from vsim: {after:?}"
     );
 
@@ -669,7 +648,7 @@ fn a_flush_takes_the_index_with_it() {
 
     client.send(&format!("vcreate {ix} 2 METRIC l2"));
     assert_reply(&client.vadd(&ix, "a", 2, "1.0 0.0"), "STORED\r\n");
-    assert_contains(&client.vsim(&ix, 1, 2, "1.0 0.0"), "VALUE a");
+    assert_contains(&client.vsim(&ix, 1, 2, "1.0 0.0"), "a");
 
     // Load-bearing. `oldest_live` is set to one second ago, so items touched
     // since then are unlinked on the spot and the trigger callback cleans up
@@ -682,15 +661,18 @@ fn a_flush_takes_the_index_with_it() {
     assert_contains(&client.send("flush_all"), "OK");
 
     // Every command that names an index goes through the same lookup.
-    assert_contains(&client.vsim(&ix, 1, 2, "1.0 0.0"), "CLIENT_ERROR");
-    assert_contains(&client.send(&format!("VSIM KEY {ix} 1 a")), "CLIENT_ERROR");
-    assert_contains(&client.send(&format!("vgetattr {ix} a")), "CLIENT_ERROR");
-    assert_contains(
-        &client.send(&format!("vsetattr {ix} a {{}}")),
-        "CLIENT_ERROR",
+    assert_reply(&client.vsim(&ix, 1, 2, "1.0 0.0"), "NOT_FOUND\r\n");
+    assert_reply(
+        &client.send(&format!("vsearch key {ix} a 1")),
+        "NOT_FOUND\r\n",
     );
-    assert_contains(&client.send(&format!("vdel {ix} a")), "CLIENT_ERROR");
-    assert_contains(&client.vadd(&ix, "b", 2, "0.5 0.5"), "CLIENT_ERROR");
+    assert_reply(&client.send(&format!("vgetattr {ix} a")), "NOT_FOUND\r\n");
+    assert_reply(
+        &client.send(&format!("vsetattr {ix} a {{}}")),
+        "NOT_FOUND\r\n",
+    );
+    assert_reply(&client.send(&format!("vdel {ix} a")), "NOT_FOUND\r\n");
+    assert_reply(&client.vadd(&ix, "b", 2, "0.5 0.5"), "NOT_FOUND\r\n");
 
     // And the name is free again: `vcreate` builds a new index, not `EXISTS`.
     assert_reply(
@@ -744,8 +726,8 @@ fn a_search_reaps_the_expired_vectors_it_walks_over() {
     assert_eq!(vectors(&mut client), "2");
 
     let hit = client.vsim(&ix, 2, 2, "1.0 0.0");
-    assert_contains(&hit, "VALUE lives");
-    assert!(!hit.contains("VALUE dies"), "{hit}");
+    assert_contains(&hit, "lives");
+    assert!(!hit.contains("dies"), "{hit}");
 
     // The search hands the key to the sweeper and answers; the cleanup is the
     // sweeper's next round. Waiting for it is the point -- asserting straight
@@ -774,7 +756,7 @@ fn a_search_reaps_the_expired_vectors_it_walks_over() {
     );
 
     // And the live one is untouched by the reaping.
-    assert_contains(&client.vsim(&ix, 1, 2, "1.0 0.0"), "VALUE lives");
+    assert_contains(&client.vsim(&ix, 1, 2, "1.0 0.0"), "lives");
     assert!(
         client
             .get_value(&format!("arcus_event{{{ix}}}:lives"))
@@ -808,7 +790,7 @@ fn repeated_searches_drain_more_expired_vectors_than_one_batch_holds() {
             .unwrap_or_else(|| panic!("no vector count in:\n{body}"))
     };
 
-    client.send(&format!("vcreate {ix} 2 METRIC l2 MAXCOUNT 1000"));
+    client.send(&format!("vcreate {ix} 2 METRIC l2"));
     assert_reply(&client.vadd(&ix, "lives", 2, "1.0 0.0"), "STORED\r\n");
     for i in 0..DOOMED {
         let id = format!("d{i}");
@@ -843,11 +825,8 @@ fn repeated_searches_drain_more_expired_vectors_than_one_batch_holds() {
         }
 
         let hit = client.vsim(&ix, 5, 2, "1.0 0.0");
-        assert_contains(&hit, "VALUE lives");
-        assert!(
-            !hit.contains("VALUE d"),
-            "an expired vector came back: {hit}"
-        );
+        assert_contains(&hit, "lives");
+        assert!(!hit.contains("d"), "an expired vector came back: {hit}");
         rounds += 1;
 
         // Wait for the sweeper to work this search's batch off before asking
@@ -875,7 +854,7 @@ fn repeated_searches_drain_more_expired_vectors_than_one_batch_holds() {
 
     // The live one survived every round, in the store and in the graph.
     assert_eq!(vectors(&mut client), LIVE);
-    assert_contains(&client.vsim(&ix, 5, 2, "1.0 0.0"), "VALUE lives");
+    assert_contains(&client.vsim(&ix, 5, 2, "1.0 0.0"), "lives");
     assert!(
         client
             .get_value(&format!("arcus_event{{{ix}}}:lives"))
@@ -885,6 +864,33 @@ fn repeated_searches_drain_more_expired_vectors_than_one_batch_holds() {
     // The index still takes writes: the accounting it kept is still usable.
     assert_reply(&client.vadd(&ix, "after", 2, "0.0 1.0"), "STORED\r\n");
     assert_eq!(vectors(&mut client), LIVE + 1);
+
+    client.send(&format!("vdrop {ix}"));
+}
+
+#[test]
+fn a_vector_expires_on_its_own_clock() {
+    // 만료가 벡터마다 따로 붙는다. `vcreate`의 인덱스 단위 EXPTIME이 빠지고
+    // `vadd`가 그 자리를 받은 결과다.
+    session!(_server, client);
+    let ix = index_name("vexp");
+    client.send(&format!("vcreate {ix} 2 METRIC l2"));
+
+    assert_reply(&client.vadd_exp(&ix, "lives", 0, "1.0 0.0"), "STORED\r\n");
+    assert_reply(&client.vadd_exp(&ix, "dies", 1, "0.9 0.0"), "STORED\r\n");
+
+    let before = client.vsim(&ix, 2, 2, "1.0 0.0");
+    assert_contains(&before, "lives 1");
+    assert_contains(&before, "dies");
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let after = client.vsim(&ix, 2, 2, "1.0 0.0");
+    assert_contains(&after, "lives 1");
+    assert!(
+        !after.contains("dies"),
+        "an expired vector came back from vsearch: {after:?}"
+    );
 
     client.send(&format!("vdrop {ix}"));
 }

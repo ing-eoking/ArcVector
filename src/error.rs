@@ -138,9 +138,26 @@ pub enum Reply {
     Deleted,
     Dropped,
     NotFound,
+    /// 인덱스는 있는데 그 벡터 이름이 없다.
+    NotFoundVector,
+    /// 그 키가 우리 인덱스가 아니다.
+    TypeMismatch,
     Overflowed,
 
     Body(String),
+}
+
+impl Error {
+    /// 이 오류가 회선에 나가는 모양.
+    ///
+    /// 인덱스가 없다는 것은 클라이언트의 잘못이 아니라 **결과**라, 접두사 없이
+    /// `NOT_FOUND`로 나간다. 나머지는 책임 소재를 앞세운다.
+    pub fn wire(&self) -> String {
+        match self {
+            Self::NoSuchIndex | Self::IndexEvicted => Reply::NotFound.as_str().to_owned(),
+            e => format!("{} {e}\r\n", e.blame().prefix()),
+        }
+    }
 }
 
 impl Reply {
@@ -152,6 +169,8 @@ impl Reply {
             Self::Deleted => "DELETED\r\n",
             Self::Dropped => "DROPPED\r\n",
             Self::NotFound => "NOT_FOUND\r\n",
+            Self::NotFoundVector => "NOT_FOUND_VECTOR\r\n",
+            Self::TypeMismatch => "TYPE_MISMATCH\r\n",
             Self::Overflowed => "OVERFLOWED\r\n",
             Self::Body(s) => s,
         }

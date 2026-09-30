@@ -322,31 +322,40 @@ impl Client {
         self.read_reply()
     }
 
-    pub fn vadd(&mut self, index: &str, id: &str, dim: usize, coords: &str) -> String {
-        self.send_body(&format!("vadd {index} {id} {} {dim}", coords.len()), coords)
+    /// `vadd <index> <vkey> <veclen> <exptime>`
+    ///
+    /// 차원은 인덱스가 정하므로 명령이 받지 않는다. 헬퍼가 그 자리에 있던
+    /// 인자를 계속 받는 것은 호출부가 전부 차원을 적어 두었기 때문이고, 그
+    /// 값은 이제 좌표 개수를 스스로 확인하는 데만 쓴다.
+    pub fn vadd(&mut self, index: &str, vkey: &str, _dim: usize, coords: &str) -> String {
+        self.send_body(&format!("vadd {index} {vkey} {} 0", coords.len()), coords)
+    }
+
+    /// 만료 시간을 주는 `vadd`.
+    pub fn vadd_exp(&mut self, index: &str, vkey: &str, exptime: u32, coords: &str) -> String {
+        self.send_body(
+            &format!("vadd {index} {vkey} {} {exptime}", coords.len()),
+            coords,
+        )
     }
 
     pub fn vadd_attr(
         &mut self,
         index: &str,
-        id: &str,
-        dim: usize,
+        vkey: &str,
+        _dim: usize,
         coords: &str,
         attr: &str,
     ) -> String {
         self.send_body(
-            &format!(
-                "vadd {index} {id} {} {dim} ATTR {} {attr}",
-                coords.len(),
-                attr.len()
-            ),
+            &format!("vadd {index} {vkey} {} 0 attr {attr}", coords.len()),
             coords,
         )
     }
 
-    pub fn vsim(&mut self, index: &str, k: usize, dim: usize, coords: &str) -> String {
+    pub fn vsim(&mut self, index: &str, k: usize, _dim: usize, coords: &str) -> String {
         self.send_body(
-            &format!("VSIM VECTOR {index} {k} {} {dim}", coords.len()),
+            &format!("vsearch vector {index} {k} {}", coords.len()),
             coords,
         )
     }
@@ -355,13 +364,13 @@ impl Client {
         &mut self,
         index: &str,
         k: usize,
-        dim: usize,
+        _dim: usize,
         coords: &str,
         terms: &[&str],
     ) -> String {
         self.send_body(
             &format!(
-                "VSIM VECTOR {index} {k} {} {dim} FILTER {} {}",
+                "vsearch vector {index} {k} {} filter {} {}",
                 coords.len(),
                 terms.len(),
                 terms.join(" ")
@@ -374,22 +383,16 @@ impl Client {
         &mut self,
         index: &str,
         k: usize,
-        dim: usize,
+        _dim: usize,
         coords: &str,
         terms: &[&str],
     ) -> String {
-        let filter = if terms.is_empty() {
-            String::new()
-        } else {
-            format!(" FILTER {} {}", terms.len(), terms.join(" "))
-        };
-        self.send_body(
-            &format!(
-                "VSIM VECTOR {index} {k} {} {dim}{filter} WITHATTR",
-                coords.len()
-            ),
-            coords,
-        )
+        let mut head = format!("vsearch vector {index} {k} {}", coords.len());
+        if !terms.is_empty() {
+            head += &format!(" filter {} {}", terms.len(), terms.join(" "));
+        }
+        head += " withattr";
+        self.send_body(&head, coords)
     }
 
     pub fn drain(&mut self) {

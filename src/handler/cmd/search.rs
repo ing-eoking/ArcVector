@@ -62,14 +62,14 @@ fn judged_attr(judged: &RefCell<Vec<(u64, String)>>, key: u64) -> Option<String>
 
 /// The line that opens one query's hits.
 ///
-/// A graph still being rebuilt from its Map answers from the part of itself that
-/// exists, which is not the nearest neighbours — it is the nearest of what has
-/// been added so far. `PARTIAL_QUERY` names that, and carries the counts so the
+/// A graph still being rebuilt answers from the part of itself that exists,
+/// which is not the nearest neighbours — it is the nearest of what has been
+/// added so far. `PARTIAL_VECTORS` names that, and carries the counts so the
 /// caller can judge how far off the answer may be.
-fn query_header(query_no: usize, hits: usize, rebuild: Option<crate::error::Rebuild>) -> String {
+fn query_header(hits: usize, rebuild: Option<crate::error::Rebuild>) -> String {
     match rebuild {
-        None => format!("QUERY {query_no} {hits}\r\n"),
-        Some(p) => format!("PARTIAL_QUERY {query_no} {hits} {}/{}\r\n", p.done, p.total),
+        None => format!("VECTORS {hits}\r\n"),
+        Some(p) => format!("PARTIAL_VECTORS {hits} {}/{}\r\n", p.done, p.total),
     }
 }
 
@@ -81,7 +81,6 @@ fn similar(
     k: usize,
     filter: Option<&Filter>,
     with_attr: bool,
-    query_no: usize,
     out: &mut String,
 ) -> Result<()> {
     let layout = index.ann.layout;
@@ -210,18 +209,15 @@ fn similar(
         ));
     }
 
-    out.push_str(&query_header(
-        query_no,
-        rendered.len(),
-        index.rebuilding_progress(),
-    ));
+    out.push_str(&query_header(rendered.len(), index.rebuilding_progress()));
     for (id, score, attr) in rendered {
         match attr {
+            // attr은 공백 없는 JSON 한 덩어리라 길이를 앞세울 필요가 없다.
             Some(attr) => {
-                let _ = write!(out, "VALUE {id} {score} {}\r\n{attr}\r\n", attr.len());
+                let _ = write!(out, "{id} {score} {attr}\r\n");
             }
             None => {
-                let _ = write!(out, "VALUE {id} {score}\r\n");
+                let _ = write!(out, "{id} {score}\r\n");
             }
         }
     }
@@ -232,28 +228,19 @@ pub fn vsim_vector(store: &Store, spec: &Sim, body: &[u8]) -> Result<Reply> {
     let Sim {
         index: name,
         k,
-        dim,
         filter,
         with_attr,
     } = spec;
-    let (k, dim, with_attr) = (*k, *dim, *with_attr);
+    let (k, with_attr) = (*k, *with_attr);
     let filter = filter.as_ref();
 
     let index = for_read(store, name)?;
     let layout = index.ann.layout;
-    if dim != layout.dim {
-        return Err(Error::bad_request(format!(
-            "index {name} has dimension {}, got {dim}",
-            layout.dim
-        )));
-    }
 
     let mut out = String::new();
-    for (query_no, query) in coord_vectors(body, dim, "query")?.iter().enumerate() {
+    for query in coord_vectors(body, layout.dim, "query")?.iter() {
         let quantized = quant::encode(query, layout.quant);
-        similar(
-            store, &index, &quantized, k, filter, with_attr, query_no, &mut out,
-        )?;
+        similar(store, &index, &quantized, k, filter, with_attr, &mut out)?;
     }
     out.push_str("END\r\n");
     Ok(Reply::Body(out))
@@ -294,7 +281,7 @@ pub fn vsim_key(store: &Store, spec: &SimKey) -> Result<Reply> {
     store.release_items(&[addr]);
 
     let mut out = String::new();
-    similar(store, &index, &query, k, filter, with_attr, 0, &mut out)?;
+    similar(store, &index, &query, k, filter, with_attr, &mut out)?;
     out.push_str("END\r\n");
     Ok(Reply::Body(out))
 }
@@ -330,7 +317,7 @@ mod tests {
 
     #[test]
     fn a_whole_index_writes_the_plain_header() {
-        assert_eq!(query_header(0, 5, None), "QUERY 0 5\r\n");
+        assert_eq!(query_header(5, None), "VECTORS 5\r\n");
     }
 
     #[test]
@@ -340,8 +327,8 @@ mod tests {
             total: 999_000,
         };
         assert_eq!(
-            query_header(0, 5, Some(half)),
-            "PARTIAL_QUERY 0 5 693000/999000\r\n"
+            query_header(5, Some(half)),
+            "PARTIAL_VECTORS 5 693000/999000\r\n"
         );
     }
 
@@ -352,8 +339,8 @@ mod tests {
             total: 999_000,
         };
         assert_eq!(
-            query_header(2, 0, Some(just_begun)),
-            "PARTIAL_QUERY 2 0 0/999000\r\n"
+            query_header(0, Some(just_begun)),
+            "PARTIAL_VECTORS 0 0/999000\r\n"
         );
     }
 }
