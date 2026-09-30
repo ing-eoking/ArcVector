@@ -323,7 +323,7 @@ fn build(store: &Store, addr: u64, name: &str) -> Option<VectorIndex> {
         meta.expansion_search,
         Arc::new(ItemElements),
     ) {
-        Ok(ann) => Some(VectorIndex::building(name.to_owned(), ann, meta.maxcount)),
+        Ok(ann) => Some(VectorIndex::building(name.to_owned(), ann)),
         Err(e) => {
             eprintln!("ArcVector: could not build the graph for '{name}': {e}");
             None

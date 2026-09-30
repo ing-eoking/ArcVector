@@ -25,7 +25,6 @@ pub struct VectorIndex {
     pub name: String,
     pub ann: AnnIndex,
 
-    pub maxcount: u32,
     state: AtomicU8,
 
     published: AtomicU64,
@@ -35,25 +34,24 @@ pub struct VectorIndex {
 }
 
 impl VectorIndex {
-    pub fn ours(name: String, ann: AnnIndex, maxcount: u32) -> Self {
-        let index = Self::new(name, ann, maxcount, SERVING);
+    pub fn ours(name: String, ann: AnnIndex) -> Self {
+        let index = Self::new(name, ann, SERVING);
         index.mark_serving();
         index
     }
 
-    pub fn rebuilding(name: String, ann: AnnIndex, maxcount: u32) -> Self {
-        Self::new(name, ann, maxcount, COLD)
+    pub fn rebuilding(name: String, ann: AnnIndex) -> Self {
+        Self::new(name, ann, COLD)
     }
 
-    pub fn building(name: String, ann: AnnIndex, maxcount: u32) -> Self {
-        Self::new(name, ann, maxcount, BUILDING)
+    pub fn building(name: String, ann: AnnIndex) -> Self {
+        Self::new(name, ann, BUILDING)
     }
 
-    fn new(name: String, ann: AnnIndex, maxcount: u32, state: u8) -> Self {
+    fn new(name: String, ann: AnnIndex, state: u8) -> Self {
         Self {
             name,
             ann,
-            maxcount,
             state: AtomicU8::new(state),
             published: AtomicU64::new(0),
             recovering: AtomicBool::new(false),
@@ -341,7 +339,7 @@ mod tests {
             Arc::new(crate::handler::arcus::engine::ItemElements),
         )
         .expect("build the graph");
-        VectorIndex::ours(name.to_owned(), ann, 8)
+        VectorIndex::ours(name.to_owned(), ann)
     }
 
     fn building(name: &str) -> VectorIndex {

@@ -30,17 +30,13 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         std::sync::Arc::new(engine::ItemElements),
     )?;
 
-    // 인덱스 크기 상한은 이제 명령으로 못 정한다. 그래도 천장은 있어야
-    // 한다 -- 없으면 한 인덱스가 데몬 메모리를 끝까지 먹는다.
-    let maxcount = DEFAULT_MAXCOUNT;
     let meta = MetaRecord {
         metric: metric.as_str().to_owned(),
         connectivity: spec.connectivity,
         expansion_add: spec.expansion_add,
         expansion_search: spec.expansion_search,
-        maxcount,
     };
-    let index = VectorIndex::building(name.to_owned(), ann, maxcount);
+    let index = VectorIndex::building(name.to_owned(), ann);
 
     let (registered, previous) = match registry::put(index) {
         Ok(pair) => pair,
@@ -82,13 +78,6 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         }
     }
 }
-
-/// What an index accepts when `vcreate` names no limit.
-///
-/// A Map had `maxcount` as an attribute and the engine enforced it. Nothing
-/// enforces a count across separate items, so this is ArcVector's own ceiling
-/// and the graph is what counts against it.
-const DEFAULT_MAXCOUNT: u32 = 50_000;
 
 /// `add`가 거절했다 -- 그 키에 이미 무언가 있다.
 ///
@@ -207,14 +196,13 @@ pub fn vlist() -> Result<Reply> {
         let layout = &index.ann.layout;
         let _ = writeln!(
             out,
-            "INDEX {} dim={} quant={} metric={} attrbytes={} count={} maxcount={}\r",
+            "INDEX {} dim={} quant={} metric={} attrbytes={} count={}\r",
             index.name,
             layout.dim,
             layout.quant,
             index.ann.metric,
             element::ATTR_BYTES,
             index.ann.len(),
-            index.maxcount,
         );
     }
     out.push_str("END\r\n");

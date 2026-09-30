@@ -142,7 +142,6 @@ pub enum Reply {
     NotFoundVector,
     /// 그 키가 우리 인덱스가 아니다.
     TypeMismatch,
-    Overflowed,
 
     Body(String),
 }
@@ -171,7 +170,6 @@ impl Reply {
             Self::NotFound => "NOT_FOUND\r\n",
             Self::NotFoundVector => "NOT_FOUND_VECTOR\r\n",
             Self::TypeMismatch => "TYPE_MISMATCH\r\n",
-            Self::Overflowed => "OVERFLOWED\r\n",
             Self::Body(s) => s,
         }
     }
@@ -251,7 +249,6 @@ mod tests {
             Reply::Deleted,
             Reply::Dropped,
             Reply::NotFound,
-            Reply::Overflowed,
             Reply::Body("END\r\n".into()),
         ] {
             assert!(r.as_str().ends_with("\r\n"), "{r:?}");

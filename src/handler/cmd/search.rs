@@ -84,7 +84,9 @@ fn similar(
     out: &mut String,
 ) -> Result<()> {
     let layout = index.ann.layout;
-    let k = k.min((index.maxcount as usize).max(1));
+    // 그래프에 있는 것보다 많이 돌려줄 수는 없다. 상한이 없으면
+    // `vsearch ... 2147483647`이 그만한 자리를 잡으라고 시킨다.
+    let k = k.min(index.ann.len().max(1));
 
     // 쿼리 하나에 한 번. 노드마다 다시 물으면 순회 중에 시계가 움직여, 앞에서
     // 받은 벡터와 같은 것을 뒤에서 거절할 수 있다.

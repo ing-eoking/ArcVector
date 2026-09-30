@@ -201,26 +201,18 @@ pub struct MetaRecord {
     pub connectivity: usize,
     pub expansion_add: usize,
     pub expansion_search: usize,
-
-    /// How many vectors the index accepts.
-    ///
-    /// This was the Map's `maxcount` attribute. A KV item has no such
-    /// attribute and there is no collection to hold one, so the number moves
-    /// into the metadata the index already carries.
-    pub maxcount: u32,
 }
 
 impl MetaRecord {
     pub fn encode(&self, layout: Layout) -> Vec<u8> {
         format!(
-            r#"{{"dim":{},"quant":"{}","metric":"{}","m":{},"efc":{},"efs":{},"max":{}}}"#,
+            r#"{{"dim":{},"quant":"{}","metric":"{}","m":{},"efc":{},"efs":{}}}"#,
             layout.dim,
             layout.quant,
             self.metric,
             self.connectivity,
             self.expansion_add,
             self.expansion_search,
-            self.maxcount,
         )
         .into_bytes()
     }
@@ -246,7 +238,6 @@ impl MetaRecord {
                 connectivity: num("m")?,
                 expansion_add: num("efc")?,
                 expansion_search: num("efs")?,
-                maxcount: u32::try_from(num("max")?).unwrap_or(u32::MAX),
             },
             Layout::new(
                 num("dim")?,
@@ -430,7 +421,6 @@ mod tests {
             connectivity: u32::MAX as usize,
             expansion_add: u32::MAX as usize,
             expansion_search: u32::MAX as usize,
-            maxcount: u32::MAX,
         };
         let encoded = meta.encode(layout);
         let (back, back_layout) = MetaRecord::decode(&encoded).unwrap();
@@ -549,7 +539,6 @@ mod meta_tests {
             connectivity: 16,
             expansion_add: 128,
             expansion_search: 64,
-            maxcount: 50_000,
         }
     }
 
@@ -565,7 +554,6 @@ mod meta_tests {
         let (meta, decoded) = MetaRecord::decode(&body).expect("the stored shape decodes");
         assert_eq!(meta.metric, "l2");
         assert_eq!(meta.connectivity, 16);
-        assert_eq!(meta.maxcount, 50_000);
         assert_eq!(decoded.dim, 4);
     }
 }

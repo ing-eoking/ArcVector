@@ -57,8 +57,6 @@ impl Drop for PreparedAdd {
 pub enum AddPlan {
     /// 할당까지 끝났다. 풀이 자리표를 넣고, 워커가 링크한다.
     Write(PreparedAdd),
-    /// `maxcount`에 걸렸고 이 id는 아직 없다. 쓸 것이 없다.
-    Overflowed,
 }
 
 /// **워커 스레드.** 검증하고, 본문을 만들고, 아이템을 할당한다.
@@ -84,18 +82,6 @@ pub fn vadd_allocate(store: &Store, spec: &Add, body: &[u8]) -> Result<AddPlan> 
     let quantized = quant::encode(&vector, layout.quant);
     let vkey = crate::trigger::key::vector_key(name, vkey);
 
-    // A Map enforced `maxcount` as an attribute; separate items have nothing to
-    // count against each other, so the graph is the count and this is the gate.
-    // An id already stored is an update and must not be refused -- it does not
-    // grow the index -- so the existence check runs only once the limit is hit.
-    if index.ann.len() >= index.maxcount as usize {
-        match store.hold_kv(&vkey) {
-            Ok(addr) => store.release_items(&[addr]),
-            Err(StoreError::KeyGone) => return Ok(AddPlan::Overflowed),
-            Err(e) => return Err(e.into()),
-        }
-    }
-
     let item = build_body(layout, &quantized, attr)?;
 
     // 클라이언트의 초를 엔진의 시계로 옮긴다. 그대로 넘기면 기동 기준 상대
@@ -114,9 +100,7 @@ pub fn vadd_allocate(store: &Store, spec: &Add, body: &[u8]) -> Result<AddPlan> 
 
 /// **풀 스레드.** 무거운 일은 이 한 줄이다.
 pub fn vadd_stage(plan: &mut AddPlan) -> Result<()> {
-    let AddPlan::Write(prepared) = plan else {
-        return Ok(());
-    };
+    let AddPlan::Write(prepared) = plan;
     prepared
         .index
         .ann
@@ -127,10 +111,7 @@ pub fn vadd_stage(plan: &mut AddPlan) -> Result<()> {
 
 /// **워커 스레드.** 링크하면 콜백이 자리표를 실제 주소로 올린다.
 pub fn vadd_commit(store: &Store, plan: AddPlan) -> Result<Reply> {
-    let mut prepared = match plan {
-        AddPlan::Write(prepared) => prepared,
-        AddPlan::Overflowed => return Ok(Reply::Overflowed),
-    };
+    let AddPlan::Write(mut prepared) = plan;
 
     // 링크가 콜백을 부르고, 콜백이 `unstage`로 자리표를 제자리에 올린다.
     match store.link_allocated(prepared.addr, ENGINE_STORE_OPERATION_OPERATION_SET) {
@@ -163,7 +144,6 @@ pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
 
 fn store_failed(name: &str, stamp: u64, e: StoreError) -> Result<Reply> {
     match e {
-        StoreError::Overflow => Ok(Reply::Overflowed),
         StoreError::KeyGone => {
             map_is_gone(name, stamp);
             Err(Error::IndexEvicted)
