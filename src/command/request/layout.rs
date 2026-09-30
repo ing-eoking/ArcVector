@@ -39,11 +39,14 @@ pub(super) mod names {
     pub const TAIL: usize = 3;
 }
 
-/// `vsetattr <index> <vkey> <JSON>`
+/// `vsetattr <index> <vkey> [<JSON>]`
 pub(super) mod setattr {
     pub const INDEX: usize = 1;
     pub const VKEY: usize = 2;
     pub const ATTR: usize = 3;
+
+    /// JSON을 생략했다 -- 속성을 비운다.
+    pub const TAIL_EMPTY: usize = 3;
     pub const TAIL: usize = 4;
 }
 

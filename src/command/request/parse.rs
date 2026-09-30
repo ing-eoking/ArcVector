@@ -171,14 +171,21 @@ fn parse_sim(tokens: &Tokens) -> Result<Sim> {
     })
 }
 
+/// `vsetattr <index> <vkey> [<JSON>]`
+///
+/// JSON을 생략하면 속성을 비운다. 길이를 받지 않게 되면서 "0바이트"라고 말할
+/// 자리가 없어졌는데, 인자를 빼는 것이 그 자리를 대신한다.
 fn parse_set_attr<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
     use layout::setattr as at;
-    if tokens.len() != at::TAIL {
-        return Err(Error::bad_request(
-            "the attr JSON must be a single argument with no spaces in it",
-        ));
-    }
-    let json = tokens.text(at::ATTR)?;
+    let json = match tokens.len() {
+        at::TAIL_EMPTY => "",
+        at::TAIL => tokens.text(at::ATTR)?,
+        _ => {
+            return Err(Error::bad_request(
+                "the attr JSON must be a single argument with no spaces in it",
+            ));
+        }
+    };
     if json.len() > ATTR_BYTES {
         return Err(Error::bad_request(format!(
             "attr is {} bytes, over the {ATTR_BYTES}-byte limit",
@@ -660,7 +667,13 @@ mod tests {
         // 길이를 받지 않으므로 인자 수가 곧 검사다. 공백이 든 JSON은 두
         // 토큰이 되어 여기서 걸린다.
         assert!(err(r#"vsetattr docs v1 {} extra"#).contains("single argument"));
-        assert!(err("vsetattr docs v1").contains("single argument"));
+
+        // JSON을 생략하면 비우는 것이다.
+        tokens!(clear = "vsetattr docs v1");
+        let Ok(Line::SetAttr { attr, .. }) = line_of(&clear) else {
+            panic!("clearing did not parse");
+        };
+        assert!(attr.is_empty());
 
         let over = format!(r#"{{"k":"{}"}}"#, "x".repeat(250));
         assert!(err(&format!("vsetattr docs v1 {over}")).contains("over the"));
