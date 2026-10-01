@@ -322,7 +322,7 @@ mod tests {
     #[test]
     fn decode_accepts_an_element_with_or_without_the_terminator() {
         let l = Layout::new(4, Quant::F32);
-        let vector = encode(&[1.0, 2.0, 3.0, 4.0], Quant::F32);
+        let vector = encode(&[1.0, 2.0, 3.0, 4.0], Quant::F32).unwrap();
         let bare = l.encode(&vector, b"{}").expect("encodes");
         assert_eq!(bare.len(), l.element_len(2));
 

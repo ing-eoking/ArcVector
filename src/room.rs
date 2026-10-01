@@ -29,9 +29,27 @@ pub fn vec<T>(n: usize) -> Result<Vec<T>> {
     Ok(v)
 }
 
+/// `n`바이트짜리 0으로 채운 버퍼. 못 잡으면 `SERVER_ERROR`.
+///
+/// `vec![0u8; n]`과 같은데 실패를 값으로 돌려준다. 자리를 먼저 정확히 잡으므로
+/// 뒤의 `resize`는 다시 할당하지 않는다.
+pub fn zeroed(n: usize) -> Result<Vec<u8>> {
+    let mut v = vec(n)?;
+    v.resize(n, 0);
+    Ok(v)
+}
+
 /// `n`바이트가 더 들어갈 자리를 문자열에 잡는다.
 pub fn reserve_str(s: &mut String, extra: usize) -> Result<()> {
     s.try_reserve(extra).map_err(|_| too_big::<u8>(extra))
+}
+
+/// `s`의 사본. 못 잡으면 `SERVER_ERROR`.
+pub fn string(s: &str) -> Result<String> {
+    let mut out = String::new();
+    reserve_str(&mut out, s.len())?;
+    out.push_str(s);
+    Ok(out)
 }
 
 fn too_big<T>(n: usize) -> Error {

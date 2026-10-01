@@ -79,7 +79,7 @@ pub fn vadd_allocate(store: &Store, spec: &Add, body: &[u8]) -> Result<AddPlan> 
     check_still_fits(store, layout)?;
 
     let stamp = registry::now();
-    let quantized = quant::encode(&vector, layout.quant);
+    let quantized = quant::encode(&vector, layout.quant)?;
     let vkey = crate::trigger::key::vector_key(name, vkey);
 
     let item = build_body(layout, &quantized, attr)?;
@@ -157,7 +157,7 @@ fn store_failed(name: &str, stamp: u64, e: StoreError) -> Result<Reply> {
 /// 종단자가 붙는 것은 이 키들이 ASCII 프로토콜로 읽히기 때문이다 -- 데몬은
 /// 아이템 본문을 클라이언트에게 그대로 넘긴다.
 fn build_body(layout: Layout, vector: &[u8], attr: &[u8]) -> Result<Vec<u8>> {
-    let mut body = vec![0u8; layout.stored_len(attr.len())];
+    let mut body = crate::room::zeroed(layout.stored_len(attr.len()))?;
     let split = layout.element_len(attr.len());
     layout.write(&mut body[..split], vector, attr)?;
     body[split..].copy_from_slice(b"\r\n");

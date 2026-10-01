@@ -62,17 +62,21 @@ impl std::fmt::Display for Quant {
     }
 }
 
-pub fn encode(v: &[f32], quant: Quant) -> Vec<u8> {
-    match quant {
+/// 자리를 못 잡으면 `SERVER_ERROR`.
+///
+/// 차원이 65535까지라 최대 256KB다. 작지만 `with_capacity`였다면 그 실패가
+/// abort였다 -- 작다는 것은 덜 일어난다는 뜻이지 안 일어난다는 뜻이 아니다.
+pub fn encode(v: &[f32], quant: Quant) -> crate::error::Result<Vec<u8>> {
+    Ok(match quant {
         Quant::F32 => {
-            let mut out = Vec::with_capacity(v.len() * 4);
+            let mut out = crate::room::vec(v.len() * 4)?;
             for x in v {
                 out.extend_from_slice(&x.to_le_bytes());
             }
             out
         }
         Quant::F16 => {
-            let mut out = Vec::with_capacity(v.len() * 2);
+            let mut out = crate::room::vec(v.len() * 2)?;
             for x in v {
                 out.extend_from_slice(&f32_to_f16_bits(*x).to_le_bytes());
             }
@@ -81,15 +85,15 @@ pub fn encode(v: &[f32], quant: Quant) -> Vec<u8> {
         Quant::I8 => {
             let scale = l2_norm(v);
             let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-            v.iter()
-                .map(|x| {
-                    let n = (x * inv * 127.0).round();
-                    (n.clamp(-127.0, 127.0) as i8).cast_unsigned()
-                })
-                .collect()
+            let mut out = crate::room::vec(v.len())?;
+            out.extend(v.iter().map(|x| {
+                let n = (x * inv * 127.0).round();
+                (n.clamp(-127.0, 127.0) as i8).cast_unsigned()
+            }));
+            out
         }
         Quant::B1 => {
-            let mut out = vec![0u8; v.len().div_ceil(8)];
+            let mut out = crate::room::zeroed(v.len().div_ceil(8))?;
             for (i, x) in v.iter().enumerate() {
                 if *x > 0.0 {
                     out[i / 8] |= 1 << (i % 8);
@@ -97,7 +101,7 @@ pub fn encode(v: &[f32], quant: Quant) -> Vec<u8> {
             }
             out
         }
-    }
+    })
 }
 
 fn l2_norm(v: &[f32]) -> f32 {
@@ -179,7 +183,7 @@ mod tests {
     #[test]
     fn f32_encoding_is_little_endian_roundtrip() {
         let v = [1.0f32, -2.5, 0.0];
-        let bytes = encode(&v, Quant::F32);
+        let bytes = encode(&v, Quant::F32).unwrap();
         assert_eq!(bytes.len(), 12);
         let back: Vec<f32> = bytes
             .chunks_exact(4)
@@ -219,24 +223,24 @@ mod tests {
 
     #[test]
     fn i8_normalizes_before_scaling() {
-        let bytes = encode(&[1.0, 0.0, 0.0], Quant::I8);
+        let bytes = encode(&[1.0, 0.0, 0.0], Quant::I8).unwrap();
         assert_eq!(bytes[0] as i8, 127);
         assert_eq!(bytes[1] as i8, 0);
 
-        let a = encode(&[3.0, 4.0], Quant::I8);
-        let b = encode(&[30.0, 40.0], Quant::I8);
+        let a = encode(&[3.0, 4.0], Quant::I8).unwrap();
+        let b = encode(&[30.0, 40.0], Quant::I8).unwrap();
         assert_eq!(a, b);
     }
 
     #[test]
     fn i8_zero_vector_does_not_divide_by_zero() {
-        let bytes = encode(&[0.0, 0.0, 0.0], Quant::I8);
+        let bytes = encode(&[0.0, 0.0, 0.0], Quant::I8).unwrap();
         assert_eq!(bytes, vec![0u8; 3]);
     }
 
     #[test]
     fn b1_packs_lsb_first() {
-        let bytes = encode(&[1.0, -1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], Quant::B1);
+        let bytes = encode(&[1.0, -1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], Quant::B1).unwrap();
         assert_eq!(bytes.len(), 2);
         assert_eq!(bytes[0], 0b0000_0101);
         assert_eq!(bytes[1], 0b0000_0001);

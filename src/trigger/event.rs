@@ -189,8 +189,18 @@ fn route(store: &Store, addr: u64) -> Option<(String, bool)> {
         return None;
     }
     store.with_item_at(addr, |key, _value| {
-        crate::trigger::key::parse(key)
-            .map(|p| (p.index.to_owned(), crate::trigger::key::is_meta(p.id)))
+        let p = crate::trigger::key::parse(key)?;
+        // **엔진 캐시락 안이다.** 이름 한 벌을 뜨는 것뿐이고 237바이트를 넘지
+        // 않지만, `to_owned`였다면 그 실패가 abort였다 -- 락을 쥔 채로.
+        // 자리가 없으면 이 이벤트를 흘린다. 그래프가 그만큼 어긋나지만,
+        // 여기서 돌려줄 오류를 받아 줄 사람이 없고 죽는 것보다는 낫다.
+        match crate::room::string(p.index) {
+            Ok(index) => Some((index, crate::trigger::key::is_meta(p.id))),
+            Err(_) => {
+                eprintln!("ArcVector: no room to route an item event; the graph will lag");
+                None
+            }
+        }
     })?
 }
 

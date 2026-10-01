@@ -248,7 +248,7 @@ pub fn vsim_vector(store: &Store, spec: &Sim, body: &[u8]) -> Result<Reply> {
 
     let mut out = String::new();
     for query in coord_vectors(body, layout.dim, "query")?.iter() {
-        let quantized = quant::encode(query, layout.quant);
+        let quantized = quant::encode(query, layout.quant)?;
         similar(store, &index, &quantized, k, filter, with_attr, &mut out)?;
     }
     out.push_str("END\r\n");

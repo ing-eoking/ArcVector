@@ -3,13 +3,19 @@ use crate::error::{Error, Result};
 pub(super) fn numbers(text: &[u8], what: &str) -> Result<Vec<f32>> {
     let text = std::str::from_utf8(text)
         .map_err(|_| Error::bad_request(format!("{what} is not valid UTF-8")))?;
-    text.split_ascii_whitespace()
-        .map(|token| {
-            token.parse::<f32>().map_err(|_| {
-                Error::bad_request(format!("{what} coordinate '{token}' is not a number"))
-            })
-        })
-        .collect()
+    // `collect`로 모으지 않는다 -- 크기를 모르는 반복자라 두 배씩 늘려가며
+    // 잡는데, 그 늘림은 못 잡으면 abort다. 토큰 하나가 최소 한 글자에 구분자
+    // 하나이므로 본문 길이의 절반이면 넉넉히 담긴다.
+    let mut out = crate::room::vec(text.len().div_ceil(2))?;
+    for token in text.split_ascii_whitespace() {
+        let x = token.parse::<f32>().map_err(|_| {
+            Error::bad_request(format!("{what} coordinate '{token}' is not a number"))
+        })?;
+        // 미리 잡은 자리를 넘을 수 없지만, 넘더라도 `push`가 abort하지 않도록.
+        crate::room::reserve(&mut out, 1)?;
+        out.push(x);
+    }
+    Ok(out)
 }
 
 pub(super) fn coord_vectors(text: &[u8], dim: usize, what: &str) -> Result<Vec<Vec<f32>>> {
@@ -28,7 +34,13 @@ pub(super) fn coord_vectors(text: &[u8], dim: usize, what: &str) -> Result<Vec<V
             "{what} contains NaN or infinity"
         )));
     }
-    Ok(all.chunks(dim).map(<[f32]>::to_vec).collect())
+    let mut out = crate::room::vec(all.len() / dim)?;
+    for chunk in all.chunks(dim) {
+        let mut one = crate::room::vec(dim)?;
+        one.extend_from_slice(chunk);
+        out.push(one);
+    }
+    Ok(out)
 }
 
 pub(super) fn coords(text: &[u8], dim: usize, what: &str) -> Result<Vec<f32>> {

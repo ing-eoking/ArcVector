@@ -926,12 +926,12 @@ mod tests {
     }
 
     fn put(idx: &AnnIndex, id: &str, coords: &[f32]) -> u64 {
-        let encoded = crate::handler::quant::encode(coords, idx.layout.quant);
+        let encoded = crate::handler::quant::encode(coords, idx.layout.quant).unwrap();
         publish(idx, id, &encoded)
     }
 
     fn search(idx: &AnnIndex, coords: &[f32], k: usize) -> Vec<String> {
-        let q = crate::handler::quant::encode(coords, idx.layout.quant);
+        let q = crate::handler::quant::encode(coords, idx.layout.quant).unwrap();
         idx.search(&q, k, None)
             .unwrap()
             .into_iter()
@@ -1028,7 +1028,8 @@ mod tests {
     #[test]
     fn linking_a_node_makes_it_findable_by_its_address() {
         let idx = build(4, Quant::F32, Metric::L2, 2);
-        let coords = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], idx.layout.quant);
+        let coords =
+            crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], idx.layout.quant).unwrap();
         let addr = FAKE.link(&idx, "a");
 
         idx.link_node(addr, &coords).expect("그래프가 받는다");
@@ -1040,7 +1041,8 @@ mod tests {
     #[test]
     fn unlinking_takes_the_node_out() {
         let idx = build(4, Quant::F32, Metric::L2, 2);
-        let coords = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], idx.layout.quant);
+        let coords =
+            crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], idx.layout.quant).unwrap();
         let addr = FAKE.link(&idx, "a");
         idx.link_node(addr, &coords).unwrap();
 
@@ -1054,7 +1056,8 @@ mod tests {
     #[test]
     fn renaming_moves_the_node_to_the_new_address() {
         let idx = build(4, Quant::F32, Metric::L2, 2);
-        let coords = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], idx.layout.quant);
+        let coords =
+            crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], idx.layout.quant).unwrap();
         let old = FAKE.link(&idx, "a");
         idx.link_node(old, &coords).unwrap();
         let new = FAKE.link(&idx, "a2");
@@ -1091,7 +1094,7 @@ mod tests {
             true
         };
 
-        let q = crate::handler::quant::encode(&[0.0, 1.0, 0.0, 0.0], idx.layout.quant);
+        let q = crate::handler::quant::encode(&[0.0, 1.0, 0.0, 0.0], idx.layout.quant).unwrap();
         let answered = idx.search(&q, 5, Some(&accept)).unwrap();
         assert!(deleted.get(), "순회가 술어를 불렀다");
         assert!(!answered.is_empty());
@@ -1157,7 +1160,7 @@ mod tests {
             removed_tx.send(removed).unwrap();
         });
 
-        let query = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], Quant::F32);
+        let query = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], Quant::F32).unwrap();
         let reported = std::cell::Cell::new(false);
         let witnessed = std::cell::Cell::new(0usize);
         let probe = |key: u64| {
@@ -1188,7 +1191,7 @@ mod tests {
         add(&idx, "keep", &[1.0, 0.0, 0.0, 0.0]);
         add(&idx, "skip", &[1.0, 0.0, 0.0, 0.0]);
 
-        let q = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], Quant::F32);
+        let q = crate::handler::quant::encode(&[1.0, 0.0, 0.0, 0.0], Quant::F32).unwrap();
 
         let keep = |key: u64| FAKE.id_at(key).is_some_and(|id| &*id == "keep");
         let hits = idx.search(&q, 10, Some(&keep as Accept)).unwrap();
@@ -1247,7 +1250,8 @@ mod tests {
                 let q = crate::handler::quant::encode(
                     &[t as f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
                     Quant::F32,
-                );
+                )
+                .unwrap();
                 for _ in 0..50 {
                     if idx.search(&q, 5, None).is_err() {
                         failures.fetch_add(1, Ordering::SeqCst);
@@ -1372,7 +1376,8 @@ mod tests {
                 handles.push(std::thread::spawn(move || {
                     for i in 0..50 {
                         let q =
-                            crate::handler::quant::encode(&[i as f32, 0.0, 0.0, 0.0], Quant::F32);
+                            crate::handler::quant::encode(&[i as f32, 0.0, 0.0, 0.0], Quant::F32)
+                                .unwrap();
                         idx.search(&q, 3, None).unwrap();
                     }
                 }));
@@ -1419,7 +1424,8 @@ mod tests {
             let searched = Arc::clone(&searched);
             handles.push(std::thread::spawn(move || {
                 for i in 0..300 {
-                    let q = crate::handler::quant::encode(&[i as f32, 0.0, 0.0, 0.0], Quant::F32);
+                    let q = crate::handler::quant::encode(&[i as f32, 0.0, 0.0, 0.0], Quant::F32)
+                        .unwrap();
                     idx.search(&q, 5, None).unwrap();
                     searched.fetch_add(1, Ordering::Relaxed);
                 }
