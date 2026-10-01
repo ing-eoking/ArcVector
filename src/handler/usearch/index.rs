@@ -263,17 +263,28 @@ impl Shards {
             // 담은 것보다 많이 답할 수는 없다. `populated`를 세운 직후라
             // `size()`가 아직 0일 수 있어, 최소 하나는 묻는다.
             let want = count.min(shard.size().max(1));
+
+            // **묻기 전에 잡는다.** 담을 자리는 어차피 필요하고(`extend`는 못
+            // 잡으면 abort다), 샤드가 돌려줄 수 있는 최대가 `want`이므로 지금
+            // 잡아 두면 크기가 같다. 순서가 요점이다 -- 바인딩도 들어가자마자
+            // 같은 크기를 잡는데 그쪽 `reserve`는 실패하면 abort라(`rust/lib.cpp`),
+            // 자리가 없다는 것을 우리가 먼저 알면 `SERVER_ERROR`로 돌아설 수 있다.
+            // 증명은 아니다: 둘이 동시에 떠 있는 순간이 있으므로 우리가 통과하고
+            // 바인딩이 실패할 수는 있다. 그걸 없애려면 usearch를 포크해 버퍼를
+            // 건네받는 검색을 만드는 수밖에 없다.
+            crate::room::reserve(&mut all, want)?;
+
             let matches = one(shard, want)?;
-            // 담을 자리부터 잡는다. `extend`는 못 잡으면 abort다.
-            crate::room::reserve(&mut all, matches.keys.len())?;
             all.extend(matches.keys.into_iter().zip(matches.distances));
         }
         all.sort_by(|a, b| a.1.total_cmp(&b.1));
         all.truncate(count);
-        Ok(Matches {
-            keys: all.iter().map(|(key, _)| *key).collect(),
-            distances: all.iter().map(|(_, distance)| *distance).collect(),
-        })
+
+        let mut keys = crate::room::vec(all.len())?;
+        let mut distances = crate::room::vec(all.len())?;
+        keys.extend(all.iter().map(|(key, _)| *key));
+        distances.extend(all.iter().map(|(_, distance)| *distance));
+        Ok(Matches { keys, distances })
     }
 
     fn memory_usage(&self) -> usize {
