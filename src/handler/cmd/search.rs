@@ -84,8 +84,6 @@ fn similar(
     out: &mut String,
 ) -> Result<()> {
     let layout = index.ann.layout;
-    // 개수는 파서가 이미 `MAX_RESULTS`로 걸렀다. 여기서 또 자르면 요청과
-    // 다르게 답하면서 그 사실을 알리지 않게 된다.
 
     // 쿼리 하나에 한 번. 노드마다 다시 물으면 순회 중에 시계가 움직여, 앞에서
     // 받은 벡터와 같은 것을 뒤에서 거절할 수 있다.

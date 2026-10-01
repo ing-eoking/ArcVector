@@ -213,8 +213,8 @@ impl Shards {
     }
 
     fn search<T: VectorType>(&self, query: &[T], count: usize) -> Result<Matches> {
-        self.merged(count, |shard| {
-            shard.search(query, count).map_err(usearch_err)
+        self.merged(count, |shard, want| {
+            shard.search(query, want).map_err(usearch_err)
         })
     }
 
@@ -227,14 +227,32 @@ impl Shards {
     where
         F: Fn(u64) -> bool,
     {
-        self.merged(count, |shard| {
+        self.merged(count, |shard, want| {
             shard
-                .filtered_search(query, count, &filter)
+                .filtered_search(query, want, &filter)
                 .map_err(usearch_err)
         })
     }
 
-    fn merged(&self, count: usize, one: impl Fn(&Index) -> Result<Matches>) -> Result<Matches> {
+    /// 샤드마다 묻고, 거리순으로 추려 `count`개를 답한다.
+    ///
+    /// **샤드에 묻는 개수는 그 샤드가 담은 노드 수로 깎는다.** 검색이 노드보다
+    /// 많이 답할 수는 없으니 결과는 그대로인데, 깎지 않으면 요청한 숫자가
+    /// 그대로 할당이 된다 -- usearch의 Rust 바인딩은 `count`개짜리 결과 버퍼를
+    /// 미리 잡고 0으로 채우고 나서야 검색을 부르고(`rust/lib.cpp`), 그 `reserve`는
+    /// 실패하면 오류가 아니라 abort다. 상한을 주지 않은 `<num>`은 그래서 숫자
+    /// 하나로 데몬을 눕힐 수 있었다. 노드 수로 깎으면 쓰는 메모리가 요청이 아니라
+    /// **가진 데이터**에 비례하고, 그건 이미 그보다 훨씬 큰 벡터를 들고 있다는
+    /// 뜻이라 따로 상한을 둘 일이 없어진다.
+    ///
+    /// 그래프 안쪽 버퍼(`top`/`next`)도 `max(efs, want)`로 같이 깎이는데, 그쪽은
+    /// 원래 실패를 값으로 돌려주므로(`index.hpp`의 `result.failed("Out of memory!")`)
+    /// 죽지 않는다.
+    fn merged(
+        &self,
+        count: usize,
+        one: impl Fn(&Index, usize) -> Result<Matches>,
+    ) -> Result<Matches> {
         let mut all: Vec<(u64, f32)> = Vec::new();
         for (shard, populated) in self.shards.iter().zip(&self.populated) {
             // A shard nothing has landed in yet is skipped, not asked: see
@@ -242,7 +260,10 @@ impl Shards {
             if !populated.load(Ordering::Acquire) {
                 continue;
             }
-            let matches = one(shard)?;
+            // 담은 것보다 많이 답할 수는 없다. `populated`를 세운 직후라
+            // `size()`가 아직 0일 수 있어, 최소 하나는 묻는다.
+            let want = count.min(shard.size().max(1));
+            let matches = one(shard, want)?;
             all.extend(matches.keys.into_iter().zip(matches.distances));
         }
         all.sort_by(|a, b| a.1.total_cmp(&b.1));

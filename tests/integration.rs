@@ -894,3 +894,31 @@ fn a_vector_expires_on_its_own_clock() {
 
     client.send(&format!("vdrop {ix}"));
 }
+
+/// `<num>`에 프로토콜이 허용하는 가장 큰 값을 줘도 살아남는다.
+///
+/// 한때 이것 하나로 데몬이 죽었다. usearch의 Rust 바인딩은 검색을 부르기 전에
+/// `count`개짜리 결과 버퍼를 잡고 0으로 채우는데, 그 `reserve`는 실패하면
+/// 오류가 아니라 abort다 -- 21억은 24GB가 되고, 그 전에 OOM 킬러가 왔다.
+/// 이제는 샤드가 담은 노드 수까지만 묻는다. 담은 것보다 많이 답할 수는 없으니
+/// 결과는 같고, 쓰는 메모리는 요청이 아니라 가진 데이터에 비례한다.
+#[test]
+fn a_huge_result_count_answers_what_the_index_holds() {
+    session!(_server, client);
+    let ix = index_name("hugenum");
+    client.send(&format!("vcreate {ix} 2 METRIC l2"));
+    for i in 0..5 {
+        assert_reply(
+            &client.vadd(&ix, &format!("v{i}"), 2, &format!("{i} 0")),
+            "STORED\r\n",
+        );
+    }
+
+    let hits = client.send_body(&format!("vsearch vector {ix} 2147483647 3"), "0 0");
+    assert_contains(&hits, "VECTORS 5");
+    assert_contains(&hits, "END");
+
+    // 죽지 않았다는 것이 요점이므로, 뒤이은 명령이 답하는지까지 본다.
+    assert_contains(&client.send(&format!("vsearch key {ix} v0 1")), "VECTORS 1");
+    client.send(&format!("vdrop {ix}"));
+}
