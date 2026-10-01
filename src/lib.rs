@@ -15,6 +15,7 @@ pub mod command;
 mod conn_state;
 pub mod error;
 pub mod handler;
+pub mod room;
 pub mod server;
 pub mod trigger;
 

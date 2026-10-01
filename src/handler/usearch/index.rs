@@ -264,6 +264,8 @@ impl Shards {
             // `size()`가 아직 0일 수 있어, 최소 하나는 묻는다.
             let want = count.min(shard.size().max(1));
             let matches = one(shard, want)?;
+            // 담을 자리부터 잡는다. `extend`는 못 잡으면 abort다.
+            crate::room::reserve(&mut all, matches.keys.len())?;
             all.extend(matches.keys.into_iter().zip(matches.distances));
         }
         all.sort_by(|a, b| a.1.total_cmp(&b.1));
@@ -712,23 +714,25 @@ impl AnnIndex {
     /// is not handed back until every search that could hold it has finished.
     /// So this is about answering a stale hit, never about reading freed
     /// memory.
-    fn resolve(&self, hits: &[(u64, f32)]) -> Vec<(u64, Arc<str>, f32)> {
+    fn resolve(&self, hits: &[(u64, f32)]) -> Result<Vec<(u64, Arc<str>, f32)>> {
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
-        hits.iter()
-            .filter_map(|(key, distance)| {
-                // 확인과 역참조를 한 가드 안에 둔다. 콜백이 거절하면 엔진이 그
-                // 자리에서 아이템을 해제하는데, 가드가 살아 있는 동안에는
-                // `halt()`가 돌아오지 않으므로 그 해제가 시작되지 않는다.
-                // 인덱스가 이미 잠겼으면 답을 포기한다 -- 그게 도는 검색까지
-                // 끊는다는 뜻이다.
-                let _touching = self.halt.touch()?;
-                if !index.contains(*key) {
-                    return None;
-                }
-                let id = self.elements.id_at(*key)?;
-                Some((*key, id, *distance))
-            })
-            .collect()
+        // 걸러지는 것이 있어 넘치게 잡을 수 있지만, 자리를 못 잡으면 거절한다는
+        // 것이 요점이다. 히트마다 조금씩 밀어 넣으면 그 push가 abort한다.
+        let mut out = crate::room::vec(hits.len())?;
+        out.extend(hits.iter().filter_map(|(key, distance)| {
+            // 확인과 역참조를 한 가드 안에 둔다. 콜백이 거절하면 엔진이 그
+            // 자리에서 아이템을 해제하는데, 가드가 살아 있는 동안에는
+            // `halt()`가 돌아오지 않으므로 그 해제가 시작되지 않는다.
+            // 인덱스가 이미 잠겼으면 답을 포기한다 -- 그게 도는 검색까지
+            // 끊는다는 뜻이다.
+            let _touching = self.halt.touch()?;
+            if !index.contains(*key) {
+                return None;
+            }
+            let id = self.elements.id_at(*key)?;
+            Some((*key, id, *distance))
+        }));
+        Ok(out)
     }
 
     fn unfiltered(&self, index: &Shards, query: &[u8], k: usize) -> Result<Matches> {
@@ -780,8 +784,9 @@ impl AnnIndex {
             }?
         };
 
-        let hits: Vec<(u64, f32)> = matches.keys.into_iter().zip(matches.distances).collect();
-        let answer = self.resolve(&hits);
+        let mut hits: Vec<(u64, f32)> = crate::room::vec(matches.keys.len())?;
+        hits.extend(matches.keys.into_iter().zip(matches.distances));
+        let answer = self.resolve(&hits)?;
 
         // 여기가 이 검색이 붙어 있던 배리어의 마지막이면, 그 뒤의 `Release`를
         // 막고 있던 것이 방금 사라진 것이다. sweeper를 기다리지 않고 그 자리에서

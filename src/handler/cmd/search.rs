@@ -158,7 +158,7 @@ fn similar(
     // 순회가 끝났으니 넘긴다. 보통 비어 있다.
     crate::handler::access::sweep::reap_later(std::mem::take(&mut *expired.borrow_mut()));
 
-    let mut rendered = Vec::with_capacity(named.len().min(k));
+    let mut rendered = crate::room::vec(named.len().min(k))?;
     for (key, id, distance) in named {
         if rendered.len() == k {
             break;
@@ -209,6 +209,16 @@ fn similar(
     }
 
     out.push_str(&query_header(rendered.len(), index.rebuilding_progress()));
+    // 행 하나하나가 문자열을 늘리는데, `write!`가 쓰는 늘림은 못 잡으면
+    // abort다. 들 것을 이미 손에 쥐고 있으니 정확히 재서 한 번에 잡고, 그
+    // 자리가 없으면 답을 짓기 전에 거절한다. 행당 덧붙는 것은 점수와 공백과
+    // CRLF인데, f32 점수의 가장 긴 표기가 열몇 자라 넉넉하게 32로 센다.
+    let body_bytes = rendered
+        .iter()
+        .map(|(id, _, attr)| id.len() + attr.as_ref().map_or(0, String::len) + 32)
+        .try_fold(0usize, |sum, n| sum.checked_add(n))
+        .ok_or_else(|| Error::Index("answer does not fit in memory".into()))?;
+    crate::room::reserve_str(out, body_bytes)?;
     for (id, score, attr) in rendered {
         match attr {
             // attr은 공백 없는 JSON 한 덩어리라 길이를 앞세울 필요가 없다.
