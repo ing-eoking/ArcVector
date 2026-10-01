@@ -166,10 +166,29 @@ impl Responder {
         Self { handler, cookie }
     }
 
+    /// 답을 내보낸다.
+    ///
+    /// 핸들러가 NUL로 끝나는 C 문자열을 받으므로 한 번 복사해야 하는데, 그
+    /// 복사가 답 전체 크기다 -- 검색이 `room`으로 조심해서 지은 답도 여기서
+    /// 다시 한 번 그만큼 잡는다. 못 잡으면 `Vec::with_capacity`는 abort이므로,
+    /// 자리를 재서 잡고 없으면 **아무것도 잡지 않는 짧은 답**으로 물러난다.
+    /// 그 답은 상수라 할당이 필요 없다.
     pub fn send(&self, msg: &str) {
         let Some(handler) = self.handler else { return };
 
-        let mut buf = Vec::with_capacity(msg.len() + 1);
+        let mut buf = Vec::new();
+        if buf.try_reserve_exact(msg.len() + 1).is_err() {
+            // 지을 자리가 없다. 연결을 끊지 않고 이것만 돌려준다.
+            const SHORT: &[u8] = b"SERVER_ERROR out of memory\r\n\0";
+            unsafe {
+                handler(
+                    self.cookie,
+                    (SHORT.len() - 1) as c_int,
+                    SHORT.as_ptr().cast::<c_char>(),
+                );
+            }
+            return;
+        }
         buf.extend_from_slice(msg.as_bytes());
         buf.push(0);
 

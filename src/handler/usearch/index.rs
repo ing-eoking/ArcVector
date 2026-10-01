@@ -270,10 +270,13 @@ impl Shards {
             // 같은 크기를 잡는데 그쪽 `reserve`는 실패하면 abort라(`rust/lib.cpp`),
             // 자리가 없다는 것을 우리가 먼저 알면 `SERVER_ERROR`로 돌아설 수 있다.
             // 바인딩이 쓸 자리는 `probe_pair`가 따로 재므로, 둘이 동시에 떠
-            // 있는 양을 그대로 확인하고 들어간다.
+            // 있는 양을 그대로 확인하고 들어간다. 확인과 실제 할당 사이에는
+            // 다른 요청이 끼어들 수 있으니 이것도 보장은 아니다.
             crate::room::reserve(&mut all, want)?;
             // 바인딩이 잡을 것도 같은 자리에서 미리 재본다. 그쪽은 실패하면
-            // abort라, 돌아설 수 있는 곳이 여기뿐이다.
+            // abort라, 돌아설 수 있는 곳이 여기뿐이다. 다만 이것이 거르는 것은
+            // **할당 시점에 드러나는 실패뿐**이고 OOM은 못 막는다 -- 자세한
+            // 것은 `room::probe_pair`에 적어 두었다.
             crate::room::probe_pair::<u64, f32>(want)?;
 
             let matches = one(shard, want)?;
