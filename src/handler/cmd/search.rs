@@ -211,11 +211,17 @@ fn similar(
     out.push_str(&query_header(rendered.len(), index.rebuilding_progress()));
     // 행 하나하나가 문자열을 늘리는데, `write!`가 쓰는 늘림은 못 잡으면
     // abort다. 들 것을 이미 손에 쥐고 있으니 정확히 재서 한 번에 잡고, 그
-    // 자리가 없으면 답을 짓기 전에 거절한다. 행당 덧붙는 것은 점수와 공백과
-    // CRLF인데, f32 점수의 가장 긴 표기가 열몇 자라 넉넉하게 32로 센다.
+    // 자리가 없으면 답을 짓기 전에 거절한다.
+    //
+    // 행당 덧붙는 것은 점수와 공백 둘과 CRLF다. `f32`의 `Display`는 지수
+    // 표기를 쓰지 않아 비정규수에서 48자까지 간다 -- 부호 하나에 `0.` 둘,
+    // 그리고 소수점 아래 45자리. 거기에 공백·CRLF 넷을 더해도 `SCORE_BYTES`
+    // 안쪽이다. **넉넉해야 하는 이유가 있다**: 모자라게 잡으면 뒤의 `write!`가
+    // 무르게 늘려 버려, 여기서 거절하려던 그 실패가 abort로 돌아온다.
+    const SCORE_BYTES: usize = 64;
     let body_bytes = rendered
         .iter()
-        .map(|(id, _, attr)| id.len() + attr.as_ref().map_or(0, String::len) + 32)
+        .map(|(id, _, attr)| id.len() + attr.as_ref().map_or(0, String::len) + SCORE_BYTES)
         .try_fold(0usize, |sum, n| sum.checked_add(n))
         .ok_or_else(|| Error::Index("answer does not fit in memory".into()))?;
     crate::room::reserve_str(out, body_bytes)?;
