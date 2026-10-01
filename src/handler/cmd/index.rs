@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use crate::command::request::Create;
 use crate::error::{Error, Reply, Result};
@@ -144,32 +145,33 @@ fn check_dimension_fits(store: &Store, layout: Layout, quant: Quant) -> Result<(
     )))
 }
 
+/// 한 인덱스가 답에 더하는 줄들의 넉넉한 상한.
+///
+/// `vstats`는 네 줄, `vlist`는 한 줄인데 둘 다 이름이 네 번/한 번 들어간다.
+/// 고정부는 필드 이름과 u64 열 자리 남짓이라, 줄당 96바이트면 남는다. 정확할
+/// 필요는 없다 -- 모자라면 뒤의 `write!`가 더 늘릴 뿐이고, 여기서 보려는 것은
+/// **이만한 답을 지을 메모리가 있느냐**다.
+const PER_INDEX_LINE: usize = 96;
+
+fn room_for_rows(out: &mut String, indexes: &[Arc<VectorIndex>], lines: usize) -> Result<()> {
+    let want = indexes
+        .iter()
+        .map(|index| (index.name.len() + PER_INDEX_LINE) * lines)
+        .try_fold(0usize, |sum, n| sum.checked_add(n))
+        .ok_or_else(|| Error::Index("listing does not fit in memory".into()))?;
+    crate::room::reserve_str(out, want)
+}
+
 pub fn vstats() -> Result<Reply> {
-    let indexes = registry::snapshot();
+    let indexes = registry::snapshot().map_err(|_| Error::Index("no room to list".into()))?;
 
     let mut vectors = 0usize;
     let mut held_bytes = 0usize;
     let mut used_bytes = 0usize;
-    let mut per_index = String::new();
     for index in &indexes {
-        let (count, held, used) = (
-            index.ann.len(),
-            index.ann.held_bytes(),
-            index.ann.used_bytes(),
-        );
-        vectors += count;
-        held_bytes += held;
-        used_bytes += used;
-
-        let name = &index.name;
-        let _ = write!(
-            per_index,
-            "STAT {name}:vectors {count}\r\n\
-             STAT {name}:index_held_bytes {held}\r\n\
-             STAT {name}:index_used_bytes {used}\r\n\
-             STAT {name}:reserved {}\r\n",
-            index.ann.reserved()
-        );
+        vectors += index.ann.len();
+        held_bytes += index.ann.held_bytes();
+        used_bytes += index.ann.used_bytes();
     }
 
     let mut out = String::new();
@@ -185,14 +187,34 @@ pub fn vstats() -> Result<Reply> {
         element::ATTR_BYTES,
         crate::trigger::waiting::count(),
     );
-    out.push_str(&per_index);
+
+    // 인덱스별 줄을 **같은 버퍼에** 잇는다. 따로 지었다가 붙이면 두 벌이 동시에
+    // 떠서 피크가 두 배가 된다. 자리는 먼저 잡고, 없으면 답을 짓지 않는다.
+    room_for_rows(&mut out, &indexes, 4)?;
+    for index in &indexes {
+        let name = &index.name;
+        let _ = write!(
+            out,
+            "STAT {name}:vectors {}\r\n\
+             STAT {name}:index_held_bytes {}\r\n\
+             STAT {name}:index_used_bytes {}\r\n\
+             STAT {name}:reserved {}\r\n",
+            index.ann.len(),
+            index.ann.held_bytes(),
+            index.ann.used_bytes(),
+            index.ann.reserved()
+        );
+    }
     out.push_str("END\r\n");
     Ok(Reply::Body(out))
 }
 
 pub fn vlist() -> Result<Reply> {
+    let indexes = registry::snapshot().map_err(|_| Error::Index("no room to list".into()))?;
+
     let mut out = String::new();
-    for index in registry::snapshot() {
+    room_for_rows(&mut out, &indexes, 1)?;
+    for index in &indexes {
         let layout = &index.ann.layout;
         let _ = writeln!(
             out,

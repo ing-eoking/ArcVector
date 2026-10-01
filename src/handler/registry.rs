@@ -176,13 +176,13 @@ pub fn known(name: &str) -> bool {
 /// 살아 있는 인덱스와 비워지는 중인 그래프를 모두. sweeper가 훑는 목록이다.
 pub fn all() -> Vec<Arc<VectorIndex>> {
     let mut all = indexes().unwrap_or_default();
-    all.extend(
-        DROPPED
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .cloned(),
-    );
+    let dropped = DROPPED.read().unwrap_or_else(PoisonError::into_inner);
+    // `indexes()`가 조심해서 잡은 것을 여기서 무르지 않는다. 자리를 못 잡으면
+    // 살아 있는 것만 훑고 지나간다 -- 비워지는 그래프는 다음 틱에 다시 온다.
+    if all.try_reserve(dropped.len()).is_err() {
+        return all;
+    }
+    all.extend(dropped.iter().cloned());
     all
 }
 
@@ -312,14 +312,19 @@ pub fn indexes() -> Result<Vec<Arc<VectorIndex>>, TryReserveError> {
     Ok(all)
 }
 
-pub fn snapshot() -> Vec<Arc<VectorIndex>> {
-    let mut all: Vec<Arc<VectorIndex>> = read()
-        .values()
-        .filter(|index| !index.is_rebuilding())
-        .cloned()
-        .collect();
-    all.sort_by(|a, b| a.name.cmp(&b.name));
-    all
+/// 이름순으로 정렬된, 재구축 중이 아닌 인덱스들.
+///
+/// `collect`로 모으지 않는다 -- 걸러진 반복자는 크기를 못 알려줘 두 배씩
+/// 늘려가며 잡는데, 그 늘림은 못 잡으면 abort다. 정렬도 안정 정렬이라 스크래치
+/// 버퍼를 `with_capacity`로 잡으므로, 같은 이유로 `sort_unstable_by`를 쓴다.
+/// 이름은 서로 다르니 안정성은 필요 없다.
+pub fn snapshot() -> Result<Vec<Arc<VectorIndex>>, TryReserveError> {
+    let reg = read();
+    let mut all = Vec::new();
+    all.try_reserve(reg.len())?;
+    all.extend(reg.values().filter(|index| !index.is_rebuilding()).cloned());
+    all.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    Ok(all)
 }
 
 #[cfg(test)]

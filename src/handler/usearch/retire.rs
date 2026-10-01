@@ -176,21 +176,36 @@ pub(super) struct Retirement {
 }
 
 impl Retirement {
-    pub(super) fn new() -> Self {
+    /// 인덱스 하나에 ~61KB다. 작아 보이지만 `vcreate` 한 번에 하나씩이고
+    /// 인덱스 개수에는 상한이 없으니, 크기를 정하는 것은 클라이언트다. 그래서
+    /// `collect`나 `with_capacity`로 잡지 않는다 -- 그것들은 못 잡으면 abort고,
+    /// 이 생성자는 복제 재생 경로에서 **엔진 캐시락을 쥔 채** 돌기도 한다.
+    pub(super) fn new() -> crate::error::Result<Self> {
         Self::with_cap_inner(CAP)
     }
 
-    fn with_cap_inner(cap: usize) -> Self {
-        Self {
-            slots: (0..POOL).map(|_| AtomicUsize::new(0)).collect(),
-            addrs: (0..RING).map(|_| AtomicU64::new(0)).collect(),
+    fn with_cap_inner(cap: usize) -> crate::error::Result<Self> {
+        let mut slots = crate::room::vec(POOL)?;
+        slots.extend((0..POOL).map(|_| AtomicUsize::new(0)));
+        let mut addrs = crate::room::vec(RING)?;
+        addrs.extend((0..RING).map(|_| AtomicU64::new(0)));
+
+        let mut events = VecDeque::new();
+        events
+            .try_reserve_exact(cap + EVENT_MARGIN)
+            .map_err(|_| crate::error::Error::Index("no room for a retirement ring".into()))?;
+
+        Ok(Self {
+            // 정확히 재어 잡았으니 `into_boxed_slice`가 다시 할당하지 않는다.
+            slots: slots.into_boxed_slice(),
+            addrs: addrs.into_boxed_slice(),
             open: AtomicUsize::new(0),
             queue: Mutex::new(Queue {
-                events: VecDeque::with_capacity(cap + EVENT_MARGIN),
+                events,
                 ..Queue::default()
             }),
             bell: OnceLock::new(),
-        }
+        })
     }
 
     /// sweeper를 깨우는 방법을 알려준다. 등록 전에는 아무것도 하지 않는다.
@@ -561,7 +576,7 @@ mod tests {
 
     #[test]
     fn an_unresolved_barrier_blocks_everything_behind_it() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let e = FakeElements::default();
 
         let reading = r.enter();
@@ -584,7 +599,7 @@ mod tests {
 
     #[test]
     fn a_full_address_ring_drops_the_batch_rather_than_growing() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let full: Vec<u64> = (0..RING as u64).collect();
 
         r.retire(&full);
@@ -598,7 +613,7 @@ mod tests {
 
     #[test]
     fn a_second_drainer_backs_off_while_one_is_releasing() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let e = FakeElements::default();
         r.retire(&[0x10]);
 
@@ -621,7 +636,7 @@ mod tests {
             }
         }
 
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         r.retire(&[0x10]);
 
         let hook = std::panic::take_hook();
@@ -644,7 +659,7 @@ mod tests {
 
     #[test]
     fn a_full_queue_has_not_drained_enough() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let full: Vec<u64> = (0..RING as u64).collect();
         r.retire(&full);
 
@@ -653,7 +668,7 @@ mod tests {
 
     #[test]
     fn draining_past_the_mark_says_so() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let e = FakeElements::default();
         let full: Vec<u64> = (0..RING as u64).collect();
         r.retire(&full);
@@ -665,14 +680,14 @@ mod tests {
 
     #[test]
     fn an_empty_queue_reports_empty() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let e = FakeElements::default();
         assert!(matches!(r.drain_once(&e), Progress::Empty));
     }
 
     #[test]
     fn a_resolved_barrier_gives_its_slot_back() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let e = FakeElements::default();
 
         let reading = r.enter();
@@ -694,7 +709,7 @@ mod tests {
 
     #[test]
     fn a_barrier_behind_a_release_does_not_block_it() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let e = FakeElements::default();
 
         // 먼저 붙은 검색이 첫 배리어를 만든다.
@@ -729,7 +744,7 @@ mod tests {
 
     #[test]
     fn a_search_holds_the_open_slot_until_it_ends() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let slot = r.open_slot();
         assert_eq!(r.slot_count(slot), 0);
 
@@ -742,7 +757,7 @@ mod tests {
 
     #[test]
     fn two_searches_share_one_slot() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let slot = r.open_slot();
 
         let a = r.enter();
@@ -757,7 +772,7 @@ mod tests {
 
     #[test]
     fn sealing_returns_the_count_at_that_moment() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let a = r.enter();
         let b = r.enter();
 
@@ -768,7 +783,7 @@ mod tests {
 
     #[test]
     fn a_search_that_meets_a_sealed_slot_goes_to_the_next_one() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let first = r.open_slot();
 
         let held_open = r.enter(); // 봉인이 0을 돌려주지 않도록 하나 붙여둔다
@@ -797,7 +812,7 @@ mod tests {
 
     #[test]
     fn attaching_to_a_sealed_slot_backs_out_without_disturbing_the_count() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let slot = r.open_slot();
 
         let holder = r.enter(); // 먼저 붙은 검색 하나
@@ -818,7 +833,7 @@ mod tests {
 
     #[test]
     fn a_retire_with_no_search_attached_queues_no_barrier() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let slot = r.open_slot();
 
         r.retire(&[0x10]);
@@ -834,7 +849,7 @@ mod tests {
 
     #[test]
     fn consecutive_releases_coalesce_into_the_tail() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         for addr in 0..50u64 {
             r.retire(&[addr]);
         }
@@ -843,7 +858,7 @@ mod tests {
 
     #[test]
     fn slots_do_not_wrap_when_no_search_is_running() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let slot = r.open_slot();
         for addr in 0..(POOL as u64 * 3) {
             r.retire(&[addr]);
@@ -857,7 +872,7 @@ mod tests {
 
     #[test]
     fn a_retire_with_a_search_attached_queues_a_barrier_first() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let slot = r.open_slot();
         let reading = r.enter();
 
@@ -880,7 +895,7 @@ mod tests {
     fn concurrent_retires_never_put_two_barriers_side_by_side() {
         // 봉인과 push가 한 덩어리가 아니면 [B, B, R, R]처럼 배리어가 붙어 나오고,
         // 그러면 두 번째 배리어 뒤의 릴리스를 첫 배리어가 안 막게 된다.
-        let r = Arc::new(Retirement::new());
+        let r = Arc::new(Retirement::new().unwrap());
         let _reading = r.enter(); // 모든 retire가 배리어를 만들도록 하나 붙여둔다
 
         std::thread::scope(|s| {
@@ -903,7 +918,7 @@ mod tests {
 
     #[test]
     fn a_search_that_starts_after_a_retire_joins_the_next_barrier() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let first = r.enter();
         r.retire(&[0x10]);
         let second = r.enter();
@@ -923,7 +938,7 @@ mod tests {
     fn the_last_search_of_a_sealed_barrier_rings_the_bell() {
         use std::sync::atomic::AtomicUsize as Counter;
 
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let rings = Arc::new(Counter::new(0));
         let seen = Arc::clone(&rings);
         r.set_bell(Arc::new(move || {
@@ -957,7 +972,7 @@ mod tests {
         // 뒤 대기를 시작한 검색이 sweeper의 TICK 만큼 잠들어 있다가 시간 초과로
         // Busy를 받을 수 있다. 배리어가 생기지 않는 경우(검색이 없을 때)도 포함해
         // retire() 호출 자체가 항상 울려야 한다.
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let rings = Arc::new(Counter::new(0));
         let seen = Arc::clone(&rings);
         r.set_bell(Arc::new(move || {
@@ -977,7 +992,7 @@ mod tests {
     fn an_empty_retire_does_not_ring() {
         use std::sync::atomic::AtomicUsize as Counter;
 
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let rings = Arc::new(Counter::new(0));
         let seen = Arc::clone(&rings);
         r.set_bell(Arc::new(move || {
@@ -1001,7 +1016,7 @@ mod tests {
         // 조건으로 울려야 한다. 슬롯이 봉인된 채 카운트가 이미 0인 상태를
         // 직접 흉내낸다 -- 마지막 리더가 막 떨어졌지만 sweeper가 아직 그
         // 배리어를 못 지운 순간과 같은 비트 모양이다.
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let rings = Arc::new(Counter::new(0));
         let seen = Arc::clone(&rings);
         r.set_bell(Arc::new(move || {
@@ -1024,7 +1039,7 @@ mod tests {
     fn a_backing_out_search_that_is_not_last_does_not_ring() {
         use std::sync::atomic::AtomicUsize as Counter;
 
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let rings = Arc::new(Counter::new(0));
         let seen = Arc::clone(&rings);
         r.set_bell(Arc::new(move || {
@@ -1047,7 +1062,7 @@ mod tests {
 
     #[test]
     fn leaving_reports_only_when_it_cleared_a_sealed_barrier() {
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
 
         // 봉인 안 된 배리어 -- 아무도 안 기다리므로 알릴 것이 없다.
         assert!(!r.enter().leave(), "봉인 전이면 false");
@@ -1064,7 +1079,7 @@ mod tests {
     fn an_unsealed_barrier_does_not_ring() {
         use std::sync::atomic::AtomicUsize as Counter;
 
-        let r = Retirement::new();
+        let r = Retirement::new().unwrap();
         let rings = Arc::new(Counter::new(0));
         let seen = Arc::clone(&rings);
         r.set_bell(Arc::new(move || {

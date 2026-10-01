@@ -385,7 +385,7 @@ impl AnnIndex {
             #[cfg(test)]
             identity: NEXT_IDENTITY.fetch_add(1, Ordering::Relaxed),
             stuck: std::sync::Mutex::new(Vec::new()),
-            retirement: Retirement::new(),
+            retirement: Retirement::new()?,
         })
     }
 
