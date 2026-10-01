@@ -40,3 +40,60 @@ fn too_big<T>(n: usize) -> Error {
         n.saturating_mul(size_of::<T>())
     ))
 }
+
+/// 바인딩이 들어가자마자 잡을 두 배열과 **같은 크기를 같은 할당기로** 미리
+/// 잡아보고, 바로 놓는다. 못 잡으면 `SERVER_ERROR`.
+///
+/// usearch의 `Matches`는 cxx의 `rust::Vec`인데, 그 `reserve`는 C++ 쪽에
+/// 구현이 있는 게 아니라 Rust의 `Vec::reserve`를 도로 불러낸다(cxx의
+/// `rust_vec.rs`). 그래서 **여기서 잡히면 거기서도 잡힌다** -- 다른 할당기도,
+/// 다른 크기도 아니고, 방금 놓아준 블록을 할당기가 그대로 다시 내준다.
+/// 바인딩 쪽 `reserve`는 실패하면 abort라 그 안에서는 돌아설 수 없으므로,
+/// 돌아설 수 있는 자리는 들어가기 전뿐이다.
+///
+/// 한때 이 방식이 안 듣는다고 봤던 것은, 그때 재보던 크기가 `<num>` 그대로라
+/// 21억이었기 때문이다. overcommit은 그만한 주소공간도 일단 내주므로 확인은
+/// 통과했고, 죽은 것은 그 뒤 바인딩이 그 영역을 0으로 **채우는** 동안이었다.
+/// 이제 크기가 노드 수로 깎여 둘이 같아졌으니, 잡히면 채우기도 끝난다.
+pub fn probe_pair<A, B>(n: usize) -> Result<()> {
+    let mut a: Vec<A> = Vec::new();
+    let mut b: Vec<B> = Vec::new();
+    a.try_reserve_exact(n).map_err(|_| too_big::<A>(n))?;
+    b.try_reserve_exact(n).map_err(|_| too_big::<B>(n))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 감당 못 할 크기는 abort가 아니라 `SERVER_ERROR`로 돌아온다.
+    ///
+    /// 이 모듈이 있는 이유 자체가 그것이다 -- `Vec::reserve`였다면 이 호출이
+    /// 프로세스를 끝냈다.
+    #[test]
+    fn an_impossible_size_comes_back_as_an_error() {
+        let huge = usize::MAX / 16;
+        let err = vec::<u64>(huge).expect_err("이만한 자리가 있을 리 없다");
+        assert_eq!(err.blame(), crate::error::Blame::Server);
+
+        let mut v: Vec<(u64, f32)> = Vec::new();
+        assert!(reserve(&mut v, huge).is_err());
+
+        let mut s = String::new();
+        assert!(reserve_str(&mut s, huge).is_err());
+    }
+
+    /// 바인딩에 들어가기 전 재보는 것도 마찬가지로 돌아온다.
+    #[test]
+    fn the_binding_probe_refuses_what_it_cannot_hold() {
+        assert!(probe_pair::<u64, f32>(usize::MAX / 16).is_err());
+    }
+
+    /// 평범한 크기는 통과하고, 잡은 자리는 바로 놓는다.
+    #[test]
+    fn an_ordinary_size_passes() {
+        assert!(probe_pair::<u64, f32>(50_000).is_ok());
+        assert_eq!(vec::<u64>(50_000).unwrap().capacity().min(50_000), 50_000);
+    }
+}

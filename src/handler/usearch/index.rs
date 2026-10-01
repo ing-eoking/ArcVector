@@ -269,10 +269,12 @@ impl Shards {
             // 잡아 두면 크기가 같다. 순서가 요점이다 -- 바인딩도 들어가자마자
             // 같은 크기를 잡는데 그쪽 `reserve`는 실패하면 abort라(`rust/lib.cpp`),
             // 자리가 없다는 것을 우리가 먼저 알면 `SERVER_ERROR`로 돌아설 수 있다.
-            // 증명은 아니다: 둘이 동시에 떠 있는 순간이 있으므로 우리가 통과하고
-            // 바인딩이 실패할 수는 있다. 그걸 없애려면 usearch를 포크해 버퍼를
-            // 건네받는 검색을 만드는 수밖에 없다.
+            // 바인딩이 쓸 자리는 `probe_pair`가 따로 재므로, 둘이 동시에 떠
+            // 있는 양을 그대로 확인하고 들어간다.
             crate::room::reserve(&mut all, want)?;
+            // 바인딩이 잡을 것도 같은 자리에서 미리 재본다. 그쪽은 실패하면
+            // abort라, 돌아설 수 있는 곳이 여기뿐이다.
+            crate::room::probe_pair::<u64, f32>(want)?;
 
             let matches = one(shard, want)?;
             all.extend(matches.keys.into_iter().zip(matches.distances));
