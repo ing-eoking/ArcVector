@@ -10,12 +10,10 @@ pub(crate) mod order;
 
 use std::os::raw::c_void;
 
-use arcus::{Store, StoreError};
-use cmd::{vadd, vcreate, vdel, vdrop, vgetattr, vlist, vsetattr, vsim_key, vsim_vector, vstats};
-
 use crate::command::Request;
-use crate::command::request::{Body, Line};
+use crate::command::request::Line;
 use crate::error::{Error, Reply, Result};
+use arcus::{Store, StoreError};
 
 unsafe fn store_for(cookie: *const c_void) -> Result<Store> {
     unsafe { Store::for_cookie(cookie) }.ok_or_else(|| {
@@ -35,17 +33,13 @@ pub unsafe fn run(cookie: *const c_void, request: Request) -> Result<Reply> {
     let store = &unsafe { store_for(cookie) }?;
 
     match request {
-        Request::Body(Body::Add(spec), bytes) => vadd(store, &spec, &bytes),
-        Request::Body(Body::Sim(spec), bytes) => vsim_vector(store, &spec, &bytes),
-        Request::Line(Line::OldCreate(spec)) => vcreate(store, &spec),
-        Request::Line(Line::SimKey(spec)) => vsim_key(store, &spec),
-        Request::Line(Line::GetAttr { index, id }) => vgetattr(store, index, id),
-        Request::Line(Line::SetAttr { index, id, attr }) => vsetattr(store, index, id, attr),
-        Request::Line(Line::Del { index, id }) => vdel(store, index, id),
-        Request::Line(Line::OldDrop { index }) => vdrop(store, index),
-        Request::Line(Line::List) => vlist(),
-        Request::Line(Line::Stats) => vstats(),
-        // Task 8이 핸들러를 잇는다.
-        Request::Body(..) | Request::Line(..) => Err(Error::bad_request("not yet")),
+        Request::Line(Line::Create(spec)) => cmd::create(store, &spec),
+        Request::Line(Line::GetMeta(spec)) => cmd::getmeta(store, &spec),
+        Request::Line(Line::Delete(spec)) => cmd::delete(store, &spec),
+        Request::Line(Line::Drop(spec)) => cmd::drop_index(store, spec.index),
+        // 본문이 있는 명령과 검색은 `offload`가 풀과 레인으로 보낸다.
+        Request::Body(..) | Request::Line(Line::SearchKey(_)) => {
+            Err(Error::bad_request("request is not routed here"))
+        }
     }
 }

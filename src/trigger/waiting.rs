@@ -365,7 +365,8 @@ pub(crate) fn take_incomplete(index: &str) -> bool {
     incomplete
 }
 
-/// 아직 붙잡고 있는 주소 수. `vstats`가 이것을 보고한다.
+/// 아직 붙잡고 있는 주소 수. 장부가 비는지 보는 시험이 쓴다.
+#[cfg(test)]
 pub(crate) fn count() -> usize {
     store().count
 }

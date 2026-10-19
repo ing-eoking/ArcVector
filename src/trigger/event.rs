@@ -472,8 +472,6 @@ fn on_create(store: &Store, map: u64) {
 /// 할당이다. 인덱스 하나당 한 번뿐이라 감수한다.
 fn build_from_value(name: String, value: &[u8]) -> Option<VectorIndex> {
     let config = IndexConfig::decode(value).ok()?;
-    // maxcount는 설정 문서에 없다. 이 콜백은 cache lock 아래라 Map 속성을 물을
-    // 수도 없으므로 모르는 채로 0을 둔다 -- 한도는 엔진이 Map의 maxcount로 지킨다.
     match AnnIndex::new(
         config.layout(),
         config.metric,
@@ -482,7 +480,7 @@ fn build_from_value(name: String, value: &[u8]) -> Option<VectorIndex> {
         config.efs,
         Arc::new(MapElements),
     ) {
-        Ok(ann) => Some(VectorIndex::ours(name, ann, 0)),
+        Ok(ann) => Some(VectorIndex::ours(name, ann)),
         Err(e) => {
             eprintln!("ArcVector: could not build the graph for '{name}': {e}");
             None

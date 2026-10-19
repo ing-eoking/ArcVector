@@ -19,29 +19,6 @@ impl Blame {
     }
 }
 
-/// How far a rebuild has got, so a search answered from a half-built graph can
-/// say what it was answered from.
-///
-/// `done` is the count the graph has published, `total` the count the Map held
-/// when the rebuild was queued. The rebuild reads that snapshot start to end, so
-/// the two only meet when it is finished. Both are read without a lock between
-/// them, so a caller sees a moment, not a transaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Rebuild {
-    pub done: usize,
-    pub total: usize,
-}
-
-impl Rebuild {
-    /// Rounded down, and 0 rather than a panic when the total is not yet known.
-    pub const fn percent(self) -> usize {
-        if self.total == 0 {
-            return 0;
-        }
-        self.done * 100 / self.total
-    }
-}
-
 #[derive(Debug)]
 pub enum Error {
     BadRequest(String),
@@ -146,8 +123,8 @@ pub enum Reply {
     NotFoundVector,
     /// 그 키가 우리 인덱스가 아니다.
     TypeMismatch,
-    /// 인덱스가 `maxcount`만큼 찼다. 엔진이 거절한 것이다.
-    Overflowed,
+    /// 있던 vkey를 덮어썼다(`vop upsert`).
+    Replaced,
 
     Body(String),
 }
@@ -178,7 +155,7 @@ impl Reply {
             Self::NotFound => "NOT_FOUND\r\n",
             Self::NotFoundVector => "NOT_FOUND_VECTOR\r\n",
             Self::TypeMismatch => "TYPE_MISMATCH\r\n",
-            Self::Overflowed => "OVERFLOWED\r\n",
+            Self::Replaced => "REPLACED\r\n",
             Self::Body(s) => s,
         }
     }
@@ -236,21 +213,14 @@ mod tests {
     }
 
     #[test]
-    fn percent_rounds_down() {
+    fn replaced_and_not_found_vector_are_wire_lines() {
+        assert_eq!(Reply::Replaced.as_str(), "REPLACED\r\n");
+        assert_eq!(Reply::NotFoundVector.as_str(), "NOT_FOUND_VECTOR\r\n");
+        // maxcount에 닿은 것은 별도 응답이 아니라 서버 오류다.
         assert_eq!(
-            Rebuild {
-                done: 693_000,
-                total: 999_000
-            }
-            .percent(),
-            69
+            Error::Index("index is full".into()).wire(),
+            "SERVER_ERROR index is full\r\n"
         );
-        assert_eq!(Rebuild { done: 1, total: 3 }.percent(), 33);
-    }
-
-    #[test]
-    fn a_rebuild_that_has_counted_nothing_yet_does_not_divide_by_zero() {
-        assert_eq!(Rebuild { done: 0, total: 0 }.percent(), 0);
     }
 
     #[test]
@@ -262,7 +232,9 @@ mod tests {
             Reply::Deleted,
             Reply::Dropped,
             Reply::NotFound,
-            Reply::Overflowed,
+            Reply::Replaced,
+            Reply::NotFoundVector,
+            Reply::TypeMismatch,
             Reply::Body("END\r\n".into()),
         ] {
             assert!(r.as_str().ends_with("\r\n"), "{r:?}");

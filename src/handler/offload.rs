@@ -25,8 +25,8 @@
 //! 다시 기다려야 할 수 있는데, `conn_io_callback`은 그것을 지원하지 않는다.
 //!
 //! 읽기는 자유롭다. `ACTION_BEFORE_READ`는 `ENABLE_MIGRATION` 안에만 있고 그건
-//! 꺼져 있다. 그래서 검색은 통째로 풀에서 돌고, `vadd`는 워커가 쓰고 난 뒤의
-//! HNSW 삽입만 풀이 한다.
+//! 꺼져 있다. 그래서 검색은 통째로 풀에서 돌고, upsert/setmeta는 워커가 쓰고
+//! 난 뒤의 HNSW 삽입만 그 키의 레인이 한다.
 //!
 //! # 쿠키를 들고 있어도 되는 이유
 //!
@@ -40,8 +40,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 use crate::command::Request;
-use crate::command::filter::Filter;
-use crate::command::request::{Body, Line, Sim, SimKey};
+use crate::command::request::{Body, Line, SearchKey, SearchVector};
 use crate::error::{Error, Reply, Result};
 use crate::handler::access::pool::{self, Job};
 use crate::handler::arcus::{Store, StoreError};
@@ -50,42 +49,30 @@ use crate::server::{self, Responder, ResponseHandler};
 
 /// 풀이 들고 갈 수 있는 형태의 명령.
 ///
-/// `Request`를 그대로 넘길 수 없어서 있다 -- `Line::SimKey`가 토큰 버퍼를
-/// 빌려 쓰고, 그 버퍼는 `execute`가 돌아오면 다음 명령이 덮어쓴다. `Add`와
-/// `Sim`은 이미 소유 타입이라 그대로 옮겨 온다.
+/// `Request`를 그대로 넘길 수 없어서 있다 -- `Line`이 토큰 버퍼를 빌려 쓰고, 그
+/// 버퍼는 `execute`가 돌아오면 다음 명령이 덮어쓴다. 검색 요청은 이미 소유
+/// 타입이라 본문 버퍼와 함께 그대로 옮겨 온다.
 pub(crate) enum Task {
-    /// 워커가 이미 엔진에 쓴 추가. 풀은 그래프에 넣기만 한다.
-    Add(cmd::Added),
-    Sim(Sim, Vec<u8>),
-    SimKey {
-        index: String,
-        key: String,
-        k: usize,
-        filter: Option<Filter>,
-        with_attr: bool,
-    },
+    /// 워커가 이미 엔진에 쓴 upsert/setmeta. 레인은 그래프에 넣기만 한다.
+    Insert(cmd::Added),
+    SearchKey(SearchKey, Vec<u8>),
+    SearchVector(SearchVector, Vec<u8>),
 }
 
 impl Task {
     /// 풀에 넘길 만한 명령이면 소유 형태로 옮긴다.
     ///
-    /// 검색은 순회가 길고, 추가는 양자화와 본문 구성이 있다. 나머지는 상수
-    /// 시간에 가까워 넘기는 값이 오히려 비싸다.
+    /// 검색은 순회가 길다. 나머지는 상수 시간에 가까워 넘기는 값이 오히려 비싸다.
     ///
-    /// `vadd`는 여기 없다. 요소 쓰기가 먼저여야 하고 그것은 엔진 쓰기라
-    /// 워커 스레드의 일이다 -- [`Task::Add`]가 그 뒤를 잇는다.
-    // 본문 구간 크기를 든 새 요청 때문에 `Request`가 커졌다. Task 8이 이 길을 다시 짠다.
+    /// upsert와 setmeta는 여기 없다. 요소 쓰기가 먼저여야 하고 그것은 엔진 쓰기라
+    /// 워커 스레드의 일이다 -- [`Task::Insert`]가 그 뒤를 잇는다.
+    // 본문 구간 크기를 든 요청 때문에 `Request`가 커졌다.
     #[allow(clippy::result_large_err)]
     pub(crate) fn from_request(request: Request) -> std::result::Result<Self, Request> {
         match request {
-            Request::Body(Body::Sim(spec), bytes) => Ok(Task::Sim(spec, bytes)),
-            Request::Line(Line::SimKey(spec)) => Ok(Task::SimKey {
-                index: spec.index.to_owned(),
-                key: spec.key.to_owned(),
-                k: spec.k,
-                filter: spec.filter,
-                with_attr: spec.with_attr,
-            }),
+            Request::Body(Body::SearchKey(spec), bytes) => Ok(Task::SearchKey(spec, bytes)),
+            Request::Body(Body::SearchVector(spec), bytes) => Ok(Task::SearchVector(spec, bytes)),
+            Request::Line(Line::SearchKey(spec)) => Ok(Task::SearchKey(spec, Vec::new())),
             other => Err(other),
         }
     }
@@ -93,37 +80,24 @@ impl Task {
     /// 엔진을 **읽기만** 하는 부분. 풀 스레드에서 돈다.
     fn work(self, store: &Store) -> Done {
         match self {
-            // 쓰기는 워커가 이미 했다. 풀 몫은 HNSW 삽입이다.
-            Task::Add(mut added) => {
-                let inserted = cmd::vadd_insert(&mut added);
+            // 쓰기는 워커가 이미 했다. 레인 몫은 HNSW 삽입이다.
+            Task::Insert(mut added) => {
+                let inserted = cmd::upsert_insert(&mut added);
                 Done::Inserted(added, inserted)
             }
-            Task::Sim(spec, bytes) => Done::Answered(cmd::vsim_vector(store, &spec, &bytes)),
-            Task::SimKey {
-                index,
-                key,
-                k,
-                filter,
-                with_attr,
-            } => {
-                let spec = SimKey {
-                    index: &index,
-                    key: &key,
-                    k,
-                    filter,
-                    with_attr,
-                };
-                Done::Answered(cmd::vsim_key(store, &spec))
+            Task::SearchKey(spec, body) => Done::Answered(cmd::search_key(store, &spec, &body)),
+            Task::SearchVector(spec, body) => {
+                Done::Answered(cmd::search_vector(store, &spec, &body))
             }
         }
     }
 }
 
-/// 풀이 끝낸 일. 검색은 답까지, 추가는 삽입까지.
+/// 풀이 끝낸 일. 검색은 답까지, upsert/setmeta는 삽입까지.
 pub(crate) enum Done {
     /// 답이 다 됐다. 워커는 문자열만 만들면 된다.
     Answered(Result<Reply>),
-    /// 그래프에 넣었다. 콜백이 `vadd_reply`로 답한다.
+    /// 그래프에 넣었다. 콜백이 `upsert_reply`로 답한다.
     Inserted(cmd::Added, Result<()>),
 }
 
@@ -311,27 +285,54 @@ unsafe fn submit_keyed(cookie: *const c_void, work: Work, index: &str, vkey: &st
     }
 }
 
+/// 쓰기가 끝난 upsert/setmeta를 마무리한다. 그래프에 넣을 것이 있으면 그 키의
+/// 레인으로 보내고, 없으면 지금 정해진 답을 콜백에 맡긴다.
+unsafe fn after_write(
+    cookie: *const c_void,
+    index: &str,
+    vkey: &str,
+    plan: Result<cmd::UpsertPlan>,
+) {
+    match plan {
+        Err(e) => unsafe { reply(cookie, Err(e)) },
+        Ok(cmd::UpsertPlan::Answered(r)) => unsafe { reply(cookie, Ok(r)) },
+        // 그래프 작업은 같은 (index, vkey)끼리 도착 순서대로.
+        Ok(cmd::UpsertPlan::Insert(added)) => unsafe {
+            submit(cookie, Task::Insert(added), Some((index, vkey)))
+        },
+    }
+}
+
 /// `execute`가 명령 하나를 여기 맡긴다. 답은 언제나 [`wake`]가 쓴다.
 ///
-/// **워커 스레드에서 돈다** -- `vadd`의 아이템 할당이 엔진 쓰기라 반드시
-/// 여기서 일어나야 한다.
+/// **워커 스레드에서 돈다** -- 엔진 쓰기(create, upsert, setmeta, delete, drop)가
+/// 모두 여기서 일어나야 한다. 쓰기가 복제 ack를 기다리게 했어도 답은 콜백이
+/// 쓰므로 ack 뒤에 나간다.
 pub(crate) unsafe fn begin(cookie: *const c_void, request: Request) {
-    // 추가는 엔진 쓰기가 먼저다. 쓰는 동안 링크 콜백이 주소를 이 명령에게
-    // 돌려주고, 풀이 그것을 그래프에 넣은 뒤에 답한다.
-    if let Request::Body(Body::Add(spec), bytes) = &request {
-        let outcome = match unsafe { Store::for_cookie(cookie) } {
-            None => Err(Error::Store(StoreError::Unavailable)),
-            Some(store) => match cmd::vadd_write(&store, spec, bytes) {
-                Err(e) => Err(e),
-                Ok(cmd::AddPlan::Answered(reply)) => Ok(reply),
-                Ok(cmd::AddPlan::Insert(added)) => {
-                    // 그래프 작업은 같은 (index, vkey)끼리 도착 순서대로.
-                    let key = (spec.index.as_str(), spec.vkey.as_str());
-                    return unsafe { submit(cookie, Task::Add(added), Some(key)) };
-                }
-            },
-        };
-        return unsafe { reply(cookie, outcome) };
+    // upsert와 setmeta는 엔진 쓰기가 먼저다. 쓰는 동안 링크 콜백이 주소를 이
+    // 명령에게 돌려주고, 레인이 그것을 그래프에 넣은 뒤에 답한다.
+    match &request {
+        Request::Body(Body::Upsert(spec), bytes) => {
+            let plan = match unsafe { Store::for_cookie(cookie) } {
+                None => Err(Error::Store(StoreError::Unavailable)),
+                Some(store) => spec
+                    .segments
+                    .split(bytes)
+                    .and_then(|parts| cmd::upsert_write(&store, spec, parts)),
+            };
+            return unsafe { after_write(cookie, &spec.index, &spec.vkey, plan) };
+        }
+        Request::Body(Body::SetMeta(spec), bytes) => {
+            let plan = match unsafe { Store::for_cookie(cookie) } {
+                None => Err(Error::Store(StoreError::Unavailable)),
+                Some(store) => spec
+                    .segments
+                    .split(bytes)
+                    .and_then(|parts| cmd::setmeta_write(&store, spec, parts)),
+            };
+            return unsafe { after_write(cookie, &spec.index, &spec.vkey, plan) };
+        }
+        _ => {}
     }
 
     match Task::from_request(request) {
@@ -363,7 +364,7 @@ unsafe extern "C" fn wake(
         Waiting::Pool(done) => match done.recv() {
             Err(_) => Err(Error::Store(StoreError::Unavailable)),
             Ok(Done::Answered(reply)) => reply,
-            Ok(Done::Inserted(added, inserted)) => cmd::vadd_reply(added, inserted),
+            Ok(Done::Inserted(added, inserted)) => cmd::upsert_reply(added, inserted),
         },
     };
 
@@ -373,14 +374,15 @@ unsafe extern "C" fn wake(
 
 /// 풀에 못 넘겼을 때, 이 스레드(`execute`)에서 끝까지 한다.
 ///
-/// 워커 스레드이므로 읽기도 엔진 쓰기도 여기서 해도 된다 -- 넣기가 실패한
-/// `vadd`는 저장소에서도 지워 맞춘다.
+/// 검색만 여기 온다. 넣기는 키 있는 길(`submit_keyed`)이라 레인이 가득이어도
+/// 같은 `relay`를 탄다.
 pub(crate) unsafe fn run_here(task: Task, cookie: *const c_void) -> Result<Reply> {
     let store =
         unsafe { Store::for_cookie(cookie) }.ok_or(Error::Store(StoreError::Unavailable))?;
     match task.work(&store) {
         Done::Answered(reply) => reply,
-        Done::Inserted(added, inserted) => cmd::vadd_finish(&store, added, inserted),
+        // 어느 길이든 같은 하나의 동작이다: 엔진에 쓰지 않고 로그만 남긴다.
+        Done::Inserted(added, inserted) => cmd::upsert_reply(added, inserted),
     }
 }
 

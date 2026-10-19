@@ -3,7 +3,6 @@ mod parse;
 
 pub use parse::parse;
 
-use super::filter::Filter;
 use crate::Metric;
 use crate::Quant;
 use crate::error::{Error, Result};
@@ -147,51 +146,6 @@ impl Segments {
     }
 }
 
-/// 예전 `vsearch`의 출처. 파서는 더 만들지 않고 Task 8이 지운다.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SimSource {
-    Vector,
-    Key,
-}
-
-impl SimSource {
-    pub fn parse(name: &str) -> Option<Self> {
-        if name.eq_ignore_ascii_case("VECTOR") {
-            Some(Self::Vector)
-        } else if name.eq_ignore_ascii_case("KEY") {
-            Some(Self::Key)
-        } else {
-            None
-        }
-    }
-}
-
-/// 예전 `vcreate`의 요청. 파서는 더 만들지 않고 Task 8이 지운다.
-#[derive(Clone, Copy, Debug)]
-pub struct OldCreate<'a> {
-    pub index: &'a str,
-    pub dim: usize,
-    pub metric: Metric,
-    pub quant: Quant,
-    pub connectivity: usize,
-    pub expansion_add: usize,
-    pub expansion_search: usize,
-    /// How many vectors the index takes. `None` is the server's `max_map_size`.
-    pub maxcount: Option<u32>,
-    /// Seconds until the whole index expires. `None` never does.
-    pub exptime: Option<u32>,
-}
-
-/// 예전 명령의 요청. Task 8이 지운다.
-#[derive(Debug)]
-pub struct SimKey<'a> {
-    pub index: &'a str,
-    pub key: &'a str,
-    pub k: usize,
-    pub filter: Option<Filter>,
-    pub with_attr: bool,
-}
-
 /// `vop create <index> <dim> <expiretime> [<maxcount>] [metric m] [quant q] [M n] [efc c] [efs s]`
 ///
 /// `maxcount`가 `None`이면 핸들러가 기본값 4000을 쓴다.
@@ -268,8 +222,7 @@ pub struct Drop<'a> {
     pub index: &'a str,
 }
 
-/// 본문이 없는 명령. `OldCreate`부터 `Stats`까지는 예전 명령의 것으로,
-/// 파서가 더 만들지 않고 Task 8이 지운다.
+/// 본문이 없는 명령.
 #[derive(Debug)]
 pub enum Line<'a> {
     Create(Create<'a>),
@@ -278,48 +231,9 @@ pub enum Line<'a> {
     GetMeta(GetMeta<'a>),
     Delete(Delete<'a>),
     Drop(Drop<'a>),
-
-    OldCreate(OldCreate<'a>),
-    SimKey(SimKey<'a>),
-    GetAttr {
-        index: &'a str,
-        id: &'a str,
-    },
-    SetAttr {
-        index: &'a str,
-        id: &'a str,
-        attr: &'a [u8],
-    },
-    Del {
-        index: &'a str,
-        id: &'a str,
-    },
-    OldDrop {
-        index: &'a str,
-    },
-    List,
-    Stats,
 }
 
-/// 예전 `vadd`의 요청. Task 8이 지운다.
-#[derive(Debug)]
-pub struct Add {
-    pub index: String,
-    pub vkey: String,
-    pub attr: Vec<u8>,
-}
-
-/// 예전 `vsearch vector`의 요청. Task 8이 지운다.
-#[derive(Debug)]
-pub struct Sim {
-    pub index: String,
-    pub k: usize,
-    pub filter: Option<Filter>,
-    pub with_attr: bool,
-}
-
-/// 본문이 있는 명령. `Add`와 `Sim`은 예전 것으로 파서가 더 만들지 않고
-/// Task 8이 지운다.
+/// 본문이 있는 명령.
 #[derive(Debug)]
 pub enum Body {
     Upsert(Upsert),
@@ -327,20 +241,16 @@ pub enum Body {
     /// filter 본문이 있는 vkey 검색.
     SearchKey(SearchKey),
     SearchVector(SearchVector),
-
-    Add(Add),
-    Sim(Sim),
 }
 
 impl Body {
     /// `execute`가 본문을 자를 때 쓰는 구간 크기.
-    pub fn segments(&self) -> Option<Segments> {
+    pub fn segments(&self) -> Segments {
         match self {
-            Body::Upsert(b) => Some(b.segments),
-            Body::SetMeta(b) => Some(b.segments),
-            Body::SearchKey(b) => Some(b.segments),
-            Body::SearchVector(b) => Some(b.segments),
-            Body::Add(_) | Body::Sim(_) => None,
+            Body::Upsert(b) => b.segments,
+            Body::SetMeta(b) => b.segments,
+            Body::SearchKey(b) => b.segments,
+            Body::SearchVector(b) => b.segments,
         }
     }
 }

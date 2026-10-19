@@ -1,11 +1,12 @@
 mod coords;
 mod index;
+mod meta;
 mod search;
 mod vector;
 
-pub use index::{vcreate, vdrop, vlist, vstats};
-pub use search::{vsim_key, vsim_vector};
+pub use index::{create, drop_index};
+pub use meta::getmeta;
+pub use search::{search_key, search_vector};
 pub use vector::{
-    AddPlan, Added, vadd, vadd_finish, vadd_insert, vadd_reply, vadd_write, vdel, vgetattr,
-    vsetattr,
+    Added, UpsertPlan, delete, setmeta_write, upsert_insert, upsert_reply, upsert_write,
 };
