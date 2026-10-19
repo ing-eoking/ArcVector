@@ -33,6 +33,8 @@ pub struct MapProbe {
 pub fn index_attr(maxcount: u32, exptime: u32) -> item_attr {
     let mut attr: item_attr = unsafe { std::mem::zeroed() };
     attr.readable = 1;
+    // 이 플래그가 선 Map만 엔진이 요소 이벤트를 보낸다. 복제본에도 따라간다.
+    attr.event = 1;
     attr.maxcount = i32::try_from(maxcount).unwrap_or(i32::MAX);
     attr.exptime = exptime;
     attr

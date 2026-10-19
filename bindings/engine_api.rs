@@ -561,6 +561,7 @@ pub struct item_attr {
     pub ovflaction: u8,
     pub readable: u8,
     pub trimmed: u8,
+    pub event: u8,
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -575,21 +576,21 @@ pub struct auth_data_t {
     pub username: *const ::std::os::raw::c_char,
     pub config: *const ::std::os::raw::c_char,
 }
-pub const event_type_t_EVENT_LINK_ITEM: event_type_t = 0;
-pub const event_type_t_EVENT_UNLINK_ITEM: event_type_t = 1;
-pub const event_type_t_EVENT_REPLACE_ITEM: event_type_t = 2;
-pub const event_type_t_EVENT_LINK_ELEM: event_type_t = 3;
-pub const event_type_t_EVENT_UNLINK_ELEM: event_type_t = 4;
-pub const event_type_t_EVENT_REPLACE_ELEM: event_type_t = 5;
+pub const event_type_t_EVENT_ITEM_LINK: event_type_t = 0;
+pub const event_type_t_EVENT_ITEM_UNLINK: event_type_t = 1;
+pub const event_type_t_EVENT_ELEM_INSERT: event_type_t = 2;
+pub const event_type_t_EVENT_ELEM_DELETE: event_type_t = 3;
+pub const event_type_t_EVENT_ELEM_REPLACE: event_type_t = 4;
 pub type event_type_t = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct event_data_t {
     pub type_: event_type_t,
-    pub ret: *mut ENGINE_ERROR_CODE,
-    pub new_it: *mut item,
-    pub old_it: *mut item,
-    pub coll_it: *mut item,
+    pub coll_item: *mut ::std::os::raw::c_void,
+    pub target: *mut ::std::os::raw::c_void,
+    pub source: *mut ::std::os::raw::c_void,
+    pub target_ref: u16,
+    pub source_ref: u16,
 }
 pub type SERVER_HANDLE_V1 = server_handle_v1_t;
 pub const protocol_binary_magic_PROTOCOL_BINARY_REQ: protocol_binary_magic = 128;
@@ -1584,6 +1585,20 @@ unsafe extern "C" {
         error: *mut FILE,
     ) -> ::std::os::raw::c_int;
 }
+#[doc = " Callback registered by on_io_complete().\n\n @param cookie cookie representing the connection\n @param cb_data data as registered\n @param response_handler callback to add data to the return buffer\n\n @return true if succeeded, false otherwise."]
+pub type AIO_CALLBACK = ::std::option::Option<
+    unsafe extern "C" fn(
+        cookie: *const ::std::os::raw::c_void,
+        cb_data: *mut ::std::os::raw::c_void,
+        response_handler: ::std::option::Option<
+            unsafe extern "C" fn(
+                cookie: *const ::std::os::raw::c_void,
+                nbytes: ::std::os::raw::c_int,
+                dta: *const ::std::os::raw::c_char,
+            ) -> bool,
+        >,
+    ) -> bool,
+>;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct SERVER_CORE_API {
@@ -1641,6 +1656,29 @@ pub struct SERVER_CORE_API {
     pub notify_io_complete: ::std::option::Option<
         unsafe extern "C" fn(cookie: *const ::std::os::raw::c_void, status: ENGINE_ERROR_CODE),
     >,
+    #[doc = " Register a callback to run after all the IO the connection waits\n for has completed. The callback runs in conn_io_callback state,\n so the command must go to that state after it is processed.\n Only one callback can be registered at a time.\n\n @param cookie cookie representing the connection\n @param cb the callback to run on the worker thread\n @param cb_data the data passed to cb, valid until cb runs"]
+    pub on_io_complete: ::std::option::Option<
+        unsafe extern "C" fn(
+            cookie: *const ::std::os::raw::c_void,
+            cb: AIO_CALLBACK,
+            cb_data: *mut ::std::os::raw::c_void,
+        ),
+    >,
+    #[doc = " Append a waiter connection to the IO wait list of the connection\n doing IO. The waiter must wait for its own IO completion by\n waitfor_io_complete() and must be notified by notify_io_complete()\n after it is taken out by next_io_wait().\n\n @param cookie cookie representing the connection doing IO\n @param waiter cookie representing the connection to wait\n @param wait_data data returned along with the waiter by next_io_wait()"]
+    pub link_io_wait: ::std::option::Option<
+        unsafe extern "C" fn(
+            cookie: *const ::std::os::raw::c_void,
+            waiter: *const ::std::os::raw::c_void,
+            wait_data: *mut ::std::os::raw::c_void,
+        ),
+    >,
+    #[doc = " Take out the first waiter from the IO wait list of the connection.\n\n @param cookie cookie representing the connection doing IO\n @param wait_data set to the data given to link_io_wait()\n @return the waiter cookie, or NULL if no waiter remains."]
+    pub next_io_wait: ::std::option::Option<
+        unsafe extern "C" fn(
+            cookie: *const ::std::os::raw::c_void,
+            wait_data: *mut *mut ::std::os::raw::c_void,
+        ) -> *const ::std::os::raw::c_void,
+    >,
     #[doc = " Check if current cache node is started with zk integration."]
     pub is_zk_integrated: ::std::option::Option<unsafe extern "C" fn() -> bool>,
     #[doc = " Check if the given key is in the right server based on\n the cluster's key hashing policy.\n\n @param key The key to check for\n @param nkey The key's length\n\n @return true if the key is in the right server."]
@@ -1692,7 +1730,7 @@ pub const ENGINE_EVENT_TYPE_ON_AUTH: ENGINE_EVENT_TYPE = 2;
 pub const ENGINE_EVENT_TYPE_ON_SWITCH_CONN: ENGINE_EVENT_TYPE = 3;
 #[doc = "< Changed log level"]
 pub const ENGINE_EVENT_TYPE_ON_LOG_LEVEL: ENGINE_EVENT_TYPE = 4;
-#[doc = "< An event item is linking or unlinking"]
+#[doc = "< Item lifecycle event"]
 pub const ENGINE_EVENT_TYPE_ON_EVENT_ITEM: ENGINE_EVENT_TYPE = 5;
 #[doc = " Event types for callbacks to the engine indicating state\n changes in the server."]
 pub type ENGINE_EVENT_TYPE = ::std::os::raw::c_uint;
@@ -1810,7 +1848,7 @@ pub struct extension_ascii_protocol_descriptor {
             ptr: *mut *mut ::std::os::raw::c_char,
         ) -> bool,
     >,
-    #[doc = " execute the command.\n\n @param cmd_cookie cookie registered with the command\n @param cookie identifying the client connection\n @param argc the number of arguments\n @param argv the argument vector\n @param response_handler callback to add data to the return buffer\n @return true if \"success\" or false if the client should be\n              disconnected."]
+    #[doc = " execute the command.\n\n @param cmd_cookie cookie registered with the command\n @param cookie identifying the client connection\n @param argc the number of arguments\n @param argv the argument vector\n @param response_handler callback to add data to the return buffer\n @return true if \"success\" or false if the client should be\n              disconnected. Before returning false, notify all\n              the IO waited for and free cb_data, if any."]
     pub execute: ::std::option::Option<
         unsafe extern "C" fn(
             cmd_cookie: *const ::std::os::raw::c_void,
@@ -1825,18 +1863,6 @@ pub struct extension_ascii_protocol_descriptor {
                 ) -> bool,
             >,
         ) -> bool,
-    >,
-    #[doc = " Did the handler take this command away to answer later?\n\n Asked right after execute() returned true, for the same connection.\n NULL means the answer is already in the response buffer and the\n command is done -- which is what every handler did before this\n existed, so leaving this member NULL keeps the old behaviour.\n\n Anything else is the function the core calls once the handler says\n the answer is ready, by way of notify_io_complete(). Until then the\n connection waits in conn_waking, out of the event loop.\n\n @param cmd_cookie cookie registered with the command\n @param cookie identifying the client connection"]
-    pub block: ::std::option::Option<
-        unsafe extern "C" fn(
-            cmd_cookie: *const ::std::os::raw::c_void,
-            cookie: *const ::std::os::raw::c_void,
-        ) -> ::std::option::Option<
-            unsafe extern "C" fn(
-                cmd_cookie: *const ::std::os::raw::c_void,
-                cookie: *const ::std::os::raw::c_void,
-            ),
-        >,
     >,
     #[doc = " abort the command.\n\n @param cmd_cookie cookie registered with the command\n @param cookie identifying the client connection"]
     pub abort: ::std::option::Option<
@@ -2304,6 +2330,18 @@ pub struct engine_interface_v1 {
             vbucket: u16,
         ) -> ENGINE_ERROR_CODE,
     >,
+    pub map_struct_create_with_value: ::std::option::Option<
+        unsafe extern "C" fn(
+            handle: *mut ENGINE_HANDLE,
+            cookie: *const ::std::os::raw::c_void,
+            key: *const ::std::os::raw::c_void,
+            nkey: ::std::os::raw::c_int,
+            value: *const ::std::os::raw::c_void,
+            nbytes: ::std::os::raw::c_int,
+            attrp: *mut item_attr,
+            vbucket: u16,
+        ) -> ENGINE_ERROR_CODE,
+    >,
     pub map_elem_alloc: ::std::option::Option<
         unsafe extern "C" fn(
             handle: *mut ENGINE_HANDLE,
@@ -2557,7 +2595,6 @@ pub struct engine_interface_v1 {
             kcount: ::std::os::raw::c_int,
             bkrange: *const bkey_range,
             efilter: *const eflag_filter,
-            offset: u32,
             count: u32,
             unique: bool,
             result: *mut smget_result_t,

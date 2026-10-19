@@ -27,6 +27,20 @@
 extern "C" {
 #endif
 
+    /**
+     * Callback registered by on_io_complete().
+     *
+     * @param cookie cookie representing the connection
+     * @param cb_data data as registered
+     * @param response_handler callback to add data to the return buffer
+     *
+     * @return true if succeeded, false otherwise.
+     */
+    typedef bool (*AIO_CALLBACK)(const void *cookie, void *cb_data,
+                                 bool (*response_handler)(const void *cookie,
+                                                          int nbytes,
+                                                          const char *dta));
+
     typedef struct {
         /**
          * The current time.
@@ -135,6 +149,41 @@ extern "C" {
          */
         void (*notify_io_complete)(const void *cookie,
                                    ENGINE_ERROR_CODE status);
+
+        /**
+         * Register a callback to run after all the IO the connection waits
+         * for has completed. The callback runs in conn_io_callback state,
+         * so the command must go to that state after it is processed.
+         * Only one callback can be registered at a time.
+         *
+         * @param cookie cookie representing the connection
+         * @param cb the callback to run on the worker thread
+         * @param cb_data the data passed to cb, valid until cb runs
+         */
+        void (*on_io_complete)(const void *cookie, AIO_CALLBACK cb,
+                               void *cb_data);
+
+        /**
+         * Append a waiter connection to the IO wait list of the connection
+         * doing IO. The waiter must wait for its own IO completion by
+         * waitfor_io_complete() and must be notified by notify_io_complete()
+         * after it is taken out by next_io_wait().
+         *
+         * @param cookie cookie representing the connection doing IO
+         * @param waiter cookie representing the connection to wait
+         * @param wait_data data returned along with the waiter by next_io_wait()
+         */
+        void (*link_io_wait)(const void *cookie, const void *waiter,
+                             void *wait_data);
+
+        /**
+         * Take out the first waiter from the IO wait list of the connection.
+         *
+         * @param cookie cookie representing the connection doing IO
+         * @param wait_data set to the data given to link_io_wait()
+         * @return the waiter cookie, or NULL if no waiter remains.
+         */
+        const void *(*next_io_wait)(const void *cookie, void **wait_data);
 
 #ifdef NEW_PREFIX_STATS_MANAGEMENT
         /**

@@ -431,6 +431,7 @@ extern "C" {
         uint8_t  ovflaction;
         uint8_t  readable;
         uint8_t  trimmed;
+        uint8_t  event;
     } item_attr;
 
 #ifdef ENABLE_REPLICATION
@@ -473,20 +474,20 @@ extern "C" {
 
     /* Event types for item lifecycle events */
     typedef enum {
-        EVENT_LINK_ITEM,
-        EVENT_UNLINK_ITEM,
-        EVENT_REPLACE_ITEM,
-        EVENT_LINK_ELEM,
-        EVENT_UNLINK_ELEM,
-        EVENT_REPLACE_ELEM,
+        EVENT_ITEM_LINK,
+        EVENT_ITEM_UNLINK,
+        EVENT_ELEM_INSERT,
+        EVENT_ELEM_DELETE,
+        EVENT_ELEM_REPLACE,
     } event_type_t;
 
     typedef struct {
         event_type_t type;
-        ENGINE_ERROR_CODE *ret;
-        item *new_it;
-        item *old_it;
-        item *coll_it; /* the collection an element belongs to; NULL for item events */
+        void *coll_item;
+        void *target; // item or element
+        void *source; // item or element
+        uint16_t target_ref; // refcount change of target
+        uint16_t source_ref; // refcount change of source
     } event_data_t;
 
     /* Forward declaration of the server handle -- to be filled in later */

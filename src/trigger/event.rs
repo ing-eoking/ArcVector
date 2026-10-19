@@ -1,32 +1,32 @@
 //! 엔진이 인덱스 Map과 그 요소의 수명을 알려오는 콜백.
 //!
-//! 여섯 경우가 한 콜백으로 온다. `event_data_t`가 어느 경우인지와, 우리 답을
-//! 담을 자리와, 관련된 포인터를 들고 온다. 요소 이벤트는 그 요소가 속한 Map
-//! 아이템(`coll_it`)도 함께 들고 온다 -- 요소에는 자기가 어느 Map 것인지 적혀
+//! 다섯 경우가 한 콜백으로 온다. `event_data_t`가 어느 경우인지와, 관련된
+//! 포인터(`target`, `source`)와, 우리가 참조를 몇 개 가져갈지 적을 자리
+//! (`target_ref`, `source_ref`)를 들고 온다. 요소 이벤트는 그 요소가 속한 Map
+//! 아이템(`coll_item`)도 함께 들고 온다 -- 요소에는 자기가 어느 Map 것인지 적혀
 //! 있지 않아서, 그것이 어느 인덱스의 일인지 알 길이 그것뿐이다.
 //!
-//! 요소 쪽 참조 규칙은 다음과 같다.
+//! 엔진은 콜백이 돌아온 뒤 우리가 적은 수만큼 참조를 옮긴다.
 //!
-//! | | 우리가 받으면 | 우리가 거절하면 |
+//! | | 엔진이 하는 일 | 우리가 적는 값 |
 //! |---|---|---|
-//! | LINK_ELEM | `refcount++(new)` | **아무것도 안 준다** |
-//! | UNLINK_ELEM | 우리가 놓아준다 | `refcount--(old)` |
-//! | REPLACE_ELEM | `refcount++(new)` | `refcount++(new)` + `refcount--(old)` |
+//! | ELEM_INSERT | `target += target_ref` | 붙잡으면 1, 못 붙잡으면 0 |
+//! | ELEM_DELETE | `target -= target_ref` | 지금 놓을 것이면 1, 계속 들거나 안 잡던 것이면 0 |
+//! | ELEM_REPLACE | `target += target_ref`, `source -= source_ref` | new는 INSERT, old는 DELETE 규칙 |
+//! | ITEM_LINK / ITEM_UNLINK | 같은 식 | 언제나 0 -- Map 아이템의 참조는 주고받지 않는다 |
 //!
-//! Map 아이템 쪽은 참조를 주고받지 않는다. LINK_ITEM은 아무것도 주지 않고,
-//! UNLINK_ITEM에서 거절하면 엔진이 받은 적 없는 참조를 깎는다 -- 그래서 아이템
-//! 이벤트에는 언제나 받았다고 답한다.
+//! DELETE·REPLACE 뒤에 참조가 0이 된 old는 엔진이 그 자리에서 해제한다.
 //!
 //! # 지켜야 하는 하나
 //!
-//! **우리가 LINK에서 받았다고 답한 요소의 참조가, 들고 있는 것의 전부다.**
-//! 거절하면 엔진은 참조를 주지 않는다.
+//! **우리가 INSERT에서 1로 답한 요소의 참조가, 들고 있는 것의 전부다.**
+//! 0으로 답하면 엔진은 참조를 주지 않는다. REPLACE의 new도 같다.
 //!
 //! 그래서 붙잡아 둘 수 없으면 거기서 끝낸다. 요소는 저장소에 남지만 우리 것이
 //! 아니다. 들고 있지도 않은 것을 나중에 놓아주면 아직 쓰는 요소가 먼저
 //! 해제되고, 들고 있는 것을 안 놓아주면 Map이 지워져도 요소가 남는다.
 //!
-//! 그러려면 unlink에서 "이걸 내가 들고 있나"에 답할 수 있어야 한다. 장부를 따로
+//! 그러려면 delete에서 "이걸 내가 들고 있나"에 답할 수 있어야 한다. 장부를 따로
 //! 두지 않고 이미 있는 것으로 답한다:
 //!
 //! | 무엇 | 들고 있나 | 무엇을 보고 아나 |
@@ -62,37 +62,98 @@ use crate::trigger::recover;
 use crate::trigger::waiting::{self, Replaced, Unlinked};
 
 use crate::engine_api::{
-    ENGINE_ERROR_CODE, ENGINE_ERROR_CODE_ENGINE_ENOMEM, ENGINE_EVENT_TYPE,
-    ENGINE_EVENT_TYPE_ON_EVENT_ITEM, event_data_t, event_type_t, event_type_t_EVENT_LINK_ELEM,
-    event_type_t_EVENT_LINK_ITEM, event_type_t_EVENT_REPLACE_ELEM, event_type_t_EVENT_REPLACE_ITEM,
-    event_type_t_EVENT_UNLINK_ELEM, event_type_t_EVENT_UNLINK_ITEM,
+    ENGINE_EVENT_TYPE, ENGINE_EVENT_TYPE_ON_EVENT_ITEM, event_data_t, event_type_t,
+    event_type_t_EVENT_ELEM_DELETE, event_type_t_EVENT_ELEM_INSERT,
+    event_type_t_EVENT_ELEM_REPLACE, event_type_t_EVENT_ITEM_LINK, event_type_t_EVENT_ITEM_UNLINK,
 };
 
-/// 콜백이 무엇을 하기로 했는지. 디스패치를 엔진 포인터에서 떼어내 시험할 수 있게
-/// 한다.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Decision {
-    /// 받았다. 엔진은 아무것도 되돌리지 않는다.
-    Took,
-    /// 못 받았다. 엔진이 참조를 회수한다.
-    Declined,
-    /// 우리 것이 아니다. 받을 것이 없다.
+/// 빠지는(또는 교체되는) 요소 old를 어떻게 하기로 했는지.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Old {
+    /// 계속 들고 있다. 그래프에 있던 것이라 진행 중인 검색이 끝난 뒤 sweeper가,
+    /// 또는 넣던 풀이 놓는다.
+    Held,
+    /// 그래프에 들어간 적이 없다. 아무도 역참조하지 않으니 엔진이 지금 회수한다.
+    Returned,
+    /// 우리가 잡은 적이 없다. 깎을 참조가 없다.
     NotOurs,
 }
 
-/// 엔진이 알려온 여섯 경우.
+/// 콜백이 무엇을 하기로 했는지. 디스패치를 엔진 포인터에서 떼어내 시험할 수 있게
+/// 한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Decision {
+    /// 새로 들어온 요소(INSERT·REPLACE의 `target`)를 붙잡았나.
+    new: bool,
+    /// 나가는 요소(DELETE의 `target`, REPLACE의 `source`)를 어떻게 하나.
+    old: Old,
+}
+
+impl Decision {
+    /// 참조를 주고받지 않는다. 아이템 이벤트와 우리 것이 아닌 요소.
+    pub(crate) const NOTHING: Self = Self {
+        new: false,
+        old: Old::NotOurs,
+    };
+
+    pub(crate) fn insert(held: bool) -> Self {
+        Self {
+            new: held,
+            old: Old::NotOurs,
+        }
+    }
+
+    pub(crate) fn delete(old: Old) -> Self {
+        Self { new: false, old }
+    }
+
+    pub(crate) fn replace(new: bool, old: Old) -> Self {
+        Self { new, old }
+    }
+}
+
+/// 엔진에 돌려줄 참조 변화량. `target_ref`, `source_ref` 그대로다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Refs {
+    pub target: u16,
+    pub source: u16,
+}
+
+/// 결정을 엔진이 옮길 참조 수로 바꾼다. 모듈 머리의 첫 표가 이것이다.
+pub(crate) fn refs_for(event: Event, decision: Decision) -> Refs {
+    let returned = u16::from(decision.old == Old::Returned);
+    let held = u16::from(decision.new);
+    match event {
+        Event::ItemLink | Event::ItemUnlink => Refs {
+            target: 0,
+            source: 0,
+        },
+        Event::Insert => Refs {
+            target: held,
+            source: 0,
+        },
+        Event::Delete => Refs {
+            target: returned,
+            source: 0,
+        },
+        Event::Replace => Refs {
+            target: held,
+            source: returned,
+        },
+    }
+}
+
+/// 엔진이 알려온 다섯 경우.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Event {
     /// Map이 링크됐다. 아직 메타가 없으니 할 일이 없다.
-    LinkMap,
+    ItemLink,
     /// Map이 빠진다. **이것이 인덱스가 사라지는 것이다.**
-    UnlinkMap,
-    /// Map이 교체된다. 컬렉션에는 일어나지 않는다.
-    ReplaceMap,
-    /// 요소가 링크됐다. 엔진이 우리 몫으로 참조를 잡아뒀다.
-    Link,
-    /// 요소가 빠진다. 링크 때 받은 참조를 계속 들지 말지 답한다.
-    Unlink,
+    ItemUnlink,
+    /// 요소가 들어왔다. 붙잡을지 답한다.
+    Insert,
+    /// 요소가 빠진다. 들고 있던 참조를 지금 놓을지 답한다.
+    Delete,
     /// 요소가 새것으로 교체된다. 그래프를 옮기고 old를 놓아준다.
     Replace,
 }
@@ -100,24 +161,13 @@ pub(crate) enum Event {
 impl Event {
     pub(crate) fn of(ty: event_type_t) -> Option<Self> {
         match ty {
-            t if t == event_type_t_EVENT_LINK_ITEM => Some(Self::LinkMap),
-            t if t == event_type_t_EVENT_UNLINK_ITEM => Some(Self::UnlinkMap),
-            t if t == event_type_t_EVENT_REPLACE_ITEM => Some(Self::ReplaceMap),
-            t if t == event_type_t_EVENT_LINK_ELEM => Some(Self::Link),
-            t if t == event_type_t_EVENT_UNLINK_ELEM => Some(Self::Unlink),
-            t if t == event_type_t_EVENT_REPLACE_ELEM => Some(Self::Replace),
+            t if t == event_type_t_EVENT_ITEM_LINK => Some(Self::ItemLink),
+            t if t == event_type_t_EVENT_ITEM_UNLINK => Some(Self::ItemUnlink),
+            t if t == event_type_t_EVENT_ELEM_INSERT => Some(Self::Insert),
+            t if t == event_type_t_EVENT_ELEM_DELETE => Some(Self::Delete),
+            t if t == event_type_t_EVENT_ELEM_REPLACE => Some(Self::Replace),
             _ => None,
         }
-    }
-}
-
-/// 결정을 엔진의 out 파라미터에 적는다.
-///
-/// 엔진이 `ENGINE_SUCCESS`로 초기화해 두고 오므로, 받았을 때는 손대지 않는다.
-/// 우리 것이 아닐 때도 마찬가지다 -- 우리가 받은 것이 없으니 되돌릴 것도 없다.
-pub(crate) fn answer(ret: &mut ENGINE_ERROR_CODE, decision: Decision) {
-    if decision == Decision::Declined {
-        *ret = ENGINE_ERROR_CODE_ENGINE_ENOMEM;
     }
 }
 
@@ -236,16 +286,18 @@ unsafe extern "C" fn on_item_event(
     if event_data.is_null() {
         return;
     }
-    let ev = unsafe { &*(event_data as *const event_data_t) };
+    // 엔진이 자기 스택의 `ev`를 넘긴다. 콜백이 돌아온 뒤 `target_ref`와
+    // `source_ref`를 읽어 참조를 옮기므로, 우리 답은 거기 적는다.
+    let ev = unsafe { &mut *(event_data as *mut event_data_t) };
     let Some(event) = Event::of(ev.type_) else {
         return;
     };
 
     let decision = unsafe { dispatch(event, ev) };
 
-    if !ev.ret.is_null() {
-        answer(unsafe { &mut *ev.ret }, decision);
-    }
+    let refs = refs_for(event, decision);
+    ev.target_ref = refs.target;
+    ev.source_ref = refs.source;
 }
 
 /// # Safety
@@ -254,34 +306,29 @@ unsafe extern "C" fn on_item_event(
 unsafe fn dispatch(event: Event, ev: &event_data_t) -> Decision {
     let Some(store) = Store::background() else {
         // vtable이 아직 없다. 등록된 인덱스도 없으니 받을 것도 없다.
-        return Decision::NotOurs;
+        return Decision::NOTHING;
     };
 
     match event {
-        Event::LinkMap | Event::ReplaceMap => Decision::NotOurs,
-        Event::UnlinkMap => {
-            if let Some(name) = index_of(&store, ev.old_it as u64) {
+        Event::ItemLink => Decision::NOTHING,
+        Event::ItemUnlink => {
+            if let Some(name) = index_of(&store, ev.target as u64) {
                 on_drop(&name);
             }
-            // 아이템 이벤트의 거절은 받은 적 없는 참조를 깎는다. 언제나 받는다.
-            Decision::NotOurs
+            // Map 아이템의 참조는 주고받지 않는다.
+            Decision::NOTHING
         }
-        Event::Link | Event::Unlink | Event::Replace => {
-            let Some(name) = index_of(&store, ev.coll_it as u64) else {
-                // `COLL_META_FLAG_EVENT`는 키 앞머리만 보고 서므로 우리 모양이
-                // 아닌 키도 여기까지 온다. LINK는 거절해 참조를 받지 않는다.
-                // 나머지는 받은 것이 없으니 엔진의 계정 그대로 둔다 -- REPLACE가
-                // 넘겨준 new는 새는 쪽으로 틀린다.
-                return if event == Event::Link {
-                    Decision::Declined
-                } else {
-                    Decision::NotOurs
-                };
+        Event::Insert | Event::Delete | Event::Replace => {
+            let Some(name) = index_of(&store, ev.coll_item as u64) else {
+                // 이벤트 플래그는 Map마다 서므로 우리 모양이 아닌 키의 Map도
+                // 여기까지 올 수 있다. 아무것도 받지 않고, 받은 적 없는 것은
+                // 깎지 않는다.
+                return Decision::NOTHING;
             };
             match event {
-                Event::Link => on_link(&store, &name, ev.new_it as u64),
-                Event::Unlink => on_unlink(&store, &name, ev.old_it as u64),
-                _ => on_replace(&store, &name, ev.old_it as u64, ev.new_it as u64),
+                Event::Insert => Decision::insert(on_link(&store, &name, ev.target as u64)),
+                Event::Delete => Decision::delete(on_unlink(&store, &name, ev.target as u64)),
+                _ => on_replace(&store, &name, ev.source as u64, ev.target as u64),
             }
         }
     }
@@ -327,21 +374,23 @@ fn on_drop(name: &str) {
 ///
 /// 인덱스를 아직 모르면 -- 복제본에서 메타보다 벡터가 먼저 도착한 경우다 --
 /// 주소만 적어 뒀다가 메타가 올 때 복구가 넣는다.
-fn on_link(store: &Store, name: &str, addr: u64) -> Decision {
+///
+/// 붙잡았으면 `true`. 엔진은 그때만 참조를 하나 올린다.
+fn on_link(store: &Store, name: &str, addr: u64) -> bool {
     if is_meta(store, addr) {
         on_meta(store, addr, name);
-        return Decision::Took;
+        return true;
     }
 
     let Some(index) = registry::get(name) else {
         if waiting::push(name, addr) {
-            return Decision::Took;
+            return true;
         }
         eprintln!(
             "ArcVector: no room to hold '{name}' vectors until its metadata arrives; \
              this one will be missing from the graph"
         );
-        return Decision::Declined;
+        return false;
     };
     link_into(&index, addr)
 }
@@ -355,20 +404,22 @@ fn on_link(store: &Store, name: &str, addr: u64) -> Decision {
 ///   넣고 나서 답한다.
 /// * 그 밖에는 주소만 적어 두고 풀의 adopt에 맡긴다 -- 복제본이 따라잡는 동안
 ///   데몬이 서지 않게 하는 것이 요점이다.
-fn link_into(index: &Arc<VectorIndex>, addr: u64) -> Decision {
+///
+/// 붙잡았으면 `true`.
+fn link_into(index: &Arc<VectorIndex>, addr: u64) -> bool {
     if hand_to_command(index, addr, false) {
-        return Decision::Took;
+        return true;
     }
 
     if !waiting::push(&index.name, addr) {
         // 적어 둘 자리가 없다. 참조를 안 받으므로 이 요소는 우리 것이 아니고,
-        // unlink는 그래프에 노드가 없는 것을 보고 놓아주지 않는다.
+        // delete는 그래프에 노드가 없는 것을 보고 놓아주지 않는다.
         eprintln!(
             "ArcVector: no room to hold a linked '{}' vector; it stays in the \
              store, out of this index",
             index.name
         );
-        return Decision::Declined;
+        return false;
     }
 
     if !recover::submit_adopt(index) {
@@ -378,24 +429,27 @@ fn link_into(index: &Arc<VectorIndex>, addr: u64) -> Decision {
             index.name
         );
     }
-    Decision::Took
+    true
 }
 
-/// REPLACE가 우리 답과 무관하게 넘겨준 새 요소를 받아 둔다.
+/// REPLACE의 새 요소를 붙잡는다. 붙잡았으면 `true`.
 ///
-/// 붙잡아 둘 수 없으면 놓아줄 큐에 넣는다. 아직 링크된 요소를 놓아주는 것은
-/// 안전하고, 그러면 이 요소의 unlink는 "우리 것이 아니다"로 읽힌다.
-fn take_replacement(live: Option<&Arc<VectorIndex>>, name: &str, new: u64) {
+/// 엔진은 우리가 1로 답할 때만 new의 참조를 올린다. 그래서 붙잡을 수 없으면
+/// 여기서 끝낸다 -- 받은 적 없는 참조를 놓아줄 큐에 넣으면 안 된다. 그 요소는
+/// 저장소에 남지만 그래프 밖이고(stored but not indexed), 나중의 delete는
+/// "우리 것이 아니다"로 읽는다.
+fn take_replacement(live: Option<&Arc<VectorIndex>>, name: &str, new: u64) -> bool {
     match live {
-        Some(index) => {
-            if link_into(index, new) == Decision::Declined && !index.ann.retire_one(new) {
-                index.ann.halt_for_overflow();
-            }
-        }
+        Some(index) => link_into(index, new),
         None => {
-            if !waiting::push(name, new) {
-                eprintln!("ArcVector: no room to hold a replaced '{name}' vector; it is dropped");
+            if waiting::push(name, new) {
+                return true;
             }
+            eprintln!(
+                "ArcVector: no room to hold a replaced '{name}' vector; it stays in the \
+                 store, out of this index"
+            );
+            false
         }
     }
 }
@@ -464,7 +518,7 @@ fn build(store: &Store, addr: u64, name: &str) -> Option<VectorIndex> {
 /// 요소가 빠진다. 우리가 들고 있는 것이면 놓아준다.
 ///
 /// 무엇을 들고 있는지는 이 모듈 머리의 표가 답한다.
-fn on_unlink(store: &Store, name: &str, addr: u64) -> Decision {
+fn on_unlink(store: &Store, name: &str, addr: u64) -> Old {
     if is_meta(store, addr) {
         // 메타는 언제나 받았다. 그래프에 노드가 없으니 아무도 이 주소를
         // 역참조하지 않는다 -- 엔진이 그 자리에서 회수해도 된다.
@@ -472,30 +526,32 @@ fn on_unlink(store: &Store, name: &str, addr: u64) -> Decision {
         // 레지스트리는 건드리지 않는다. 메타 요소는 Map이 지워진 **뒤에**
         // 컬렉션 삭제 스레드가 지우는데, 그 사이 같은 이름으로 새 인덱스가
         // 생겼을 수 있다. 인덱스를 내리는 것은 Map의 unlink다.
-        return Decision::Declined;
+        return Old::Returned;
     }
 
     match waiting::unlink(name, addr) {
-        // 그래프에 들어간 적은 없지만 참조는 우리 것이다. 거절하면 엔진이 회수한다.
-        Unlinked::NeverLinked => return Decision::Declined,
-        // 풀이 넣는 중이다. 받아두면 그쪽이 노드를 빼고 참조를 돌려준다.
-        Unlinked::Recovering => return Decision::Took,
+        // 그래프에 들어간 적은 없지만 참조는 우리 것이다. 엔진이 지금 회수한다.
+        Unlinked::NeverLinked => return Old::Returned,
+        // 풀이 넣는 중이다. 들고 있으면 그쪽이 노드를 빼고 참조를 돌려준다.
+        Unlinked::Recovering => return Old::Held,
         Unlinked::NotWaiting => {}
     }
 
     let Some(index) = registry::holding(name, addr) else {
         // 어느 그래프도 이 주소를 갖고 있지 않다. 링크 때 거절했다는 뜻이라
         // 놓아줄 참조가 없다 -- 없는 것을 큐에 넣으면 안 받은 참조를 놓는다.
-        return Decision::NotOurs;
+        return Old::NotOurs;
     };
 
     index.ann.unlink_at(addr);
     if index.ann.retire_one(addr) {
-        return Decision::Took;
+        return Old::Held;
     }
 
+    // 놓아줄 큐가 찼다. 잠그는 것이 도는 역참조를 기다려 주므로 엔진이 그
+    // 자리에서 회수해도 된다.
     index.ann.halt_for_overflow();
-    Decision::Declined
+    Old::Returned
 }
 
 /// 두 요소가 같은 벡터를 담고 있나. attr만 바꾼 쓰기를 가려낸다.
@@ -516,15 +572,13 @@ fn same_vector(store: &Store, index: &VectorIndex, old: u64, new: u64) -> bool {
 
 /// 요소가 새것으로 교체된다.
 ///
-/// REPLACE에서 거절은 "new를 못 받았다"가 아니라 **"old의 참조를 도로 가져가라"**
-/// 하나뿐이다 -- 엔진은 `ret`과 무관하게 `refcount++(new)`를 하고, `ret`이
-/// 실패일 때만 `refcount--(old)`를 한다. 그래서 new는 어느 길로든 받아 둔다.
+/// 두 답이 따로다. new는 INSERT처럼 붙잡았는지(`target_ref`), old는 DELETE처럼
+/// 지금 놓을지(`source_ref`). 엔진은 new를 우리가 답한 만큼만 올린다.
 fn on_replace(store: &Store, name: &str, old: u64, new: u64) -> Decision {
     if is_meta(store, old) {
-        // 메타는 언제나 받았으니 old를 돌려준다. new는 엔진이 넘겨줬고, 메타의
-        // 링크처럼 받아 둔다.
+        // 메타는 언제나 받았으니 old를 돌려준다. new도 메타의 링크처럼 받아 둔다.
         on_meta(store, new, name);
-        return Decision::Declined;
+        return Decision::replace(true, Old::Returned);
     }
 
     let live = registry::get(name);
@@ -535,39 +589,40 @@ fn on_replace(store: &Store, name: &str, old: u64, new: u64) -> Decision {
         Replaced::Swapped => {
             // new가 old의 자리에 들어갔다. 이 스레드의 명령이 쓴 것이면 그 명령
             // 몫으로 돌리고, 아니면 adopt에 맡긴다. old는 그래프에 없으니
-            // 거절해서 엔진이 회수하게 한다.
+            // 엔진이 지금 회수한다.
             if let Some(index) = &live
                 && !hand_to_command(index, new, true)
             {
                 recover::submit_adopt(index);
             }
-            return Decision::Declined;
+            return Decision::replace(true, Old::Returned);
         }
         // 풀이 old를 넣는 중이다. 그쪽이 빼고 돌려주고, new는 따로 잡아둔다.
         Replaced::Recovering => {
-            take_replacement(live.as_ref(), name, new);
-            return Decision::Took;
+            let held = take_replacement(live.as_ref(), name, new);
+            return Decision::replace(held, Old::Held);
         }
         Replaced::NotWaiting => {}
     }
 
     let Some(holder) = registry::holding(name, old) else {
         // old는 링크 때 거절한 것이라 돌려줄 참조가 없다. new만 받아 둔다.
-        take_replacement(live.as_ref(), name, new);
-        return Decision::NotOurs;
+        let held = take_replacement(live.as_ref(), name, new);
+        return Decision::replace(held, Old::NotOurs);
     };
     let in_live = live.as_ref().is_some_and(|live| Arc::ptr_eq(live, &holder));
 
     // attr만 바뀌었다(`vsetattr`). 노드를 새 주소로 옮기면 끝이다 -- 다시 넣을
     // 이유가 없고, 그래프가 한순간도 이 벡터를 놓치지 않는다.
+    // 노드가 new를 가리키게 됐으니 new는 붙잡은 것이다.
     if in_live && same_vector(store, &holder, old, new) && holder.ann.rename_node(old, new) {
         if holder.ann.retire_one(old) {
-            return Decision::Took;
+            return Decision::replace(true, Old::Held);
         }
         // old는 이미 그래프에 없다. 잠그는 것이 도는 역참조를 기다려 주므로
         // 엔진이 그 자리에서 회수해도 된다.
         holder.ann.halt_for_overflow();
-        return Decision::Declined;
+        return Decision::replace(true, Old::Returned);
     }
 
     // 벡터가 바뀌었거나 old가 버려지는 중인 그래프에 있다. old를 빼고 new를
@@ -578,61 +633,103 @@ fn on_replace(store: &Store, name: &str, old: u64, new: u64) -> Decision {
     if !gave_back {
         holder.ann.halt_for_overflow();
     }
-    take_replacement(live.as_ref(), name, new);
-    if gave_back {
-        Decision::Took
-    } else {
-        Decision::Declined
-    }
+    let held = take_replacement(live.as_ref(), name, new);
+    let old = if gave_back { Old::Held } else { Old::Returned };
+    Decision::replace(held, old)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_decision_to_decline_is_written_into_the_out_parameter() {
-        let mut ret: ENGINE_ERROR_CODE = 0;
-        answer(&mut ret, Decision::Declined);
-        assert_eq!(ret, ENGINE_ERROR_CODE_ENGINE_ENOMEM);
+    fn refs(target: u16, source: u16) -> Refs {
+        Refs { target, source }
     }
 
     #[test]
-    fn taking_leaves_the_out_parameter_alone() {
-        // 엔진이 SUCCESS로 초기화해 두고 온다. 받았으면 건드릴 이유가 없다.
-        let mut ret: ENGINE_ERROR_CODE = 0;
-        answer(&mut ret, Decision::Took);
-        assert_eq!(ret, 0);
+    fn insert_takes_one_when_held_and_none_when_declined() {
+        assert_eq!(refs_for(Event::Insert, Decision::insert(true)), refs(1, 0));
+        // 못 붙잡았으면 참조를 받지 않는다. 나중에 놓아줄 것도 없다.
+        assert_eq!(refs_for(Event::Insert, Decision::insert(false)), refs(0, 0));
     }
 
     #[test]
-    fn a_key_that_is_not_ours_is_left_alone() {
-        let mut ret: ENGINE_ERROR_CODE = 0;
-        answer(&mut ret, Decision::NotOurs);
-        assert_eq!(ret, 0, "우리 것이 아니면 엔진의 계정을 건드리지 않는다");
+    fn delete_returns_now_only_what_never_reached_the_graph() {
+        // 그래프에 있던 것: 들고 있다가 배리어 뒤에 sweeper가 놓는다.
+        assert_eq!(
+            refs_for(Event::Delete, Decision::delete(Old::Held)),
+            refs(0, 0)
+        );
+        // `waiting`에서 지운 것: 아무도 역참조하지 않으니 엔진이 지금 회수한다.
+        assert_eq!(
+            refs_for(Event::Delete, Decision::delete(Old::Returned)),
+            refs(1, 0)
+        );
+        // 안 잡던 것: 받은 적 없는 참조를 깎으면 안 된다.
+        assert_eq!(
+            refs_for(Event::Delete, Decision::delete(Old::NotOurs)),
+            refs(0, 0)
+        );
     }
 
     #[test]
-    fn the_six_event_types_are_told_apart() {
+    fn replace_takes_new_and_keeps_old_for_the_sweeper() {
         assert_eq!(
-            Event::of(event_type_t_EVENT_LINK_ITEM),
-            Some(Event::LinkMap)
+            refs_for(Event::Replace, Decision::replace(true, Old::Held)),
+            refs(1, 0)
         );
         assert_eq!(
-            Event::of(event_type_t_EVENT_UNLINK_ITEM),
-            Some(Event::UnlinkMap)
+            refs_for(Event::Replace, Decision::replace(true, Old::Returned)),
+            refs(1, 1)
         );
         assert_eq!(
-            Event::of(event_type_t_EVENT_REPLACE_ITEM),
-            Some(Event::ReplaceMap)
+            refs_for(Event::Replace, Decision::replace(true, Old::NotOurs)),
+            refs(1, 0)
         );
-        assert_eq!(Event::of(event_type_t_EVENT_LINK_ELEM), Some(Event::Link));
+        // new를 못 잡았으면 엔진이 new를 올리지 않는다. old는 따로 정한다.
         assert_eq!(
-            Event::of(event_type_t_EVENT_UNLINK_ELEM),
-            Some(Event::Unlink)
+            refs_for(Event::Replace, Decision::replace(false, Old::Held)).target,
+            0
         );
         assert_eq!(
-            Event::of(event_type_t_EVENT_REPLACE_ELEM),
+            refs_for(Event::Replace, Decision::replace(false, Old::Returned)),
+            refs(0, 1)
+        );
+    }
+
+    #[test]
+    fn item_events_never_move_references() {
+        for event in [Event::ItemLink, Event::ItemUnlink] {
+            for decision in [
+                Decision::NOTHING,
+                Decision::insert(true),
+                Decision::replace(true, Old::Returned),
+            ] {
+                assert_eq!(refs_for(event, decision), refs(0, 0), "{event:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_five_event_types_are_told_apart() {
+        assert_eq!(
+            Event::of(event_type_t_EVENT_ITEM_LINK),
+            Some(Event::ItemLink)
+        );
+        assert_eq!(
+            Event::of(event_type_t_EVENT_ITEM_UNLINK),
+            Some(Event::ItemUnlink)
+        );
+        assert_eq!(
+            Event::of(event_type_t_EVENT_ELEM_INSERT),
+            Some(Event::Insert)
+        );
+        assert_eq!(
+            Event::of(event_type_t_EVENT_ELEM_DELETE),
+            Some(Event::Delete)
+        );
+        assert_eq!(
+            Event::of(event_type_t_EVENT_ELEM_REPLACE),
             Some(Event::Replace)
         );
         assert_eq!(Event::of(9999), None, "모르는 값은 무시한다");

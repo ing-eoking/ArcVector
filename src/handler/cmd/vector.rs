@@ -131,6 +131,24 @@ pub fn vadd_finish(store: &Store, added: Added, inserted: Result<()>) -> Result<
     }
 }
 
+/// 넣기의 결과로 답만 한다. **엔진에 쓰지 않는다.**
+///
+/// `on_io_complete` 콜백에서 쓰인다. 거기서는 엔진 쓰기를 할 수 없어
+/// [`vadd_finish`]처럼 지워 맞추지 못한다 -- 그래프가 받지 못한 요소는 저장소에
+/// 남고(stored but not indexed), 그것을 로그로 남긴다.
+pub fn vadd_reply(added: Added, inserted: Result<()>) -> Result<Reply> {
+    match inserted {
+        Ok(()) => Ok(Reply::Stored),
+        Err(e) => {
+            eprintln!(
+                "ArcVector: '{}' in '{}' is stored but not indexed: {e}",
+                added.id, added.name
+            );
+            Err(e)
+        }
+    }
+}
+
 /// 세 단계를 한 스레드에서 이어 한다.
 ///
 /// 풀에 못 넘겼을 때 쓰인다. 워커 스레드이므로 엔진 쓰기도 여기서 해도 된다.

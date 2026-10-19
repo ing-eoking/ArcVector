@@ -13,12 +13,12 @@ extern "C" {
      * changes in the server.
      */
     typedef enum {
-        ON_CONNECT        = 0,  /**< A new connection was established. */
-        ON_DISCONNECT     = 1,  /**< A connection was terminated. */
-        ON_AUTH           = 2,  /**< A connection was authenticated. */
-        ON_SWITCH_CONN    = 3,  /**< Processing a different connection on this thread. */
-        ON_LOG_LEVEL      = 4,  /**< Changed log level */
-        ON_EVENT_ITEM     = 5,  /**< An event item is linking or unlinking */
+        ON_CONNECT     = 0,     /**< A new connection was established. */
+        ON_DISCONNECT  = 1,     /**< A connection was terminated. */
+        ON_AUTH        = 2,     /**< A connection was authenticated. */
+        ON_SWITCH_CONN = 3,     /**< Processing a different connection on this thread. */
+        ON_LOG_LEVEL   = 4,     /**< Changed log level */
+        ON_EVENT_ITEM  = 5      /**< Item lifecycle event */
     } ENGINE_EVENT_TYPE;
 
     #define MAX_ENGINE_EVENT_TYPE 6

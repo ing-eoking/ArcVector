@@ -26,12 +26,6 @@ fn core() -> *const SERVER_CORE_API {
     unsafe { (*server).core }
 }
 
-/// Tells the core this connection has one more answer outstanding.
-///
-/// **Called before the work is handed to the pool, never after.** The core
-/// only takes a connection out of the event loop when this count is above
-/// zero, so a pool thread that finished first would otherwise leave the
-/// connection parked with nothing left to wake it.
 /// 클라이언트가 말한 만료 시각을 서버의 시계로 옮긴다.
 ///
 /// 프로토콜의 `exptime`은 "몇 초 뒤"(작은 값)이거나 유닉스 시각(큰 값)이고,
@@ -52,6 +46,12 @@ pub fn realtime(exptime: u32) -> rel_time_t {
     }
 }
 
+/// Tells the core this connection has one more answer outstanding.
+///
+/// **Called before the work is handed to the pool, never after.** The core
+/// only takes a connection out of the event loop when this count is above
+/// zero, so a pool thread that finished first would otherwise leave the
+/// connection parked with nothing left to wake it.
 pub unsafe fn waitfor_io_complete(cookie: *const c_void) {
     let core = core();
     if core.is_null() {
@@ -64,10 +64,12 @@ pub unsafe fn waitfor_io_complete(cookie: *const c_void) {
 
 /// One outstanding answer is ready.
 ///
-/// The core puts the connection back on its thread's pending list and drives
-/// the state machine from `conn_waking`, which is where our callback runs.
-/// Safe to call on a connection that has gone away: the core checks for that
-/// under the thread lock.
+/// The count is per connection (`MULTI_NOTIFY_IO_COMPLETE`): only when every
+/// wait has been notified does the core put the connection back on its
+/// thread's pending list and run the callback registered by
+/// [`on_io_complete`], from `conn_io_callback`. Calling it before the
+/// connection has actually parked just takes one off the count, which is also
+/// how a wait that turned out not to be needed is withdrawn.
 pub unsafe fn notify_io_complete(cookie: *const c_void, status: ENGINE_ERROR_CODE) {
     let core = core();
     if core.is_null() {
@@ -76,6 +78,59 @@ pub unsafe fn notify_io_complete(cookie: *const c_void, status: ENGINE_ERROR_COD
     if let Some(notify) = unsafe { (*core).notify_io_complete } {
         unsafe { notify(cookie, status) };
     }
+}
+
+/// [`on_io_complete`]가 받는 콜백. 바인딩의 `AIO_CALLBACK`과 같은 모양이다.
+///
+/// 워커 스레드에서, 이 연결이 기다리던 IO가 모두 끝난 뒤 `conn_io_callback`이
+/// 부른다. `false`를 돌려주면 코어가 연결을 닫는다.
+pub type IoCallback = unsafe extern "C" fn(*const c_void, *mut c_void, ResponseHandler) -> bool;
+
+/// 이 명령의 답을 쓸 콜백을 건다. 명령 하나에 한 번만 -- 코어가
+/// `aiocb == NULL`을 assert한다.
+///
+/// `execute`가 `true`로 돌아오면 코어가 연결을 `conn_io_callback`으로 보낸다.
+/// 기다리는 IO가 있으면(`waitfor_io_complete`) 그것이 모두 notify된 뒤에, 없으면
+/// 곧바로 `cb(cookie, data, response_handler)`를 부른다. `data`는 그때까지
+/// 살아 있어야 하고, 거두는 것은 `cb`의 몫이다.
+pub unsafe fn on_io_complete(cookie: *const c_void, cb: IoCallback, data: *mut c_void) {
+    let core = core();
+    if core.is_null() {
+        return;
+    }
+    if let Some(register) = unsafe { (*core).on_io_complete } {
+        unsafe { register(cookie, Some(cb), data) };
+    }
+}
+
+/// `waiter`를 `owner`의 IO 대기 줄 끝에 잇는다.
+///
+/// `waiter`는 이미 `waitfor_io_complete`를 해 둔 상태여야 하고, 나중에
+/// [`next_io_wait`]로 꺼낸 쪽이 `notify_io_complete`로 깨워야 한다.
+pub unsafe fn link_io_wait(owner: *const c_void, waiter: *const c_void, data: *mut c_void) {
+    let core = core();
+    if core.is_null() {
+        return;
+    }
+    if let Some(link) = unsafe { (*core).link_io_wait } {
+        unsafe { link(owner, waiter, data) };
+    }
+}
+
+/// `owner`의 IO 대기 줄에서 맨 앞 커넥션과 그것을 이을 때 준 `data`를 꺼낸다.
+/// 줄이 비었으면 `None`.
+pub unsafe fn next_io_wait(owner: *const c_void) -> Option<(*const c_void, *mut c_void)> {
+    let core = core();
+    if core.is_null() {
+        return None;
+    }
+    let next = unsafe { (*core).next_io_wait }?;
+    let mut data = std::ptr::null_mut();
+    let waiter = unsafe { next(owner, &mut data) };
+    if waiter.is_null() {
+        return None;
+    }
+    Some((waiter, data))
 }
 
 pub unsafe fn store_conn_state(cookie: *const c_void, data: *mut c_void) -> bool {
@@ -92,21 +147,6 @@ pub unsafe fn store_conn_state(cookie: *const c_void, data: *mut c_void) -> bool
             }
             None => false,
         }
-    }
-}
-
-/// 연결에 매달린 것을 **지우지 않고** 본다.
-///
-/// `block` 훅이 "이 연결이 답을 기다리는 중인가"를 묻는 자리라 필요하다 --
-/// 가져가 버리면 뒤이어 깨어날 콜백이 답할 것을 잃는다.
-pub unsafe fn peek_conn_state(cookie: *const c_void) -> *mut c_void {
-    let core = core();
-    if core.is_null() {
-        return std::ptr::null_mut();
-    }
-    match unsafe { (*core).get_engine_specific } {
-        Some(get) => unsafe { get(cookie) },
-        None => std::ptr::null_mut(),
     }
 }
 
