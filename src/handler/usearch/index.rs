@@ -1286,6 +1286,28 @@ mod tests {
         assert_eq!(failures.load(Ordering::SeqCst), 0);
     }
 
+    /// 허용 범위의 끝(`element::M_RANGE`/`EF_RANGE`)에서 usearch가 지어지고 넣고
+    /// 찾는다. 범위 밖(M=u32::MAX)은 지을 때 메모리를 다 써 프로세스가 죽는 것을
+    /// 확인했으므로 시험하지 않는다 -- 그래서 범위를 건다.
+    #[test]
+    fn usearch_builds_at_the_largest_allowed_hnsw_parameters() {
+        use crate::handler::arcus::element::{EF_RANGE, M_RANGE};
+        let options = ::usearch::IndexOptions {
+            dimensions: 8,
+            metric: Metric::Cos.kind(),
+            quantization: ScalarKind::F32,
+            connectivity: *M_RANGE.end(),
+            expansion_add: *EF_RANGE.end(),
+            expansion_search: *EF_RANGE.end(),
+            multi: false,
+        };
+        let index = Index::new(&options).unwrap();
+        index.reserve(16).unwrap();
+        index.add(1, &[1.0; 8]).unwrap();
+        index.add(2, &[2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]).unwrap();
+        assert_eq!(index.search(&[1.0; 8], 2).unwrap().keys.len(), 2);
+    }
+
     #[test]
     #[ignore]
     fn scaling_probe_raw_usearch() {

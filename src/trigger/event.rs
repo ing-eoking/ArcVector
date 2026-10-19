@@ -59,7 +59,7 @@ use std::cell::RefCell;
 use std::os::raw::c_void;
 use std::sync::Arc;
 
-use crate::handler::arcus::element::IndexConfig;
+use crate::handler::arcus::element::{CodecError, IndexConfig};
 use crate::handler::arcus::engine::{MapElements, Store};
 use crate::handler::registry::{self, VectorIndex};
 use crate::handler::usearch::AnnIndex;
@@ -471,7 +471,15 @@ fn on_create(store: &Store, map: u64) {
 /// `AnnIndex::new`가 usearch의 그래프를 잡으므로 cache lock 아래에서 도는
 /// 할당이다. 인덱스 하나당 한 번뿐이라 감수한다.
 fn build_from_value(name: String, value: &[u8]) -> Option<VectorIndex> {
-    let config = IndexConfig::decode(value).ok()?;
+    let config = match IndexConfig::decode(value) {
+        Ok(config) => config,
+        // 범위를 벗어난 값은 우리 설정이 망가진 것이다. 조용히 넘기지 않고 알린다.
+        Err(e @ CodecError::OutOfRange(_)) => {
+            eprintln!("ArcVector: not building the graph for '{name}': {e}");
+            return None;
+        }
+        Err(_) => return None,
+    };
     match AnnIndex::new(
         config.layout(),
         config.metric,
@@ -719,6 +727,31 @@ mod tests {
             !index.is_rebuilding(),
             "Map이 요소보다 먼저 링크되므로 기다릴 것이 없다 -- 곧장 서빙한다"
         );
+    }
+
+    #[test]
+    fn a_replicated_config_out_of_bounds_builds_no_index() {
+        use crate::handler::quant::Quant;
+        use crate::handler::usearch::Metric;
+
+        // 복제/복구로 들어온 값은 `create`의 검사를 거치지 않았다.
+        for (dim, m, efc, efs) in [
+            (4, u32::MAX as usize, 128, 64),
+            (4, 16, u32::MAX as usize, 64),
+            (4, 16, 128, u32::MAX as usize),
+            (0, 16, 128, 64),
+            (70000, 16, 128, 64),
+        ] {
+            let config = IndexConfig {
+                dim,
+                metric: Metric::L2,
+                quant: Quant::F32,
+                m,
+                efc,
+                efs,
+            };
+            assert!(build_from_value("bad".to_owned(), &config.encode()).is_none());
+        }
     }
 
     #[test]

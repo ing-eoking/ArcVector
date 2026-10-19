@@ -1,6 +1,7 @@
 use super::layout;
 use super::*;
 use crate::command::tokens::Tokens;
+use crate::handler::arcus::element::{EF_RANGE, M_RANGE};
 
 fn malformed() -> Error {
     Error::bad_request("bad command line format")
@@ -110,6 +111,22 @@ fn parse_create<'a>(tokens: &Tokens<'a>) -> Result<Create<'a>> {
                     other.to_ascii_lowercase()
                 )));
             }
+        }
+    }
+
+    // HNSW 값의 상한은 `element::M_RANGE`/`EF_RANGE` 참고 -- 복제본과 복구도
+    // 같은 범위로 거른다.
+    for (what, n, range) in [
+        ("M", create.m, &M_RANGE),
+        ("efc", create.efc, &EF_RANGE),
+        ("efs", create.efs, &EF_RANGE),
+    ] {
+        if !range.contains(&n) {
+            return Err(Error::bad_request(format!(
+                "{what} out of range ({}..={})",
+                range.start(),
+                range.end()
+            )));
         }
     }
 
@@ -455,6 +472,27 @@ mod tests {
         assert!(err("vop create docs 8 0 0").contains("maxcount"));
         assert!(err("vop create docs 8 0 nope 1").contains("unknown option"));
         assert!(err("vop create docs 8 0 100 efs").contains("needs a value"));
+    }
+
+    #[test]
+    fn create_bounds_the_hnsw_parameters() {
+        for line in [
+            "vop create d 8 0 M 1",
+            "vop create d 8 0 M 0",
+            "vop create d 8 0 M 1025",
+            "vop create d 8 0 M 4294967295",
+            "vop create d 8 0 efc 0",
+            "vop create d 8 0 efc 65537",
+            "vop create d 8 0 efs 0",
+            "vop create d 8 0 efs 99999999999",
+        ] {
+            let e = err(line);
+            assert!(e.contains("out of range"), "{line}: {e}");
+        }
+        let c = create_of("vop create d 8 0 M 2 efc 1 efs 1");
+        assert_eq!((c.m, c.efc, c.efs), (2, 1, 1));
+        let c = create_of("vop create d 8 0 M 1024 efc 65536 efs 65536");
+        assert_eq!((c.m, c.efc, c.efs), (1024, 65536, 65536));
     }
 
     #[test]

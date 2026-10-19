@@ -8,6 +8,8 @@ const EMPTY_META_BYTES: usize = bson::EMPTY.len();
 #[derive(Debug, PartialEq, Eq)]
 pub enum CodecError {
     BadMetadata(String),
+    /// 설정 문서는 읽혔으나 값이 허용 범위 밖이다(복제/복구로 들어온 값).
+    OutOfRange(String),
     UnknownQuant(u8),
     Truncated { need: usize, got: usize },
     LayoutMismatch,
@@ -20,6 +22,7 @@ impl std::fmt::Display for CodecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BadMetadata(m) => write!(f, "index metadata is unusable: {m}"),
+            Self::OutOfRange(m) => write!(f, "index config out of range: {m}"),
             Self::UnknownQuant(q) => write!(f, "unknown quantization {q}"),
             Self::Truncated { need, got } => {
                 write!(f, "element truncated (need {need} bytes, got {got})")
@@ -154,6 +157,15 @@ pub struct IndexConfig {
     pub efs: usize,
 }
 
+/// HNSW 설정의 허용 범위. usearch는 M을 거의 그대로 노드마다의 이웃 배열 크기로
+/// 쓴다 -- 시험에서 M=u32::MAX는 인덱스를 만드는 자리에서 메모리를 다 쓰고
+/// 프로세스가 죽었다. 값이 cache lock 아래 `ITEM_LINK` 콜백에서 인덱스를 지을 때
+/// 쓰이므로, `create`와 설정 복원(복제/복구) 둘 다 이 범위로 거른다.
+/// M은 2..=1024, efc/efs는 1..=65536, dim은 1..=65535.
+pub const M_RANGE: std::ops::RangeInclusive<usize> = 2..=1024;
+pub const EF_RANGE: std::ops::RangeInclusive<usize> = 1..=65536;
+pub const DIM_RANGE: std::ops::RangeInclusive<usize> = 1..=65535;
+
 /// 설정 문서의 형식 버전.
 const CONFIG_VERSION: usize = 1;
 
@@ -212,14 +224,30 @@ impl IndexConfig {
             Metric::parse(metric).ok_or_else(|| bad(format!("unknown metric '{metric}'")))?;
         let quant = text("quant")?;
         let quant = Quant::parse(quant).ok_or_else(|| bad(format!("unknown quant '{quant}'")))?;
-        Ok(Self {
+        let config = Self {
             dim: num("dim")?,
             metric,
             quant,
             m: num("M")?,
             efc: num("efc")?,
             efs: num("efs")?,
-        })
+        };
+        let check = |name: &str, n: usize, range: &std::ops::RangeInclusive<usize>| {
+            if range.contains(&n) {
+                Ok(())
+            } else {
+                Err(CodecError::OutOfRange(format!(
+                    "{name} {n} not in {}..={}",
+                    range.start(),
+                    range.end()
+                )))
+            }
+        };
+        check("dim", config.dim, &DIM_RANGE)?;
+        check("M", config.m, &M_RANGE)?;
+        check("efc", config.efc, &EF_RANGE)?;
+        check("efs", config.efs, &EF_RANGE)?;
+        Ok(config)
     }
 }
 
@@ -435,17 +463,63 @@ mod tests {
         }
     }
 
+    fn sample() -> IndexConfig {
+        IndexConfig {
+            dim: 4,
+            metric: Metric::L2,
+            quant: Quant::F32,
+            m: 16,
+            efc: 128,
+            efs: 64,
+        }
+    }
+
     #[test]
-    fn config_round_trips_at_the_widest_values() {
+    fn config_round_trips_at_the_widest_allowed_values() {
         let config = IndexConfig {
-            dim: u32::MAX as usize,
-            metric: Metric::Tanimoto,
-            quant: Quant::B1,
-            m: u32::MAX as usize,
-            efc: u32::MAX as usize,
-            efs: u32::MAX as usize,
+            dim: *DIM_RANGE.end(),
+            m: *M_RANGE.end(),
+            efc: *EF_RANGE.end(),
+            efs: *EF_RANGE.end(),
+            ..sample()
         };
         assert_eq!(IndexConfig::decode(&config.encode()).unwrap(), config);
+        let config = IndexConfig {
+            dim: *DIM_RANGE.start(),
+            m: *M_RANGE.start(),
+            efc: *EF_RANGE.start(),
+            efs: *EF_RANGE.start(),
+            ..sample()
+        };
+        assert_eq!(IndexConfig::decode(&config.encode()).unwrap(), config);
+    }
+
+    #[test]
+    fn config_outside_the_bounds_is_refused_on_decode() {
+        let max = u32::MAX as usize;
+        for bad in [
+            IndexConfig { dim: 0, ..sample() },
+            IndexConfig { dim: 65536, ..sample() },
+            IndexConfig { dim: max, ..sample() },
+            IndexConfig { m: 0, ..sample() },
+            IndexConfig { m: 1, ..sample() },
+            IndexConfig { m: 1025, ..sample() },
+            IndexConfig { m: max, ..sample() },
+            IndexConfig { efc: 0, ..sample() },
+            IndexConfig { efc: 65537, ..sample() },
+            IndexConfig { efc: max, ..sample() },
+            IndexConfig { efs: 0, ..sample() },
+            IndexConfig { efs: 65537, ..sample() },
+            IndexConfig { efs: max, ..sample() },
+        ] {
+            assert!(
+                matches!(
+                    IndexConfig::decode(&bad.encode()),
+                    Err(CodecError::OutOfRange(_))
+                ),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
