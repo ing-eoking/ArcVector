@@ -89,7 +89,7 @@ vop create <index> <dim> <expiretime> [<maxcount>] [metric m] [quant q] [M n] [e
 | `maxcount` | 4000 | max vectors; above the server's `max_map_size` is `CLIENT_ERROR` |
 | `metric` | `cos` | `cos`, `l2`, `ip`, `hamming`, `tanimoto` |
 | `quant` | `f32` | `f32`, `f16`, `i8`, `b1` |
-| `M` / `efc` / `efs` | 16 / 128 / 64 | HNSW connectivity / expansion on insert / on search |
+| `M` / `efc` / `efs` | 16 / 128 / 64 | HNSW connectivity / expansion on insert / on search (M 2-1024, efc and efs 1-65536) |
 
 `<expiretime>` follows the memcached rule (0 = never, small = seconds, large = unix
 time) and expires the whole index with its vectors.
@@ -205,10 +205,11 @@ on first use.
 
 ### Write durability
 
-Writes go through the EE asynchronous-reply path: the reply to `upsert`, `setmeta`,
-`delete` and `drop` is held until both the graph work and, on a sync-replication
-master, the replica's acknowledgement are done. A write is therefore not
-acknowledged to the client ahead of the replica.
+Writes go through the EE asynchronous-reply path. `upsert` and `setmeta` reply after
+the graph insert (or move) is done; `delete` and `drop` do not wait for any graph work.
+Every write command replies only after the engine's sync-replication wait, if there
+is one -- on a sync-replication master that is the replica's acknowledgement. A write
+is therefore not acknowledged to the client ahead of the replica.
 
 ---
 
