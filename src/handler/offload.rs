@@ -208,15 +208,32 @@ pub(crate) enum Waiting {
 ///
 /// 돌려주는 포인터는 콜백이 돌기 전까지, 즉 `execute`가 돌아오기 전까지는 이
 /// 스레드만 만진다.
-unsafe fn register(cookie: *const c_void, waiting: Waiting) -> *mut Waiting {
+///
+/// 코어가 콜백을 받지 않으면 상자를 여기서 거두고 `None`. 부른 쪽이 그 자리에서
+/// 답해야 한다 -- 콜백이 영영 안 돌아도 클라이언트는 답을 받는다.
+unsafe fn register(cookie: *const c_void, waiting: Waiting) -> Option<*mut Waiting> {
     let raw = Box::into_raw(Box::new(waiting));
-    unsafe { server::on_io_complete(cookie, wake, raw.cast::<c_void>()) };
-    raw
+    if unsafe { server::on_io_complete(cookie, wake, raw.cast::<c_void>()) } {
+        Some(raw)
+    } else {
+        drop(unsafe { Box::from_raw(raw) });
+        None
+    }
 }
 
 /// 지금 정해진 답을 콜백으로 쓰게 한다.
-pub(crate) unsafe fn reply(cookie: *const c_void, outcome: Result<Reply>) {
-    unsafe { register(cookie, Waiting::Ready(outcome)) };
+///
+/// 등록이 안 되면 `handler`로 곧바로 쓴다.
+pub(crate) unsafe fn reply(cookie: *const c_void, outcome: Result<Reply>, handler: ResponseHandler) {
+    // 등록이 실패하면 `outcome`은 상자와 함께 사라지므로, 먼저 복사해 둘 수는
+    // 없다. 대신 실패한 상자에서 꺼내 쓴다.
+    let raw = Box::into_raw(Box::new(Waiting::Ready(outcome)));
+    if unsafe { server::on_io_complete(cookie, wake, raw.cast::<c_void>()) } {
+        return;
+    }
+    if let Waiting::Ready(outcome) = *unsafe { Box::from_raw(raw) } {
+        Responder::new(handler, cookie).reply(outcome);
+    }
 }
 
 /// 명령을 풀에 넘기고, 답을 받을 콜백을 건다.
@@ -226,7 +243,12 @@ pub(crate) unsafe fn reply(cookie: *const c_void, outcome: Result<Reply>) {
 ///
 /// 대기열이 가득 차면 이 자리(워커)에서 끝까지 하고 답을 같은 콜백에 남긴다
 /// -- 넘기지 못했다고 명령이 실패할 이유는 없다.
-unsafe fn submit(cookie: *const c_void, task: Task, key: Option<(&str, &str)>) {
+unsafe fn submit(
+    cookie: *const c_void,
+    task: Task,
+    key: Option<(&str, &str)>,
+    handler: ResponseHandler,
+) {
     // 하나짜리 채널. 한 연결이 한 번에 한 명령이라 그 이상 필요 없고, 미리
     // 잡아두므로 풀 스레드가 보낼 때 할당하지 않는다.
     let (tx, rx) = sync_channel(1);
@@ -234,7 +256,13 @@ unsafe fn submit(cookie: *const c_void, task: Task, key: Option<(&str, &str)>) {
     // **제출보다 먼저.** 풀이 먼저 끝내 notify가 앞서도 코어가 그 수를 센다.
     // 줄에 설 때도 먼저다 -- 소유자가 이어서 하고 깨운다.
     unsafe { server::waitfor_io_complete(cookie) };
-    let waiting = unsafe { register(cookie, Waiting::Pool(rx)) };
+    let Some(waiting) = (unsafe { register(cookie, Waiting::Pool(rx)) }) else {
+        // 콜백을 못 걸었다. 세운 기다림을 거두고 여기서 끝까지 해 바로 답한다.
+        unsafe { server::notify_io_complete(cookie, 0) };
+        let outcome = unsafe { run_here(task, cookie) };
+        Responder::new(handler, cookie).reply(outcome);
+        return;
+    };
 
     let work = Work {
         task,
@@ -292,13 +320,14 @@ unsafe fn after_write(
     index: &str,
     vkey: &str,
     plan: Result<cmd::UpsertPlan>,
+    handler: ResponseHandler,
 ) {
     match plan {
-        Err(e) => unsafe { reply(cookie, Err(e)) },
-        Ok(cmd::UpsertPlan::Answered(r)) => unsafe { reply(cookie, Ok(r)) },
+        Err(e) => unsafe { reply(cookie, Err(e), handler) },
+        Ok(cmd::UpsertPlan::Answered(r)) => unsafe { reply(cookie, Ok(r), handler) },
         // 그래프 작업은 같은 (index, vkey)끼리 도착 순서대로.
         Ok(cmd::UpsertPlan::Insert(added)) => unsafe {
-            submit(cookie, Task::Insert(added), Some((index, vkey)))
+            submit(cookie, Task::Insert(added), Some((index, vkey)), handler)
         },
     }
 }
@@ -308,7 +337,7 @@ unsafe fn after_write(
 /// **워커 스레드에서 돈다** -- 엔진 쓰기(create, upsert, setmeta, delete, drop)가
 /// 모두 여기서 일어나야 한다. 쓰기가 복제 ack를 기다리게 했어도 답은 콜백이
 /// 쓰므로 ack 뒤에 나간다.
-pub(crate) unsafe fn begin(cookie: *const c_void, request: Request) {
+pub(crate) unsafe fn begin(cookie: *const c_void, request: Request, handler: ResponseHandler) {
     // upsert와 setmeta는 엔진 쓰기가 먼저다. 쓰는 동안 링크 콜백이 주소를 이
     // 명령에게 돌려주고, 레인이 그것을 그래프에 넣은 뒤에 답한다.
     match &request {
@@ -320,7 +349,7 @@ pub(crate) unsafe fn begin(cookie: *const c_void, request: Request) {
                     .split(bytes)
                     .and_then(|parts| cmd::upsert_write(&store, spec, parts)),
             };
-            return unsafe { after_write(cookie, &spec.index, &spec.vkey, plan) };
+            return unsafe { after_write(cookie, &spec.index, &spec.vkey, plan, handler) };
         }
         Request::Body(Body::SetMeta(spec), bytes) => {
             let plan = match unsafe { Store::for_cookie(cookie) } {
@@ -330,15 +359,15 @@ pub(crate) unsafe fn begin(cookie: *const c_void, request: Request) {
                     .split(bytes)
                     .and_then(|parts| cmd::setmeta_write(&store, spec, parts)),
             };
-            return unsafe { after_write(cookie, &spec.index, &spec.vkey, plan) };
+            return unsafe { after_write(cookie, &spec.index, &spec.vkey, plan, handler) };
         }
         _ => {}
     }
 
     match Task::from_request(request) {
         // 가벼운 명령은 그 자리에서. 넘기는 값이 일보다 비싸다.
-        Err(request) => unsafe { reply(cookie, crate::handler::run(cookie, request)) },
-        Ok(task) => unsafe { submit(cookie, task, None) },
+        Err(request) => unsafe { reply(cookie, crate::handler::run(cookie, request), handler) },
+        Ok(task) => unsafe { submit(cookie, task, None, handler) },
     }
 }
 

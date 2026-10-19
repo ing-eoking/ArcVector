@@ -69,7 +69,7 @@ unsafe extern "C" fn execute_vector_cmd(
     cookie: *const c_void,
     argc: c_int,
     argv: *mut token_t,
-    _handler: ResponseHandler,
+    handler: ResponseHandler,
 ) -> bool {
     let tokens = unsafe { Tokens::new(argv, argc) };
 
@@ -86,8 +86,8 @@ unsafe extern "C" fn execute_vector_cmd(
     }
 
     match unsafe { command::parse(cookie, &tokens) } {
-        Err(e) => unsafe { offload::reply(cookie, Err(e)) },
-        Ok(request) => unsafe { offload::begin(cookie, request) },
+        Err(e) => unsafe { offload::reply(cookie, Err(e), handler) },
+        Ok(request) => unsafe { offload::begin(cookie, request, handler) },
     }
     true
 }
@@ -127,6 +127,17 @@ pub extern "C" fn memcached_extensions_initialize(
         let server = get_api();
         if server.is_null() {
             return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
+        }
+        match server::missing_core_members() {
+            None => return EXTENSION_ERROR_CODE_EXTENSION_FATAL,
+            Some(missing) if !missing.is_empty() => {
+                eprintln!(
+                    "ArcVector: the server core lacks {}; this extension needs an arcus-memcached EE build with the IO-wait list (vectest)",
+                    missing.join(", ")
+                );
+                return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
+            }
+            Some(_) => {}
         }
         let extension = (*server).extension;
         if extension.is_null() {

@@ -93,14 +93,55 @@ pub type IoCallback = unsafe extern "C" fn(*const c_void, *mut c_void, ResponseH
 /// 기다리는 IO가 있으면(`waitfor_io_complete`) 그것이 모두 notify된 뒤에, 없으면
 /// 곧바로 `cb(cookie, data, response_handler)`를 부른다. `data`는 그때까지
 /// 살아 있어야 하고, 거두는 것은 `cb`의 몫이다.
-pub unsafe fn on_io_complete(cookie: *const c_void, cb: IoCallback, data: *mut c_void) {
+///
+/// 걸지 못하면 `false`. 그때 `data`는 아무도 거두지 않으므로 부른 쪽이 직접
+/// 거두고, 답도 그 자리에서 해야 한다.
+pub unsafe fn on_io_complete(cookie: *const c_void, cb: IoCallback, data: *mut c_void) -> bool {
     let core = core();
     if core.is_null() {
-        return;
+        return false;
     }
-    if let Some(register) = unsafe { (*core).on_io_complete } {
-        unsafe { register(cookie, Some(cb), data) };
+    match unsafe { (*core).on_io_complete } {
+        Some(register) => {
+            unsafe { register(cookie, Some(cb), data) };
+            true
+        }
+        None => false,
     }
+}
+
+/// 이 크레이트가 부르는 `SERVER_CORE_API` 멤버 중 없는 것의 이름.
+///
+/// 멤버마다 `(이름, 있는가)`를 받는 순수 함수라 코어 없이 시험할 수 있다.
+pub fn missing_members(members: &[(&'static str, bool)]) -> Vec<&'static str> {
+    members
+        .iter()
+        .filter(|(_, present)| !present)
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+/// 코어가 이 크레이트가 쓰는 멤버를 모두 갖췄는지 본다. 없는 멤버의 이름을
+/// 돌려준다(비었으면 정상). 코어 자체가 없으면 `None`.
+///
+/// IO 대기 목록(`link_io_wait`/`next_io_wait`)은 vectest 갈래의 EE 서버에만
+/// 있다.
+pub fn missing_core_members() -> Option<Vec<&'static str>> {
+    let core = core();
+    if core.is_null() {
+        return None;
+    }
+    let core = unsafe { &*core };
+    Some(missing_members(&[
+        ("waitfor_io_complete", core.waitfor_io_complete.is_some()),
+        ("notify_io_complete", core.notify_io_complete.is_some()),
+        ("on_io_complete", core.on_io_complete.is_some()),
+        ("link_io_wait", core.link_io_wait.is_some()),
+        ("next_io_wait", core.next_io_wait.is_some()),
+        ("realtime", core.realtime.is_some()),
+        ("store_engine_specific", core.store_engine_specific.is_some()),
+        ("get_engine_specific", core.get_engine_specific.is_some()),
+    ]))
 }
 
 /// `waiter`를 `owner`의 IO 대기 줄 끝에 잇는다.
@@ -228,5 +269,22 @@ impl Responder {
             Ok(reply) => self.send(reply.as_str()),
             Err(e) => self.send(&e.wire()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lists_only_the_absent_members_in_order() {
+        let got = missing_members(&[("a", true), ("b", false), ("c", true), ("d", false)]);
+        assert_eq!(got, ["b", "d"]);
+    }
+
+    #[test]
+    fn nothing_is_missing_when_all_are_present() {
+        assert!(missing_members(&[("a", true), ("b", true)]).is_empty());
+        assert!(missing_members(&[]).is_empty());
     }
 }
