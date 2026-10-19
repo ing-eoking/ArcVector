@@ -62,7 +62,8 @@ unsafe extern "C" fn accept_vector_cmd(
 
 /// 명령을 처리한다. 답은 언제나 `on_io_complete` 콜백이 쓴다(`offload`).
 ///
-/// 언제나 `true`다. 실패도 답으로 보낸다 -- `false`는 연결을 닫으라는 뜻이다.
+/// 실패도 답으로 보내므로 보통 `true`다. `false`는 연결을 닫으라는 뜻이고, 비울 수
+/// 없는 큰 본문에만 쓴다.
 unsafe extern "C" fn execute_vector_cmd(
     _cmd_cookie: *const c_void,
     cookie: *const c_void,
@@ -71,6 +72,18 @@ unsafe extern "C" fn execute_vector_cmd(
     _handler: ResponseHandler,
 ) -> bool {
     let tokens = unsafe { Tokens::new(argv, argc) };
+
+    // 상한을 넘는 본문은 코어가 버퍼 하나로만 받으므로 비울 길이 없이 버릴 수
+    // 없다. 그냥 답하면 클라이언트가 이미 보낸 본문이 명령으로 읽히니, 경고를
+    // 남기고 연결을 닫게 한다.
+    if let Ok(Parsed::Body { len, .. }) = request::parse(&tokens)
+        && len > MAX_BODY_BYTES
+    {
+        eprintln!(
+            "ArcVector: closing a connection that declared a {len}-byte body (limit {MAX_BODY_BYTES})"
+        );
+        return false;
+    }
 
     match unsafe { command::parse(cookie, &tokens) } {
         Err(e) => unsafe { offload::reply(cookie, Err(e)) },

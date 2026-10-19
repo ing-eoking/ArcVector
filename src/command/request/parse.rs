@@ -119,17 +119,25 @@ fn parse_create<'a>(tokens: &Tokens<'a>) -> Result<Create<'a>> {
 
 /// 꼬리 옵션(`meta <n>`, `filter <n>`, `withmeta`, `bin|str`)에서 읽은 것.
 ///
-/// 순서는 가리지 않는다. 잘못된 옵션을 만나도 그때까지 읽은 구간 크기는
-/// 남아 있어서, 호출한 쪽이 본문을 비울 길이를 알 수 있다.
+/// 순서는 가리지 않는다. 틀린 토큰을 만나도 끝까지 훑어서 `meta <n>`과
+/// `filter <n>`의 길이를 찾는다 -- 본문을 비울 길이는 줄의 다른 오류와
+/// 상관없이 알 수 있는 만큼 알아야 한다. 오류는 처음 것만 기억한다.
 #[derive(Default)]
 struct Tail {
     meta: Option<usize>,
     filter: Option<usize>,
     with_meta: bool,
     format: Format,
+    error: Option<Error>,
 }
 
-/// `allowed`에 든 옵션만 받는다. 실패하면 읽다 만 `Tail`을 함께 돌려준다.
+impl Tail {
+    fn fail(&mut self, e: Error) {
+        self.error.get_or_insert(e);
+    }
+}
+
+/// 허용한 옵션만 받는다.
 fn read_tail(
     tokens: &Tokens,
     from: usize,
@@ -137,50 +145,55 @@ fn read_tail(
     filter: bool,
     with_meta: bool,
     format: bool,
-) -> (Tail, Result<()>) {
+) -> Tail {
     let mut tail = Tail::default();
-    let outcome = (|| {
-        let mut i = from;
-        while i < tokens.len() {
-            let word = tokens.text(i)?;
-            let is = |name: &str| word.eq_ignore_ascii_case(name);
-            if meta && is("meta") {
-                if tail.meta.is_some() {
-                    return Err(Error::bad_request("meta given twice"));
+    let mut i = from;
+    while i < tokens.len() {
+        let Ok(word) = tokens.text(i) else {
+            i += 1;
+            continue;
+        };
+        let is = |name: &str| word.eq_ignore_ascii_case(name);
+        if meta && is("meta") {
+            match tokens.parse::<usize>(i + 1, "metadata length") {
+                Ok(n) if tail.meta.is_none() => {
+                    tail.meta = Some(n);
+                    i += 2;
+                    continue;
                 }
-                tail.meta = Some(tokens.parse(i + 1, "metadata length")?);
-                i += 2;
-            } else if filter && is("filter") {
-                if tail.filter.is_some() {
-                    return Err(Error::bad_request("filter given twice"));
-                }
-                let n: usize = tokens.parse(i + 1, "filter length")?;
-                tail.filter = Some(n);
-                if n > MAX_FILTER_BYTES {
-                    return Err(Error::bad_request(format!(
-                        "filter is {n} bytes, over the {MAX_FILTER_BYTES}-byte limit"
-                    )));
-                }
-                i += 2;
-            } else if with_meta && is("withmeta") {
-                tail.with_meta = true;
-                i += 1;
-            } else if format && is("bin") {
-                tail.format = Format::Bin;
-                i += 1;
-            } else if format && is("str") {
-                tail.format = Format::Str;
-                i += 1;
-            } else {
-                return Err(Error::bad_request(format!(
-                    "unknown option {}",
-                    word.to_ascii_lowercase()
-                )));
+                Ok(_) => tail.fail(Error::bad_request("meta given twice")),
+                Err(e) => tail.fail(e),
             }
+        } else if filter && is("filter") {
+            match tokens.parse::<usize>(i + 1, "filter length") {
+                Ok(n) if tail.filter.is_none() => {
+                    tail.filter = Some(n);
+                    if n > MAX_FILTER_BYTES {
+                        tail.fail(Error::bad_request(format!(
+                            "filter is {n} bytes, over the {MAX_FILTER_BYTES}-byte limit"
+                        )));
+                    }
+                    i += 2;
+                    continue;
+                }
+                Ok(_) => tail.fail(Error::bad_request("filter given twice")),
+                Err(e) => tail.fail(e),
+            }
+        } else if with_meta && is("withmeta") {
+            tail.with_meta = true;
+        } else if format && is("bin") {
+            tail.format = Format::Bin;
+        } else if format && is("str") {
+            tail.format = Format::Str;
+        } else {
+            tail.fail(Error::bad_request(format!(
+                "unknown option {}",
+                word.to_ascii_lowercase()
+            )));
         }
-        Ok(())
-    })();
-    (tail, outcome)
+        i += 1;
+    }
+    tail
 }
 
 fn result_count(tokens: &Tokens, at: usize) -> Result<usize> {
@@ -193,9 +206,13 @@ fn result_count(tokens: &Tokens, at: usize) -> Result<usize> {
     Ok(k)
 }
 
-/// 본문 길이를 알아낸 뒤의 결과를 `Parsed::Body`로 싼다. 요청이 틀려도
-/// 길이만 알면 본문을 비울 수 있다.
+/// 알아낸 구간 길이로 `Parsed::Body`를 만든다. 요청이 틀려도 길이를 하나라도
+/// 알면 본문을 비울 수 있으니 `Body`로 돌려준다. 하나도 모르면(길이 토큰
+/// 자체가 틀렸다면) 줄 전체를 거절하는 수밖에 없다.
 fn with_body<'a>(segments: Segments, request: Result<Body>) -> Result<Parsed<'a>> {
+    if segments == Segments::default() {
+        return Err(request.err().unwrap_or_else(malformed));
+    }
     Ok(Parsed::Body {
         len: segments.total(),
         request,
@@ -204,17 +221,18 @@ fn with_body<'a>(segments: Segments, request: Result<Body>) -> Result<Parsed<'a>
 
 fn parse_upsert<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
     use layout::upsert as at;
-    if tokens.len() <= at::VECTOR_BYTES {
-        return Err(malformed());
-    }
-    let vector: usize = tokens.parse(at::VECTOR_BYTES, "vector length")?;
-    let (tail, outcome) = read_tail(tokens, at::TAIL, true, false, false, true);
+    let vector = tokens.parse::<usize>(at::VECTOR_BYTES, "vector length");
+    let tail = read_tail(tokens, at::TAIL, true, false, false, true);
     let segments = Segments {
         meta: tail.meta,
         filter: None,
-        vector: Some(vector),
+        vector: vector.as_ref().ok().copied(),
     };
-    let request = outcome.and_then(|()| {
+    let request = (|| {
+        vector?;
+        if let Some(e) = tail.error {
+            return Err(e);
+        }
         Ok(Body::Upsert(Upsert {
             index: tokens.text(layout::INDEX)?.to_owned(),
             vkey: tokens.text(at::VKEY)?.to_owned(),
@@ -222,28 +240,29 @@ fn parse_upsert<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
             has_meta: tail.meta.is_some(),
             segments,
         }))
-    });
+    })();
     with_body(segments, request)
 }
 
 fn parse_setmeta<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
     use layout::setmeta as at;
-    if tokens.len() != at::LEN {
-        return Err(malformed());
-    }
-    let meta: usize = tokens.parse(at::META_BYTES, "metadata length")?;
+    let meta = tokens.parse::<usize>(at::META_BYTES, "metadata length");
     let segments = Segments {
-        meta: Some(meta),
+        meta: meta.as_ref().ok().copied(),
         ..Segments::default()
     };
-    let request = || {
+    let request = (|| {
+        meta?;
+        if tokens.len() != at::LEN {
+            return Err(malformed());
+        }
         Ok(Body::SetMeta(SetMeta {
             index: tokens.text(layout::INDEX)?.to_owned(),
             vkey: tokens.text(at::VKEY)?.to_owned(),
             segments,
         }))
-    };
-    with_body(segments, request())
+    })();
+    with_body(segments, request)
 }
 
 fn parse_search<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
@@ -261,16 +280,17 @@ fn parse_search<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
 
 fn parse_search_key<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
     use layout::search_key as at;
-    if tokens.len() <= at::NUM {
-        return Err(malformed());
-    }
-    let k = result_count(tokens, at::NUM)?;
-    let (tail, outcome) = read_tail(tokens, at::TAIL, false, true, true, false);
+    let k = result_count(tokens, at::NUM);
+    let tail = read_tail(tokens, at::TAIL, false, true, true, false);
     let segments = Segments {
         filter: tail.filter,
         ..Segments::default()
     };
-    let request = outcome.and_then(|()| {
+    let request = (|| {
+        let k = k?;
+        if let Some(e) = tail.error {
+            return Err(e);
+        }
         Ok(SearchKey {
             index: tokens.text(layout::INDEX)?.to_owned(),
             vkey: tokens.text(at::VKEY)?.to_owned(),
@@ -279,28 +299,30 @@ fn parse_search_key<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
             has_filter: tail.filter.is_some(),
             segments,
         })
-    });
-    match (tail.filter, request) {
+    })();
+    if tail.filter.is_none() {
         // 필터 본문이 없으면 줄만으로 끝난다.
-        (None, request) => request.map(|s| Parsed::Line(Line::SearchKey(s))),
-        (Some(_), request) => with_body(segments, request.map(Body::SearchKey)),
+        return request.map(|s| Parsed::Line(Line::SearchKey(s)));
     }
+    with_body(segments, request.map(Body::SearchKey))
 }
 
 fn parse_search_vector<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
     use layout::search_vector as at;
-    if tokens.len() <= at::VECTOR_BYTES {
-        return Err(malformed());
-    }
-    let k = result_count(tokens, at::NUM)?;
-    let vector: usize = tokens.parse(at::VECTOR_BYTES, "vector length")?;
-    let (tail, outcome) = read_tail(tokens, at::TAIL, false, true, true, true);
+    let k = result_count(tokens, at::NUM);
+    let vector = tokens.parse::<usize>(at::VECTOR_BYTES, "vector length");
+    let tail = read_tail(tokens, at::TAIL, false, true, true, true);
     let segments = Segments {
         meta: None,
         filter: tail.filter,
-        vector: Some(vector),
+        vector: vector.as_ref().ok().copied(),
     };
-    let request = outcome.and_then(|()| {
+    let request = (|| {
+        let k = k?;
+        vector?;
+        if let Some(e) = tail.error {
+            return Err(e);
+        }
         Ok(Body::SearchVector(SearchVector {
             index: tokens.text(layout::INDEX)?.to_owned(),
             k,
@@ -309,7 +331,7 @@ fn parse_search_vector<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
             has_filter: tail.filter.is_some(),
             segments,
         }))
-    });
+    })();
     with_body(segments, request)
 }
 
@@ -622,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn a_body_over_the_limit_is_refused_but_drained() {
+    fn a_body_over_the_limit_is_reported_with_its_length_and_never_buffered() {
         let line = format!("vop upsert i v {}", MAX_BODY_BYTES);
         tokens!(t = &line);
         let Ok(Parsed::Body { len, .. }) = parse(&t) else {
@@ -642,6 +664,37 @@ mod tests {
             panic!("expected a body-carrying command")
         };
         assert!(len > MAX_BODY_BYTES);
+    }
+
+    fn drain_len(line: &str) -> usize {
+        tokens!(t = line);
+        match parse(&t) {
+            Ok(Parsed::Body { len, request }) => {
+                assert!(request.is_err(), "{line}");
+                len
+            }
+            _ => panic!("expected a refused body-carrying line: {line}"),
+        }
+    }
+
+    #[test]
+    fn every_declared_length_still_drains_when_the_line_is_wrong() {
+        // 개수가 틀려도, 옵션이 틀려도, 필터/메타 길이는 찾아서 비운다.
+        assert_eq!(drain_len("vop search i vector 0 16 filter 5"), 7 + 18);
+        assert_eq!(drain_len("vop search i vkey v 0 filter 9"), 11);
+        assert_eq!(drain_len("vop upsert i v 8 bogus meta 100"), 102 + 10);
+        assert_eq!(drain_len("vop upsert i v 8 meta abc"), 10, "벡터만");
+        assert_eq!(
+            drain_len("vop search i vector 10 16 bogus filter 50"),
+            52 + 18
+        );
+        assert_eq!(drain_len("vop setmeta docs v1 7 extra"), 9);
+        assert_eq!(drain_len("vop upsert i v 8 meta abc filter 5"), 10);
+
+        // 길이 토큰 자체가 틀리면 줄 전체를 거절한다.
+        assert!(err("vop upsert i v abc").contains("vector length"));
+        tokens!(t = "vop setmeta docs v1 abc");
+        assert!(parse(&t).is_err());
     }
 
     #[test]
