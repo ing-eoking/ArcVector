@@ -2,7 +2,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
 use super::Store;
-use super::error::{Result, StoreError, as_int, check};
+use super::error::{Result, StoreError, as_int, check, written};
 use crate::engine_api::{
     ENGINE_ITEM_ATTR, ENGINE_ITEM_ATTR_ATTR_COUNT, ENGINE_ITEM_ATTR_ATTR_MAXCOUNT,
     ENGINE_ITEM_ATTR_ATTR_TYPE, ENGINE_ITEM_TYPE_ITEM_TYPE_MAP, eitem, eitem_info, elems_result,
@@ -112,7 +112,7 @@ impl Store {
         let Some(remove) = self.vtable().remove else {
             return Err(StoreError::Unavailable);
         };
-        check(unsafe {
+        written(unsafe {
             remove(
                 self.handle(),
                 self.cookie,
@@ -216,7 +216,9 @@ impl Store {
                 0, // vbucket
             )
         };
-        if let Err(e) = check(code) {
+        // EWOULDBLOCK은 링크된 뒤의 복제 대기라 성공이다. 그때 요소는 엔진 것이고
+        // `done`도 엔진이 채웠다 -- 여기서 풀면 링크된 요소를 푼다.
+        if let Err(e) = written(code) {
             // Not linked, so nothing else saw it. It is still ours to free.
             unsafe { elem_free(self.handle(), self.cookie, elem) };
             return Err(e);
@@ -232,7 +234,7 @@ impl Store {
         let selector = selector(field);
         let mut deleted: u32 = 0;
         let mut dropped = false;
-        check(unsafe {
+        written(unsafe {
             delete(
                 self.handle(),
                 self.cookie,

@@ -32,6 +32,11 @@ pub enum StoreError {
     CorruptElement,
     Overflow,
     ReplicaSlave,
+
+    /// sync 복제 마스터에서 쓰기가 복제 ack를 기다린다(`ENGINE_EWOULDBLOCK`).
+    /// 엔진이 이미 `waitfor_io_complete`를 불렀고, ack가 오면 깨운다. 쓰기는
+    /// 된 것이라 [`written`]이 성공으로 바꾼다 -- 쓰기 호출자에게는 오지 않는다.
+    WouldBlock,
     Engine(u32),
 }
 
@@ -58,6 +63,7 @@ impl fmt::Display for StoreError {
             Self::ReplicaSlave => {
                 f.write_str("this node is a replica; vector commands are served by the master")
             }
+            Self::WouldBlock => f.write_str("the engine is waiting for a replica"),
             Self::Engine(code) => write!(f, "engine error {code}"),
         }
     }
@@ -79,6 +85,7 @@ pub(super) fn translate(code: u32) -> StoreError {
         ENGINE_ERROR_CODE_ENGINE_EBADTYPE => StoreError::BadType,
         ENGINE_ERROR_CODE_ENGINE_EOVERFLOW => StoreError::Overflow,
         ENGINE_REPL_SLAVE => StoreError::ReplicaSlave,
+        ENGINE_ERROR_CODE_ENGINE_EWOULDBLOCK => StoreError::WouldBlock,
         other => StoreError::Engine(other),
     }
 }
@@ -87,15 +94,25 @@ pub(super) fn as_int(len: usize) -> c_int {
     c_int::try_from(len).unwrap_or(c_int::MAX)
 }
 
-pub(super) fn completed(code: u32) -> bool {
-    code == ENGINE_ERROR_CODE_ENGINE_SUCCESS || code == ENGINE_ERROR_CODE_ENGINE_EWOULDBLOCK
-}
-
+/// 읽기의 결과. 읽기는 복제 ack를 기다리지 않으므로 성공만 받는다.
 pub(super) fn check(code: u32) -> Result<()> {
-    if completed(code) {
+    if code == ENGINE_ERROR_CODE_ENGINE_SUCCESS {
         Ok(())
     } else {
         Err(translate(code))
+    }
+}
+
+/// 엔진 **쓰기**의 결과. `WouldBlock`은 성공이다.
+///
+/// sync 복제 마스터는 받아들인 쓰기에도 ack를 기다리며 EWOULDBLOCK을 준다. 그
+/// 쓰기는 이미 링크됐고 출력 인자(`replaced`/`created` 등)도 채워져 있다 --
+/// 오류로 읽으면 엔진이 받은 쓰기를 거절했다고 답하고, `insert_elem`은 링크된
+/// 요소를 풀어 버린다.
+pub(super) fn written(code: u32) -> Result<()> {
+    match check(code) {
+        Err(StoreError::WouldBlock) => Ok(()),
+        other => other,
     }
 }
 
@@ -128,22 +145,41 @@ mod tests {
         assert_eq!(translate(9999), StoreError::Engine(9999));
     }
 
-    /// Renamed from `check_only_accepts_success`, which was never what `check`
-    /// did -- `completed` has always taken `ENGINE_EWOULDBLOCK` as well -- and
-    /// which asserted nothing about that code either way. It matters because
-    /// every write goes through here: a sync-replication master waiting on a
-    /// slave gets EWOULDBLOCK from an accepted write, and reading that as an
-    /// error would refuse a write the engine took.
+    /// Every write goes through [`written`]: a sync-replication master waiting
+    /// on a slave gets EWOULDBLOCK from an accepted write, and reading that as
+    /// an error would refuse a write the engine took. Reads never wait on a
+    /// slave, so [`check`] keeps it an error.
     #[test]
-    fn check_accepts_a_write_that_is_still_waiting_on_a_slave() {
-        assert!(check(ENGINE_ERROR_CODE_ENGINE_SUCCESS).is_ok());
+    fn written_accepts_a_write_that_is_still_waiting_on_a_slave() {
+        assert!(written(ENGINE_ERROR_CODE_ENGINE_SUCCESS).is_ok());
         assert!(
-            check(ENGINE_ERROR_CODE_ENGINE_EWOULDBLOCK).is_ok(),
+            written(ENGINE_ERROR_CODE_ENGINE_EWOULDBLOCK).is_ok(),
             "the gate accepted the write; it is only waiting for an acknowledgement"
         );
         assert_eq!(
-            check(ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT),
+            written(ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT),
             Err(StoreError::KeyGone)
+        );
+        assert_eq!(
+            check(ENGINE_ERROR_CODE_ENGINE_EWOULDBLOCK),
+            Err(StoreError::WouldBlock)
+        );
+    }
+
+    /// sync 복제 마스터에서 쓰기가 ack를 기다리면 엔진이 EWOULDBLOCK을 준다.
+    /// 엔진은 이미 `waitfor_io_complete`를 불렀고 ack가 오면 깨운다 -- 쓰기는
+    /// 된 것이다.
+    #[test]
+    fn ewouldblock_from_a_write_counts_as_written() {
+        assert_eq!(
+            translate(ENGINE_ERROR_CODE_ENGINE_EWOULDBLOCK),
+            StoreError::WouldBlock
+        );
+        assert_eq!(written(ENGINE_ERROR_CODE_ENGINE_SUCCESS), Ok(()));
+        assert_eq!(written(ENGINE_ERROR_CODE_ENGINE_EWOULDBLOCK), Ok(()));
+        assert_eq!(
+            written(ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT),
+            Err(StoreError::ElemGone)
         );
     }
 

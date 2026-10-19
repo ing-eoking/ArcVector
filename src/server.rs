@@ -107,13 +107,20 @@ pub unsafe fn on_io_complete(cookie: *const c_void, cb: IoCallback, data: *mut c
 ///
 /// `waiter`는 이미 `waitfor_io_complete`를 해 둔 상태여야 하고, 나중에
 /// [`next_io_wait`]로 꺼낸 쪽이 `notify_io_complete`로 깨워야 한다.
-pub unsafe fn link_io_wait(owner: *const c_void, waiter: *const c_void, data: *mut c_void) {
+///
+/// 코어에 이 함수가 없으면 잇지 못하고 `false`. 그때 `waiter`를 깨울 쪽은
+/// 부른 쪽이다.
+pub unsafe fn link_io_wait(owner: *const c_void, waiter: *const c_void, data: *mut c_void) -> bool {
     let core = core();
     if core.is_null() {
-        return;
+        return false;
     }
-    if let Some(link) = unsafe { (*core).link_io_wait } {
-        unsafe { link(owner, waiter, data) };
+    match unsafe { (*core).link_io_wait } {
+        Some(link) => {
+            unsafe { link(owner, waiter, data) };
+            true
+        }
+        None => false,
     }
 }
 

@@ -6,6 +6,7 @@ pub mod usearch;
 pub(crate) mod access;
 pub(crate) mod cmd;
 pub(crate) mod offload;
+pub(crate) mod order;
 
 use std::os::raw::c_void;
 

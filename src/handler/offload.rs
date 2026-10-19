@@ -36,6 +36,7 @@
 //! 들고 있는 것이 안전하다.
 
 use std::os::raw::c_void;
+use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 use crate::command::Request;
@@ -44,7 +45,7 @@ use crate::command::request::{Body, Line, Sim, SimKey};
 use crate::error::{Error, Reply, Result};
 use crate::handler::access::pool::{self, Job};
 use crate::handler::arcus::{Store, StoreError};
-use crate::handler::cmd;
+use crate::handler::{cmd, order};
 use crate::server::{self, Responder, ResponseHandler};
 
 /// 풀이 들고 갈 수 있는 형태의 명령.
@@ -129,11 +130,33 @@ pub(crate) struct Work {
     task: Task,
     cookie: usize,
     done: SyncSender<Done>,
+    /// 그래프 작업의 `(index, vkey)`. 있으면 같은 키의 작업과 한 줄에 선다
+    /// (`order`). 검색은 없다.
+    key: Option<(String, String)>,
 }
 
 impl Work {
     /// **풀 스레드에서 돈다.** 엔진 쓰기를 부르지 않는다.
+    ///
+    /// 키 있는 일이면 끝낸 뒤 그 키에 줄 선 다음 일을 꺼내 이 스레드에서
+    /// 이어서 한다. 줄이 빌 때까지.
     pub(crate) fn run(self) {
+        relay(
+            self,
+            Work::deliver,
+            |owner, (index, vkey)| {
+                // 꺼낸 job은 대기자가 `Box::into_raw`로 줄에 맡긴 `Work`다. 줄에서
+                // 꺼낸 쪽이 한 번 되찾는다.
+                unsafe { order::finish(owner as *const c_void, index, vkey) }
+                    .map(|(_, job)| *unsafe { Box::from_raw(job.cast::<Work>()) })
+            },
+            |cookie| unsafe { server::notify_io_complete(cookie as *const c_void, 0) },
+        );
+    }
+
+    /// 일을 하고 결과를 채널에 넣는다. 깨우지는 않는다 -- [`relay`]가 줄을
+    /// 넘긴 뒤에 깨운다.
+    fn deliver(self) {
         // 읽기 전용이라 background 쿠키로 충분하다. 연결의 쿠키를 엔진에
         // 넘기지 않는 편이, 복제가 그것에 거는 스레드 가정과 엮이지 않아
         // 안전하다.
@@ -141,10 +164,55 @@ impl Work {
             Some(store) => self.task.work(&store),
             None => Done::Answered(Err(Error::Store(StoreError::Unavailable))),
         };
-
-        // 보내고 나서 깨운다. 순서가 뒤집히면 깨어난 워커가 빈 채널을 본다.
         let _ = self.done.send(outcome);
-        unsafe { server::notify_io_complete(self.cookie as *const c_void, 0) };
+    }
+}
+
+/// [`relay`]가 일감에서 보는 것.
+trait Relayed {
+    fn cookie(&self) -> usize;
+    fn take_key(&mut self) -> Option<(String, String)>;
+}
+
+impl Relayed for Work {
+    fn cookie(&self) -> usize {
+        self.cookie
+    }
+    fn take_key(&mut self) -> Option<(String, String)> {
+        self.key.take()
+    }
+}
+
+/// 일 하나를 하고, 키가 있으면 그 줄의 다음 일로 넘어간다.
+///
+/// 순서가 정확성이다.
+///
+/// 1. `run` -- 결과를 그 연결의 채널에 넣는다. 실패한 일도 결과다.
+/// 2. `finish` -- 키를 다음 대기자에게 넘긴다. **결과와 상관없이** 언제나.
+///    안 넘기면 뒤에 선 연결들이 오지 않을 notify를 기다린다.
+/// 3. `notify` -- 끝낸 연결을 깨운다. 줄을 넘긴 **뒤**라 깨어난 연결의 줄은
+///    비어 있고, 결과를 넣은 뒤라 콜백이 빈 채널을 보지 않는다.
+///
+/// `waitfor_io_complete` 하나에 `notify` 하나가 모든 길에서 맞는다.
+fn relay<W: Relayed, R>(
+    first: W,
+    mut run: impl FnMut(W) -> R,
+    mut finish: impl FnMut(usize, &(String, String)) -> Option<W>,
+    mut notify: impl FnMut(usize),
+) {
+    let mut work = first;
+    loop {
+        let cookie = work.cookie();
+        let key = work.take_key();
+        // 결과는 이미 채널로 갔다. 여기서 볼 것은 없다. 일이 패닉해도 넘기고
+        // 깨운다 -- 보낼 쪽이 풀리며 채널이 닫혀, 깨어난 콜백은 오류로 답한다.
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| run(work)));
+        let next = key.as_ref().and_then(|key| finish(cookie, key));
+        notify(cookie);
+        match next {
+            Some(next) => work = next,
+            None => return,
+        }
     }
 }
 
@@ -177,14 +245,18 @@ pub(crate) unsafe fn reply(cookie: *const c_void, outcome: Result<Reply>) {
 
 /// 명령을 풀에 넘기고, 답을 받을 콜백을 건다.
 ///
+/// `key`가 있으면 그 키의 레인으로, 같은 키의 앞선 그래프 작업이 있으면 그
+/// 뒤에 줄 세운다. 없으면 아무 레인이나.
+///
 /// 대기열이 가득 차면 이 자리(워커)에서 끝까지 하고 답을 같은 콜백에 남긴다
 /// -- 넘기지 못했다고 명령이 실패할 이유는 없다.
-unsafe fn submit(cookie: *const c_void, task: Task) {
+unsafe fn submit(cookie: *const c_void, task: Task, key: Option<(&str, &str)>) {
     // 하나짜리 채널. 한 연결이 한 번에 한 명령이라 그 이상 필요 없고, 미리
     // 잡아두므로 풀 스레드가 보낼 때 할당하지 않는다.
     let (tx, rx) = sync_channel(1);
 
     // **제출보다 먼저.** 풀이 먼저 끝내 notify가 앞서도 코어가 그 수를 센다.
+    // 줄에 설 때도 먼저다 -- 소유자가 이어서 하고 깨운다.
     unsafe { server::waitfor_io_complete(cookie) };
     let waiting = unsafe { register(cookie, Waiting::Pool(rx)) };
 
@@ -192,7 +264,12 @@ unsafe fn submit(cookie: *const c_void, task: Task) {
         task,
         cookie: cookie as usize,
         done: tx,
+        key: key.map(|(index, vkey)| (index.to_owned(), vkey.to_owned())),
     };
+    if let Some((index, vkey)) = key {
+        return unsafe { submit_keyed(cookie, work, index, vkey) };
+    }
+
     let work = match pool::try_submit(Job::Offload(work)) {
         None => return,
         Some(Job::Offload(work)) => work,
@@ -205,6 +282,31 @@ unsafe fn submit(cookie: *const c_void, task: Task) {
     let outcome = unsafe { run_here(work.task, cookie) };
     // 콜백은 `execute`가 돌아온 뒤에야 돈다. 그때까지 이 상자는 이 스레드 것이다.
     unsafe { *waiting = Waiting::Ready(outcome) };
+}
+
+/// 키 있는 일. 소유하면 그 키의 레인에, 아니면 소유자 뒤에.
+///
+/// 레인이 가득이면 레인 스레드가 할 일을 이 자리에서 그대로 한다 -- 키를 이미
+/// 가졌으므로 뒤에 선 일까지 이어서 하고 각자 깨운다. 따로 거둘 기다림은 없다:
+/// 이 연결의 notify도 [`relay`]가 한다(`execute`가 돌아오기 전이라 수만 줄어든다).
+unsafe fn submit_keyed(cookie: *const c_void, work: Work, index: &str, vkey: &str) {
+    // 레인도 같은 해시에서 고른다. 해시가 겹친 두 키는 줄도 레인도 같다.
+    let lane = order::lane_of(index, vkey);
+
+    // 줄에 서면 소유자의 레인 스레드가 `Box::from_raw`로 한 번 되찾는다. 그 뒤로
+    // 이 상자를 만지지 않으므로, 키는 상자 안의 것이 아니라 요청의 것을 쓴다.
+    let job = Box::into_raw(Box::new(work));
+    match unsafe { order::begin(index, vkey, cookie, job.cast::<c_void>()) } {
+        order::Begin::Queued => {}
+        order::Begin::Own => {
+            let work = *unsafe { Box::from_raw(job) };
+            match pool::submit_to(lane, Job::Offload(work)) {
+                None => {}
+                Some(Job::Offload(work)) => work.run(),
+                Some(_) => unreachable!("submit_to hands back the job it was given"),
+            }
+        }
+    }
 }
 
 /// `execute`가 명령 하나를 여기 맡긴다. 답은 언제나 [`wake`]가 쓴다.
@@ -221,7 +323,9 @@ pub(crate) unsafe fn begin(cookie: *const c_void, request: Request) {
                 Err(e) => Err(e),
                 Ok(cmd::AddPlan::Answered(reply)) => Ok(reply),
                 Ok(cmd::AddPlan::Insert(added)) => {
-                    return unsafe { submit(cookie, Task::Add(added)) };
+                    // 그래프 작업은 같은 (index, vkey)끼리 도착 순서대로.
+                    let key = (spec.index.as_str(), spec.vkey.as_str());
+                    return unsafe { submit(cookie, Task::Add(added), Some(key)) };
                 }
             },
         };
@@ -231,7 +335,7 @@ pub(crate) unsafe fn begin(cookie: *const c_void, request: Request) {
     match Task::from_request(request) {
         // 가벼운 명령은 그 자리에서. 넘기는 값이 일보다 비싸다.
         Err(request) => unsafe { reply(cookie, crate::handler::run(cookie, request)) },
-        Ok(task) => unsafe { submit(cookie, task) },
+        Ok(task) => unsafe { submit(cookie, task, None) },
     }
 }
 
@@ -275,5 +379,114 @@ pub(crate) unsafe fn run_here(task: Task, cookie: *const c_void) -> Result<Reply
     match task.work(&store) {
         Done::Answered(reply) => reply,
         Done::Inserted(added, inserted) => cmd::vadd_finish(&store, added, inserted),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    /// 가짜 일감. `fails`면 작업 결과가 `Err`다.
+    struct Fake {
+        cookie: usize,
+        key: Option<(String, String)>,
+        fails: bool,
+    }
+
+    impl Relayed for Fake {
+        fn cookie(&self) -> usize {
+            self.cookie
+        }
+        fn take_key(&mut self) -> Option<(String, String)> {
+            self.key.take()
+        }
+    }
+
+    fn keyed(cookie: usize, fails: bool) -> Fake {
+        Fake {
+            cookie,
+            key: Some(("idx".into(), "v".into())),
+            fails,
+        }
+    }
+
+    #[test]
+    fn a_failed_job_still_hands_the_key_on() {
+        let log = RefCell::new(Vec::new());
+        relay(
+            keyed(1, true),
+            |job| {
+                log.borrow_mut().push(format!("run {}", job.cookie));
+                if job.fails { Err(()) } else { Ok(()) }
+            },
+            |owner, _key| {
+                log.borrow_mut().push(format!("finish {owner}"));
+                None
+            },
+            |cookie| log.borrow_mut().push(format!("notify {cookie}")),
+        );
+        assert_eq!(*log.borrow(), ["run 1", "finish 1", "notify 1"]);
+    }
+
+    #[test]
+    fn relay_runs_the_chain_on_one_thread_and_wakes_each_owner_after_handing_on() {
+        let log = RefCell::new(Vec::new());
+        let mut rest = vec![keyed(3, false), keyed(2, true)];
+        relay(
+            keyed(1, false),
+            |job| {
+                log.borrow_mut().push(format!("run {}", job.cookie));
+                if job.fails { Err(()) } else { Ok(()) }
+            },
+            |owner, key| {
+                assert_eq!(key, &("idx".to_owned(), "v".to_owned()));
+                log.borrow_mut().push(format!("finish {owner}"));
+                rest.pop()
+            },
+            |cookie| log.borrow_mut().push(format!("notify {cookie}")),
+        );
+        assert_eq!(
+            *log.borrow(),
+            [
+                "run 1", "finish 1", "notify 1", "run 2", "finish 2", "notify 2", "run 3",
+                "finish 3", "notify 3",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_job_that_panics_still_hands_the_key_on_and_wakes_its_connection() {
+        let log = RefCell::new(Vec::new());
+        relay(
+            keyed(1, true),
+            |_| -> () { panic!("the graph insert blew up") },
+            |owner, _key| {
+                log.borrow_mut().push(format!("finish {owner}"));
+                None
+            },
+            |cookie| log.borrow_mut().push(format!("notify {cookie}")),
+        );
+        assert_eq!(*log.borrow(), ["finish 1", "notify 1"]);
+    }
+
+    #[test]
+    fn an_unkeyed_job_is_only_woken() {
+        let log = RefCell::new(Vec::new());
+        relay(
+            Fake {
+                cookie: 9,
+                key: None,
+                fails: false,
+            },
+            |_| Ok::<(), ()>(()),
+            |owner, _| {
+                log.borrow_mut().push(format!("finish {owner}"));
+                None
+            },
+            |cookie| log.borrow_mut().push(format!("notify {cookie}")),
+        );
+        assert_eq!(*log.borrow(), ["notify 9"]);
     }
 }
