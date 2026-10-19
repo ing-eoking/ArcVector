@@ -70,9 +70,7 @@ impl Error {
             }
 
             Self::Codec(e) => match e {
-                CodecError::AttrTooLarge { .. } | CodecError::VectorLenMismatch { .. } => {
-                    Blame::Client
-                }
+                CodecError::VectorLenMismatch { .. } => Blame::Client,
                 _ => Blame::Server,
             },
 
@@ -196,11 +194,7 @@ mod tests {
         assert_eq!(Error::NoSuchIndex.blame(), Blame::Client);
         assert_eq!(Error::Filter(ParseError::Empty).blame(), Blame::Client);
         assert_eq!(
-            Error::Codec(CodecError::AttrTooLarge {
-                limit: 128,
-                got: 200
-            })
-            .blame(),
+            Error::Codec(CodecError::VectorLenMismatch { need: 4, got: 3 }).blame(),
             Blame::Client
         );
     }

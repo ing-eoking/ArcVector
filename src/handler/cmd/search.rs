@@ -69,11 +69,11 @@ fn similar(
             return true;
         };
         let Some(Verdict::Take(attr)) =
-            store.with_elem_at(key, |_field, value| match layout.attr_of(value) {
-                // 임시: 원소가 BSON을 저장하기 전까지 JSON attr을 변환해서 비교한다.
-                Ok(attr) if crate::bson::from_json(attr).is_ok_and(|doc| filter.matches(&doc)) => {
-                    Verdict::Take(Some(String::from_utf8_lossy(attr).into_owned()))
-                }
+            store.with_elem_at(key, |_field, value| match layout.split(value) {
+                Ok((meta, _)) if filter.matches(meta) => match crate::bson::to_json(meta) {
+                    Ok(json) => Verdict::Take(Some(json)),
+                    Err(_) => Verdict::Drop,
+                },
                 _ => Verdict::Drop,
             })
         else {
@@ -114,10 +114,10 @@ fn similar(
             let stored = match store
                 .get_elem(&crate::trigger::key::map_key(&index.name), &id)
                 .and_then(|body| {
-                    layout
-                        .attr_of(&body)
-                        .map(<[u8]>::to_vec)
-                        .map_err(|_| StoreError::CorruptElement)
+                    let (meta, _) = layout
+                        .split(&body)
+                        .map_err(|_| StoreError::CorruptElement)?;
+                    crate::bson::to_json(meta).map_err(|_| StoreError::CorruptElement)
                 }) {
                 Ok(stored) => stored,
 
@@ -136,7 +136,7 @@ fn similar(
                 }
                 Err(_) => continue,
             };
-            Some(String::from_utf8_lossy(&stored).into_owned())
+            Some(stored)
         };
         rendered.push((
             id.to_owned(),
@@ -224,7 +224,7 @@ pub fn vsim_key(store: &Store, spec: &SimKey) -> Result<Reply> {
         Ok(Some(query)) => Ok(query),
         Ok(None) => store
             .with_elem_at(addr, |_field, value| {
-                layout.vector_of(value).map(<[u8]>::to_vec)
+                layout.split(value).ok().map(|(_, v)| v.to_vec())
             })
             .flatten()
             .ok_or(Error::Unreadable),

@@ -1,6 +1,9 @@
 use super::layout;
 use super::*;
 
+/// 예전 명령이 받는 attr JSON의 최대 바이트. 이 파서들은 vop 명령으로 대체되며 지워진다.
+const MAX_ATTR_JSON: usize = 255;
+
 fn malformed() -> Error {
     Error::bad_request("bad command line format")
 }
@@ -195,9 +198,9 @@ fn parse_set_attr<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
             ));
         }
     };
-    if json.len() > ATTR_BYTES {
+    if json.len() > MAX_ATTR_JSON {
         return Err(Error::bad_request(format!(
-            "attr is {} bytes, over the {ATTR_BYTES}-byte limit",
+            "attr is {} bytes, over the {MAX_ATTR_JSON}-byte limit",
             json.len()
         )));
     }
@@ -228,9 +231,9 @@ fn attr_clause(tokens: &Tokens, at: usize) -> Result<Vec<u8>> {
             "the attr JSON must be a single argument with no spaces in it",
         ));
     }
-    if json.len() > ATTR_BYTES {
+    if json.len() > MAX_ATTR_JSON {
         return Err(Error::bad_request(format!(
-            "attr is {} bytes, over the {ATTR_BYTES}-byte limit",
+            "attr is {} bytes, over the {MAX_ATTR_JSON}-byte limit",
             json.len()
         )));
     }
@@ -504,7 +507,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        assert!(json.len() <= ATTR_BYTES);
+        assert!(json.len() <= MAX_ATTR_JSON);
         assert_eq!(
             attr_of(&format!("vadd docs v1 16 attr {json}")).unwrap(),
             json.as_bytes()
@@ -540,7 +543,7 @@ mod tests {
     #[test]
     fn an_attr_exactly_at_the_limit_is_accepted() {
         let json = format!(r#"{{"k":"{}"}}"#, "x".repeat(247));
-        assert_eq!(json.len(), ATTR_BYTES);
+        assert_eq!(json.len(), MAX_ATTR_JSON);
         assert!(attr_of(&format!("vadd docs v1 16 attr {json}")).is_ok());
     }
 

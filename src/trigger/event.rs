@@ -54,11 +54,10 @@ use std::cell::RefCell;
 use std::os::raw::c_void;
 use std::sync::Arc;
 
-use crate::handler::arcus::element::MetaRecord;
+use crate::handler::arcus::element::IndexConfig;
 use crate::handler::arcus::engine::{MapElements, Store};
 use crate::handler::registry::{self, VectorIndex};
 use crate::handler::usearch::AnnIndex;
-use crate::handler::usearch::metric::Metric;
 use crate::trigger::recover;
 use crate::trigger::waiting::{self, Replaced, Unlinked};
 
@@ -438,29 +437,23 @@ fn on_meta(store: &Store, addr: u64, name: &str) {
 /// 할당이다. 인덱스 하나당 한 번뿐이라 감수한다.
 fn build(store: &Store, addr: u64, name: &str) -> Option<VectorIndex> {
     let decoded = store
-        .with_elem_at(addr, |_field, value| MetaRecord::decode(value).ok())
+        .with_elem_at(addr, |_field, value| IndexConfig::decode(value).ok())
         .flatten();
-    let Some((meta, layout)) = decoded else {
+    let Some(config) = decoded else {
         eprintln!("ArcVector: the metadata of '{name}' is unreadable; the index stays unknown");
         return None;
     };
-    let Some(metric) = Metric::parse(&meta.metric) else {
-        eprintln!(
-            "ArcVector: the metadata of '{name}' names metric '{}', which this build \
-             does not know",
-            meta.metric
-        );
-        return None;
-    };
+    // maxcount는 설정 문서에 없다. 이 콜백은 cache lock 아래라 Map 속성을 물을
+    // 수도 없으므로 모르는 채로 0을 둔다 -- 한도는 엔진이 Map의 maxcount로 지킨다.
     match AnnIndex::new(
-        layout,
-        metric,
-        meta.connectivity,
-        meta.expansion_add,
-        meta.expansion_search,
+        config.layout(),
+        config.metric,
+        config.m,
+        config.efc,
+        config.efs,
         Arc::new(MapElements),
     ) {
-        Ok(ann) => Some(VectorIndex::building(name.to_owned(), ann, meta.maxcount)),
+        Ok(ann) => Some(VectorIndex::building(name.to_owned(), ann, 0)),
         Err(e) => {
             eprintln!("ArcVector: could not build the graph for '{name}': {e}");
             None
@@ -511,8 +504,8 @@ fn same_vector(store: &Store, index: &VectorIndex, old: u64, new: u64) -> bool {
     store
         .with_elem_at(old, |_field, old_value| {
             store.with_elem_at(new, |_field, new_value| {
-                match (layout.vector_of(old_value), layout.vector_of(new_value)) {
-                    (Some(a), Some(b)) => a == b,
+                match (layout.split(old_value), layout.split(new_value)) {
+                    (Ok((_, a)), Ok((_, b))) => a == b,
                     _ => false,
                 }
             })

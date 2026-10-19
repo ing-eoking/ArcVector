@@ -139,8 +139,9 @@ fn insert_claimed(store: Option<&Store>, index: &Arc<VectorIndex>, addr: u64) ->
             store
                 .with_elem_at(addr, |_field, value| {
                     layout
-                        .vector_of(value)
-                        .map(|vector| index.ann.link_node(addr, vector))
+                        .split(value)
+                        .ok()
+                        .map(|(_, vector)| index.ann.link_node(addr, vector))
                 })
                 .flatten()
                 .unwrap_or(Err(Error::Store(StoreError::CorruptElement)))

@@ -1,4 +1,5 @@
 use super::coords::coords;
+use crate::bson;
 use crate::command::request::Add;
 use crate::error::{Error, Reply, Result};
 use crate::handler::access::{for_read, for_write, map_is_gone};
@@ -63,12 +64,12 @@ pub fn vadd_write(store: &Store, spec: &Add, body: &[u8]) -> Result<AddPlan> {
     let vector = coords(body, layout.dim, "vector")?;
 
     check_id(vkey)?;
-    check_attr(attr)?;
-    check_still_fits(store, layout)?;
+    let meta = meta_of(attr)?;
+    check_still_fits(store, layout, meta.len())?;
 
     let stamp = registry::now();
     let quantized = quant::encode(&vector, layout.quant)?;
-    let value = build_body(layout, &quantized, attr)?;
+    let value = build_body(layout, &quantized, &meta)?;
 
     write(store, name, vkey, &value, stamp)
 }
@@ -158,10 +159,10 @@ fn store_failed(name: &str, stamp: u64, e: StoreError) -> Result<Reply> {
     }
 }
 
-/// 요소 값 하나. 길이 바이트, attr, 벡터. 종단자는 `insert_elem`이 붙인다.
-fn build_body(layout: Layout, vector: &[u8], attr: &[u8]) -> Result<Vec<u8>> {
-    let mut body = crate::room::zeroed(layout.element_len(attr.len()))?;
-    layout.write(&mut body, vector, attr)?;
+/// 요소 값 하나. BSON 메타, 벡터. 종단자는 `insert_elem`이 붙인다.
+fn build_body(layout: Layout, vector: &[u8], meta: &[u8]) -> Result<Vec<u8>> {
+    let mut body = crate::room::zeroed(layout.element_len(meta.len()))?;
+    layout.write(&mut body, vector, meta)?;
     Ok(body)
 }
 
@@ -176,26 +177,23 @@ fn check_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn check_attr(attr: &[u8]) -> Result<()> {
+/// 클라이언트의 JSON attr을 요소 메타(BSON)로 바꾼다. 비었으면 빈 문서다.
+/// JSON 객체가 아니면 `from_json`의 오류가 그대로 나간다.
+fn meta_of(attr: &[u8]) -> Result<Vec<u8>> {
     if attr.is_empty() {
-        return Ok(());
+        return Ok(bson::EMPTY.to_vec());
     }
-    match serde_json::from_slice::<serde_json::Value>(attr) {
-        Ok(serde_json::Value::Object(_)) => Ok(()),
-        Ok(_) => Err(Error::bad_request("ATTR must be a JSON object")),
-        Err(e) => Err(Error::bad_request(format!("ATTR is not valid JSON: {e}"))),
-    }
+    Ok(bson::from_json(attr)?)
 }
 
-fn check_still_fits(store: &Store, layout: Layout) -> Result<()> {
+fn check_still_fits(store: &Store, layout: Layout, meta_len: usize) -> Result<()> {
     let limit = store.max_element_bytes() as usize;
-    if layout.max_stored_len() <= limit {
+    let stored = layout.stored_len(meta_len);
+    if stored <= limit {
         return Ok(());
     }
     Err(Error::bad_request(format!(
-        "element is {} bytes ({} header+ATTR + {} vector), over max_element_bytes {limit}",
-        layout.max_stored_len(),
-        Layout::vector_offset(crate::handler::arcus::element::ATTR_BYTES),
+        "element is {stored} bytes ({meta_len} metadata + {} vector), over max_element_bytes {limit}",
         layout.vector_bytes(),
     )))
 }
@@ -206,14 +204,13 @@ pub fn vgetattr(store: &Store, name: &str, id: &str) -> Result<Reply> {
 
     let layout = index.ann.layout;
     match store.get_elem(&key::map_key(name), id).and_then(|body| {
-        layout
-            .attr_of(&body)
-            .map(<[u8]>::to_vec)
-            .map_err(|_| StoreError::CorruptElement)
+        let (meta, _) = layout
+            .split(&body)
+            .map_err(|_| StoreError::CorruptElement)?;
+        bson::to_json(meta).map_err(|_| StoreError::CorruptElement)
     }) {
-        Ok(attr) => {
+        Ok(json) => {
             // attr은 공백 없는 JSON 한 덩어리라 길이를 앞세울 필요가 없다.
-            let json = String::from_utf8_lossy(&attr);
             Ok(Reply::Body(format!("ATTR {id}={json}\r\nEND\r\n")))
         }
         Err(StoreError::ElemGone) => Ok(Reply::NotFound),
@@ -236,7 +233,8 @@ pub fn vgetattr(store: &Store, name: &str, id: &str) -> Result<Reply> {
 pub fn vsetattr(store: &Store, name: &str, id: &str, attr: &[u8]) -> Result<Reply> {
     let index = for_write(store, name)?;
     let stamp = registry::now();
-    check_attr(attr)?;
+    let meta = meta_of(attr)?;
+    check_still_fits(store, index.ann.layout, meta.len())?;
     let layout = index.ann.layout;
 
     // 지금 값을 읽어 attr만 갈아 끼우고 다시 쓴다. 그래프는 건드리지 않는다 --
@@ -251,12 +249,12 @@ pub fn vsetattr(store: &Store, name: &str, id: &str, attr: &[u8]) -> Result<Repl
         }
         Err(e) => return Err(e.into()),
     };
-    // attr 길이가 바뀌면 벡터가 앉는 자리도 바뀐다. 제자리 수정이 불가능하니
+    // 메타 길이가 바뀌면 벡터가 앉는 자리도 바뀐다. 제자리 수정이 불가능하니
     // 벡터를 꺼내 새 길이로 다시 만든다.
-    let Some(vector) = layout.vector_of(&value) else {
+    let Ok((_, vector)) = layout.split(&value) else {
         return Err(StoreError::CorruptElement.into());
     };
-    let body = build_body(layout, vector, attr).map_err(|_| StoreError::CorruptElement)?;
+    let body = build_body(layout, vector, &meta).map_err(|_| StoreError::CorruptElement)?;
 
     match write(store, name, id, &body, stamp) {
         Err(Error::IndexEvicted) => Ok(Reply::NotFound),

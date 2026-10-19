@@ -20,7 +20,6 @@ pub mod room;
 pub mod server;
 pub mod trigger;
 
-pub use handler::arcus::element::ATTR_BYTES;
 pub use handler::quant::Quant;
 pub use handler::usearch::Metric;
 

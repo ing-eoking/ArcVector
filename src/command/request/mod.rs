@@ -5,9 +5,9 @@ pub use parse::parse;
 
 use super::filter::Filter;
 use super::tokens::Tokens;
+use crate::Metric;
 use crate::Quant;
 use crate::error::{Error, Result};
-use crate::{ATTR_BYTES, Metric};
 
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
 

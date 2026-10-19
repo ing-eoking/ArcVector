@@ -30,7 +30,7 @@ fn an_index_is_created_once_and_listed() {
 
     let listed = client.send("vlist");
     assert_contains(&listed, &format!("INDEX {ix} dim=2 quant=f32 metric=l2"));
-    assert_contains(&listed, "attrbytes=255 count=0");
+    assert_contains(&listed, "count=0");
 
     assert_reply(&client.send(&format!("vdrop {ix}")), "DROPPED\r\n");
     assert_reply(&client.send(&format!("vdrop {ix}")), "NOT_FOUND\r\n");
@@ -66,7 +66,7 @@ fn attributes_are_optional_and_come_back_empty() {
     assert_reply(&client.vadd(&ix, "v1", 2, "0.1 0.2"), "STORED\r\n");
     assert_reply(
         &client.send(&format!("vgetattr {ix} v1")),
-        "ATTR v1=\r\nEND\r\n",
+        "ATTR v1={}\r\nEND\r\n",
     );
     client.send(&format!("vdrop {ix}"));
 }
@@ -359,7 +359,6 @@ fn vstats_reports_module_memory_and_follows_the_vector_count() {
     let full = client.send("vstats");
     assert!(full.ends_with("END\r\n"), "{full}");
     assert_contains(&full, &format!("STAT {ix}:vectors 40"));
-    assert_eq!(stat(&full, "attr_bytes_per_vector"), 255);
     let used = stat(&full, &format!("{ix}:index_used_bytes"));
     let held = stat(&full, &format!("{ix}:index_held_bytes"));
     assert!(used > 0, "used {used}");
@@ -419,7 +418,7 @@ fn an_index_answers_after_its_metadata_and_vectors_round_trip() {
     // there. So it never shows up as a vector, and the counts stay honest.
     assert_reply(
         &client.send(&format!("vgetattr {ix} v1")),
-        "ATTR v1=\r\nEND\r\n",
+        "ATTR v1={}\r\nEND\r\n",
     );
     assert_contains(&client.send("vlist"), &format!("INDEX {ix} dim=2"));
     assert_contains(&client.send("vlist"), "count=1");

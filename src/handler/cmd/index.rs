@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::command::request::Create;
 use crate::error::{Error, Reply, Result};
 use crate::handler::access::resolve;
-use crate::handler::arcus::element::{self, Layout, MetaRecord};
+use crate::handler::arcus::element::{IndexConfig, Layout};
 use crate::handler::arcus::engine::{self, Store, StoreError};
 use crate::handler::quant::Quant;
 use crate::handler::registry::{self, VectorIndex};
@@ -35,12 +35,13 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
     // 메타가 같은 Map의 한 칸을 차지하므로 Map에는 하나 더 잡는다.
     let held = map_size_for(store, spec.maxcount);
     let maxcount = held - 1;
-    let meta = MetaRecord {
-        metric: metric.as_str().to_owned(),
-        connectivity: spec.connectivity,
-        expansion_add: spec.expansion_add,
-        expansion_search: spec.expansion_search,
-        maxcount,
+    let config = IndexConfig {
+        dim,
+        metric,
+        quant,
+        m: spec.connectivity,
+        efc: spec.expansion_add,
+        efs: spec.expansion_search,
     };
     let index = VectorIndex::building(name.to_owned(), ann, maxcount);
 
@@ -65,7 +66,7 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
     let settled = store.insert_elem(
         &key::map_key(name),
         key::META_ID,
-        &meta.encode(layout),
+        &config.encode(),
         false,
         Some(engine::index_attr(held, exptime)),
     );
@@ -151,13 +152,14 @@ pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {
 fn check_dimension_fits(store: &Store, layout: Layout, quant: Quant) -> Result<()> {
     let limit = store.max_element_bytes() as usize;
 
-    if layout.max_stored_len() <= limit {
+    // 메타가 가장 작은 경우(빈 문서)로 잰다. 메타가 큰 요소는 쓸 때 다시 잰다.
+    let stored = layout.stored_len(crate::bson::EMPTY.len());
+    if stored <= limit {
         return Ok(());
     }
     Err(Error::bad_request(format!(
-        "element would be {} bytes, over max_element_bytes {limit} \
+        "element would be {stored} bytes, over max_element_bytes {limit} \
          (max dimension is {} for quant {quant})",
-        layout.max_stored_len(),
         Layout::max_dim_for(quant, limit),
     )))
 }
@@ -198,10 +200,8 @@ pub fn vstats() -> Result<Reply> {
          STAT vectors {vectors}\r\n\
          STAT index_held_bytes {held_bytes}\r\n\
          STAT index_used_bytes {used_bytes}\r\n\
-         STAT attr_bytes_per_vector {}\r\n\
          STAT vectors_awaiting_metadata {}\r\n",
         indexes.len(),
-        element::ATTR_BYTES,
         crate::trigger::waiting::count(),
     );
 
@@ -235,12 +235,11 @@ pub fn vlist() -> Result<Reply> {
         let layout = &index.ann.layout;
         let _ = writeln!(
             out,
-            "INDEX {} dim={} quant={} metric={} attrbytes={} count={} maxcount={}\r",
+            "INDEX {} dim={} quant={} metric={} count={} maxcount={}\r",
             index.name,
             layout.dim,
             layout.quant,
             index.ann.metric,
-            element::ATTR_BYTES,
             index.ann.len(),
             index.maxcount,
         );
