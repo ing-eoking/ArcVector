@@ -11,6 +11,7 @@ pub mod engine_api {
     include!(concat!(env!("OUT_DIR"), "/engine_api.rs"));
 }
 
+pub mod bson;
 pub mod command;
 mod conn_state;
 pub mod error;
