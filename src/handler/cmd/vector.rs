@@ -36,7 +36,7 @@ impl Drop for Added {
     /// 여기서 넣는다. `Reserved`로 남겨 두면 adopt도 건드리지 않아 그 벡터가
     /// 영영 그래프 밖에 남는다.
     fn drop(&mut self) {
-        for (index, addr) in self.linked.drain(..) {
+        while let Some((index, addr)) = self.linked.pop() {
             let _ = recover::insert_reserved(&index, addr);
         }
     }
@@ -209,9 +209,22 @@ fn finish_write(
 
 /// **레인 스레드.** 무거운 일은 이것뿐이다.
 pub fn upsert_insert(added: &mut Added) -> Result<()> {
+    insert_each(&mut added.linked, |(index, addr)| {
+        recover::insert_reserved(&index, addr)
+    })
+}
+
+/// 주소를 하나씩 꺼내 넣는다. 첫 오류를 돌려주되 나머지도 계속 넣는다.
+///
+/// `drain`으로 돌지 않는 이유: `insert`가 패닉하면 `drain`은 안 본 항목까지
+/// 버려, 그 주소가 `Reserved`로 영영 남고 요소가 그래프 밖에 남는다. 하나씩
+/// `pop`하면 패닉 때도 남은 것이 `linked`에 있어 `Added::drop`이 넣는다.
+fn insert_each<T>(linked: &mut Vec<T>, mut insert: impl FnMut(T) -> Result<()>) -> Result<()> {
     let mut outcome = Ok(());
-    for (index, addr) in added.linked.drain(..) {
-        if let Err(e) = recover::insert_reserved(&index, addr)
+    // 들어온 순서대로 넣는다.
+    linked.reverse();
+    while let Some(item) = linked.pop() {
+        if let Err(e) = insert(item)
             && outcome.is_ok()
         {
             outcome = Err(e);
@@ -303,5 +316,45 @@ pub fn delete(store: &Store, spec: &Delete) -> Result<Reply> {
             Ok(Reply::NotFound)
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn every_address_is_inserted_in_order_and_the_first_error_wins() {
+        let mut linked = vec![1, 2, 3, 4];
+        let mut seen = Vec::new();
+        let outcome = insert_each(&mut linked, |n| {
+            seen.push(n);
+            if n == 2 || n == 3 {
+                Err(Error::Index(format!("fail {n}")))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(seen, [1, 2, 3, 4]);
+        assert!(outcome.unwrap_err().to_string().contains("fail 2"));
+        assert!(linked.is_empty());
+    }
+
+    #[test]
+    fn a_panic_leaves_the_unvisited_addresses_for_drop() {
+        let mut linked = vec![1, 2, 3, 4];
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            let _ = insert_each(&mut linked, |n| {
+                if n == 2 {
+                    panic!("insert blew up");
+                }
+                Ok(())
+            });
+        }));
+        assert!(caught.is_err());
+        // 1은 넣었고, 패닉한 2는 꺼냈으며, 3과 4는 `Added::drop`의 몫으로 남는다.
+        linked.sort();
+        assert_eq!(linked, [3, 4]);
     }
 }
