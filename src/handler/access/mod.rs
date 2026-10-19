@@ -9,9 +9,19 @@ use crate::handler::registry::{self, VectorIndex};
 
 /// The registry answers, once the engine has had a chance to disagree.
 ///
-/// An index exists in this process when its metadata element has been linked
-/// and the event callback registered it -- by `vcreate` on this node, by arcus
-/// replicating the Map in, or by the persistence log replaying it at startup.
+/// The index name is the key, and indexes share the key space with every
+/// other item. An index exists in this process when its Map has been linked
+/// and the event callback read the settings out of the Map's value and
+/// registered it -- by `vcreate` on this node, by arcus replicating the Map
+/// in, or by the persistence log replaying it at startup. So "is this Map
+/// ours" is the registry's answer, and the value is not read again here.
+///
+/// | engine | registry | answer |
+/// |---|---|---|
+/// | no such key | -- | `NoSuchIndex` |
+/// | not a Map | -- | `TypeMismatch` |
+/// | a Map | has the name | the index |
+/// | a Map | does not | `TypeMismatch` |
 /// For anything that *removes* an index, the unlink of its Map is the whole
 /// answer and there is nothing to read back.
 ///
@@ -30,12 +40,12 @@ pub(super) fn resolve(store: &Store, name: &str) -> Result<Arc<VectorIndex>> {
     // `KeyGone` is the answer here, not a failure: the Map is gone, so the
     // index is. Any other error means the engine could not be asked at all --
     // fall through to the registry rather than refuse a command over it.
-    match store.probe_map(&crate::trigger::key::map_key(name)) {
-        Err(StoreError::KeyGone) => return Err(Error::NoSuchIndex),
-        Ok(probe) if !probe.is_map => return Err(Error::NoSuchIndex),
-        _ => {}
+    match store.probe_map(name) {
+        Err(StoreError::KeyGone) => Err(Error::NoSuchIndex),
+        Ok(probe) if !probe.is_map => Err(Error::TypeMismatch),
+        Ok(_) => registry::serving(name).ok_or(Error::TypeMismatch),
+        Err(_) => registry::serving(name).ok_or(Error::NoSuchIndex),
     }
-    registry::serving(name).ok_or(Error::NoSuchIndex)
 }
 
 /// 읽는 쪽만 잠금을 본다.

@@ -2,8 +2,9 @@ use std::ffi::CStr;
 
 use crate::engine_api::{SERVER_HANDLE_V1, engine_interface_v1};
 
-const REQUIRED: [&str; 10] = [
+const REQUIRED: [&str; 12] = [
     "remove",
+    "map_struct_create_with_value",
     "map_elem_alloc",
     "map_elem_free",
     "map_elem_release",
@@ -13,11 +14,13 @@ const REQUIRED: [&str; 10] = [
     "getattr",
     "get_config",
     "get_elem_info",
+    "get_item_info",
 ];
 
 fn present(vt: &engine_interface_v1, name: &str) -> bool {
     match name {
         "remove" => vt.remove.is_some(),
+        "map_struct_create_with_value" => vt.map_struct_create_with_value.is_some(),
         "map_elem_alloc" => vt.map_elem_alloc.is_some(),
         "map_elem_free" => vt.map_elem_free.is_some(),
         "map_elem_release" => vt.map_elem_release.is_some(),
@@ -27,6 +30,7 @@ fn present(vt: &engine_interface_v1, name: &str) -> bool {
         "getattr" => vt.getattr.is_some(),
         "get_config" => vt.get_config.is_some(),
         "get_elem_info" => vt.get_elem_info.is_some(),
+        "get_item_info" => vt.get_item_info.is_some(),
         _ => true,
     }
 }

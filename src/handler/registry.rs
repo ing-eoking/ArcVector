@@ -88,7 +88,8 @@ impl VectorIndex {
     /// Marks this index ready to serve.
     ///
     /// There is no ownership token any more: an index is in this registry
-    /// because the trigger callback saw its metadata item linked, and no other
+    /// because the trigger callback saw its Map linked with settings in its
+    /// value, and no other
     /// process can have put it there.
     /// 복구 표를 끊는다. 이미 누가 끊었으면 `false`.
     ///

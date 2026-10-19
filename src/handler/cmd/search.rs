@@ -21,6 +21,8 @@ enum Verdict {
     Take(Option<String>),
     /// 필터가 걸렀다.
     Drop,
+    /// 필터는 받았는데 attr을 JSON으로 내지 못했다. 저장된 BSON이 깨졌다.
+    Corrupt,
 }
 
 fn judged_attr(judged: &RefCell<Vec<(u64, String)>>, key: u64) -> Option<String> {
@@ -57,6 +59,10 @@ fn similar(
     let layout = index.ann.layout;
 
     let judged: RefCell<Vec<(u64, String)>> = RefCell::new(Vec::new());
+    // 순회 안에서는 오류를 낼 수 없어 적어 두고, 끝난 뒤 필터 없는 길과 같은
+    // `CorruptElement`로 답한다. 조용히 빼면 깨진 요소가 검색에서 사라질 뿐
+    // 아무도 모른다.
+    let corrupt = std::cell::Cell::new(false);
     let accepted = |key: u64| -> bool {
         // 순회 중 방문하는 노드마다 엔진 메모리를 따라간다. 콜백이 거절하면
         // 엔진이 그 자리에서 해제하므로, 가드 없이 읽으면 해제된 메모리를 본다.
@@ -68,17 +74,20 @@ fn similar(
             // 필터가 없으면 그래프에 있다는 것이 곧 판정이다.
             return true;
         };
-        let Some(Verdict::Take(attr)) =
-            store.with_elem_at(key, |_field, value| match layout.split(value) {
-                Ok((meta, _)) if filter.matches(meta) => match crate::bson::to_json(meta) {
-                    Ok(json) => Verdict::Take(Some(json)),
-                    Err(_) => Verdict::Drop,
-                },
-                _ => Verdict::Drop,
-            })
-        else {
+        let attr = match store.with_elem_at(key, |_field, value| match layout.split(value) {
+            Ok((meta, _)) if filter.matches(meta) => match crate::bson::to_json(meta) {
+                Ok(json) => Verdict::Take(Some(json)),
+                Err(_) => Verdict::Corrupt,
+            },
+            _ => Verdict::Drop,
+        }) {
+            Some(Verdict::Take(attr)) => attr,
+            Some(Verdict::Corrupt) => {
+                corrupt.set(true);
+                return false;
+            }
             // 읽을 수 없거나 필터가 걸렀다.
-            return false;
+            Some(Verdict::Drop) | None => return false,
         };
 
         let Some(attr) = attr else {
@@ -100,6 +109,13 @@ fn similar(
     let accept: Option<Accept> = Some(&accepted as Accept);
 
     let named = index.ann.search(query, k, accept)?;
+    if corrupt.get() {
+        eprintln!(
+            "ArcVector: an element of index '{}' matched the filter but its attr is unreadable",
+            index.name
+        );
+        return Err(StoreError::CorruptElement.into());
+    }
 
     let mut rendered = crate::room::vec(named.len().min(k))?;
     for (key, id, distance) in named {
@@ -111,14 +127,12 @@ fn similar(
         } else if let Some(attr) = judged_attr(&judged, key) {
             Some(attr)
         } else {
-            let stored = match store
-                .get_elem(&crate::trigger::key::map_key(&index.name), &id)
-                .and_then(|body| {
-                    let (meta, _) = layout
-                        .split(&body)
-                        .map_err(|_| StoreError::CorruptElement)?;
-                    crate::bson::to_json(meta).map_err(|_| StoreError::CorruptElement)
-                }) {
+            let stored = match store.get_elem(&index.name, &id).and_then(|body| {
+                let (meta, _) = layout
+                    .split(&body)
+                    .map_err(|_| StoreError::CorruptElement)?;
+                crate::bson::to_json(meta).map_err(|_| StoreError::CorruptElement)
+            }) {
                 Ok(stored) => stored,
 
                 // A delete that landed between the search and here. One hit
@@ -209,7 +223,7 @@ pub fn vsim_key(store: &Store, spec: &SimKey) -> Result<Reply> {
     let (k, with_attr, filter) = (*k, *with_attr, filter.as_ref());
 
     let index = for_read(store, name)?;
-    let addr = match store.hold_elem(&crate::trigger::key::map_key(name), key) {
+    let addr = match store.hold_elem(name, key) {
         Ok(addr) => addr,
         // The query vector's own element. Gone means gone: this is a NOT_FOUND
         // for the query, never a verdict on the index.

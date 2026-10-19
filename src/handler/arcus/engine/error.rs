@@ -5,8 +5,8 @@ use crate::engine_api::{
     ENGINE_ERROR_CODE_ENGINE_E2BIG, ENGINE_ERROR_CODE_ENGINE_EBADTYPE,
     ENGINE_ERROR_CODE_ENGINE_ELEM_EEXISTS, ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT,
     ENGINE_ERROR_CODE_ENGINE_EOVERFLOW, ENGINE_ERROR_CODE_ENGINE_EWOULDBLOCK,
-    ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT, ENGINE_ERROR_CODE_ENGINE_NOT_STORED,
-    ENGINE_ERROR_CODE_ENGINE_SUCCESS,
+    ENGINE_ERROR_CODE_ENGINE_KEY_EEXISTS, ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT,
+    ENGINE_ERROR_CODE_ENGINE_NOT_STORED, ENGINE_ERROR_CODE_ENGINE_SUCCESS,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -17,6 +17,10 @@ pub enum StoreError {
     ElemGone,
 
     ElemExists,
+
+    /// 만들려던 키가 이미 있다(`ENGINE_KEY_EEXISTS`). 무엇이 있는지는 부른 쪽이
+    /// 가린다 -- `vcreate`는 우리 인덱스면 `EXISTS`, 아니면 `TYPE_MISMATCH`.
+    KeyExists,
 
     /// `add` refused because the key was already there. `vcreate` reads this
     /// as `EXISTS` -- it is how the engine answers "does this index exist?"
@@ -51,6 +55,7 @@ impl fmt::Display for StoreError {
             Self::KeyGone => f.write_str("index not found in engine"),
             Self::ElemGone => f.write_str("element not found"),
             Self::ElemExists => f.write_str("element already exists"),
+            Self::KeyExists => f.write_str("the key already exists"),
             Self::BadType => f.write_str("key holds an item that is not a Map"),
             Self::CorruptElement => {
                 f.write_str("the engine described an element that cannot be read")
@@ -80,6 +85,7 @@ pub(super) fn translate(code: u32) -> StoreError {
         ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT => StoreError::KeyGone,
         ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT => StoreError::ElemGone,
         ENGINE_ERROR_CODE_ENGINE_ELEM_EEXISTS => StoreError::ElemExists,
+        ENGINE_ERROR_CODE_ENGINE_KEY_EEXISTS => StoreError::KeyExists,
         ENGINE_ERROR_CODE_ENGINE_NOT_STORED => StoreError::NotStored,
         ENGINE_ERROR_CODE_ENGINE_E2BIG => StoreError::TooBig,
         ENGINE_ERROR_CODE_ENGINE_EBADTYPE => StoreError::BadType,
@@ -141,6 +147,10 @@ mod tests {
         assert_eq!(
             translate(ENGINE_ERROR_CODE_ENGINE_EOVERFLOW),
             StoreError::Overflow
+        );
+        assert_eq!(
+            translate(ENGINE_ERROR_CODE_ENGINE_KEY_EEXISTS),
+            StoreError::KeyExists
         );
         assert_eq!(translate(9999), StoreError::Engine(9999));
     }

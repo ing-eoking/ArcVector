@@ -47,6 +47,9 @@ pub enum Error {
     BadRequest(String),
     NoSuchIndex,
 
+    /// 키는 있는데 우리 인덱스가 아니다. 인덱스와 일반 키가 한 키 공간을 쓴다.
+    TypeMismatch,
+
     IndexEvicted,
 
     Unreadable,
@@ -65,9 +68,11 @@ impl Error {
 
     pub fn blame(&self) -> Blame {
         match self {
-            Self::BadRequest(_) | Self::NoSuchIndex | Self::IndexEvicted | Self::Filter(_) => {
-                Blame::Client
-            }
+            Self::BadRequest(_)
+            | Self::NoSuchIndex
+            | Self::TypeMismatch
+            | Self::IndexEvicted
+            | Self::Filter(_) => Blame::Client,
 
             Self::Codec(e) => match e {
                 CodecError::VectorLenMismatch { .. } => Blame::Client,
@@ -85,6 +90,7 @@ impl fmt::Display for Error {
         match self {
             Self::BadRequest(m) | Self::Index(m) => f.write_str(m),
             Self::NoSuchIndex => f.write_str("index not found"),
+            Self::TypeMismatch => f.write_str("the key holds something that is not an index"),
             Self::IndexEvicted => f.write_str("index was evicted"),
             Self::Unreadable => f.write_str("index is unreadable while it rebuilds from Map"),
             Self::Rebuilding => f.write_str("index is being released for a rebuild; retry"),
@@ -150,10 +156,12 @@ impl Error {
     /// 이 오류가 회선에 나가는 모양.
     ///
     /// 인덱스가 없다는 것은 클라이언트의 잘못이 아니라 **결과**라, 접두사 없이
-    /// `NOT_FOUND`로 나간다. 나머지는 책임 소재를 앞세운다.
+    /// `NOT_FOUND`로 나간다. 키가 인덱스가 아닌 것(`TYPE_MISMATCH`)도 같다.
+    /// 나머지는 책임 소재를 앞세운다.
     pub fn wire(&self) -> String {
         match self {
             Self::NoSuchIndex | Self::IndexEvicted => Reply::NotFound.as_str().to_owned(),
+            Self::TypeMismatch => Reply::TypeMismatch.as_str().to_owned(),
             e => format!("{} {e}\r\n", e.blame().prefix()),
         }
     }
@@ -217,6 +225,14 @@ mod tests {
         assert!(matches!(e, Error::Filter(_)));
         let e: Error = StoreError::KeyGone.into();
         assert!(matches!(e, Error::Store(_)));
+    }
+
+    #[test]
+    fn a_key_that_is_not_an_index_answers_type_mismatch() {
+        // 인덱스와 일반 키가 한 키 공간을 쓴다. 키가 있는데 우리 것이 아니면
+        // 결과이지 잘못이 아니라, 접두사 없이 나간다.
+        assert_eq!(Error::TypeMismatch.wire(), "TYPE_MISMATCH\r\n");
+        assert_eq!(Error::TypeMismatch.blame(), Blame::Client);
     }
 
     #[test]

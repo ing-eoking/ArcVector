@@ -8,14 +8,14 @@
 //! 요소가 링크되면 엔진이 cache lock을 쥔 채 콜백을 부른다. 거기서 HNSW에
 //! 넣으면 그동안 데몬 전체가 서므로, 콜백은 주소만 여기 적고 풀이 넣는다.
 //! 엔진이 LINK에서 우리 몫의 참조를 이미 잡아뒀으니 적어둘 것은 주소뿐이다.
-//! 주소가 여기 오는 길은 셋이다.
+//! 주소가 여기 오는 길은 둘이다.
 //!
 //! * `vadd`/`vsetattr` -- 그 명령의 워커 스레드에서 링크된 요소. 명령이 직접
 //!   풀에 넘겨 넣고 나서 답하므로 `Reserved`로 적어 다른 누구도 집지 않게 한다.
 //! * 복제·복구로 들어온 요소 -- `Pending`. 인덱스의 adopt가 순서대로 집어간다.
-//! * 메타보다 먼저 도착한 요소 -- 역시 `Pending`. 복제본에는 `vcreate`가 오지
-//!   않고, 요소가 메타 요소보다 먼저 올 수 있다. 메타가 오면 그때 그래프를
-//!   세워 쭉 넣는다.
+//!
+//! 어느 쪽이든 인덱스는 이미 있다. 설정이 Map 값에 있어 인덱스는 Map이 링크될
+//! 때 생기고, 요소는 그 뒤에야 들어온다.
 //!
 //! # 넣는 스레드와 unlink 콜백을 가르는 것
 //!
@@ -393,20 +393,6 @@ mod tests {
         let guard = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
         forget(name);
         guard
-    }
-
-    #[test]
-    fn a_vector_that_arrives_before_its_metadata_is_kept() {
-        let ix = "pending-kept";
-        let _alone = alone(ix);
-        assert!(push(ix, 0x10));
-        assert!(push(ix, 0x20));
-
-        let mut cursor = 0;
-        assert_eq!(claim(ix, &mut cursor), Some(0x10));
-        assert_eq!(claim(ix, &mut cursor), Some(0x20));
-        assert_eq!(claim(ix, &mut cursor), None, "두 개뿐이었다");
-        forget(ix);
     }
 
     #[test]

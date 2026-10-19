@@ -76,8 +76,7 @@ pub fn vadd_write(store: &Store, spec: &Add, body: &[u8]) -> Result<AddPlan> {
 
 /// 요소를 쓰고, 링크 콜백이 돌려준 주소를 챙긴다.
 fn write(store: &Store, name: &str, id: &str, value: &[u8], stamp: u64) -> Result<AddPlan> {
-    let (written, linked) =
-        event::capture(|| store.insert_elem(&key::map_key(name), id, value, true, None));
+    let (written, linked) = event::capture(|| store.insert_elem(name, id, value, true, None));
     let added = Added {
         name: name.to_owned(),
         id: id.to_owned(),
@@ -118,7 +117,7 @@ pub fn vadd_finish(store: &Store, added: Added, inserted: Result<()>) -> Result<
     match inserted {
         Ok(()) => Ok(Reply::Stored),
         Err(e) => {
-            if let Err(gone) = store.delete_elem(&key::map_key(&added.name), &added.id)
+            if let Err(gone) = store.delete_elem(&added.name, &added.id)
                 && gone != StoreError::ElemGone
             {
                 eprintln!(
@@ -221,7 +220,7 @@ pub fn vgetattr(store: &Store, name: &str, id: &str) -> Result<Reply> {
     let stamp = registry::now();
 
     let layout = index.ann.layout;
-    match store.get_elem(&key::map_key(name), id).and_then(|body| {
+    match store.get_elem(name, id).and_then(|body| {
         let (meta, _) = layout
             .split(&body)
             .map_err(|_| StoreError::CorruptElement)?;
@@ -258,7 +257,7 @@ pub fn vsetattr(store: &Store, name: &str, id: &str, attr: &[u8]) -> Result<Repl
     // 지금 값을 읽어 attr만 갈아 끼우고 다시 쓴다. 그래프는 건드리지 않는다 --
     // 이 쓰기가 엔진의 replace 이벤트를 부르고, 벡터가 같으니 콜백이 노드를 새
     // 주소로 옮긴다.
-    let value = match store.get_elem(&key::map_key(name), id) {
+    let value = match store.get_elem(name, id) {
         Ok(value) => value,
         Err(StoreError::ElemGone) => return Ok(Reply::NotFound),
         Err(StoreError::KeyGone) => {
@@ -289,7 +288,7 @@ pub fn vdel(store: &Store, name: &str, id: &str) -> Result<Reply> {
 
     // 그래프는 건드리지 않는다. 이 삭제가 엔진의 unlink 이벤트를 부르고, 그
     // 콜백이 노드를 빼고 참조를 sweeper에게 넘긴다.
-    match store.delete_elem(&key::map_key(name), id) {
+    match store.delete_elem(name, id) {
         Ok(()) => Ok(Reply::Deleted),
         Err(StoreError::ElemGone) => Ok(Reply::NotFoundVector),
         Err(StoreError::KeyGone) => {

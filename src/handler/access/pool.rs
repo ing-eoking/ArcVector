@@ -1,9 +1,9 @@
 //! 요청 경로 밖의 일을 맡는 작은 스레드 풀.
 //!
-//! 지금 쓰는 곳은 복구 하나다. 메타 아이템이 링크되면 그 인덱스의 보류된 벡터를
-//! 그래프에 넣어야 하는데, 그 콜백은 **엔진의 cache lock을 쥔 채** 불린다. 거기서
-//! 수만 건을 삽입하면 데몬 전체가 그동안 선다. 그래서 콜백은 일감만 넘기고 곧장
-//! 돌아오고, 삽입은 여기 스레드가 한다.
+//! 처음 쓰인 곳은 복구다. 복제·재생으로 링크된 벡터를 그래프에 넣어야 하는데,
+//! 그 콜백은 **엔진의 cache lock을 쥔 채** 불린다. 거기서 수만 건을 삽입하면
+//! 데몬 전체가 그동안 선다. 그래서 콜백은 일감만 넘기고 곧장 돌아오고, 삽입은
+//! 여기 스레드가 한다.
 //!
 //! 콜백에서 스레드를 그때그때 만들지 않는 이유도 같다 -- `pthread_create`는
 //! 시스템 콜이고 실패할 수도 있어서, cache lock 아래에서 할 일이 아니다. 미리
@@ -39,8 +39,6 @@ const WORKERS: usize = 32;
 const QUEUE: usize = 256;
 
 pub(crate) enum Job {
-    /// 메타가 도착했다. 보류된 벡터를 그래프에 넣고 서빙으로 올린다.
-    Recover(Arc<VectorIndex>),
     /// 서빙 중인 인덱스의 보류 목록을 비운다. 링크 콜백이 맡긴다.
     Adopt(Arc<VectorIndex>),
     /// 연결 하나가 답을 기다리는 명령. 끝나면 코어를 깨운다.
@@ -114,9 +112,9 @@ fn queue(lane: &Lane) -> MutexGuard<'_, VecDeque<Job>> {
 
 /// 일감을 맡긴다. 대기열이 가득 차 있으면 `false`.
 ///
-/// 부른 쪽은 `false`를 흘려보내면 안 된다 -- 복구를 안 하면 그 인덱스는 `BUILDING`
-/// 으로 남아 영영 안 보인다. sweeper가 매 틱 `BUILDING`을 다시 맡기는 것이 그
-/// 안전망이다.
+/// 부른 쪽은 `false`를 흘려보내면 안 된다 -- 맡기지 못한 adopt는 그 벡터들을
+/// 그래프 밖에 둔다. sweeper가 매 틱 보류 목록이 남은 인덱스를 다시 맡기는 것이
+/// 그 안전망이다.
 pub(crate) fn submit(job: Job) -> bool {
     try_submit(job).is_none()
 }
@@ -180,7 +178,6 @@ fn run(n: usize) {
         // 패닉한 일 하나 때문에 레인 스레드가 죽으면 그 레인에 들어오는 일이 영영
         // 돌지 않는다. 일은 버리고 스레드는 산다.
         let ran = std::panic::catch_unwind(AssertUnwindSafe(|| match job {
-            Job::Recover(index) => crate::trigger::recover::work(&index),
             Job::Adopt(index) => crate::trigger::recover::adopt_work(&index),
             // 키 있는 일이면 그 키에 줄 선 일까지 이 스레드에서 잇는다.
             Job::Offload(work) => work.run(),

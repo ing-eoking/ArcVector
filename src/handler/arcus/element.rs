@@ -108,7 +108,11 @@ impl Layout {
         Ok(())
     }
 
-    /// 값을 메타와 벡터로 나눈다. 뒤에 붙은 종단자는 무시한다.
+    /// 값을 메타와 벡터로 나눈다.
+    ///
+    /// 메타 뒤에는 벡터만 있어야 한다. 엔진이 붙인 CRLF는 있어도 되고 없어도
+    /// 되지만, 그 밖의 바이트가 남으면 이 인덱스의 요소가 아니다 -- 차원이나
+    /// 양자화가 다른 값을 벡터로 읽어 그래프에 넣는 것보다 거절하는 편이 낫다.
     pub fn split<'a>(&self, value: &'a [u8]) -> Result<(&'a [u8], &'a [u8]), CodecError> {
         let declared = value
             .get(..4)
@@ -129,11 +133,15 @@ impl Layout {
                 got: value.len(),
             });
         }
+        let tail = &value[need..];
+        if !tail.is_empty() && tail != b"\r\n" {
+            return Err(CodecError::LayoutMismatch);
+        }
         Ok((&value[..meta_len], &value[meta_len..need]))
     }
 }
 
-/// 인덱스 설정. 인덱스 Map의 메타 요소 값으로 저장된다.
+/// 인덱스 설정. 인덱스 Map 아이템의 값으로 저장된다.
 ///
 /// BSON 키는 `v`(=1), `dim`, `metric`, `quant`, `M`, `efc`, `efs`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -335,6 +343,54 @@ mod tests {
             l.split(&good[..4]),
             Err(CodecError::Truncated { .. })
         ));
+    }
+
+    /// 4바이트 머리 하나로 시작하는 값. 머리가 말하는 길이만 바꿔 본다.
+    fn with_header(declared: i32, rest: &[u8]) -> Vec<u8> {
+        let mut value = declared.to_le_bytes().to_vec();
+        value.extend_from_slice(rest);
+        value
+    }
+
+    #[test]
+    fn a_header_under_five_bytes_is_truncated() {
+        let l = layout();
+        for declared in [0, 1, 4] {
+            let value = with_header(declared, &[0; 16]);
+            assert!(
+                matches!(l.split(&value), Err(CodecError::Truncated { .. })),
+                "{declared}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_negative_header_is_truncated() {
+        let value = with_header(-5, &[0; 16]);
+        assert!(matches!(
+            layout().split(&value),
+            Err(CodecError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn a_header_longer_than_the_value_is_truncated() {
+        let value = with_header(64, &[0; 8]);
+        assert!(matches!(
+            layout().split(&value),
+            Err(CodecError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn bytes_past_the_vector_other_than_the_terminator_are_refused() {
+        let l = layout();
+        let good = l.encode(&[1, 2, 3, 4], &bson::EMPTY).unwrap();
+        for tail in [&b"x"[..], b"\r", b"\n\r", b"ab", b"\r\nx", b"\r\n\r\n"] {
+            let mut value = good.clone();
+            value.extend_from_slice(tail);
+            assert_eq!(l.split(&value), Err(CodecError::LayoutMismatch), "{tail:?}");
+        }
     }
 
     #[test]

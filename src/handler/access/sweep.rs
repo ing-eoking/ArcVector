@@ -96,15 +96,10 @@ fn run() {
             for index in &indexes {
                 index.ann.retry_stuck();
 
-                // 복구를 못 맡긴 인덱스를 다시 맡긴다. 풀의 대기열이 가득 차
-                // 있었을 수 있는데, `BUILDING`으로 남으면 그 이름은 어떤 명령에도
-                // 안 보이므로 여기서 집어주지 않으면 영영 안 올라온다.
-                if index.state() == registry::BUILDING {
-                    crate::trigger::recover::submit(index);
-                } else if crate::trigger::waiting::pending(&index.name) {
-                    // 링크 콜백이 적어 두고 풀에 넘기지 못한 주소들. 서빙
-                    // 중인 인덱스는 복구가 다시 맡아주지 않으므로, 여기가
-                    // 그것들이 그래프에 들어가는 마지막 길이다.
+                // 링크 콜백이 적어 두고 풀에 넘기지 못한 주소들. 풀의 대기열이
+                // 가득 차 있었을 수 있는데, 여기서 집어주지 않으면 그것들은
+                // 영영 그래프 밖에 남는다.
+                if crate::trigger::waiting::pending(&index.name) {
                     crate::trigger::recover::submit_adopt(index);
                 }
             }

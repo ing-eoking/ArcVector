@@ -4,7 +4,13 @@
 //! 포인터(`target`, `source`)와, 우리가 참조를 몇 개 가져갈지 적을 자리
 //! (`target_ref`, `source_ref`)를 들고 온다. 요소 이벤트는 그 요소가 속한 Map
 //! 아이템(`coll_item`)도 함께 들고 온다 -- 요소에는 자기가 어느 Map 것인지 적혀
-//! 있지 않아서, 그것이 어느 인덱스의 일인지 알 길이 그것뿐이다.
+//! 있지 않아서, 그것이 어느 인덱스의 일인지 알 길이 그것뿐이다. Map의 키가 곧
+//! 인덱스 이름이다.
+//!
+//! 인덱스는 Map이 링크될 때(`ITEM_LINK`) 생긴다. 설정이 Map 아이템의 값에 있어
+//! 콜백이 그 자리에서 읽는다 -- 이 노드의 `vcreate`든, 복제나 persistence 재생으로
+//! 들어온 Map이든 같은 길이다. 요소는 언제나 링크된 Map에 들어가므로, 요소
+//! 이벤트가 올 때 그 인덱스는 이미 레지스트리에 있다. 없으면 우리 인덱스가 아니다.
 //!
 //! 엔진은 콜백이 돌아온 뒤 우리가 적은 수만큼 참조를 옮긴다.
 //!
@@ -32,7 +38,6 @@
 //! | 무엇 | 들고 있나 | 무엇을 보고 아나 |
 //! |---|---|---|
 //! | 그래프에 들어가길 기다리는 벡터 | 예 | `waiting`에 있다 |
-//! | 메타 요소 | 예 | 메타는 언제나 받는다 |
 //! | 그래프에 있던 벡터 | 예 | 그 이름의 그래프가 `holds` |
 //! | 그 밖의 것 | 아니오 | 링크에서 거절했다 |
 //!
@@ -146,7 +151,7 @@ pub(crate) fn refs_for(event: Event, decision: Decision) -> Refs {
 /// 엔진이 알려온 다섯 경우.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Event {
-    /// Map이 링크됐다. 아직 메타가 없으니 할 일이 없다.
+    /// Map이 링크됐다. 값이 설정 문서면 **이것이 인덱스가 생기는 것이다.**
     ItemLink,
     /// Map이 빠진다. **이것이 인덱스가 사라지는 것이다.**
     ItemUnlink,
@@ -310,7 +315,11 @@ unsafe fn dispatch(event: Event, ev: &event_data_t) -> Decision {
     };
 
     match event {
-        Event::ItemLink => Decision::NOTHING,
+        Event::ItemLink => {
+            on_create(&store, ev.target as u64);
+            // Map 아이템의 참조는 주고받지 않는다.
+            Decision::NOTHING
+        }
         Event::ItemUnlink => {
             if let Some(name) = index_of(&store, ev.target as u64) {
                 on_drop(&name);
@@ -320,14 +329,13 @@ unsafe fn dispatch(event: Event, ev: &event_data_t) -> Decision {
         }
         Event::Insert | Event::Delete | Event::Replace => {
             let Some(name) = index_of(&store, ev.coll_item as u64) else {
-                // 이벤트 플래그는 Map마다 서므로 우리 모양이 아닌 키의 Map도
-                // 여기까지 올 수 있다. 아무것도 받지 않고, 받은 적 없는 것은
-                // 깎지 않는다.
+                // 이름으로 읽히지 않는 키다. 우리 인덱스일 수 없으니 아무것도
+                // 받지 않고, 받은 적 없는 것은 깎지 않는다.
                 return Decision::NOTHING;
             };
             match event {
-                Event::Insert => Decision::insert(on_link(&store, &name, ev.target as u64)),
-                Event::Delete => Decision::delete(on_unlink(&store, &name, ev.target as u64)),
+                Event::Insert => Decision::insert(on_link(&name, ev.target as u64)),
+                Event::Delete => Decision::delete(on_unlink(&name, ev.target as u64)),
                 _ => on_replace(&store, &name, ev.source as u64, ev.target as u64),
             }
         }
@@ -353,13 +361,6 @@ fn index_of(store: &Store, map: u64) -> Option<String> {
     })?
 }
 
-/// 요소가 인덱스의 메타인가.
-fn is_meta(store: &Store, elem: u64) -> bool {
-    store
-        .with_elem_at(elem, |field, _value| crate::trigger::key::is_meta(field))
-        .unwrap_or(false)
-}
-
 /// 인덱스의 Map이 빠졌다. 레지스트리에서 내린다.
 ///
 /// 마스터에서는 `vdrop`이, 복제본과 재생에서는 복제된 삭제가, 어디서든 만료와
@@ -372,24 +373,12 @@ fn on_drop(name: &str) {
 
 /// 벡터 요소가 링크됐다. 붙잡아 두고 그래프에 넣을 길로 보낸다.
 ///
-/// 인덱스를 아직 모르면 -- 복제본에서 메타보다 벡터가 먼저 도착한 경우다 --
-/// 주소만 적어 뒀다가 메타가 올 때 복구가 넣는다.
+/// 인덱스를 모르면 우리 Map이 아니다 -- 인덱스는 Map이 링크될 때 등록되고,
+/// 요소는 링크된 Map에만 들어간다. 받지 않는다.
 ///
 /// 붙잡았으면 `true`. 엔진은 그때만 참조를 하나 올린다.
-fn on_link(store: &Store, name: &str, addr: u64) -> bool {
-    if is_meta(store, addr) {
-        on_meta(store, addr, name);
-        return true;
-    }
-
+fn on_link(name: &str, addr: u64) -> bool {
     let Some(index) = registry::get(name) else {
-        if waiting::push(name, addr) {
-            return true;
-        }
-        eprintln!(
-            "ArcVector: no room to hold '{name}' vectors until its metadata arrives; \
-             this one will be missing from the graph"
-        );
         return false;
     };
     link_into(&index, addr)
@@ -437,66 +426,52 @@ fn link_into(index: &Arc<VectorIndex>, addr: u64) -> bool {
 /// 엔진은 우리가 1로 답할 때만 new의 참조를 올린다. 그래서 붙잡을 수 없으면
 /// 여기서 끝낸다 -- 받은 적 없는 참조를 놓아줄 큐에 넣으면 안 된다. 그 요소는
 /// 저장소에 남지만 그래프 밖이고(stored but not indexed), 나중의 delete는
-/// "우리 것이 아니다"로 읽는다.
-fn take_replacement(live: Option<&Arc<VectorIndex>>, name: &str, new: u64) -> bool {
-    match live {
-        Some(index) => link_into(index, new),
-        None => {
-            if waiting::push(name, new) {
-                return true;
-            }
-            eprintln!(
-                "ArcVector: no room to hold a replaced '{name}' vector; it stays in the \
-                 store, out of this index"
-            );
-            false
-        }
-    }
+/// "우리 것이 아니다"로 읽는다. 살아 있는 인덱스가 없으면 우리 Map이 아니라
+/// 받지 않는다.
+fn take_replacement(live: Option<&Arc<VectorIndex>>, new: u64) -> bool {
+    live.is_some_and(|index| link_into(index, new))
 }
 
-/// 인덱스의 메타 요소가 링크됐다.
+/// 이벤트 플래그가 선 Map이 링크됐다. 값이 설정 문서면 인덱스를 세워 등록한다.
 ///
-/// 이 노드의 `vcreate`가 쓴 것이면 레지스트리에 이미 있다 -- 그래프에 들어갈
-/// 것이 없으니 서빙으로 올리기만 한다. 없으면 복제나 persistence 재생으로 들어온
-/// 것이고, **그때가 이 인덱스가 이 프로세스에서 생기는 순간**이다. 복제본에는
+/// **이때가 이 인덱스가 이 프로세스에서 생기는 순간이다.** 이 노드의 `vcreate`,
+/// 복제로 들어온 Map, persistence 재생이 모두 이 링크에 닿는다. 복제본에는
 /// `vcreate`가 오지 않으므로 이 경로 말고는 인덱스가 생길 길이 없다.
 ///
-/// 메타 요소의 참조는 인덱스를 세웠든 못 세웠든 언제나 받는다. 그래야 unlink와
-/// replace가 "들고 있었나"를 묻지 않고 돌려줄 수 있다.
-fn on_meta(store: &Store, addr: u64, name: &str) {
-    if let Some(index) = registry::get(name) {
-        index.publish();
-        index.mark_serving();
+/// 등록하자마자 서빙한다. 막 링크된 Map에는 요소가 없고, 뒤따라 들어오는 요소는
+/// 링크 콜백이 `waiting`에 적어 풀의 adopt가 넣는다.
+fn on_create(store: &Store, map: u64) {
+    let Some(name) = index_of(store, map) else {
         return;
-    }
-
-    let Some(index) = build(store, addr, name) else {
+    };
+    let Some(index) = store
+        .with_item_value_at(map, |value| build_from_value(name, value))
+        .flatten()
+    else {
         return;
     };
     let Ok((registered, previous)) = registry::put(index) else {
-        eprintln!("ArcVector: the index registry could not grow; '{name}' stays unknown");
+        // 이름은 인덱스와 함께 넘어갔다. cache lock 아래라 따로 떠 두지 않는다.
+        eprintln!("ArcVector: the index registry could not grow; a new index stays unknown");
         return;
     };
+    // 같은 키의 Map은 둘일 수 없고 옛 Map의 unlink가 먼저 내렸을 것이다. 혹시
+    // 남아 있었으면 그 그래프는 비워질 때까지 들고 있는다.
     registry::keep_until_empty(previous);
-
-    if !recover::submit(&registered) {
-        // 안전망은 sweeper다. 매 틱 `BUILDING`으로 남은 인덱스를 다시 맡긴다.
-        eprintln!("ArcVector: '{name}' waits for a free worker before it can recover");
-    }
+    // 이 시각 전에 시작한 명령의 "Map이 없다"는 판정이 새 인덱스를 내리지 않게
+    // 한다(`registry::remove_if_stale`).
+    registered.publish();
 }
 
-/// 메타 본문으로 인덱스를 세운다. 아직 등록하지는 않는다.
+/// Map 값으로 인덱스를 세운다. 아직 등록하지는 않는다.
+///
+/// 값이 설정 문서로 읽히지 않으면 `None` -- 우리 인덱스가 아니다. 조용히
+/// 지나간다.
 ///
 /// `AnnIndex::new`가 usearch의 그래프를 잡으므로 cache lock 아래에서 도는
 /// 할당이다. 인덱스 하나당 한 번뿐이라 감수한다.
-fn build(store: &Store, addr: u64, name: &str) -> Option<VectorIndex> {
-    let decoded = store
-        .with_elem_at(addr, |_field, value| IndexConfig::decode(value).ok())
-        .flatten();
-    let Some(config) = decoded else {
-        eprintln!("ArcVector: the metadata of '{name}' is unreadable; the index stays unknown");
-        return None;
-    };
+fn build_from_value(name: String, value: &[u8]) -> Option<VectorIndex> {
+    let config = IndexConfig::decode(value).ok()?;
     // maxcount는 설정 문서에 없다. 이 콜백은 cache lock 아래라 Map 속성을 물을
     // 수도 없으므로 모르는 채로 0을 둔다 -- 한도는 엔진이 Map의 maxcount로 지킨다.
     match AnnIndex::new(
@@ -507,7 +482,7 @@ fn build(store: &Store, addr: u64, name: &str) -> Option<VectorIndex> {
         config.efs,
         Arc::new(MapElements),
     ) {
-        Ok(ann) => Some(VectorIndex::building(name.to_owned(), ann, 0)),
+        Ok(ann) => Some(VectorIndex::ours(name, ann, 0)),
         Err(e) => {
             eprintln!("ArcVector: could not build the graph for '{name}': {e}");
             None
@@ -518,17 +493,11 @@ fn build(store: &Store, addr: u64, name: &str) -> Option<VectorIndex> {
 /// 요소가 빠진다. 우리가 들고 있는 것이면 놓아준다.
 ///
 /// 무엇을 들고 있는지는 이 모듈 머리의 표가 답한다.
-fn on_unlink(store: &Store, name: &str, addr: u64) -> Old {
-    if is_meta(store, addr) {
-        // 메타는 언제나 받았다. 그래프에 노드가 없으니 아무도 이 주소를
-        // 역참조하지 않는다 -- 엔진이 그 자리에서 회수해도 된다.
-        //
-        // 레지스트리는 건드리지 않는다. 메타 요소는 Map이 지워진 **뒤에**
-        // 컬렉션 삭제 스레드가 지우는데, 그 사이 같은 이름으로 새 인덱스가
-        // 생겼을 수 있다. 인덱스를 내리는 것은 Map의 unlink다.
-        return Old::Returned;
-    }
-
+///
+/// 레지스트리에 없는 이름이어도 묻는다. Map이 지워진 **뒤에** 컬렉션 삭제
+/// 스레드가 요소를 지우므로, 그때 인덱스는 이미 내려가 있고 그래프는
+/// `registry::holding`이 찾는 버려지는 쪽에 있다.
+fn on_unlink(name: &str, addr: u64) -> Old {
     match waiting::unlink(name, addr) {
         // 그래프에 들어간 적은 없지만 참조는 우리 것이다. 엔진이 지금 회수한다.
         Unlinked::NeverLinked => return Old::Returned,
@@ -575,12 +544,6 @@ fn same_vector(store: &Store, index: &VectorIndex, old: u64, new: u64) -> bool {
 /// 두 답이 따로다. new는 INSERT처럼 붙잡았는지(`target_ref`), old는 DELETE처럼
 /// 지금 놓을지(`source_ref`). 엔진은 new를 우리가 답한 만큼만 올린다.
 fn on_replace(store: &Store, name: &str, old: u64, new: u64) -> Decision {
-    if is_meta(store, old) {
-        // 메타는 언제나 받았으니 old를 돌려준다. new도 메타의 링크처럼 받아 둔다.
-        on_meta(store, new, name);
-        return Decision::replace(true, Old::Returned);
-    }
-
     let live = registry::get(name);
 
     // 기다리던 벡터가 교체됐다. 자리를 그대로 물려받으므로 목록이 자라지 않고,
@@ -599,7 +562,7 @@ fn on_replace(store: &Store, name: &str, old: u64, new: u64) -> Decision {
         }
         // 풀이 old를 넣는 중이다. 그쪽이 빼고 돌려주고, new는 따로 잡아둔다.
         Replaced::Recovering => {
-            let held = take_replacement(live.as_ref(), name, new);
+            let held = take_replacement(live.as_ref(), new);
             return Decision::replace(held, Old::Held);
         }
         Replaced::NotWaiting => {}
@@ -607,7 +570,7 @@ fn on_replace(store: &Store, name: &str, old: u64, new: u64) -> Decision {
 
     let Some(holder) = registry::holding(name, old) else {
         // old는 링크 때 거절한 것이라 돌려줄 참조가 없다. new만 받아 둔다.
-        let held = take_replacement(live.as_ref(), name, new);
+        let held = take_replacement(live.as_ref(), new);
         return Decision::replace(held, Old::NotOurs);
     };
     let in_live = live.as_ref().is_some_and(|live| Arc::ptr_eq(live, &holder));
@@ -633,7 +596,7 @@ fn on_replace(store: &Store, name: &str, old: u64, new: u64) -> Decision {
     if !gave_back {
         holder.ann.halt_for_overflow();
     }
-    let held = take_replacement(live.as_ref(), name, new);
+    let held = take_replacement(live.as_ref(), new);
     let old = if gave_back { Old::Held } else { Old::Returned };
     Decision::replace(held, old)
 }
@@ -733,6 +696,39 @@ mod tests {
             Some(Event::Replace)
         );
         assert_eq!(Event::of(9999), None, "모르는 값은 무시한다");
+    }
+
+    #[test]
+    fn an_item_link_builds_the_index_from_the_map_value() {
+        use crate::handler::quant::Quant;
+        use crate::handler::usearch::Metric;
+
+        let config = IndexConfig {
+            dim: 4,
+            metric: Metric::L2,
+            quant: Quant::F32,
+            m: 16,
+            efc: 128,
+            efs: 64,
+        };
+        // Map 값은 엔진이 붙인 CRLF까지 그대로 온다.
+        let index = build_from_value("photos".to_owned(), &config.encode())
+            .expect("설정 문서가 든 Map은 우리 인덱스다");
+        assert_eq!(index.name, "photos");
+        assert_eq!(index.ann.layout, config.layout());
+        assert_eq!(index.ann.metric, Metric::L2);
+        assert!(
+            !index.is_rebuilding(),
+            "Map이 요소보다 먼저 링크되므로 기다릴 것이 없다 -- 곧장 서빙한다"
+        );
+    }
+
+    #[test]
+    fn a_map_whose_value_is_not_a_config_is_not_ours() {
+        // `mop create`로 만든 Map은 값이 CRLF뿐이다.
+        assert!(build_from_value("plain".to_owned(), b"\r\n").is_none());
+        assert!(build_from_value("plain".to_owned(), b"").is_none());
+        assert!(build_from_value("plain".to_owned(), &crate::bson::EMPTY).is_none());
     }
 
     #[test]

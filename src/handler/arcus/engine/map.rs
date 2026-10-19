@@ -106,6 +106,36 @@ impl Store {
         })
     }
 
+    /// Creates an index's Map with its settings as the Map item's own value.
+    ///
+    /// One engine call, so no replica ever sees the Map without its settings.
+    /// **This is the call that fires the item link event**, under the cache
+    /// lock and on this thread -- the callback reads `config` back out of the
+    /// item and registers the index before this returns. `config` must already
+    /// carry the CRLF the engine expects of an item's value.
+    ///
+    /// `KeyExists` when anything at all is at `key`.
+    ///
+    /// **Worker thread only**, for the same reason as [`Store::insert_elem`].
+    pub fn create_index_map(&self, key: &str, config: &[u8], attr: item_attr) -> Result<()> {
+        let Some(create) = self.vtable().map_struct_create_with_value else {
+            return Err(StoreError::Unavailable);
+        };
+        let mut attr = attr;
+        written(unsafe {
+            create(
+                self.handle(),
+                self.cookie,
+                key.as_ptr().cast::<c_void>(),
+                as_int(key.len()),
+                config.as_ptr().cast::<c_void>(),
+                as_int(config.len()),
+                ptr::from_mut(&mut attr),
+                0, // vbucket
+            )
+        })
+    }
+
     /// Removes the whole Map. Its elements go later, from the engine's
     /// collection-delete thread, each with its own unlink event.
     pub fn drop_map(&self, key: &str) -> Result<()> {
@@ -242,7 +272,7 @@ impl Store {
                 as_int(key.len()),
                 1,
                 ptr::from_ref(&selector),
-                false, // drop_if_empty: the metadata keeps it from emptying anyway
+                false, // drop_if_empty: an index with no vectors is still an index
                 ptr::from_mut(&mut deleted),
                 ptr::from_mut(&mut dropped),
                 0,
@@ -392,5 +422,29 @@ impl Store {
         }
         let key = unsafe { std::slice::from_raw_parts(info.key.cast::<u8>(), info.nkey as usize) };
         Some(f(key))
+    }
+
+    /// Reads a hash item's value in place, taking no lock and no reference.
+    ///
+    /// The same `get_item_info` as [`Store::with_key_at`], so it may be called
+    /// from inside the event callback. For an index's Map the value is its
+    /// settings, CRLF included -- this is how a replica, or a replay of the
+    /// persistence log, learns what the index is.
+    pub fn with_item_value_at<T>(&self, item: u64, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
+        let info_of = self.vtable().get_item_info?;
+        let it = item as *const item;
+        if it.is_null() {
+            return None;
+        }
+        let mut info: item_info = unsafe { std::mem::zeroed() };
+        if !unsafe { info_of(self.handle(), self.cookie, it, ptr::from_mut(&mut info)) } {
+            return None;
+        }
+        if info.value.is_null() || info.naddnl != 0 {
+            return None;
+        }
+        let value =
+            unsafe { std::slice::from_raw_parts(info.value.cast::<u8>(), info.nbytes as usize) };
+        Some(f(value))
     }
 }

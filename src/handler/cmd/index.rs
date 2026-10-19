@@ -8,8 +8,6 @@ use crate::handler::arcus::element::{IndexConfig, Layout};
 use crate::handler::arcus::engine::{self, Store, StoreError};
 use crate::handler::quant::Quant;
 use crate::handler::registry::{self, VectorIndex};
-use crate::handler::usearch::AnnIndex;
-use crate::trigger::key;
 
 pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
     let Create {
@@ -22,19 +20,9 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
 
     let layout = Layout::new(dim, quant);
     check_dimension_fits(store, layout, quant)?;
+    // 그래프는 링크 콜백이 세운다. 거기서 거절될 설정은 Map을 만들기 전에 막는다.
+    metric.check_quant(quant)?;
 
-    let ann = AnnIndex::new(
-        layout,
-        metric,
-        spec.connectivity,
-        spec.expansion_add,
-        spec.expansion_search,
-        std::sync::Arc::new(engine::MapElements),
-    )?;
-
-    // 메타가 같은 Map의 한 칸을 차지하므로 Map에는 하나 더 잡는다.
-    let held = map_size_for(store, spec.maxcount);
-    let maxcount = held - 1;
     let config = IndexConfig {
         dim,
         metric,
@@ -43,89 +31,68 @@ pub fn vcreate(store: &Store, spec: &Create) -> Result<Reply> {
         efc: spec.expansion_add,
         efs: spec.expansion_search,
     };
-    let index = VectorIndex::building(name.to_owned(), ann, maxcount);
 
-    let (registered, previous) = match registry::put(index) {
-        Ok(pair) => pair,
-        Err(e) => {
-            return Err(Error::Index(format!(
-                "the index registry could not grow: {e}"
-            )));
-        }
-    };
-
-    // 이 이름으로 먼저 도착해 기다리던 벡터가 있으면 여기서 그래프에 넣는다.
-    // 보통은 없어서 곧장 지나간다. 메타를 쓰기 **전**에 하는 것은, 링크 콜백이
-    // 곧바로 이 인덱스를 서빙으로 올리기 때문이다 -- 그 뒤에 넣으면 반쯤 찬
-    // 그래프가 잠깐 조회에 보인다.
-    crate::trigger::recover::adopt(&registered);
-
-    // Map을 만들면서 메타를 넣는다. 한 번의 엔진 호출이라, 메타 없는 Map이
-    // 복제본에 보이는 순간이 없다.
+    // Map과 설정을 한 번의 엔진 호출로 만든다. 설정 없는 Map이 복제본에 보이는
+    // 순간이 없다. 그 링크가 콜백을 부르고, 콜백이 값을 읽어 인덱스를 등록한다
+    // -- 복제본과 재생이 타는 바로 그 길이다.
+    //
+    // 등록하는 `registry::put`이 sweeper와 풀을 처음 띄우는 자리이기도 하다.
+    // 콜백은 cache lock 아래라 스레드를 거기서 만들지 않게 여기서 먼저 띄운다.
+    crate::handler::access::sweep::ensure_sweeper();
+    crate::handler::access::pool::ensure_pool();
     let exptime = spec.exptime.map_or(0, crate::server::realtime);
-    let settled = store.insert_elem(
-        &key::map_key(name),
-        key::META_ID,
+    let created = store.create_index_map(
+        name,
         &config.encode(),
-        false,
-        Some(engine::index_attr(held, exptime)),
+        engine::index_attr(map_size_for(store, spec.maxcount), exptime),
     );
 
-    match settled {
-        Ok(done) if done.created => {
-            // 서빙으로 올리는 것은 `on_meta`가 한다. 복제본에는 `vcreate`가
-            // 오지 않아 콜백이 유일한 길이므로, 마스터도 같은 길을 타게 둔다.
-            if previous.is_some() {
-                eprintln!("ArcVector: index '{name}' had no Map; released the graph it stood on");
-                registry::keep_until_empty(previous);
+    match created {
+        Ok(()) if registry::contains(name) => Ok(Reply::Created),
+        Ok(()) => {
+            // Map은 섰는데 콜백이 그래프를 세우지 못했다(할당 실패). 이대로 두면
+            // 그 키는 어느 명령에도 `TYPE_MISMATCH`로 답하는 빈 Map이 된다.
+            if let Err(e) = store.drop_map(name)
+                && e != StoreError::KeyGone
+            {
+                eprintln!(
+                    "ArcVector: could not remove the Map of '{name}' after a failed create: {e}"
+                );
             }
-            Ok(Reply::Created)
+            Err(Error::Index(format!(
+                "the graph for '{name}' could not be built"
+            )))
         }
-
-        // 그 키에 메타 없는 Map이 이미 있었다 -- 우리 것이 아니다. 방금 넣은
-        // 메타를 도로 뺀다.
-        Ok(_) => {
-            registry::unput(&registered, previous);
-            let _ = store.delete_elem(&key::map_key(name), key::META_ID);
-            Ok(Reply::TypeMismatch)
-        }
-
-        Err(e) => {
-            registry::unput(&registered, previous);
-            match e {
-                StoreError::ElemExists => already_there(store, name),
-                StoreError::BadType => Ok(Reply::TypeMismatch),
-                e => Err(e.into()),
-            }
-        }
+        // 그 키에 무언가 있다. 우리 인덱스면 `EXISTS`, 아니면 일반 키나 우리가
+        // 읽지 못하는 Map이다.
+        Err(StoreError::KeyExists) => Ok(if registry::contains(name) {
+            Reply::Exists
+        } else {
+            Reply::TypeMismatch
+        }),
+        Err(e) => Err(e.into()),
     }
 }
 
-/// 그 Map에 메타가 이미 있다.
-///
-/// 우리가 아는 인덱스면 `EXISTS`다. 아니면 그 자리에 우리가 읽지 못한 것이
-/// 있다는 뜻이라 `TYPE_MISMATCH`로 답한다.
-fn already_there(store: &Store, name: &str) -> Result<Reply> {
-    match resolve(store, name) {
-        Ok(_) => Ok(Reply::Exists),
-        Err(_) => Ok(Reply::TypeMismatch),
-    }
-}
-
-/// Map에 잡을 칸 수. 메타 한 칸을 더한 것이고, 서버의 `max_map_size`를 넘지
-/// 않는다. 이름을 안 했으면 그 상한이다.
+/// Map에 잡을 칸 수. 서버의 `max_map_size`를 넘지 않는다. 이름을 안 했으면
+/// 그 상한이다.
 fn map_size_for(store: &Store, maxcount: Option<u32>) -> u32 {
-    let ceiling = store.max_map_size().max(2);
-    maxcount
-        .unwrap_or(ceiling)
-        .saturating_add(1)
-        .clamp(2, ceiling)
+    let ceiling = store.max_map_size().max(1);
+    maxcount.unwrap_or(ceiling).clamp(1, ceiling)
 }
 
 pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {
-    // 살아 있는 엔트리만 센다. 앞서 드롭돼 비워지는 중인 그래프는 `known`에
-    // 잡히지만, 그건 이미 없는 인덱스다 -- 두 번째 `vdrop`은 `NOT_FOUND`다.
-    let known = registry::contains(name);
+    // 키가 인덱스와 같은 공간에 있다. 일반 키를 `vdrop`으로 지우면 안 된다.
+    match resolve(store, name) {
+        Ok(_) => {}
+        Err(Error::TypeMismatch) => return Ok(Reply::TypeMismatch),
+        Err(Error::NoSuchIndex) => {
+            // 키가 없다. 혹시 남은 엔트리가 있으면 그것도 이제 없는 인덱스다.
+            registry::remove(name);
+            return Ok(Reply::NotFound);
+        }
+        Err(e) => return Err(e),
+    }
 
     // Map을 지운다. 그 unlink가 콜백을 부르고, 콜백이 인덱스를 레지스트리에서
     // 내린다 -- 여기서나 복제본에서나 같다. 복제본은 이 명령이 아니라 복제된
@@ -134,19 +101,13 @@ pub fn vdrop(store: &Store, name: &str) -> Result<Reply> {
     // 그래프는 같이 버리지 않는다. 요소들은 엔진의 컬렉션 삭제 스레드가 나중에
     // 지우고, 그때마다 오는 unlink가 `registry::holding`으로 이 그래프를 다시
     // 찾아 참조를 돌려준다.
-    let dropped = match store.drop_map(&key::map_key(name)) {
-        Ok(()) => true,
-        Err(StoreError::KeyGone) => false,
+    match store.drop_map(name) {
+        Ok(()) | Err(StoreError::KeyGone) => {}
         Err(e) => return Err(e.into()),
-    };
-    // Map이 없었으면 콜백도 없었으니 엔트리가 아직 있다.
+    }
+    // Map이 그 사이 없어졌으면 콜백도 없었으니 엔트리가 아직 있다.
     registry::remove(name);
-
-    Ok(if known || dropped {
-        Reply::Dropped
-    } else {
-        Reply::NotFound
-    })
+    Ok(Reply::Dropped)
 }
 
 fn check_dimension_fits(store: &Store, layout: Layout, quant: Quant) -> Result<()> {
