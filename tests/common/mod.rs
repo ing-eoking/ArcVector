@@ -14,7 +14,7 @@ const TERMINATORS: [&str; 11] = [
     "DELETED\r\n",
     "DROPPED\r\n",
     "NOT_FOUND\r\n",
-    "OVERFLOWED\r\n",
+    "REPLACED\r\n",
     "NOT_FOUND_ELEMENT\r\n",
     "NOT_FOUND_VECTOR\r\n",
     "TYPE_MISMATCH\r\n",
@@ -175,10 +175,10 @@ impl Server {
     }
 
     fn assert_extension_registered(&self, module: &Path) {
-        let reply = self.connect().send("vlist");
+        let reply = self.connect().send("vop drop it-registration-probe");
         assert!(
-            reply == "END\r\n",
-            "the server is up but did not answer `vlist`, so {} was not registered \
+            reply == "NOT_FOUND\r\n",
+            "the server is up but did not answer `vop`, so {} was not registered \
              as an extension.\nGot {reply:?}.\n{}",
             module.display(),
             self.diagnostics()
@@ -227,129 +227,110 @@ impl Client {
         self.read_reply()
     }
 
+    /// 줄 끝 `\r\n`을 덧붙이지 않고 그대로 보낸다.
+    pub fn send_raw(&mut self, raw: &str) -> String {
+        self.write(raw);
+        self.read_reply()
+    }
+
     pub fn send_body(&mut self, line: &str, body: &str) -> String {
         self.write(&format!("{line}\r\n{body}\r\n"));
         self.read_reply()
     }
 
-    /// `vadd <index> <vkey> <veclen>`
-    ///
-    /// 차원은 인덱스가 정하므로 명령이 받지 않는다. 헬퍼가 그 자리에 있던
-    /// 인자를 계속 받는 것은 호출부가 전부 차원을 적어 두었기 때문이고, 그
-    /// 값은 이제 좌표 개수를 스스로 확인하는 데만 쓴다.
-    pub fn vadd(&mut self, index: &str, vkey: &str, _dim: usize, coords: &str) -> String {
-        self.send_body(&format!("vadd {index} {vkey} {}", coords.len()), coords)
+    /// `vop upsert <index> <vkey> <len> str` -- 좌표를 텍스트로 보낸다.
+    pub fn upsert(&mut self, index: &str, vkey: &str, coords: &str) -> String {
+        self.send_body(
+            &format!("vop upsert {index} {vkey} {} str", coords.len()),
+            coords,
+        )
     }
 
-    pub fn vadd_attr(
+    /// `vop upsert ... meta <m> str` -- 본문은 메타데이터 줄, 벡터 줄 순서다.
+    pub fn upsert_meta(&mut self, index: &str, vkey: &str, coords: &str, json: &str) -> String {
+        self.send_body(
+            &format!(
+                "vop upsert {index} {vkey} {} meta {} str",
+                coords.len(),
+                json.len()
+            ),
+            &format!("{json}\r\n{coords}"),
+        )
+    }
+
+    /// `vop upsert` with `bin` (little-endian f32) 벡터.
+    pub fn upsert_bin(&mut self, index: &str, vkey: &str, coords: &[f32]) -> String {
+        let bytes: Vec<u8> = coords.iter().flat_map(|c| c.to_le_bytes()).collect();
+        self.send_bytes(
+            &format!("vop upsert {index} {vkey} {}", bytes.len()),
+            &bytes,
+        )
+    }
+
+    /// `vop search <index> vector <num> <len> [filter <f>] [withmeta] str`
+    pub fn search_vector(
+        &mut self,
+        index: &str,
+        num: usize,
+        coords: &str,
+        filter: Option<&str>,
+        withmeta: bool,
+    ) -> String {
+        let mut head = format!("vop search {index} vector {num} {}", coords.len());
+        let mut body = String::new();
+        if let Some(f) = filter {
+            head += &format!(" filter {}", f.len());
+            body += &format!("{f}\r\n");
+        }
+        if withmeta {
+            head += " withmeta";
+        }
+        head += " str";
+        body += coords;
+        self.send_body(&head, &body)
+    }
+
+    /// `vop search <index> vkey <vkey> <num> [filter <f>] [withmeta]`
+    pub fn search_vkey(
         &mut self,
         index: &str,
         vkey: &str,
-        _dim: usize,
-        coords: &str,
-        attr: &str,
+        num: usize,
+        filter: Option<&str>,
+        withmeta: bool,
     ) -> String {
-        self.send_body(
-            &format!("vadd {index} {vkey} {} attr {attr}", coords.len()),
-            coords,
-        )
-    }
-
-    pub fn vsim(&mut self, index: &str, k: usize, _dim: usize, coords: &str) -> String {
-        self.send_body(
-            &format!("vsearch vector {index} {k} {}", coords.len()),
-            coords,
-        )
-    }
-
-    pub fn vsim_filter(
-        &mut self,
-        index: &str,
-        k: usize,
-        _dim: usize,
-        coords: &str,
-        terms: &[&str],
-    ) -> String {
-        self.send_body(
-            &format!(
-                "vsearch vector {index} {k} {} filter {} {}",
-                coords.len(),
-                terms.len(),
-                terms.join(" ")
-            ),
-            coords,
-        )
-    }
-
-    pub fn vsim_withattr(
-        &mut self,
-        index: &str,
-        k: usize,
-        _dim: usize,
-        coords: &str,
-        terms: &[&str],
-    ) -> String {
-        let mut head = format!("vsearch vector {index} {k} {}", coords.len());
-        if !terms.is_empty() {
-            head += &format!(" filter {} {}", terms.len(), terms.join(" "));
+        let mut head = format!("vop search {index} vkey {vkey} {num}");
+        if let Some(f) = filter {
+            head += &format!(" filter {}", f.len());
         }
-        head += " withattr";
-        self.send_body(&head, coords)
-    }
-
-    pub fn drain(&mut self) {
-        let previous = self.stream.read_timeout().ok().flatten();
-        let _ = self
-            .stream
-            .set_read_timeout(Some(Duration::from_millis(200)));
-        let mut buf = [0u8; 4096];
-        while let Ok(n) = self.stream.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
+        if withmeta {
+            head += " withmeta";
         }
-        let _ = self.stream.set_read_timeout(previous);
-    }
-
-    /// Reads the payload of a single-key `get`, byte for byte.
-    ///
-    /// The bodies this crate stores are binary -- a length header, the
-    /// attribute bytes, then the packed vector -- so a test that replays one
-    /// cannot go through `String`.
-    /// The value of one Map element, read with a plain `mop get`, bypassing
-    /// this crate's commands.
-    pub fn elem_value(&mut self, key: &str, field: &str) -> Option<Vec<u8>> {
-        self.write(&format!("mop get {key} {} 1\r\n{field}\r\n", field.len()));
-        let reply = self.read_raw();
-        // VALUE <flags> <count>\r\n<field> <bytes> <data>\r\nEND\r\n
-        let head = reply.windows(2).position(|w| w == b"\r\n")?;
-        if !reply.starts_with(b"VALUE") {
-            return None;
+        match filter {
+            Some(f) => self.send_body(&head, f),
+            None => self.send(&head),
         }
-        let rest = &reply[head + 2..];
-        let prefix = format!("{field} ");
-        let rest = rest.strip_prefix(prefix.as_bytes())?;
-        let space = rest.iter().position(|b| *b == b' ')?;
-        let len: usize = std::str::from_utf8(&rest[..space]).ok()?.parse().ok()?;
-        rest.get(space + 1..space + 1 + len).map(<[u8]>::to_vec)
     }
 
-    /// Writes one Map element verbatim with a plain `mop insert`, bypassing
-    /// this crate's commands -- the way replication delivers one.
-    pub fn insert_elem(&mut self, key: &str, field: &str, body: &[u8]) -> String {
-        let mut raw = format!("mop insert {key} {field} {}\r\n", body.len()).into_bytes();
+    /// `vop setmeta <index> <vkey> <len>`
+    pub fn setmeta(&mut self, index: &str, vkey: &str, json: &str) -> String {
+        self.send_body(&format!("vop setmeta {index} {vkey} {}", json.len()), json)
+    }
+
+    pub fn getmeta(&mut self, index: &str, vkey: &str) -> String {
+        self.send(&format!("vop getmeta {index} {vkey}"))
+    }
+
+    /// 헤더 줄과 이진 본문(끝 `\r\n` 포함 전송)을 보낸다.
+    pub fn send_bytes(&mut self, line: &str, body: &[u8]) -> String {
+        let mut raw = format!("{line}\r\n").into_bytes();
         raw.extend_from_slice(body);
         raw.extend_from_slice(b"\r\n");
         self.stream
             .write_all(&raw)
             .expect("the connection accepts writes");
         self.stream.flush().expect("the connection flushes");
-        String::from_utf8_lossy(&self.read_raw()).into_owned()
-    }
-
-    /// Removes one Map element with a plain `mop delete`.
-    pub fn delete_elem(&mut self, key: &str, field: &str) -> String {
-        self.send(&format!("mop delete {key} {} 1\r\n{field}", field.len()))
+        self.read_reply()
     }
 
     fn write(&mut self, raw: &str) {
@@ -383,6 +364,17 @@ impl Client {
 }
 
 fn is_complete(reply: &[u8]) -> bool {
+    // META <vkey> <metabytes>\r\n<json>\r\n 은 고정 종결 문자열이 없다.
+    if reply.starts_with(b"META ") {
+        let Some(head) = reply.windows(2).position(|w| w == b"\r\n") else {
+            return false;
+        };
+        let len = std::str::from_utf8(&reply[..head])
+            .ok()
+            .and_then(|h| h.rsplit(' ').next())
+            .and_then(|n| n.parse::<usize>().ok());
+        return len.is_some_and(|n| reply.len() >= head + 2 + n + 2);
+    }
     if TERMINATORS.iter().any(|t| reply.ends_with(t.as_bytes())) {
         return true;
     }

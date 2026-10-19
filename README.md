@@ -2,35 +2,17 @@
 
 Vector similarity search for **arcus-memcached**, as an ASCII protocol extension.
 
-ArcVector loads into a running arcus server as a dynamic library and adds
-`vcreate` / `vadd` / `VSIM` and friends to the ASCII protocol. Vectors live in
-arcus **Map collections**, so they inherit the engine's memory accounting,
-eviction, TTL and replication. The ANN graph is a
-[usearch](https://github.com/unum-cloud/usearch) index kept alongside as a cache.
+ArcVector loads into a running arcus server as a dynamic library and adds the
+`vop` command set to the ASCII protocol. An index is one arcus **Map collection**
+whose key is the index name; each vector is a Map element keyed by its vkey. So
+vectors inherit the engine's memory accounting, eviction, TTL and replication.
+The ANN graph is a [usearch](https://github.com/unum-cloud/usearch) index kept
+alongside as a cache.
+
+It targets arcus-memcached-EE (the extension API with asynchronous replies and
+per-element item events).
 
 ---
-
-## Quick start
-
-```sh
-cargo build --release --features replication
-memcached -E .../default_engine.so -X .../libarcusv.so
-```
-
-```
-vcreate docs 1024 METRIC cos QUANT i8
-→ CREATED
-
-vadd docs v1 7 2
-0.1 0.2
-→ STORED
-
-VSIM KEY docs 5 v1
-→ QUERY 0 5
-  VALUE v1 0
-  VALUE v7 0.08
-  END
-```
 
 ## Build
 
@@ -75,150 +57,131 @@ rather than crashing the server. See [docs/내부구조.md §11](docs/내부구�
 
 ## Conventions
 
-- Command names, keywords and enum values are **case-insensitive**:
-  `VSIM` = `vsim`, `METRIC COS` = `metric cos`.
-- Coordinates travel as **whitespace-separated decimal text**, not binary.
+- Command names and keywords are **case-insensitive**: `VOP` = `vop`, `METRIC L2` = `metric l2`.
+- Vector data is `bin` (the default: little-endian `f32`, `vector_bytes == dim * 4`) or
+  `str` (whitespace-separated decimal text, `dim` numbers). Quantization is done by the server.
+- Metadata is a **JSON object** on the wire and **BSON** in the engine. `getmeta` and
+  `withmeta` emit compact JSON (no spaces, key order kept, numbers normalized);
+  `metabytes` is the byte length of the JSON line.
+- Every body section ends with its own `\r\n`. A section that does not is
+  `CLIENT_ERROR bad data chunk`.
 - Errors are `CLIENT_ERROR <reason>` when the request was at fault,
-  `SERVER_ERROR <reason>` when we were.
+  `SERVER_ERROR <reason>` when we were. `NOT_FOUND` means no such index,
+  `NOT_FOUND_VECTOR` no such vkey, `TYPE_MISMATCH` a key that exists but is not an index.
+- Search scores are **raw metric distances, smaller is closer**: cos `1-cos`,
+  l2 squared Euclidean, ip `1-dot`, hamming, tanimoto `1-similarity`.
+
+Index settings (`dim`, `metric`, `quant`, `M`, `efc`, `efs`) live in the Map's value
+as a BSON document, so a replica learns them from the replicated Map itself.
 
 ---
 
-## vcreate
+## Commands
+
+### vop create
 
 ```
-vcreate <index> <dim> [METRIC <m>] [QUANT <q>] [M <n>] [EFC <n>] [EFS <n>]
-                      [MAXCOUNT <n>] [EXPTIME <n>]
+vop create <index> <dim> <expiretime> [<maxcount>] [metric m] [quant q] [M n] [efc c] [efs s]
 ```
 
 | Option | Default | Values |
 |---|---|---|
-| `METRIC` | `cos` | `cos`(`cosine`), `l2`(`l2sq`, `euclidean`), `ip`(`dot`), `hamming`, `tanimoto`(`jaccard`) |
-| `QUANT` | `f32` | `f32`, `f16`, `i8`, `b1` |
-| `M` | usearch default | HNSW connectivity |
-| `EFC` / `EFS` | usearch default | expansion on insert / on search |
-| `MAXCOUNT` | engine `max_map_size` | max vectors, 1 … 2147483647 |
-| `EXPTIME` | none | TTL on the backing Map -- the whole index expires together; vectors have no expiry of their own |
+| `maxcount` | 4000 | max vectors; above the server's `max_map_size` is `CLIENT_ERROR` |
+| `metric` | `cos` | `cos`, `l2`, `ip`, `hamming`, `tanimoto` |
+| `quant` | `f32` | `f32`, `f16`, `i8`, `b1` |
+| `M` / `efc` / `efs` | 16 / 128 / 64 | HNSW connectivity / expansion on insert / on search |
 
-**Replies** `CREATED` · `EXISTS`
+`<expiretime>` follows the memcached rule (0 = never, small = seconds, large = unix
+time) and expires the whole index with its vectors.
 
-Quantization and metric are not independent. `b1` packs one bit per dimension and
-carries no magnitude, so it takes only `hamming` or `tanimoto`; conversely those
-two metrics require `b1`. `i8` L2-normalizes before scaling, so distances live in
-the normalized space.
+**Replies** `CREATED` · `EXISTS` · `TYPE_MISMATCH`
 
-Maximum dimension, with the engine's default 16 KB `max_element_bytes`, the fixed
-130-byte element overhead and the 2-byte terminator arcus counts per element:
+`b1` takes only `hamming` or `tanimoto`, and those two require `b1`. A dimension whose
+vector does not fit `max_element_bytes` is refused at create.
 
-| quant | f32 | f16 | i8 | b1 |
-|---|---|---|---|---|
-| max dim | 4,063 | 8,126 | **16,252** | 130,016 |
-
-## vadd
+### vop upsert
 
 ```
-vadd <index> <id> <veclen> [ATTR <attr JSON>]
-<coordinates>
+vop upsert <index> <vkey> <vector_bytes> [meta <metabytes>] [bin|str]
+[<metadata>\r\n]<vector_data>\r\n
 ```
 
-`<veclen>` is the **byte length of the coordinate text**. The dimension comes from
-the index, and the coordinate count is checked against it.
+**Replies** `STORED` (new vkey) · `REPLACED` (existing vkey) · `NOT_FOUND` ·
+`TYPE_MISMATCH` · `SERVER_ERROR index is full` (at `maxcount`)
 
-`ATTR` is optional, must be a **JSON object**, and is capped at **255 bytes**. It
-has to arrive as a single argument, so **no spaces inside the JSON** — the command
-line is tokenized on spaces and the pieces cannot be reassembled unambiguously.
+The reply is sent after the vector is in the graph, so the next search from any
+client sees it. The index is never created implicitly.
 
-There is no per-vector expiry: a vector is a Map element, and elements do not
-expire on their own. Give the index an `EXPTIME` at `vcreate` instead.
-
-**Replies** `STORED` · `OVERFLOWED` (at `MAXCOUNT`)
-
-`STORED` is sent once the vector is in the graph, so the next search from any
-client sees it.
+### vop setmeta
 
 ```
-vadd docs v1 7 ATTR {"abc":123,"def":"abc"}
-0.1 0.2
-→ STORED
+vop setmeta <index> <vkey> <metabytes>
+<metadata>\r\n
 ```
 
-## VSIM
+**Replies** `STORED` · `NOT_FOUND` · `NOT_FOUND_VECTOR` · `TYPE_MISMATCH`
+
+Replaces the metadata and keeps the vector bytes. The graph is not rebuilt.
+
+### vop search
 
 ```
-VSIM VECTOR <index> <num> <bytes> <dim> [FILTER <n> <term>...] [WITHATTR]
-<coordinates>
+vop search <index> vkey <vkey> <num> [filter <filter_bytes>] [withmeta]
+[<filter>\r\n]
 
-VSIM KEY <index> <num> <key> [FILTER <n> <term>...] [WITHATTR]
+vop search <index> vector <num> <vector_bytes> [filter <filter_bytes>] [withmeta] [bin|str]
+[<filter>\r\n]<vector_data>\r\n
 ```
 
-`<num>` is how many neighbours to return.
-
-- **VECTOR** reads `<bytes>` of coordinate text and splits it into `count / dim`
-  query vectors, so several queries share one round trip.
-- **KEY** searches with a vector already in the index. No body, and no
-  re-encoding — the stored bytes are already quantized.
-
-`FILTER` and `WITHATTR` are both optional and may come in either order.
-
-**Reply**, one group per query. `WITHATTR` decides the `VALUE` line:
+`filter`, `withmeta` and `bin|str` may come in any order.
 
 ```
-QUERY <query_no> <count>          without WITHATTR
-VALUE <id> <distance>
+VECTORS <count>\r\n
+<vkey> <score>\r\n                          without withmeta
+<vkey> <score> <metabytes>\r\n<json>\r\n    with withmeta
 ...
-END
-
-QUERY <query_no> <count>          with WITHATTR
-VALUE <id> <distance> <attrlen>
-<attr JSON>
-...
-END
+END\r\n
 ```
 
-Without `WITHATTR` a hit costs no engine read — the reply is built from the graph
-alone. The trade is that this fastest path (no `FILTER`, no `WITHATTR`) can return
-the id of an element deleted between the search and the reply; anything that reads
-the element catches that.
+**Other replies** `NOT_FOUND` · `NOT_FOUND_VECTOR` (vkey search, unknown vkey) · `TYPE_MISMATCH`
 
-`FILTER <n> <term>...` takes a **term count**, then that many terms. Each term is
-a single token, so it must not contain spaces; terms are combined with `AND`.
-Operators are `=` `!=` `<` `<=` `>` `>=`, over top-level JSON fields only. A
-condition on an absent field is **always false**, `!=` included.
+A filter is `<field> <op> <value>` (spaces around `op` optional) with `op` one of
+`=` `!=` `<` `<=` `>` `>=`. A value containing spaces is quoted `'...'`. Conditions
+join with `and` / `or`; **`and` binds tighter than `or`**. Fields are top-level BSON
+fields, and a condition on an absent field is false, `!=` included.
 
 ```
-VSIM VECTOR docs 10 15 2 FILTER 2 abc>12 def=abc WITHATTR
+vop search docs vector 10 15 filter 29 withmeta str
+n >= 2 and city = 'new york'
 0.1 0.2 0.3 0.4
-→ QUERY 0 10
-  VALUE v1 0.12 23
-  {"abc":123,"def":"abc"}
-  ...
-  END
 ```
 
-## vgetattr · vsetattr · vdel · vdrop · vlist
-
-| Command | Replies |
-|---|---|
-| `vgetattr <index> <id>` | `VALUE <id> <attrlen>` + attr + `END` · `NOT_FOUND` |
-| `vsetattr <index> <id> <attrlen> <attr JSON>` | `STORED` · `NOT_FOUND` |
-| `vdel <index> <id>` | `DELETED` · `NOT_FOUND` |
-| `vdrop <index>` | `DROPPED` · `NOT_FOUND` |
-| `vlist` | one `INDEX <name> dim=… quant=… metric=… attrbytes=128 count=… maxcount=…` per index, then `END` |
-| `vstats` | module memory, then `END` |
-
-`vgetattr` returns attributes only, not coordinates.
-
-`vsetattr` replaces the whole attribute region, so `<attrlen> 0` with no JSON
-clears it. **The graph is not touched**: the region is a fixed width, so the value
-going back is exactly as long as the one that came out and the engine writes it in
-place — no allocation, no relink, and none of the ~370us HNSW insert a `vadd` pays.
+### vop getmeta
 
 ```
-vsetattr docs v1 20 {"cat":"news","n":2}
-→ STORED
-
-vsetattr docs v1 0
-→ STORED          # attributes cleared
+vop getmeta <index> <vkey>
 ```
+
+**Replies** `META <vkey> <metabytes>\r\n<json>\r\n` · `NOT_FOUND` · `NOT_FOUND_VECTOR` · `TYPE_MISMATCH`
+
+### vop delete
+
+```
+vop delete <index> <vkey>
+```
+
+**Replies** `DELETED` · `NOT_FOUND` · `NOT_FOUND_VECTOR` · `TYPE_MISMATCH`
+
+The reply follows the engine delete; the graph removal happens a moment later, but a
+search right after the reply already skips the deleted vector.
+
+### vop drop
+
+```
+vop drop <index>
+```
+
+**Replies** `DROPPED` · `NOT_FOUND` · `TYPE_MISMATCH`
 
 ---
 
@@ -242,95 +205,40 @@ on first use.
 
 ### Write durability
 
-**A write answers before the replica has acknowledged it, even on a cluster
-configured for sync replication.** This applies to `vcreate`, `vadd`, `vdel` and
-`vdrop`, and it is standing behaviour, not an occasional case — measured over 500
-`vadd`s, all 500 replied ahead of the acknowledgement.
-
-The write is committed locally and on its way to the replica; what is missing is
-the wait. Parking a connection until the acknowledgement arrives needs a `conn`
-field memcached exposes to its own commands and not to extensions.
-
-The exposure is narrow but real: a master lost inside that window drops a write
-its client was told had succeeded — the same guarantee arcus gives under
-`no_sync_mode 1`, applied to vector commands only. Nothing is corrupted by it; the
-write is simply absent. [docs/내부구조.md §12](docs/내부구조.md) has the mechanism.
+Writes go through the EE asynchronous-reply path: the reply to `upsert`, `setmeta`,
+`delete` and `drop` is held until both the graph work and, on a sync-replication
+master, the replica's acknowledgement are done. A write is therefore not
+acknowledged to the client ahead of the replica.
 
 ---
 
-## vstats — memory outside the engine
+## Memory outside the engine
 
 arcus's `-m` limit covers slab memory, so the Map items holding vectors are
 already accounted for. The usearch graph and the address set are plain heap
-allocations in the module and are not. That gap is what this reports.
-
-```
-vstats
-→ STAT indexes 2
-  STAT vectors 201
-  STAT addr_set_bytes 13556
-  STAT index_held_bytes 33600720
-  STAT index_used_bytes 51384
-  STAT attr_bytes_per_vector 128
-  STAT docs:vectors 200
-  STAT docs:addr_set_bytes 13490
-  STAT docs:index_held_bytes 16800360
-  STAT docs:index_used_bytes 51200
-  STAT docs:reserved 1024
-  ... one block per index ...
-  END
-```
-
-| Field | Meaning |
-|---|---|
-| `indexes` | live index count |
-| `vectors` | live vectors — not the number ever added |
-| `addr_set_bytes` | the set of element addresses the graph holds. An estimate; excludes hash-map slack |
-| `index_held_bytes` | bytes usearch has taken from the allocator |
-| `index_used_bytes` | the part of that carrying real graph nodes and vectors |
-| `reserved` | members usearch has room for; grows ahead of `vectors` |
-| `attr_bytes_per_vector` | the fixed ATTR region, 128 |
-
-There is no `stats vector` equivalent — memcached only consults an extension for
-an *unknown* command, so `stats` cannot be hooked.
-
-### Two figures, because held is chunked
+allocations in the module and are not. There is no command that reports them
+(`vstats` is gone, and memcached cannot hook `stats`).
 
 usearch allocates its graph and its vectors from two tape allocators that grow in
-**8 MiB chunks**. Measured on an otherwise idle index:
+**8 MiB chunks**: **an index holds ~16.8 MB from its first vector onward, whether it
+has one vector or a thousand.** A hundred small indexes cost ~1.7 GB resident
+regardless of the data in them. Prefer fewer, larger indexes.
 
-| | `index_held_bytes` |
-|---|---|
-| empty | 23 KB |
-| 1 vector | 16.8 MB |
-| 1 000 vectors | 16.8 MB |
-| 1 000 vectors, dim 1024 | 16.8 MB |
-
-The first insert takes one chunk from each allocator and nothing moves after that,
-at any dimension — so held memory alone would report every index as the same size.
-`index_used_bytes` is the figure that tracks the vector count.
-
-**An index holds ~16.8 MB from its first vector onward, whether it has one vector
-or a thousand.** A hundred small indexes cost ~1.7 GB resident regardless of the
-data in them, and none of it is visible to `-m` or to `vlist`'s `count`. Prefer
-fewer, larger indexes.
-
-Neither figure falls when vectors are deleted. A tape allocator hands out bytes in
-order and has no per-object free, so `vdel` returns the Map element and the
-`addr_set_bytes` — both of which do drop — but the usearch tape keeps its
-high-water mark. Only `vdrop` releases it. On a workload that churns ids,
-`index_used_bytes` reads as total ever inserted rather than currently live;
-compare it against `vectors` to tell the two apart.
+The memory does not fall when vectors are deleted: a tape allocator has no
+per-object free, so `vop delete` returns the Map element but the usearch tape keeps
+its high-water mark. Only `vop drop` releases it.
 
 ---
 
-## Limitations
+## Known limitations
 
-- `vgetattr` cannot read coordinates back, and there is no command that can.
-- Filters support `AND` over top-level fields. No `OR`, no parentheses, no nested
-  paths, and no spaces inside a term value.
-- Writes answer before the replica acknowledges — see
-  [Write durability](#write-durability).
+- Metadata is read and written whole; there is no partial update and no command that
+  reads the vector back.
+- A filter reads top-level fields only: no parentheses, no nested paths.
+- A concurrent `upsert` of the same vkey between `setmeta`'s read and its update can
+  be overwritten: `setmeta` writes back the vector bytes it read.
+- If the graph insert of an `upsert` fails, the element stays stored but unindexed
+  and the client gets `SERVER_ERROR`.
 - The graph is not serialized. A restart rebuilds it from the Map on first use.
   (A *failover* does not, with `replication`.)
 - Every non-empty index holds ~16.8 MB of usearch allocator chunks regardless of
