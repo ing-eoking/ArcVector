@@ -117,17 +117,17 @@ mod tests {
 
     #[test]
     fn tokens_are_borrowed_not_copied() {
-        let (_buf, raw) = tokenize_for_test("vcreate docs 1024");
+        let (_buf, raw) = tokenize_for_test("vop docs 1024");
         let t = view(&raw);
         assert_eq!(t.len(), 3);
-        assert_eq!(t.command(), Some(Cmd::VCreate));
+        assert_eq!(t.command(), Some(Cmd::Vop));
         assert_eq!(t.text(1).unwrap(), "docs");
         assert_eq!(t.parse::<usize>(2, "dimension").unwrap(), 1024);
     }
 
     #[test]
     fn reading_past_the_end_is_a_client_error() {
-        let (_buf, raw) = tokenize_for_test("vlist");
+        let (_buf, raw) = tokenize_for_test("vop");
         let t = view(&raw);
         assert!(t.text(1).is_err());
         assert!(t.parse::<usize>(1, "k").is_err());

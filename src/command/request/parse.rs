@@ -1,8 +1,6 @@
 use super::layout;
 use super::*;
-
-/// 예전 명령이 받는 attr JSON의 최대 바이트. 이 파서들은 vop 명령으로 대체되며 지워진다.
-const MAX_ATTR_JSON: usize = 255;
+use crate::command::tokens::Tokens;
 
 fn malformed() -> Error {
     Error::bad_request("bad command line format")
@@ -10,89 +8,86 @@ fn malformed() -> Error {
 
 pub fn parse<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
     match tokens.command() {
-        Some(Cmd::VAdd) => two_phase(tokens, layout::add::BODY_LEN, |t| {
-            parse_add(t).map(Body::Add)
-        }),
-        Some(Cmd::VSearch) => match search_source(tokens)? {
-            SimSource::Vector => two_phase(tokens, layout::search_vector::BODY_LEN, |t| {
-                parse_sim(t).map(Body::Sim)
-            }),
-            SimSource::Key => parse_search_key(tokens).map(|s| Parsed::Line(Line::SimKey(s))),
-        },
-        Some(Cmd::VCreate) => parse_create(tokens).map(|c| Parsed::Line(Line::Create(c))),
-        Some(Cmd::VGetAttr) => {
-            let (index, id) = two_names(tokens)?;
-            Ok(Parsed::Line(Line::GetAttr { index, id }))
+        Some(Cmd::Vop) => {}
+        None => {
+            return Err(Error::bad_request(format!(
+                "unknown command {}",
+                tokens.text(0).unwrap_or("")
+            )));
         }
-        Some(Cmd::VSetAttr) => parse_set_attr(tokens),
-        Some(Cmd::VDel) => {
-            let (index, id) = two_names(tokens)?;
-            Ok(Parsed::Line(Line::Del { index, id }))
+    }
+    let raw = tokens.text(layout::SUB)?;
+    let sub =
+        Sub::parse(raw).ok_or_else(|| Error::bad_request(format!("unknown subcommand '{raw}'")))?;
+    match sub {
+        Sub::Create => parse_create(tokens).map(|c| Parsed::Line(Line::Create(c))),
+        Sub::Upsert => parse_upsert(tokens),
+        Sub::SetMeta => parse_setmeta(tokens),
+        Sub::Search => parse_search(tokens),
+        Sub::GetMeta => {
+            let (index, vkey) = keyed(tokens)?;
+            Ok(Parsed::Line(Line::GetMeta(GetMeta { index, vkey })))
         }
-        Some(Cmd::VDrop) => {
-            if tokens.len() != layout::drop::TAIL {
+        Sub::Delete => {
+            let (index, vkey) = keyed(tokens)?;
+            Ok(Parsed::Line(Line::Delete(Delete { index, vkey })))
+        }
+        Sub::Drop => {
+            if tokens.len() != layout::drop::LEN {
                 return Err(malformed());
             }
-            Ok(Parsed::Line(Line::Drop {
-                index: tokens.text(layout::drop::INDEX)?,
-            }))
+            Ok(Parsed::Line(Line::Drop(Drop {
+                index: tokens.text(layout::INDEX)?,
+            })))
         }
-        Some(Cmd::VList) => no_arguments(tokens).map(|()| Parsed::Line(Line::List)),
-        Some(Cmd::VStats) => no_arguments(tokens).map(|()| Parsed::Line(Line::Stats)),
-        None => Err(Error::bad_request(format!(
-            "unknown command {}",
-            tokens.text(0).unwrap_or("")
-        ))),
     }
 }
 
-fn two_phase<'a>(
-    tokens: &Tokens,
-    at: usize,
-    parse_rest: impl FnOnce(&Tokens) -> Result<Body>,
-) -> Result<Parsed<'a>> {
-    let len = tokens.parse(at, "vector length")?;
-    Ok(Parsed::Body {
-        len,
-        request: parse_rest(tokens),
-    })
-}
-
-fn search_source(tokens: &Tokens) -> Result<SimSource> {
-    let raw = tokens.text(layout::SEARCH_SOURCE)?;
-    SimSource::parse(raw)
-        .ok_or_else(|| Error::bad_request(format!("expected VECTOR or KEY, got '{raw}'")))
-}
-
-fn no_arguments(tokens: &Tokens) -> Result<()> {
-    if tokens.len() == 1 {
-        Ok(())
-    } else {
-        Err(malformed())
-    }
-}
-
-fn two_names<'a>(tokens: &Tokens<'a>) -> Result<(&'a str, &'a str)> {
-    if tokens.len() != layout::names::TAIL {
+fn keyed<'a>(tokens: &Tokens<'a>) -> Result<(&'a str, &'a str)> {
+    if tokens.len() != layout::keyed::LEN {
         return Err(malformed());
     }
     Ok((
-        tokens.text(layout::names::INDEX)?,
-        tokens.text(layout::names::ID)?,
+        tokens.text(layout::INDEX)?,
+        tokens.text(layout::keyed::VKEY)?,
     ))
 }
 
 fn parse_create<'a>(tokens: &Tokens<'a>) -> Result<Create<'a>> {
-    if tokens.len() < layout::create::TAIL {
+    use layout::create as at;
+    if tokens.len() <= at::EXPTIME {
         return Err(malformed());
     }
-    let dim: usize = tokens.parse(layout::create::DIM, "dimension")?;
+    let dim: usize = tokens.parse(at::DIM, "dimension")?;
     if dim == 0 || dim > u16::MAX as usize {
         return Err(Error::bad_request("dimension out of range (1..65535)"));
     }
-    let mut create = Create::with_defaults(tokens.text(layout::create::INDEX)?, dim);
+    let mut create = Create {
+        index: tokens.text(layout::INDEX)?,
+        dim,
+        exptime: tokens.parse(at::EXPTIME, "expiretime")?,
+        maxcount: None,
+        metric: Metric::Cos,
+        quant: Quant::F32,
+        m: DEFAULT_M,
+        efc: DEFAULT_EFC,
+        efs: DEFAULT_EFS,
+    };
 
-    for (key, raw) in tokens.options(layout::create::TAIL)? {
+    // 다섯째 토큰이 숫자면 maxcount이고, 아니면 옵션이 거기서 시작한다.
+    let mut options_at = at::MAXCOUNT_OR_OPTIONS;
+    if let Ok(raw) = tokens.text(options_at)
+        && raw.parse::<u32>().is_ok()
+    {
+        let n: u32 = tokens.parse(options_at, "maxcount")?;
+        if n == 0 {
+            return Err(Error::bad_request(format!("maxcount out of range '{raw}'")));
+        }
+        create.maxcount = Some(n);
+        options_at += 1;
+    }
+
+    for (key, raw) in tokens.options(options_at)? {
         let number = |what: &str| -> Result<usize> {
             raw.parse::<usize>()
                 .map_err(|_| Error::bad_request(format!("invalid {what} '{raw}'")))
@@ -106,25 +101,15 @@ fn parse_create<'a>(tokens: &Tokens<'a>) -> Result<Create<'a>> {
                 create.quant = Quant::parse(raw)
                     .ok_or_else(|| Error::bad_request(format!("unknown quantization '{raw}'")))?;
             }
-            "M" => create.connectivity = number("M")?,
-            "EFC" => create.expansion_add = number("EFC")?,
-            "EFS" => create.expansion_search = number("EFS")?,
-            "MAXCOUNT" => {
-                let n = number("MAXCOUNT")?;
-                if n == 0 || n > u32::MAX as usize {
-                    return Err(Error::bad_request(format!("MAXCOUNT out of range '{raw}'")));
-                }
-                create.maxcount = Some(n as u32);
+            "M" => create.m = number("M")?,
+            "EFC" => create.efc = number("efc")?,
+            "EFS" => create.efs = number("efs")?,
+            other => {
+                return Err(Error::bad_request(format!(
+                    "unknown option {}",
+                    other.to_ascii_lowercase()
+                )));
             }
-            "EXPTIME" => {
-                let n = number("EXPTIME")?;
-                if n > u32::MAX as usize {
-                    return Err(Error::bad_request(format!("EXPTIME out of range '{raw}'")));
-                }
-                create.exptime = Some(n as u32);
-            }
-
-            other => return Err(Error::bad_request(format!("unknown option {other}"))),
         }
     }
 
@@ -132,19 +117,70 @@ fn parse_create<'a>(tokens: &Tokens<'a>) -> Result<Create<'a>> {
     Ok(create)
 }
 
-fn parse_search_key<'a>(tokens: &Tokens<'a>) -> Result<SimKey<'a>> {
-    use layout::search_key as at;
-    if tokens.len() < at::TAIL {
-        return Err(malformed());
-    }
-    let Trailing { filter, with_attr } = trailing(tokens, at::TAIL)?;
-    Ok(SimKey {
-        index: tokens.text(at::INDEX)?,
-        key: tokens.text(at::VKEY)?,
-        k: result_count(tokens, at::NUM)?,
-        filter,
-        with_attr,
-    })
+/// 꼬리 옵션(`meta <n>`, `filter <n>`, `withmeta`, `bin|str`)에서 읽은 것.
+///
+/// 순서는 가리지 않는다. 잘못된 옵션을 만나도 그때까지 읽은 구간 크기는
+/// 남아 있어서, 호출한 쪽이 본문을 비울 길이를 알 수 있다.
+#[derive(Default)]
+struct Tail {
+    meta: Option<usize>,
+    filter: Option<usize>,
+    with_meta: bool,
+    format: Format,
+}
+
+/// `allowed`에 든 옵션만 받는다. 실패하면 읽다 만 `Tail`을 함께 돌려준다.
+fn read_tail(
+    tokens: &Tokens,
+    from: usize,
+    meta: bool,
+    filter: bool,
+    with_meta: bool,
+    format: bool,
+) -> (Tail, Result<()>) {
+    let mut tail = Tail::default();
+    let outcome = (|| {
+        let mut i = from;
+        while i < tokens.len() {
+            let word = tokens.text(i)?;
+            let is = |name: &str| word.eq_ignore_ascii_case(name);
+            if meta && is("meta") {
+                if tail.meta.is_some() {
+                    return Err(Error::bad_request("meta given twice"));
+                }
+                tail.meta = Some(tokens.parse(i + 1, "metadata length")?);
+                i += 2;
+            } else if filter && is("filter") {
+                if tail.filter.is_some() {
+                    return Err(Error::bad_request("filter given twice"));
+                }
+                let n: usize = tokens.parse(i + 1, "filter length")?;
+                tail.filter = Some(n);
+                if n > MAX_FILTER_BYTES {
+                    return Err(Error::bad_request(format!(
+                        "filter is {n} bytes, over the {MAX_FILTER_BYTES}-byte limit"
+                    )));
+                }
+                i += 2;
+            } else if with_meta && is("withmeta") {
+                tail.with_meta = true;
+                i += 1;
+            } else if format && is("bin") {
+                tail.format = Format::Bin;
+                i += 1;
+            } else if format && is("str") {
+                tail.format = Format::Str;
+                i += 1;
+            } else {
+                return Err(Error::bad_request(format!(
+                    "unknown option {}",
+                    word.to_ascii_lowercase()
+                )));
+            }
+        }
+        Ok(())
+    })();
+    (tail, outcome)
 }
 
 fn result_count(tokens: &Tokens, at: usize) -> Result<usize> {
@@ -157,128 +193,124 @@ fn result_count(tokens: &Tokens, at: usize) -> Result<usize> {
     Ok(k)
 }
 
-fn parse_add(tokens: &Tokens) -> Result<Add> {
-    use layout::add as at;
-    if tokens.len() < at::TAIL {
-        return Err(malformed());
-    }
-    Ok(Add {
-        index: tokens.text(at::INDEX)?.to_owned(),
-        vkey: tokens.text(at::VKEY)?.to_owned(),
-        attr: attr_clause(tokens, at::TAIL)?,
+/// 본문 길이를 알아낸 뒤의 결과를 `Parsed::Body`로 싼다. 요청이 틀려도
+/// 길이만 알면 본문을 비울 수 있다.
+fn with_body<'a>(segments: Segments, request: Result<Body>) -> Result<Parsed<'a>> {
+    Ok(Parsed::Body {
+        len: segments.total(),
+        request,
     })
 }
 
-fn parse_sim(tokens: &Tokens) -> Result<Sim> {
-    use layout::search_vector as at;
-    if tokens.len() < at::TAIL {
+fn parse_upsert<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
+    use layout::upsert as at;
+    if tokens.len() <= at::VECTOR_BYTES {
         return Err(malformed());
     }
-    let Trailing { filter, with_attr } = trailing(tokens, at::TAIL)?;
-    Ok(Sim {
-        index: tokens.text(at::INDEX)?.to_owned(),
-        k: result_count(tokens, at::NUM)?,
-        filter,
-        with_attr,
-    })
-}
-
-/// `vsetattr <index> <vkey> [<JSON>]`
-///
-/// JSON을 생략하면 속성을 비운다. 길이를 받지 않게 되면서 "0바이트"라고 말할
-/// 자리가 없어졌는데, 인자를 빼는 것이 그 자리를 대신한다.
-fn parse_set_attr<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
-    use layout::setattr as at;
-    let json = match tokens.len() {
-        at::TAIL_EMPTY => "",
-        at::TAIL => tokens.text(at::ATTR)?,
-        _ => {
-            return Err(Error::bad_request(
-                "the attr JSON must be a single argument with no spaces in it",
-            ));
-        }
+    let vector: usize = tokens.parse(at::VECTOR_BYTES, "vector length")?;
+    let (tail, outcome) = read_tail(tokens, at::TAIL, true, false, false, true);
+    let segments = Segments {
+        meta: tail.meta,
+        filter: None,
+        vector: Some(vector),
     };
-    if json.len() > MAX_ATTR_JSON {
-        return Err(Error::bad_request(format!(
-            "attr is {} bytes, over the {MAX_ATTR_JSON}-byte limit",
-            json.len()
-        )));
-    }
-    Ok(Parsed::Line(Line::SetAttr {
-        index: tokens.text(at::INDEX)?,
-        id: tokens.text(at::VKEY)?,
-        attr: json.as_bytes(),
-    }))
+    let request = outcome.and_then(|()| {
+        Ok(Body::Upsert(Upsert {
+            index: tokens.text(layout::INDEX)?.to_owned(),
+            vkey: tokens.text(at::VKEY)?.to_owned(),
+            format: tail.format,
+            has_meta: tail.meta.is_some(),
+            segments,
+        }))
+    });
+    with_body(segments, request)
 }
 
-/// `attr <JSON>` -- 길이를 받지 않는다.
-///
-/// JSON은 토큰 하나라 공백이 들어갈 수 없고, 그것이 곧 길이를 대신한다.
-fn attr_clause(tokens: &Tokens, at: usize) -> Result<Vec<u8>> {
-    if tokens.len() <= at {
-        return Ok(Vec::new());
+fn parse_setmeta<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
+    use layout::setmeta as at;
+    if tokens.len() != at::LEN {
+        return Err(malformed());
     }
-    let keyword = tokens.text(at)?;
-    if !keyword.eq_ignore_ascii_case("ATTR") {
-        return Err(Error::bad_request(format!(
-            "expected attr, got '{keyword}'"
-        )));
-    }
-
-    let json = tokens.text(at + 1)?;
-    if tokens.len() > at + 2 {
-        return Err(Error::bad_request(
-            "the attr JSON must be a single argument with no spaces in it",
-        ));
-    }
-    if json.len() > MAX_ATTR_JSON {
-        return Err(Error::bad_request(format!(
-            "attr is {} bytes, over the {MAX_ATTR_JSON}-byte limit",
-            json.len()
-        )));
-    }
-    Ok(json.as_bytes().to_vec())
+    let meta: usize = tokens.parse(at::META_BYTES, "metadata length")?;
+    let segments = Segments {
+        meta: Some(meta),
+        ..Segments::default()
+    };
+    let request = || {
+        Ok(Body::SetMeta(SetMeta {
+            index: tokens.text(layout::INDEX)?.to_owned(),
+            vkey: tokens.text(at::VKEY)?.to_owned(),
+            segments,
+        }))
+    };
+    with_body(segments, request())
 }
 
-fn trailing(tokens: &Tokens, at: usize) -> Result<Trailing> {
-    let mut out = Trailing::default();
-    let mut i = at;
-    while i < tokens.len() {
-        let word = tokens.text(i)?;
-        if word.eq_ignore_ascii_case("FILTER") {
-            let count: usize = tokens.parse(i + 1, "filter term count")?;
-            let first = i + 2;
-            let supplied = tokens.len().saturating_sub(first);
-            if supplied < count {
-                return Err(Error::bad_request(format!(
-                    "FILTER declares {count} terms but {supplied} were supplied"
-                )));
-            }
-            if count > 0 {
-                out.filter = Some(and_terms(tokens, first, count)?);
-            }
-            i = first + count;
-        } else if word.eq_ignore_ascii_case("WITHATTR") {
-            out.with_attr = true;
-            i += 1;
-        } else {
-            return Err(Error::bad_request(format!(
-                "expected FILTER or WITHATTR, got '{word}'"
-            )));
-        }
+fn parse_search<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
+    let raw = tokens.text(layout::search::SOURCE)?;
+    if raw.eq_ignore_ascii_case("vkey") {
+        parse_search_key(tokens)
+    } else if raw.eq_ignore_ascii_case("vector") {
+        parse_search_vector(tokens)
+    } else {
+        Err(Error::bad_request(format!(
+            "expected vkey or vector, got '{raw}'"
+        )))
     }
-    Ok(out)
 }
 
-fn and_terms(tokens: &Tokens, first: usize, count: usize) -> Result<Filter> {
-    let mut expression = String::new();
-    for i in first..first + count {
-        if i > first {
-            expression.push_str(" AND ");
-        }
-        expression.push_str(tokens.text(i)?);
+fn parse_search_key<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
+    use layout::search_key as at;
+    if tokens.len() <= at::NUM {
+        return Err(malformed());
     }
-    Filter::parse(&expression).map_err(Error::from)
+    let k = result_count(tokens, at::NUM)?;
+    let (tail, outcome) = read_tail(tokens, at::TAIL, false, true, true, false);
+    let segments = Segments {
+        filter: tail.filter,
+        ..Segments::default()
+    };
+    let request = outcome.and_then(|()| {
+        Ok(SearchKey {
+            index: tokens.text(layout::INDEX)?.to_owned(),
+            vkey: tokens.text(at::VKEY)?.to_owned(),
+            k,
+            with_meta: tail.with_meta,
+            has_filter: tail.filter.is_some(),
+            segments,
+        })
+    });
+    match (tail.filter, request) {
+        // 필터 본문이 없으면 줄만으로 끝난다.
+        (None, request) => request.map(|s| Parsed::Line(Line::SearchKey(s))),
+        (Some(_), request) => with_body(segments, request.map(Body::SearchKey)),
+    }
+}
+
+fn parse_search_vector<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
+    use layout::search_vector as at;
+    if tokens.len() <= at::VECTOR_BYTES {
+        return Err(malformed());
+    }
+    let k = result_count(tokens, at::NUM)?;
+    let vector: usize = tokens.parse(at::VECTOR_BYTES, "vector length")?;
+    let (tail, outcome) = read_tail(tokens, at::TAIL, false, true, true, true);
+    let segments = Segments {
+        meta: None,
+        filter: tail.filter,
+        vector: Some(vector),
+    };
+    let request = outcome.and_then(|()| {
+        Ok(Body::SearchVector(SearchVector {
+            index: tokens.text(layout::INDEX)?.to_owned(),
+            k,
+            format: tail.format,
+            with_meta: tail.with_meta,
+            has_filter: tail.filter.is_some(),
+            segments,
+        }))
+    });
+    with_body(segments, request)
 }
 
 #[cfg(test)]
@@ -295,11 +327,6 @@ mod tests {
         };
     }
 
-    fn on_line<T>(line: &str, f: impl FnOnce(&Tokens) -> T) -> T {
-        tokens!(t = line);
-        f(&t)
-    }
-
     fn line_of<'a>(tokens: &Tokens<'a>) -> Result<Line<'a>> {
         match parse(tokens)? {
             Parsed::Line(line) => Ok(line),
@@ -307,9 +334,10 @@ mod tests {
         }
     }
 
-    fn body_of(tokens: &Tokens) -> Result<Body> {
-        match parse(tokens)? {
-            Parsed::Body { request, .. } => request,
+    fn body_of(line: &str) -> (usize, Body) {
+        tokens!(t = line);
+        match parse(&t).unwrap() {
+            Parsed::Body { len, request } => (len, request.unwrap()),
             Parsed::Line(_) => panic!("expected a body-carrying command"),
         }
     }
@@ -327,396 +355,302 @@ mod tests {
         }
     }
 
-    #[test]
-    fn command_names_are_case_insensitive() {
-        for (text, cmd) in [
-            ("vsearch", Cmd::VSearch),
-            ("VSEARCH", Cmd::VSearch),
-            ("VSearch", Cmd::VSearch),
-            ("vcreate", Cmd::VCreate),
-            ("VADD", Cmd::VAdd),
-            ("VSTATS", Cmd::VStats),
-        ] {
-            assert_eq!(Cmd::parse(text), Some(cmd), "{text}");
+    fn create_of(line: &str) -> Create<'static> {
+        tokens!(t = line);
+        let Ok(Line::Create(c)) = line_of(&t) else {
+            panic!("expected a create")
+        };
+        // 테스트 안에서만: 토큰 버퍼가 사라져도 쓰도록 문자열을 새어 둔다.
+        Create {
+            index: Box::leak(c.index.to_owned().into_boxed_str()),
+            ..c
         }
-        assert_eq!(Cmd::parse("vsimilar"), None);
+    }
+
+    #[test]
+    fn vop_and_its_subcommands_are_case_insensitive() {
+        assert_eq!(Cmd::parse("vop"), Some(Cmd::Vop));
+        assert_eq!(Cmd::parse("VOP"), Some(Cmd::Vop));
+        assert_eq!(Cmd::parse("Vop"), Some(Cmd::Vop));
+        assert_eq!(Cmd::parse("vadd"), None);
+        assert_eq!(Cmd::parse("vcreate"), None);
         assert_eq!(Cmd::parse(""), None);
-    }
-
-    #[test]
-    fn sim_sources_are_case_insensitive() {
-        assert_eq!(SimSource::parse("VECTOR"), Some(SimSource::Vector));
-        assert_eq!(SimSource::parse("vector"), Some(SimSource::Vector));
-        assert_eq!(SimSource::parse("KEY"), Some(SimSource::Key));
-        assert_eq!(SimSource::parse("ID"), None);
-    }
-
-    #[test]
-    fn only_vadd_and_vsim_vector_carry_a_body() {
-        fn body_len(line: &str) -> Option<usize> {
-            tokens!(t = line);
-            match parse(&t) {
-                Ok(Parsed::Body { len, .. }) => Some(len),
-                _ => None,
-            }
+        for (text, sub) in [
+            ("create", Sub::Create),
+            ("UPSERT", Sub::Upsert),
+            ("SetMeta", Sub::SetMeta),
+            ("Search", Sub::Search),
+            ("getmeta", Sub::GetMeta),
+            ("DELETE", Sub::Delete),
+            ("drop", Sub::Drop),
+        ] {
+            assert_eq!(Sub::parse(text), Some(sub), "{text}");
         }
-        assert_eq!(body_len("vadd i d 28"), Some(28));
-        assert_eq!(body_len("VSEARCH VECTOR docs 10 4096"), Some(4096));
-        assert_eq!(body_len("VSEARCH KEY docs v1 10"), None);
-        assert_eq!(body_len("vlist"), None);
-        assert_eq!(body_len("vgetattr docs v1"), None);
-        assert_eq!(body_len("nonsense"), None);
+        assert_eq!(Sub::parse("list"), None);
+        assert!(matches!(
+            {
+                tokens!(t = "VOP DROP docs");
+                line_of(&t)
+            },
+            Ok(Line::Drop(_))
+        ));
+    }
+
+    #[test]
+    fn create_fills_the_pdf_defaults() {
+        let c = create_of("vop create docs 8 0");
+        assert_eq!(c.index, "docs");
+        assert_eq!(c.dim, 8);
+        assert_eq!(c.exptime, 0);
+        assert_eq!(c.m, 16);
+        assert_eq!(c.efc, 128);
+        assert_eq!(c.efs, 64);
+        assert_eq!(c.metric, Metric::Cos);
+        assert_eq!(c.quant, Quant::F32);
+        assert_eq!(c.maxcount, None);
+    }
+
+    #[test]
+    fn create_reads_a_positional_maxcount_then_options() {
+        let c = create_of("vop create docs 8 60 100 metric l2 quant f16 M 8 efc 64 efs 32");
+        assert_eq!(c.exptime, 60);
+        assert_eq!(c.maxcount, Some(100));
+        assert_eq!(c.metric, Metric::L2);
+        assert_eq!(c.quant, Quant::F16);
+        assert_eq!((c.m, c.efc, c.efs), (8, 64, 32));
+
+        let c = create_of("vop create docs 8 60 METRIC l2");
+        assert_eq!(c.maxcount, None, "키워드면 옵션의 시작이다");
+        assert_eq!(c.metric, Metric::L2);
+    }
+
+    #[test]
+    fn create_requires_an_expiretime() {
+        assert!(err("vop create docs 8").contains("bad command line format"));
+        assert!(err("vop create docs").contains("bad command line format"));
+        assert!(err("vop create docs 8 abc").contains("expiretime"));
+        assert!(err("vop create docs 0 0").contains("out of range"));
+        assert!(err("vop create docs 8 0 0").contains("maxcount"));
+        assert!(err("vop create docs 8 0 nope 1").contains("unknown option"));
+        assert!(err("vop create docs 8 0 100 efs").contains("needs a value"));
+    }
+
+    #[test]
+    fn create_rejects_b1_with_cos_and_hamming_without_b1() {
+        assert!(err("vop create docs 8 0 quant b1 metric cos").contains("b1"));
+        assert!(err("vop create docs 8 0 quant f32 metric hamming").contains("b1"));
+        tokens!(t = "vop create docs 8 0 quant b1 metric hamming");
+        assert!(line_of(&t).is_ok());
+    }
+
+    #[test]
+    fn upsert_body_is_meta_then_vector() {
+        let (len, body) = body_of("vop upsert i v 8 meta 7");
+        assert_eq!(len, 7 + 2 + 8 + 2);
+        let Body::Upsert(u) = body else {
+            panic!("expected an upsert")
+        };
+        assert_eq!((u.index.as_str(), u.vkey.as_str()), ("i", "v"));
+        assert!(u.has_meta);
+        assert_eq!(u.format, Format::Bin);
+
+        let mut raw = br#"{"a":1}"#.to_vec();
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(&[9; 8]);
+        raw.extend_from_slice(b"\r\n");
+        let parts = u.segments.split(&raw).unwrap();
+        assert_eq!(parts.meta, Some(&br#"{"a":1}"#[..]));
+        assert_eq!(parts.vector, Some(&[9u8; 8][..]));
+        assert_eq!(parts.filter, None);
+    }
+
+    #[test]
+    fn upsert_without_meta_is_vector_only() {
+        let (len, body) = body_of("vop upsert i v 8 str");
+        assert_eq!(len, 8 + 2);
+        let Body::Upsert(u) = body else {
+            panic!("expected an upsert")
+        };
+        assert!(!u.has_meta);
+        assert_eq!(u.format, Format::Str);
+        assert_eq!(u.segments.meta, None);
+    }
+
+    #[test]
+    fn a_short_vector_after_a_good_meta_is_a_bad_data_chunk() {
+        let (_, Body::Upsert(u)) = body_of("vop upsert i v 8 meta 7") else {
+            panic!("expected an upsert")
+        };
+        // 길이가 모자란 것도, 길이는 맞는데 구간 끝이 \r\n이 아닌 것도 거절한다.
+        let mut short = br#"{"a":1}"#.to_vec();
+        short.extend_from_slice(b"\r\n123456\r\n");
+        let msg = u.segments.split(&short).unwrap_err().to_string();
+        assert_eq!(msg, "bad data chunk");
+
+        let mut bad_end = br#"{"a":1}"#.to_vec();
+        bad_end.extend_from_slice(b"\r\n12345678xx");
+        assert_eq!(
+            u.segments.split(&bad_end).unwrap_err().to_string(),
+            "bad data chunk"
+        );
+
+        let mut bad_meta = br#"{"a":1}"#.to_vec();
+        bad_meta.extend_from_slice(b"xx12345678\r\n");
+        assert_eq!(
+            u.segments.split(&bad_meta).unwrap_err().to_string(),
+            "bad data chunk"
+        );
+    }
+
+    #[test]
+    fn search_vector_reads_num_before_vector_bytes() {
+        let (len, body) = body_of("vop search docs vector 10 16 filter 5 withmeta str");
+        assert_eq!(len, 5 + 2 + 16 + 2);
+        let Body::SearchVector(s) = body else {
+            panic!("expected a vector search")
+        };
+        assert_eq!(s.index, "docs");
+        assert_eq!(s.k, 10);
+        assert_eq!(s.segments.vector, Some(16));
+        assert_eq!(s.segments.filter, Some(5));
+        assert!(s.has_filter && s.with_meta);
+        assert_eq!(s.format, Format::Str);
+
+        let mut raw = b"a = 1".to_vec();
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(&[7; 16]);
+        raw.extend_from_slice(b"\r\n");
+        let parts = s.segments.split(&raw).unwrap();
+        assert_eq!(parts.filter, Some(&b"a = 1"[..]));
+        assert_eq!(parts.vector, Some(&[7u8; 16][..]));
+        assert_eq!(parts.meta, None);
+
+        let (len, _) = body_of("vop search docs vector 3 16");
+        assert_eq!(len, 18, "필터가 없으면 벡터 구간뿐이다");
+    }
+
+    #[test]
+    fn search_options_come_in_any_order() {
+        for tail in [
+            "filter 5 withmeta str",
+            "withmeta filter 5 str",
+            "str withmeta filter 5",
+            "STR WITHMETA FILTER 5",
+        ] {
+            let (len, body) = body_of(&format!("vop search docs vector 10 16 {tail}"));
+            assert_eq!(len, 25, "{tail}");
+            let Body::SearchVector(s) = body else {
+                panic!("expected a vector search")
+            };
+            assert!(s.has_filter && s.with_meta, "{tail}");
+            assert_eq!(s.format, Format::Str, "{tail}");
+        }
+        tokens!(t = "vop search docs vkey v1 5 withmeta");
+        let Ok(Line::SearchKey(s)) = line_of(&t) else {
+            panic!("expected a key search line")
+        };
+        assert!(s.with_meta && !s.has_filter);
+    }
+
+    #[test]
+    fn search_by_vkey_carries_only_a_filter_body() {
+        tokens!(t = "vop search docs vkey v1 5");
+        let Ok(Line::SearchKey(s)) = line_of(&t) else {
+            panic!("expected a key search line")
+        };
+        assert_eq!((s.index.as_str(), s.vkey.as_str(), s.k), ("docs", "v1", 5));
+
+        let (len, body) = body_of("vop search docs vkey v1 5 withmeta filter 12");
+        assert_eq!(len, 14);
+        let Body::SearchKey(s) = body else {
+            panic!("expected a key search body")
+        };
+        assert!(s.has_filter && s.with_meta);
+        assert_eq!(s.segments.filter, Some(12));
+        assert_eq!(s.segments.vector, None);
+    }
+
+    #[test]
+    fn setmeta_body_is_the_metadata_alone() {
+        let (len, body) = body_of("vop setmeta docs v1 7");
+        assert_eq!(len, 9);
+        let Body::SetMeta(m) = body else {
+            panic!("expected a setmeta")
+        };
+        assert_eq!((m.index.as_str(), m.vkey.as_str()), ("docs", "v1"));
+        let parts = m.segments.split(b"{\"a\":1}\r\n").unwrap();
+        assert_eq!(parts.meta, Some(&br#"{"a":1}"#[..]));
+        assert!(err("vop setmeta docs v1").contains("bad command line format"));
+        assert!(err("vop setmeta docs v1 abc").contains("metadata length"));
+    }
+
+    #[test]
+    fn getmeta_delete_drop_check_arity() {
+        tokens!(g = "vop getmeta docs v1");
+        assert!(matches!(line_of(&g), Ok(Line::GetMeta(_))));
+        tokens!(d = "vop delete docs v1");
+        assert!(matches!(line_of(&d), Ok(Line::Delete(_))));
+        tokens!(p = "vop drop docs");
+        assert!(matches!(line_of(&p), Ok(Line::Drop(_))));
+
+        assert!(err("vop getmeta docs").contains("bad command line format"));
+        assert!(err("vop delete docs v1 extra").contains("bad command line format"));
+        assert!(err("vop drop").contains("bad command line format"));
+        assert!(err("vop drop docs extra").contains("bad command line format"));
+        assert!(err("vop").contains("bad command line format"));
+    }
+
+    #[test]
+    fn an_unknown_subcommand_or_option_is_a_client_error() {
+        assert!(err("vop list").contains("unknown subcommand"));
+        assert!(err("vop search docs ids v1 5").contains("expected vkey or vector"));
+        assert!(err("vop search docs vkey v1 0").contains("result count"));
+        assert!(err("vop search docs vector 0 16").contains("result count"));
+        assert!(err("vop search docs vector 5 16 bogus").contains("unknown option"));
+        assert!(err("vop upsert i v 8 attr 7").contains("unknown option"));
+        assert!(err("vop upsert i v 8 meta").contains("bad command line format"));
+        assert!(err("vop upsert i v abc").contains("vector length"));
+        assert!(err("vop search docs vector 5 16 filter").contains("bad command line format"));
+        assert!(err("vcreate docs 8").contains("unknown command"));
+    }
+
+    #[test]
+    fn a_filter_over_4096_bytes_is_a_client_error() {
+        assert!(err("vop search docs vector 5 16 filter 4096").contains("accepted"));
+        assert!(err("vop search docs vector 5 16 filter 4097").contains("filter"));
+        assert!(err("vop search docs vkey v1 5 filter 4097").contains("filter"));
+    }
+
+    #[test]
+    fn a_body_over_the_limit_is_refused_but_drained() {
+        let line = format!("vop upsert i v {}", MAX_BODY_BYTES);
+        tokens!(t = &line);
+        let Ok(Parsed::Body { len, .. }) = parse(&t) else {
+            panic!("expected a body-carrying command")
+        };
+        assert!(len > MAX_BODY_BYTES, "accept는 버퍼를 열지 않는다");
+        assert!(
+            body_refused(len).to_string().contains("transfer limit"),
+            "execute가 답하는 메시지"
+        );
+        assert_eq!(body_refused(28).to_string(), "lost command state");
+
+        // 숫자가 넘쳐도 패닉 없이 상한에 걸린다.
+        let line = format!("vop upsert i v {} meta {}", usize::MAX, usize::MAX);
+        tokens!(t = &line);
+        let Ok(Parsed::Body { len, .. }) = parse(&t) else {
+            panic!("expected a body-carrying command")
+        };
+        assert!(len > MAX_BODY_BYTES);
     }
 
     #[test]
     fn a_body_length_survives_an_unusable_remainder() {
-        tokens!(t = "vadd i d 28 nope");
+        tokens!(t = "vop upsert i v 28 nope");
         let Ok(Parsed::Body { len, request }) = parse(&t) else {
             panic!("expected a body-carrying command")
         };
-        assert_eq!(len, 28);
-        assert!(request.unwrap_err().to_string().contains("expected attr"));
-    }
-
-    #[test]
-    fn an_unusable_body_length_refuses_the_whole_line() {
-        tokens!(t = "vadd i d abc 7");
-        let msg = parse(&t).unwrap_err().to_string();
-        assert!(msg.contains("vector length"), "{msg}");
-    }
-
-    #[test]
-    fn a_body_line_that_reached_execute_names_the_limit_it_broke() {
-        assert!(
-            body_refused(MAX_BODY_BYTES + 1)
-                .to_string()
-                .contains("transfer limit")
-        );
-        assert_eq!(body_refused(28).to_string(), "lost command state");
-    }
-
-    #[test]
-    fn vcreate_defaults_are_filled_in() {
-        tokens!(t = "vcreate docs 1024");
-        let c = parse_create(&t).unwrap();
-        assert_eq!(c.index, "docs");
-        assert_eq!(c.dim, 1024);
-        assert_eq!(c.metric, Metric::Cos);
-        assert_eq!(c.quant, Quant::F32);
-    }
-
-    #[test]
-    fn vcreate_options_are_case_insensitive() {
-        tokens!(t = "vcreate docs 8 quant i8 metric l2 efs 64");
-        let c = parse_create(&t).unwrap();
-        assert_eq!(c.quant, Quant::I8);
-        assert_eq!(c.metric, Metric::L2);
-        assert_eq!(c.expansion_search, 64);
-    }
-
-    #[test]
-    fn vcreate_rejects_unknown_options_and_values() {
-        assert!(err("vcreate docs 8 NOPE 1").contains("unknown option"));
-        assert!(err("vcreate docs 8 QUANT f64").contains("unknown quantization"));
-        assert!(err("vcreate docs 8 METRIC manhattan").contains("unknown metric"));
-        assert!(err("vcreate docs 8 FBYTES 128").contains("unknown option"));
-        assert!(err("vcreate docs 8 THREADS 8").contains("unknown option"));
-    }
-
-    #[test]
-    fn vcreate_rejects_an_out_of_range_dimension() {
-        assert!(err("vcreate docs 0").contains("out of range"));
-        assert!(err("vcreate docs 65536").contains("out of range"));
-        assert!(err("vcreate docs abc").contains("dimension"));
-    }
-
-    #[test]
-    fn vcreate_takes_a_size_and_an_expiry() {
-        // 둘 다 인덱스 Map의 속성이다. 요소에는 만료가 따로 없어서, 만료는
-        // `vadd`가 아니라 여기서 인덱스 전체에 붙는다.
-        tokens!(t = "vcreate docs 8 MAXCOUNT 100 EXPTIME 60");
-        let c = parse_create(&t).unwrap();
-        assert_eq!(c.maxcount, Some(100));
-        assert_eq!(c.exptime, Some(60));
-
-        tokens!(t = "vcreate docs 8");
-        let c = parse_create(&t).unwrap();
-        assert_eq!(c.maxcount, None, "이름을 안 하면 서버의 상한을 쓴다");
-        assert_eq!(c.exptime, None);
-
-        assert!(err("vcreate docs 8 MAXCOUNT 0").contains("MAXCOUNT"));
-        assert!(err("vcreate docs 8 MAXCOUNT -1").contains("MAXCOUNT"));
-        assert!(err("vcreate docs 8 EXPTIME abc").contains("EXPTIME"));
-    }
-
-    #[test]
-    fn incompatible_metric_and_quantization_are_rejected_at_parse_time() {
-        assert!(err("vcreate docs 8 QUANT b1 METRIC cos").contains("b1"));
-        assert!(err("vcreate docs 8 QUANT f32 METRIC hamming").contains("b1"));
-        tokens!(t = "vcreate docs 8 QUANT b1 METRIC hamming");
-        assert!(parse_create(&t).is_ok());
-    }
-
-    #[test]
-    fn vadd_yields_index_id_dimension_and_attr() {
-        let Body::Add(a) =
-            on_line(r#"vadd index doc1 7 attr {"abc":123,"def":"abc"}"#, body_of).unwrap()
-        else {
-            panic!("expected an Add")
-        };
-        assert_eq!(a.index, "index");
-        assert_eq!(a.vkey, "doc1");
-        assert_eq!(a.attr, br#"{"abc":123,"def":"abc"}"#);
-    }
-
-    #[test]
-    fn vadd_attr_is_optional() {
-        let Body::Add(a) = on_line("vadd index doc1 7", body_of).unwrap() else {
-            panic!("expected an Add")
-        };
-        assert!(a.attr.is_empty());
-    }
-
-    #[test]
-    fn vadd_takes_no_expiry() {
-        // 만료는 인덱스 단위로 `vcreate`가 받는다. 예전 자리에 숫자를 주면
-        // attr 키워드 자리로 읽혀 거절된다.
-        assert!(err("vadd index doc1").contains("bad command line format"));
-        assert!(err("vadd index doc1 28 0").contains("expected attr"));
-    }
-
-    fn attr_of(line: &str) -> Result<Vec<u8>> {
-        on_line(line, |t| attr_clause(t, layout::add::TAIL))
-    }
-
-    #[test]
-    fn attr_json_must_be_one_token() {
-        let json = r#"{"cat": "tech"}"#;
-        let msg = attr_of(&format!("vadd docs v1 16 attr {json}"))
-            .unwrap_err()
-            .to_string();
-        assert!(msg.contains("no spaces in it"), "{msg}");
-    }
-
-    #[test]
-    fn attr_json_without_spaces_fills_the_whole_region() {
-        let json = format!(
-            "{{{}}}",
-            (0..14)
-                .map(|i| format!("\"k{i}\":{i}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        assert!(json.len() <= MAX_ATTR_JSON);
-        assert_eq!(
-            attr_of(&format!("vadd docs v1 16 attr {json}")).unwrap(),
-            json.as_bytes()
-        );
-    }
-
-    #[test]
-    fn the_attr_keyword_and_its_json_are_validated() {
-        assert!(attr_of("vadd docs v1 16 attr {}").is_ok());
-        assert!(
-            attr_of("vadd docs v1 16 ATTRS {}")
-                .unwrap_err()
-                .to_string()
-                .contains("expected attr")
-        );
-        // 길이를 따로 받지 않으니, 한도를 넘는지는 실제 바이트 수로 본다.
-        let over = format!(r#"{{"k":"{}"}}"#, "x".repeat(250));
-        assert!(
-            attr_of(&format!("vadd docs v1 16 attr {over}"))
-                .unwrap_err()
-                .to_string()
-                .contains("over the 255-byte limit")
-        );
-        // JSON은 토큰 하나여야 한다. 공백이 들어가면 두 토큰이 된다.
-        assert!(
-            attr_of(r#"vadd docs v1 16 attr {"a": 1}"#)
-                .unwrap_err()
-                .to_string()
-                .contains("single argument")
-        );
-    }
-
-    #[test]
-    fn an_attr_exactly_at_the_limit_is_accepted() {
-        let json = format!(r#"{{"k":"{}"}}"#, "x".repeat(247));
-        assert_eq!(json.len(), MAX_ATTR_JSON);
-        assert!(attr_of(&format!("vadd docs v1 16 attr {json}")).is_ok());
-    }
-
-    #[test]
-    fn vsim_vector_yields_index_k_dimension_and_filter() {
-        let Body::Sim(s) =
-            on_line("VSEARCH VECTOR docs 10 8192 FILTER 1 cat=tech", body_of).unwrap()
-        else {
-            panic!("expected a Sim")
-        };
-        assert_eq!(s.index, "docs");
-        assert_eq!(s.k, 10);
-        assert!(s.filter.is_some());
-    }
-
-    #[test]
-    fn vsim_key_yields_index_k_and_key() {
-        tokens!(t = "VSEARCH KEY docs v1 5");
-        let Line::SimKey(s) = line_of(&t).unwrap() else {
-            panic!("expected a SimKey")
-        };
-        assert_eq!(s.index, "docs");
-        assert_eq!(s.k, 5);
-        assert_eq!(s.key, "v1");
-        assert!(s.filter.is_none());
-    }
-
-    #[test]
-    fn vsim_rejects_an_unknown_source_and_a_zero_count() {
-        assert!(err("VSEARCH ID docs v1 5").contains("expected VECTOR or KEY"));
-        assert!(err("VSEARCH KEY docs v1 0").contains("result count"));
-        assert!(err("VSEARCH VECTOR docs 0 4096").contains("result count"));
-    }
-
-    #[test]
-    fn a_result_count_past_the_ceiling_is_refused_before_anything_is_sized_by_it() {
-        let over = MAX_RESULTS + 1;
-        assert!(err(&format!("VSEARCH KEY docs v1 {over}")).contains("result count"));
-        assert!(err(&format!("VSEARCH VECTOR docs {over} 4096")).contains("result count"));
-
-        assert!(on_line(
-            &format!("VSEARCH KEY docs v1 {MAX_RESULTS}"),
-            |t| { matches!(parse(t), Ok(Parsed::Line(_))) }
-        ));
-    }
-
-    fn filter_of(line: &str) -> Result<Option<Filter>> {
-        on_line(line, |t| trailing(t, layout::search_key::TAIL)).map(|t| t.filter)
-    }
-
-    fn trailing_of(line: &str) -> Result<Trailing> {
-        on_line(line, |t| trailing(t, layout::search_key::TAIL))
-    }
-
-    #[test]
-    fn filter_terms_are_anded_together() {
-        let f = filter_of("VSEARCH KEY docs v1 5 FILTER 2 cat=tech ts>1700000000")
-            .unwrap()
-            .unwrap();
-        assert!(f.matches(&crate::bson::from_json(br#"{"cat":"tech","ts":1723248000}"#).unwrap()));
-        assert!(!f.matches(&crate::bson::from_json(br#"{"cat":"tech","ts":1}"#).unwrap()));
-        assert!(!f.matches(&crate::bson::from_json(br#"{"cat":"news","ts":1723248000}"#).unwrap()));
-    }
-
-    #[test]
-    fn an_absent_or_empty_filter_is_none() {
-        assert!(filter_of("VSEARCH KEY docs v1 5").unwrap().is_none());
-        assert!(
-            filter_of("VSEARCH KEY docs v1 5 FILTER 0")
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn a_filter_short_of_its_declared_terms_is_rejected() {
-        assert!(
-            filter_of("VSEARCH KEY docs v1 5 FILTER 3 cat=tech")
-                .unwrap_err()
-                .to_string()
-                .contains("declares 3 terms but 1")
-        );
-    }
-
-    #[test]
-    fn a_term_past_the_declared_count_reads_as_a_clause() {
-        let msg = filter_of("VSEARCH KEY docs v1 5 FILTER 1 cat=tech lang=ko")
-            .unwrap_err()
-            .to_string();
-        assert!(msg.contains("expected FILTER or WITHATTR"), "{msg}");
-        assert!(msg.contains("lang=ko"), "{msg}");
-    }
-
-    #[test]
-    fn withattr_is_read_with_or_without_a_filter() {
-        let bare = trailing_of("VSEARCH KEY docs v1 5").unwrap();
-        assert!(bare.filter.is_none() && !bare.with_attr);
-
-        let only = trailing_of("VSEARCH KEY docs v1 5 WITHATTR").unwrap();
-        assert!(only.filter.is_none() && only.with_attr);
-
-        let reversed = trailing_of("VSEARCH KEY docs v1 5 WITHATTR FILTER 1 cat=tech").unwrap();
-        assert!(
-            reversed.with_attr && reversed.filter.is_some(),
-            "either order is accepted"
-        );
-
-        let both = trailing_of("VSEARCH KEY docs v1 5 FILTER 1 cat=tech WITHATTR").unwrap();
-        assert!(both.filter.is_some() && both.with_attr);
-
-        let flipped = trailing_of("VSEARCH KEY docs v1 5 withattr FILTER 1 cat=tech").unwrap();
-        assert!(flipped.filter.is_some() && flipped.with_attr);
-
-        let empty = trailing_of("VSEARCH KEY docs v1 5 FILTER 0").unwrap();
-        assert!(empty.filter.is_none() && !empty.with_attr);
-    }
-
-    #[test]
-    fn a_misspelled_or_unparseable_filter_is_reported() {
-        assert!(
-            filter_of("VSEARCH KEY docs v1 5 FILTERS 1 cat=tech")
-                .unwrap_err()
-                .to_string()
-                .contains("expected FILTER")
-        );
-        assert!(filter_of("VSEARCH KEY docs v1 5 FILTER 1 nonsense").is_err());
-    }
-
-    #[test]
-    fn set_attr_takes_one_json_token() {
-        tokens!(set = r#"vsetattr docs v1 {"cat":"tech"}"#);
-        let Ok(Line::SetAttr { index, id, attr }) = line_of(&set) else {
-            panic!("vsetattr did not parse");
-        };
-        assert_eq!((index, id), ("docs", "v1"));
-        assert_eq!(attr, br#"{"cat":"tech"}"#);
-    }
-
-    #[test]
-    fn set_attr_wants_exactly_one_json_argument() {
-        // 길이를 받지 않으므로 인자 수가 곧 검사다. 공백이 든 JSON은 두
-        // 토큰이 되어 여기서 걸린다.
-        assert!(err(r#"vsetattr docs v1 {} extra"#).contains("single argument"));
-
-        // JSON을 생략하면 비우는 것이다.
-        tokens!(clear = "vsetattr docs v1");
-        let Ok(Line::SetAttr { attr, .. }) = line_of(&clear) else {
-            panic!("clearing did not parse");
-        };
-        assert!(attr.is_empty());
-
-        let over = format!(r#"{{"k":"{}"}}"#, "x".repeat(250));
-        assert!(err(&format!("vsetattr docs v1 {over}")).contains("over the"));
-    }
-
-    #[test]
-    fn simple_lines_parse_and_reject_wrong_arity() {
-        tokens!(get = "vgetattr docs v1");
-        assert!(matches!(line_of(&get), Ok(Line::GetAttr { .. })));
-        tokens!(del = "vdel docs v1");
-        assert!(matches!(line_of(&del), Ok(Line::Del { .. })));
-        tokens!(drop_ = "vdrop docs");
-        assert!(matches!(line_of(&drop_), Ok(Line::Drop { .. })));
-        tokens!(list = "vlist");
-        assert!(matches!(line_of(&list), Ok(Line::List)));
-        tokens!(stats = "vstats");
-        assert!(matches!(line_of(&stats), Ok(Line::Stats)));
-
-        assert!(err("vgetattr docs").contains("bad command line format"));
-        assert!(err("vdel docs v1 extra").contains("bad command line format"));
-        assert!(err("vdrop").contains("bad command line format"));
-        assert!(err("vlist extra").contains("bad command line format"));
-        assert!(err("vstats extra").contains("bad command line format"));
-        assert!(err("nonsense").contains("unknown command"));
+        assert_eq!(len, 30, "본문은 그래도 비워야 한다");
+        assert!(request.unwrap_err().to_string().contains("unknown option"));
     }
 }

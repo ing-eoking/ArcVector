@@ -74,6 +74,8 @@ impl Task {
     ///
     /// `vadd`는 여기 없다. 요소 쓰기가 먼저여야 하고 그것은 엔진 쓰기라
     /// 워커 스레드의 일이다 -- [`Task::Add`]가 그 뒤를 잇는다.
+    // 본문 구간 크기를 든 새 요청 때문에 `Request`가 커졌다. Task 8이 이 길을 다시 짠다.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn from_request(request: Request) -> std::result::Result<Self, Request> {
         match request {
             Request::Body(Body::Sim(spec), bytes) => Ok(Task::Sim(spec, bytes)),

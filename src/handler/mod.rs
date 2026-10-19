@@ -37,13 +37,15 @@ pub unsafe fn run(cookie: *const c_void, request: Request) -> Result<Reply> {
     match request {
         Request::Body(Body::Add(spec), bytes) => vadd(store, &spec, &bytes),
         Request::Body(Body::Sim(spec), bytes) => vsim_vector(store, &spec, &bytes),
-        Request::Line(Line::Create(spec)) => vcreate(store, &spec),
+        Request::Line(Line::OldCreate(spec)) => vcreate(store, &spec),
         Request::Line(Line::SimKey(spec)) => vsim_key(store, &spec),
         Request::Line(Line::GetAttr { index, id }) => vgetattr(store, index, id),
         Request::Line(Line::SetAttr { index, id, attr }) => vsetattr(store, index, id, attr),
         Request::Line(Line::Del { index, id }) => vdel(store, index, id),
-        Request::Line(Line::Drop { index }) => vdrop(store, index),
+        Request::Line(Line::OldDrop { index }) => vdrop(store, index),
         Request::Line(Line::List) => vlist(),
         Request::Line(Line::Stats) => vstats(),
+        // Task 8이 핸들러를 잇는다.
+        Request::Body(..) | Request::Line(..) => Err(Error::bad_request("not yet")),
     }
 }
