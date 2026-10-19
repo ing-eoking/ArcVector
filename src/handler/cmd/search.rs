@@ -70,7 +70,8 @@ fn similar(
         };
         let Some(Verdict::Take(attr)) =
             store.with_elem_at(key, |_field, value| match layout.attr_of(value) {
-                Ok(attr) if filter.matches(attr) => {
+                // 임시: 원소가 BSON을 저장하기 전까지 JSON attr을 변환해서 비교한다.
+                Ok(attr) if crate::bson::from_json(attr).is_ok_and(|doc| filter.matches(&doc)) => {
                     Verdict::Take(Some(String::from_utf8_lossy(attr).into_owned()))
                 }
                 _ => Verdict::Drop,

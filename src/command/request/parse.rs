@@ -600,9 +600,9 @@ mod tests {
         let f = filter_of("VSEARCH KEY docs v1 5 FILTER 2 cat=tech ts>1700000000")
             .unwrap()
             .unwrap();
-        assert!(f.matches(br#"{"cat":"tech","ts":1723248000}"#));
-        assert!(!f.matches(br#"{"cat":"tech","ts":1}"#));
-        assert!(!f.matches(br#"{"cat":"news","ts":1723248000}"#));
+        assert!(f.matches(&crate::bson::from_json(br#"{"cat":"tech","ts":1723248000}"#).unwrap()));
+        assert!(!f.matches(&crate::bson::from_json(br#"{"cat":"tech","ts":1}"#).unwrap()));
+        assert!(!f.matches(&crate::bson::from_json(br#"{"cat":"news","ts":1723248000}"#).unwrap()));
     }
 
     #[test]

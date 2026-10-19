@@ -1,6 +1,4 @@
-mod json;
-
-use json::{JsonVal, lookup};
+use crate::bson::{Value, lookup};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Op {
@@ -83,30 +81,31 @@ impl Filter {
         Ok(Self { terms })
     }
 
-    pub fn matches(&self, json: &[u8]) -> bool {
+    pub fn matches(&self, doc: &[u8]) -> bool {
         self.terms
             .iter()
-            .any(|term| term.iter().all(|c| eval_cond(c, json)))
+            .any(|term| term.iter().all(|c| eval_cond(c, doc)))
     }
 }
 
-fn eval_cond(c: &Cond, json: &[u8]) -> bool {
-    let Some(found) = lookup(json, c.field.as_bytes()) else {
+fn eval_cond(c: &Cond, doc: &[u8]) -> bool {
+    let Some(found) = lookup(doc, c.field.as_bytes()) else {
         return false;
     };
     match (&found, &c.value) {
-        (JsonVal::Num(a), Operand::Num(b)) => cmp_ord(a.partial_cmp(b), c.op),
-        (JsonVal::Str(a), Operand::Str(b)) => cmp_ord(Some((*a).cmp(b.as_bytes())), c.op),
-        (JsonVal::Bool(a), Operand::Str(b)) => match c.op {
+        (Value::Num(a), Operand::Num(b)) => cmp_ord(a.partial_cmp(b), c.op),
+        (Value::Str(a), Operand::Str(b)) => cmp_ord(Some((*a).cmp(b.as_bytes())), c.op),
+        (Value::Bool(a), Operand::Str(b)) => match c.op {
             Op::Eq => bool_str_eq(*a, b),
             Op::Ne => !bool_str_eq(*a, b),
             _ => false,
         },
-        (JsonVal::Null, Operand::Str(b)) => match c.op {
+        (Value::Null, Operand::Str(b)) => match c.op {
             Op::Eq => b == "null",
             Op::Ne => b != "null",
             _ => false,
         },
+        // Other(중첩 문서/배열)도 타입 불일치로 본다.
         _ => matches!(c.op, Op::Ne),
     }
 }
@@ -276,11 +275,21 @@ fn is_ident_byte(b: u8) -> bool {
 mod tests {
     use super::*;
 
+    use crate::bson;
+
     const DOC: &[u8] =
         br#"{"cat":"tech","lang":"ko","ts":1723248000,"score":-1.5,"ok":true,"nil":null}"#;
 
+    fn bs(json: &[u8]) -> Vec<u8> {
+        bson::from_json(json).unwrap()
+    }
+
+    fn on(expr: &str, json: &[u8]) -> bool {
+        Filter::parse(expr).unwrap().matches(&bs(json))
+    }
+
     fn m(expr: &str) -> bool {
-        Filter::parse(expr).unwrap().matches(DOC)
+        on(expr, DOC)
     }
 
     #[test]
@@ -288,7 +297,7 @@ mod tests {
         assert!(m("cat = tech and lang = ko"));
         assert!(m("cat = sports or lang = ko"));
         let f = Filter::parse("ANDROID = 1").unwrap();
-        assert!(f.matches(br#"{"ANDROID":1}"#));
+        assert!(f.matches(&bs(br#"{"ANDROID":1}"#)));
     }
 
     #[test]
@@ -321,38 +330,8 @@ mod tests {
     fn empty_json_matches_nothing() {
         let f = Filter::parse("cat = tech").unwrap();
         assert!(!f.matches(b""));
-        assert!(!f.matches(b"{}"));
-    }
-
-    #[test]
-    fn lookup_reads_each_value_kind() {
-        assert_eq!(lookup(DOC, b"cat"), Some(JsonVal::Str(b"tech")));
-        assert_eq!(lookup(DOC, b"ts"), Some(JsonVal::Num(1723248000.0)));
-        assert_eq!(lookup(DOC, b"score"), Some(JsonVal::Num(-1.5)));
-        assert_eq!(lookup(DOC, b"ok"), Some(JsonVal::Bool(true)));
-        assert_eq!(lookup(DOC, b"nil"), Some(JsonVal::Null));
-        assert_eq!(lookup(DOC, b"missing"), None);
-    }
-
-    #[test]
-    fn lookup_skips_nested_values() {
-        let doc = br#"{"a":{"b":1,"c":[1,2,{"d":3}]},"z":9}"#;
-        assert_eq!(lookup(doc, b"z"), Some(JsonVal::Num(9.0)));
-        assert_eq!(lookup(doc, b"a"), None);
-    }
-
-    #[test]
-    fn lookup_handles_escaped_quotes_in_values() {
-        let doc = br#"{"a":"x\"y","z":1}"#;
-        assert_eq!(lookup(doc, b"z"), Some(JsonVal::Num(1.0)));
-        assert_eq!(lookup(doc, b"a"), Some(JsonVal::Str(br#"x\"y"#)));
-    }
-
-    #[test]
-    fn lookup_tolerates_whitespace() {
-        let doc = br#" { "a" : 1 , "b" : "x" } "#;
-        assert_eq!(lookup(doc, b"a"), Some(JsonVal::Num(1.0)));
-        assert_eq!(lookup(doc, b"b"), Some(JsonVal::Str(b"x")));
+        assert!(!f.matches(&bs(b"{}")));
+        assert!(!f.matches(&bson::EMPTY));
     }
 
     #[test]
@@ -404,5 +383,50 @@ mod tests {
         assert!(!m("cat = 5"));
         assert!(m("cat != 5"));
         assert!(!m("ts = tech"));
+    }
+
+    #[test]
+    fn and_binds_tighter_than_or() {
+        let e = "a=1 or b=2 and c=3";
+        assert!(on(e, br#"{"a":1}"#));
+        assert!(!on(e, br#"{"b":2}"#));
+        assert!(on(e, br#"{"b":2,"c":3}"#));
+    }
+
+    #[test]
+    fn keywords_are_case_insensitive() {
+        for e in ["a=1 AND b=2", "a=1 and b=2"] {
+            assert!(on(e, br#"{"a":1,"b":2}"#));
+            assert!(!on(e, br#"{"a":1,"b":3}"#));
+        }
+    }
+
+    #[test]
+    fn spaces_around_the_operator_are_optional() {
+        for e in ["a=1", "a = 1", "a =1"] {
+            assert!(on(e, br#"{"a":1}"#));
+        }
+    }
+
+    #[test]
+    fn quoted_values_keep_spaces_and_operators() {
+        assert!(on("title = 'a <= b'", br#"{"title":"a <= b"}"#));
+    }
+
+    #[test]
+    fn a_missing_field_is_false_even_for_ne() {
+        assert!(!on("x != 1", br#"{"a":1}"#));
+    }
+
+    #[test]
+    fn int64_and_double_compare_as_numbers() {
+        assert!(on("n > 4000000000", br#"{"n":5000000000}"#));
+        assert!(on("f <= 1.5", br#"{"f":1.5}"#));
+    }
+
+    #[test]
+    fn a_nested_value_is_a_type_mismatch() {
+        assert!(!on("a = 1", br#"{"a":{"b":1}}"#));
+        assert!(on("a != 1", br#"{"a":[1]}"#));
     }
 }
