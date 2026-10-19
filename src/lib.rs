@@ -47,10 +47,16 @@ unsafe extern "C" fn accept_vector_cmd(
 ) -> bool {
     let tokens = unsafe { Tokens::new(argv, argc) };
 
-    let Ok(Parsed::Body { len, request }) = request::parse(&tokens) else {
+    let Ok(Parsed::Body {
+        len,
+        unknown_len,
+        request,
+    }) = request::parse(&tokens)
+    else {
         return tokens.command().is_some();
     };
-    if len > MAX_BODY_BYTES {
+    // 상한을 넘는 본문과, 길이를 다 알 수 없는 줄은 받지 않는다. `execute`가 닫는다.
+    if len > MAX_BODY_BYTES || unknown_len {
         return true;
     }
 
@@ -58,6 +64,17 @@ unsafe extern "C" fn accept_vector_cmd(
         nread::expect_body(cookie, request, len, ndata, ptr_out);
     }
     true
+}
+
+/// 본문을 비울 수 없는 줄이면 연결을 닫는 이유.
+fn should_close(len: usize, unknown_len: bool) -> Option<String> {
+    if len > MAX_BODY_BYTES {
+        Some(format!("declaring a {len}-byte body (limit {MAX_BODY_BYTES})"))
+    } else if unknown_len {
+        Some("with a segment length that could not be determined".to_owned())
+    } else {
+        None
+    }
 }
 
 /// 명령을 처리한다. 답은 언제나 `on_io_complete` 콜백이 쓴다(`offload`).
@@ -74,14 +91,15 @@ unsafe extern "C" fn execute_vector_cmd(
     let tokens = unsafe { Tokens::new(argv, argc) };
 
     // 상한을 넘는 본문은 코어가 버퍼 하나로만 받으므로 비울 길이 없이 버릴 수
-    // 없다. 그냥 답하면 클라이언트가 이미 보낸 본문이 명령으로 읽히니, 경고를
-    // 남기고 연결을 닫게 한다.
-    if let Ok(Parsed::Body { len, .. }) = request::parse(&tokens)
-        && len > MAX_BODY_BYTES
+    // 없다. 길이를 알 수 없는 구간이 있는 줄도 마찬가지다 -- 비울 만큼을 모르니
+    // 그냥 답하면 클라이언트가 보낸 본문이 명령으로 읽힌다. 경고를 남기고 연결을
+    // 닫게 한다.
+    if let Ok(Parsed::Body {
+        len, unknown_len, ..
+    }) = request::parse(&tokens)
+        && let Some(why) = should_close(len, unknown_len)
     {
-        eprintln!(
-            "ArcVector: closing a connection that declared a {len}-byte body (limit {MAX_BODY_BYTES})"
-        );
+        eprintln!("ArcVector: closing a connection that sent a body-carrying line {why}");
         return false;
     }
 
@@ -159,4 +177,18 @@ pub extern "C" fn memcached_extensions_initialize(
     crate::trigger::event::install();
 
     EXTENSION_ERROR_CODE_EXTENSION_SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_oversize_or_undeterminable_body_closes_the_connection() {
+        assert!(should_close(MAX_BODY_BYTES + 1, false).is_some());
+        assert!(should_close(0, true).is_some());
+        assert!(should_close(30, true).is_some());
+        assert!(should_close(30, false).is_none());
+        assert!(should_close(MAX_BODY_BYTES, false).is_none());
+    }
 }

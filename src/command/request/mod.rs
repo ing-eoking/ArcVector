@@ -27,7 +27,15 @@ pub const MAX_RESULTS: usize = i32::MAX as usize;
 pub enum Parsed<'a> {
     Line(Line<'a>),
 
-    Body { len: usize, request: Result<Body> },
+    /// `len`은 알아낸 구간만 센 본문 크기다. `unknown_len`이면 줄이 선언한 구간
+    /// 중 길이를 알 수 없는 것(읽히지 않는 길이 토큰, 둘째 `meta`/`filter`)이
+    /// 있어 `len`만큼 비워도 클라이언트 바이트가 남을 수 있다 -- 이때 `request`는
+    /// 언제나 `Err`이고, `execute`는 답하는 대신 연결을 닫게 한다.
+    Body {
+        len: usize,
+        unknown_len: bool,
+        request: Result<Body>,
+    },
 }
 
 pub fn body_refused(len: usize) -> Error {

@@ -146,6 +146,9 @@ struct Tail {
     with_meta: bool,
     format: Format,
     error: Option<Error>,
+    /// 선언된 길이를 하나라도 알 수 없다: 길이 토큰이 있는데 읽히지 않거나,
+    /// 같은 구간이 두 번 선언돼 둘째 길이를 버렸다.
+    unknown_len: bool,
 }
 
 impl Tail {
@@ -178,8 +181,14 @@ fn read_tail(
                     i += 2;
                     continue;
                 }
-                Ok(_) => tail.fail(Error::bad_request("meta given twice")),
-                Err(e) => tail.fail(e),
+                Ok(_) => {
+                    tail.unknown_len = true;
+                    tail.fail(Error::bad_request("meta given twice"));
+                }
+                Err(e) => {
+                    tail.unknown_len |= tokens.len() > i + 1;
+                    tail.fail(e);
+                }
             }
         } else if filter && is("filter") {
             match tokens.parse::<usize>(i + 1, "filter length") {
@@ -193,8 +202,14 @@ fn read_tail(
                     i += 2;
                     continue;
                 }
-                Ok(_) => tail.fail(Error::bad_request("filter given twice")),
-                Err(e) => tail.fail(e),
+                Ok(_) => {
+                    tail.unknown_len = true;
+                    tail.fail(Error::bad_request("filter given twice"));
+                }
+                Err(e) => {
+                    tail.unknown_len |= tokens.len() > i + 1;
+                    tail.fail(e);
+                }
             }
         } else if with_meta && is("withmeta") {
             tail.with_meta = true;
@@ -224,22 +239,37 @@ fn result_count(tokens: &Tokens, at: usize) -> Result<usize> {
 }
 
 /// 알아낸 구간 길이로 `Parsed::Body`를 만든다. 요청이 틀려도 길이를 하나라도
-/// 알면 본문을 비울 수 있으니 `Body`로 돌려준다. 하나도 모르면(길이 토큰
-/// 자체가 틀렸다면) 줄 전체를 거절하는 수밖에 없다.
-fn with_body<'a>(segments: Segments, request: Result<Body>) -> Result<Parsed<'a>> {
-    if segments == Segments::default() {
+/// 알면 본문을 비울 수 있으니 `Body`로 돌려준다. 길이 토큰이 아예 없어 선언된
+/// 본문이 없으면 줄 전체를 거절한다.
+///
+/// `unknown_len`은 `segments`에서 추정하지 않고 파서가 직접 알려 준다 -- 길이를
+/// 못 읽은 구간이 있으면 비울 길이가 모자라 클라이언트 바이트가 명령으로 읽힐 수
+/// 있다. 그 줄은 `execute`가 연결을 닫는다(`Parsed::Body` 참고).
+fn with_body<'a>(
+    segments: Segments,
+    unknown_len: bool,
+    request: Result<Body>,
+) -> Result<Parsed<'a>> {
+    if segments == Segments::default() && !unknown_len {
         return Err(request.err().unwrap_or_else(malformed));
     }
     Ok(Parsed::Body {
         len: segments.total(),
+        unknown_len,
         request,
     })
+}
+
+/// 줄에 `at`번 토큰이 있는데 길이로 읽히지 않는다.
+fn unreadable(tokens: &Tokens, at: usize, parsed: &Result<usize>) -> bool {
+    parsed.is_err() && tokens.len() > at
 }
 
 fn parse_upsert<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
     use layout::upsert as at;
     let vector = tokens.parse::<usize>(at::VECTOR_BYTES, "vector length");
     let tail = read_tail(tokens, at::TAIL, true, false, false, true);
+    let unknown = tail.unknown_len || unreadable(tokens, at::VECTOR_BYTES, &vector);
     let segments = Segments {
         meta: tail.meta,
         filter: None,
@@ -258,12 +288,13 @@ fn parse_upsert<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
             segments,
         }))
     })();
-    with_body(segments, request)
+    with_body(segments, unknown, request)
 }
 
 fn parse_setmeta<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
     use layout::setmeta as at;
     let meta = tokens.parse::<usize>(at::META_BYTES, "metadata length");
+    let unknown = unreadable(tokens, at::META_BYTES, &meta);
     let segments = Segments {
         meta: meta.as_ref().ok().copied(),
         ..Segments::default()
@@ -279,7 +310,7 @@ fn parse_setmeta<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
             segments,
         }))
     })();
-    with_body(segments, request)
+    with_body(segments, unknown, request)
 }
 
 fn parse_search<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
@@ -317,11 +348,11 @@ fn parse_search_key<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
             segments,
         })
     })();
-    if tail.filter.is_none() {
+    if tail.filter.is_none() && !tail.unknown_len {
         // 필터 본문이 없으면 줄만으로 끝난다.
         return request.map(|s| Parsed::Line(Line::SearchKey(s)));
     }
-    with_body(segments, request.map(Body::SearchKey))
+    with_body(segments, tail.unknown_len, request.map(Body::SearchKey))
 }
 
 fn parse_search_vector<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
@@ -329,6 +360,7 @@ fn parse_search_vector<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
     let k = result_count(tokens, at::NUM);
     let vector = tokens.parse::<usize>(at::VECTOR_BYTES, "vector length");
     let tail = read_tail(tokens, at::TAIL, false, true, true, true);
+    let unknown = tail.unknown_len || unreadable(tokens, at::VECTOR_BYTES, &vector);
     let segments = Segments {
         meta: None,
         filter: tail.filter,
@@ -349,7 +381,7 @@ fn parse_search_vector<'a>(tokens: &Tokens<'a>) -> Result<Parsed<'a>> {
             segments,
         }))
     })();
-    with_body(segments, request)
+    with_body(segments, unknown, request)
 }
 
 #[cfg(test)]
@@ -376,7 +408,7 @@ mod tests {
     fn body_of(line: &str) -> (usize, Body) {
         tokens!(t = line);
         match parse(&t).unwrap() {
-            Parsed::Body { len, request } => (len, request.unwrap()),
+            Parsed::Body { len, request, .. } => (len, request.unwrap()),
             Parsed::Line(_) => panic!("expected a body-carrying command"),
         }
     }
@@ -707,7 +739,7 @@ mod tests {
     fn drain_len(line: &str) -> usize {
         tokens!(t = line);
         match parse(&t) {
-            Ok(Parsed::Body { len, request }) => {
+            Ok(Parsed::Body { len, request, .. }) => {
                 assert!(request.is_err(), "{line}");
                 len
             }
@@ -729,19 +761,74 @@ mod tests {
         assert_eq!(drain_len("vop setmeta docs v1 7 extra"), 9);
         assert_eq!(drain_len("vop upsert i v 8 meta abc filter 5"), 10);
 
-        // 길이 토큰 자체가 틀리면 줄 전체를 거절한다.
+        // 길이 토큰 자체가 틀리면 비울 길이를 모른다. 줄은 거절되고 `unknown_len`이
+        // 서서 `execute`가 연결을 닫는다.
         assert!(err("vop upsert i v abc").contains("vector length"));
-        tokens!(t = "vop setmeta docs v1 abc");
-        assert!(parse(&t).is_err());
+        assert!(flags("vop setmeta docs v1 abc").1);
     }
 
     #[test]
     fn a_body_length_survives_an_unusable_remainder() {
         tokens!(t = "vop upsert i v 28 nope");
-        let Ok(Parsed::Body { len, request }) = parse(&t) else {
+        let Ok(Parsed::Body { len, request, .. }) = parse(&t) else {
             panic!("expected a body-carrying command")
         };
         assert_eq!(len, 30, "본문은 그래도 비워야 한다");
         assert!(request.unwrap_err().to_string().contains("unknown option"));
+    }
+
+    fn flags(line: &str) -> (usize, bool) {
+        tokens!(t = line);
+        match parse(&t) {
+            Ok(Parsed::Body {
+                len,
+                unknown_len,
+                request,
+            }) => {
+                if unknown_len {
+                    assert!(request.is_err(), "{line}");
+                }
+                (len, unknown_len)
+            }
+            other => panic!("expected a body-carrying parse for {line}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_line_with_an_undeterminable_length_is_flagged_so_the_connection_closes() {
+        // 읽히지 않는 길이 토큰
+        assert!(flags("vop upsert i v 8 meta abc").1);
+        assert!(flags("vop upsert i v abc meta 5").1);
+        assert!(flags("vop upsert i v abc").1);
+        assert!(flags("vop setmeta i v abc").1);
+        assert!(flags("vop search i vkey v 5 filter abc").1);
+        assert!(flags("vop search i vector 5 abc filter 7").1);
+        assert!(flags("vop search i vector 5 16 filter abc").1);
+        // 둘째 선언의 길이는 버려진다
+        assert!(flags("vop upsert i v 8 meta 5 meta 9").1);
+        assert!(flags("vop search i vkey v 5 filter 5 filter 9").1);
+        assert!(flags("vop search i vector 5 16 filter 5 filter 9").1);
+        // 알아낸 길이는 그대로 센다
+        assert_eq!(flags("vop upsert i v abc meta 5"), (7, true));
+    }
+
+    #[test]
+    fn a_refused_line_whose_lengths_are_all_known_still_drains_and_does_not_close() {
+        for (line, len) in [
+            ("vop upsert i v 8 bogus meta 100", 102 + 10),
+            ("vop upsert i v 8 meta 5 bogus", 7 + 10),
+            ("vop setmeta docs v1 7 extra", 9),
+            ("vop search i vector 0 16 filter 5", 7 + 18),
+            ("vop search i vkey v 0 filter 9", 11),
+            ("vop search i vector 10 16 bogus filter 50", 52 + 18),
+            ("vop upsert i v 28 nope", 30),
+        ] {
+            assert_eq!(flags(line), (len, false), "{line}");
+        }
+        // 길이 토큰이 줄에 없으면 선언된 본문도 없다.
+        tokens!(t = "vop upsert i v");
+        assert!(parse(&t).is_err());
+        tokens!(t = "vop setmeta i v");
+        assert!(parse(&t).is_err());
     }
 }
