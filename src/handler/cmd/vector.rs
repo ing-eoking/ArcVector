@@ -4,7 +4,7 @@ use crate::command::request::{Delete, Parts, SetMeta, Upsert};
 use crate::error::{Error, Reply, Result};
 use crate::handler::access::{for_write, map_is_gone};
 use crate::handler::arcus::element::Layout;
-use crate::handler::arcus::engine::{Store, StoreError};
+use crate::handler::arcus::engine::{Inserted, Store, StoreError};
 use crate::handler::quant;
 use crate::handler::registry;
 use crate::trigger::{event, key, recover};
@@ -116,7 +116,12 @@ pub fn upsert_write(store: &Store, spec: &Upsert, parts: Parts) -> Result<Upsert
     write(store, name, vkey, &value, stamp)
 }
 
-/// **워커 스레드.** 요소를 읽어 메타만 새 BSON으로 바꿔 replace로 쓴다.
+/// **워커 스레드.** 요소를 읽어 메타만 새 BSON으로 바꿔 갱신한다.
+///
+/// 쓰기는 `map_elem_update`라 없는 필드를 만들지 않는다 -- 읽은 뒤 지워진
+/// vkey는 `NOT_FOUND_VECTOR`다. 알려진 한계: 읽기와 갱신 사이에 같은 vkey의
+/// upsert가 끼어들면 그 벡터가 읽어 둔 옛 벡터 바이트로 덮인다(엔진에 조건부
+/// 갱신이 없다).
 ///
 /// 그래프는 다시 넣지 않는다. 이 쓰기가 엔진의 replace 이벤트를 부르고, 벡터가
 /// 같으니 콜백이 노드를 새 주소로 옮긴다.
@@ -151,8 +156,15 @@ pub fn setmeta_write(store: &Store, spec: &SetMeta, parts: Parts) -> Result<Upse
     };
     let body = build_body(layout, vector, &meta).map_err(|_| StoreError::CorruptElement)?;
 
-    match write(store, name, vkey, &body, stamp) {
+    let outcome = event::capture(|| {
+        store.update_elem(name, vkey, &body).map(|()| Inserted {
+            replaced: true,
+            ..Inserted::default()
+        })
+    });
+    match finish_write(name, vkey, stamp, outcome) {
         Err(Error::IndexEvicted) => Ok(UpsertPlan::Answered(Reply::NotFound)),
+        Err(Error::Store(StoreError::ElemGone)) => Ok(UpsertPlan::Answered(Reply::NotFoundVector)),
         Err(e) => Err(e),
         Ok(plan) => Ok(plan.stored()),
     }
@@ -160,7 +172,17 @@ pub fn setmeta_write(store: &Store, spec: &SetMeta, parts: Parts) -> Result<Upse
 
 /// 요소를 쓰고, 링크 콜백이 돌려준 주소를 챙긴다.
 fn write(store: &Store, name: &str, id: &str, value: &[u8], stamp: u64) -> Result<UpsertPlan> {
-    let (written, linked) = event::capture(|| store.insert_elem(name, id, value, true, None));
+    let outcome = event::capture(|| store.insert_elem(name, id, value, true, None));
+    finish_write(name, id, stamp, outcome)
+}
+
+/// 쓰기의 결과와, 그 쓰기가 링크한 주소로 다음 일을 정한다.
+fn finish_write(
+    name: &str,
+    id: &str,
+    stamp: u64,
+    (written, linked): (std::result::Result<Inserted, StoreError>, event::Linked),
+) -> Result<UpsertPlan> {
     let mut added = Added {
         name: name.to_owned(),
         id: id.to_owned(),

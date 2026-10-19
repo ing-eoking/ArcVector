@@ -156,11 +156,7 @@ fn similar(
             };
             Some(stored)
         };
-        rendered.push((
-            id.to_string(),
-            index.ann.metric.score(distance, layout.dim),
-            meta,
-        ));
+        rendered.push((id.to_string(), distance, meta));
     }
     Ok(rendered)
 }

@@ -908,6 +908,75 @@ mod tests {
         true
     }
 
+    fn distances(idx: &AnnIndex, coords: &[f32], k: usize) -> Vec<(String, f32)> {
+        let q = crate::handler::quant::encode(coords, idx.layout.quant).unwrap();
+        idx.search(&q, k, None)
+            .unwrap()
+            .into_iter()
+            .map(|(_, id, d)| (id.to_string(), d))
+            .collect()
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-5
+    }
+
+    // 와이어의 점수는 usearch가 내는 거리 그대로다(스펙 §5.3). 아래는 그 정의를 못 박는다.
+
+    #[test]
+    fn cos_distance_is_one_minus_cos_and_zero_for_the_same_vector() {
+        let idx = build(2, Quant::F32, Metric::Cos, 2);
+        add(&idx, "same", &[1.0, 2.0]);
+        add(&idx, "orth", &[2.0, -1.0]);
+        add(&idx, "opp", &[-1.0, -2.0]);
+        let got = distances(&idx, &[1.0, 2.0], 3);
+        assert_eq!(got[0].0, "same");
+        assert!(close(got[0].1, 0.0), "{got:?}");
+        assert!(close(got[1].1, 1.0), "{got:?}");
+        assert!(close(got[2].1, 2.0), "{got:?}");
+    }
+
+    #[test]
+    fn l2_distance_is_the_squared_euclidean_distance() {
+        let idx = build(2, Quant::F32, Metric::L2, 2);
+        add(&idx, "o", &[0.0, 0.0]);
+        let got = distances(&idx, &[3.0, 4.0], 1);
+        assert!(close(got[0].1, 25.0), "{got:?}");
+    }
+
+    #[test]
+    fn ip_distance_is_one_minus_the_dot_product() {
+        let idx = build(2, Quant::F32, Metric::IP, 2);
+        add(&idx, "x", &[1.0, 0.0]);
+        add(&idx, "y", &[0.6, 0.8]);
+        let got = distances(&idx, &[1.0, 0.0], 2);
+        assert_eq!(got[0].0, "x");
+        assert!(close(got[0].1, 0.0), "{got:?}");
+        assert!(close(got[1].1, 1.0 - 0.6), "{got:?}");
+    }
+
+    #[test]
+    fn hamming_distance_is_the_number_of_differing_bits() {
+        let idx = build(8, Quant::B1, Metric::Hamming, 2);
+        add(&idx, "a", &[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
+        add(&idx, "b", &[1.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0]);
+        let got = distances(&idx, &[1.0; 8], 2);
+        assert_eq!(got[0].0, "a");
+        assert!(close(got[0].1, 0.0), "{got:?}");
+        assert!(close(got[1].1, 3.0), "{got:?}");
+    }
+
+    #[test]
+    fn tanimoto_distance_is_one_minus_the_similarity() {
+        // 켜진 비트 {0,1,2,3}과 {0,1}: 교집합 2, 합집합 4 -> 유사도 0.5.
+        let idx = build(8, Quant::B1, Metric::Tanimoto, 2);
+        add(&idx, "a", &[1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0]);
+        add(&idx, "b", &[1.0, 1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]);
+        let got = distances(&idx, &[1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0], 2);
+        assert!(close(got[0].1, 0.0), "{got:?}");
+        assert!(close(got[1].1, 0.5), "{got:?}");
+    }
+
     #[test]
     fn add_and_search_returns_the_nearest_neighbour() {
         let idx = build(4, Quant::F32, Metric::L2, 4);

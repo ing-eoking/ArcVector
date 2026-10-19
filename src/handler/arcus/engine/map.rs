@@ -4,9 +4,10 @@ use std::ptr;
 use super::Store;
 use super::error::{Result, StoreError, as_int, check, written};
 use crate::engine_api::{
-    ENGINE_ITEM_ATTR, ENGINE_ITEM_ATTR_ATTR_COUNT, ENGINE_ITEM_ATTR_ATTR_MAXCOUNT,
-    ENGINE_ITEM_ATTR_ATTR_TYPE, ENGINE_ITEM_TYPE_ITEM_TYPE_MAP, eitem, eitem_info, elems_result,
-    field_t, item, item_attr, item_info,
+    ENGINE_ERROR_CODE_ENGINE_ENOMEM as ENGINE_ENOMEM, ENGINE_ITEM_ATTR,
+    ENGINE_ITEM_ATTR_ATTR_COUNT, ENGINE_ITEM_ATTR_ATTR_MAXCOUNT, ENGINE_ITEM_ATTR_ATTR_TYPE,
+    ENGINE_ITEM_TYPE_ITEM_TYPE_MAP, eitem, eitem_info, elems_result, field_t, item, item_attr,
+    item_info,
 };
 use crate::handler::arcus::abi;
 use crate::handler::arcus::element::Layout;
@@ -254,6 +255,39 @@ impl Store {
             return Err(e);
         }
         Ok(done)
+    }
+
+    /// Replaces the value of an element that is already there.
+    ///
+    /// Unlike [`Store::insert_elem`] with `replace`, a field that is not there
+    /// is not created: the engine answers `ElemGone`, so a delete that lands
+    /// between a read and this write is not undone. The engine takes the value
+    /// as is (`nbytes` counts the CRLF terminator, like an allocated element),
+    /// and on an event Map the replacement fires the same REPLACE event.
+    ///
+    /// **Worker thread only**, for the same reason as [`Store::insert_elem`].
+    pub fn update_elem(&self, key: &str, field: &str, value: &[u8]) -> Result<()> {
+        let Some(update) = self.vtable().map_elem_update else {
+            return Err(StoreError::Unavailable);
+        };
+        let selector = selector(field);
+        // 엔진이 값을 그대로 복사하므로 CRLF를 붙인 것을 넘긴다.
+        let mut terminated = crate::room::vec::<u8>(value.len() + Layout::STORED_TERMINATOR)
+            .map_err(|_| StoreError::Engine(ENGINE_ENOMEM))?;
+        terminated.extend_from_slice(value);
+        terminated.extend_from_slice(b"\r\n");
+        written(unsafe {
+            update(
+                self.handle(),
+                self.cookie,
+                key.as_ptr().cast::<c_void>(),
+                as_int(key.len()),
+                ptr::from_ref(&selector),
+                terminated.as_ptr().cast::<c_void>(),
+                as_int(terminated.len()),
+                0, // vbucket
+            )
+        })
     }
 
     /// Removes one element. `ElemGone` when there was nothing at `field`.
