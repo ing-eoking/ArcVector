@@ -151,7 +151,7 @@ join with `and` / `or`; **`and` binds tighter than `or`**. Fields are top-level 
 fields, and a condition on an absent field is false, `!=` included.
 
 ```
-vop search docs vector 10 15 filter 29 withmeta str
+vop search docs vector 10 15 filter 28 withmeta str
 n >= 2 and city = 'new york'
 0.1 0.2 0.3 0.4
 ```
