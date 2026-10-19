@@ -25,6 +25,9 @@ pub struct VectorIndex {
     pub name: String,
     pub ann: AnnIndex,
 
+    /// How many vectors the engine lets the index's Map hold. `vlist` reports
+    /// it; the engine is what enforces it.
+    pub maxcount: u32,
     state: AtomicU8,
 
     published: AtomicU64,
@@ -34,24 +37,25 @@ pub struct VectorIndex {
 }
 
 impl VectorIndex {
-    pub fn ours(name: String, ann: AnnIndex) -> Self {
-        let index = Self::new(name, ann, SERVING);
+    pub fn ours(name: String, ann: AnnIndex, maxcount: u32) -> Self {
+        let index = Self::new(name, ann, maxcount, SERVING);
         index.mark_serving();
         index
     }
 
-    pub fn rebuilding(name: String, ann: AnnIndex) -> Self {
-        Self::new(name, ann, COLD)
+    pub fn rebuilding(name: String, ann: AnnIndex, maxcount: u32) -> Self {
+        Self::new(name, ann, maxcount, COLD)
     }
 
-    pub fn building(name: String, ann: AnnIndex) -> Self {
-        Self::new(name, ann, BUILDING)
+    pub fn building(name: String, ann: AnnIndex, maxcount: u32) -> Self {
+        Self::new(name, ann, maxcount, BUILDING)
     }
 
-    fn new(name: String, ann: AnnIndex, state: u8) -> Self {
+    fn new(name: String, ann: AnnIndex, maxcount: u32, state: u8) -> Self {
         Self {
             name,
             ann,
+            maxcount,
             state: AtomicU8::new(state),
             published: AtomicU64::new(0),
             recovering: AtomicBool::new(false),
@@ -119,11 +123,11 @@ static INDICES: LazyLock<RwLock<HashMap<String, Arc<VectorIndex>>>> =
 
 /// `vdrop`한 인덱스. 아직 버리지 않는다.
 ///
-/// `flush`는 프리픽스의 아이템을 그 자리에서 다 빼지 않는다 -- LRU를 훑다가
-/// 방금 건드린 것 너머에서 멈추고, 나머지는 누가 손댈 때 무효화된다
-/// (`items.c`). 그 늦은 unlink가 올 때 콜백은 "이 주소를 내가 받았나"를 답해야
-/// 하는데, usearch에는 키를 열거하는 방법이 없어서 그래프를 버리면 그 질문에
-/// 답할 길이 사라진다. 장부를 따로 두는 대신 그래프를 남겨둔다.
+/// Map을 지워도 요소는 그 자리에서 빠지지 않는다 -- 엔진의 컬렉션 삭제
+/// 스레드가 나중에 하나씩 지우고, 그때마다 unlink 이벤트가 온다. 그 늦은
+/// unlink가 올 때 콜백은 "이 주소를 내가 받았나"를 답해야 하는데, usearch에는
+/// 키를 열거하는 방법이 없어서 그래프를 버리면 그 질문에 답할 길이 사라진다.
+/// 장부를 따로 두는 대신 그래프를 남겨둔다.
 ///
 /// 그래프가 비면 sweeper가 버린다. 그때까지 남아 있는 것은 그동안 실제로
 /// 참조를 쥐고 있기 때문이라, 이 목록의 크기는 정확한 값이다.
@@ -275,8 +279,8 @@ pub fn remove(name: &str) -> bool {
 
 /// 레지스트리를 떠난 그래프를 비워질 때까지 들고 있는다.
 ///
-/// 버리면 안 된다. 이 그래프는 아직 자기가 쥔 아이템들의 참조를 들고 있고,
-/// 그것들이 언제 빠질지는 `flush`가 아니라 누가 건드리느냐가 정한다. 그때
+/// 버리면 안 된다. 이 그래프는 아직 자기가 쥔 요소들의 참조를 들고 있고,
+/// 그것들이 언제 빠질지는 엔진의 컬렉션 삭제 스레드가 정한다. 그때
 /// 콜백이 "이 주소를 내가 받았나"를 물어볼 곳이 여기다.
 pub fn keep_until_empty(index: Option<Arc<VectorIndex>>) {
     let Some(index) = index else { return };
@@ -341,10 +345,10 @@ mod tests {
             0,
             0,
             0,
-            Arc::new(crate::handler::arcus::engine::ItemElements),
+            Arc::new(crate::handler::arcus::engine::MapElements),
         )
         .expect("build the graph");
-        VectorIndex::ours(name.to_owned(), ann)
+        VectorIndex::ours(name.to_owned(), ann, 8)
     }
 
     fn building(name: &str) -> VectorIndex {

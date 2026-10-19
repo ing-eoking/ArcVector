@@ -97,7 +97,7 @@ vcreate <index> <dim> [METRIC <m>] [QUANT <q>] [M <n>] [EFC <n>] [EFS <n>]
 | `M` | usearch default | HNSW connectivity |
 | `EFC` / `EFS` | usearch default | expansion on insert / on search |
 | `MAXCOUNT` | engine `max_map_size` | max vectors, 1 … 2147483647 |
-| `EXPTIME` | none | TTL on the backing Map |
+| `EXPTIME` | none | TTL on the backing Map -- the whole index expires together; vectors have no expiry of their own |
 
 **Replies** `CREATED` · `EXISTS`
 
@@ -116,23 +116,27 @@ Maximum dimension, with the engine's default 16 KB `max_element_bytes`, the fixe
 ## vadd
 
 ```
-vadd <index> <id> <veclen> <dim> [ATTR <attrlen> <attr JSON>]
+vadd <index> <id> <veclen> [ATTR <attr JSON>]
 <coordinates>
 ```
 
-`<veclen>` is the **byte length of the coordinate text** and `<dim>` is the
-coordinate count. Both are required: text length does not determine how many
-numbers it holds (`0.1 0.2` is 7 bytes and 2 coordinates; `1 2 3` is 5 bytes and
-3), so each checks the other.
+`<veclen>` is the **byte length of the coordinate text**. The dimension comes from
+the index, and the coordinate count is checked against it.
 
-`ATTR` is optional, must be a **JSON object**, and is capped at **128 bytes**. It
+`ATTR` is optional, must be a **JSON object**, and is capped at **255 bytes**. It
 has to arrive as a single argument, so **no spaces inside the JSON** — the command
 line is tokenized on spaces and the pieces cannot be reassembled unambiguously.
 
+There is no per-vector expiry: a vector is a Map element, and elements do not
+expire on their own. Give the index an `EXPTIME` at `vcreate` instead.
+
 **Replies** `STORED` · `OVERFLOWED` (at `MAXCOUNT`)
 
+`STORED` is sent once the vector is in the graph, so the next search from any
+client sees it.
+
 ```
-vadd docs v1 7 2 ATTR 23 {"abc":123,"def":"abc"}
+vadd docs v1 7 ATTR {"abc":123,"def":"abc"}
 0.1 0.2
 → STORED
 ```

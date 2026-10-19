@@ -1,12 +1,11 @@
 pub(super) const SEARCH_SOURCE: usize = 1;
 
-/// `vadd <index> <vkey> <veclen> <exptime> [attr <JSON>]`
+/// `vadd <index> <vkey> <veclen> [attr <JSON>]`
 pub(super) mod add {
     pub const INDEX: usize = 1;
     pub const VKEY: usize = 2;
     pub const BODY_LEN: usize = 3;
-    pub const EXPTIME: usize = 4;
-    pub const TAIL: usize = 5;
+    pub const TAIL: usize = 4;
 }
 
 /// `vsearch vector <index> <num> <veclen> [...]`

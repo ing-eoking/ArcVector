@@ -106,6 +106,20 @@ fn parse_create<'a>(tokens: &Tokens<'a>) -> Result<Create<'a>> {
             "M" => create.connectivity = number("M")?,
             "EFC" => create.expansion_add = number("EFC")?,
             "EFS" => create.expansion_search = number("EFS")?,
+            "MAXCOUNT" => {
+                let n = number("MAXCOUNT")?;
+                if n == 0 || n > u32::MAX as usize {
+                    return Err(Error::bad_request(format!("MAXCOUNT out of range '{raw}'")));
+                }
+                create.maxcount = Some(n as u32);
+            }
+            "EXPTIME" => {
+                let n = number("EXPTIME")?;
+                if n > u32::MAX as usize {
+                    return Err(Error::bad_request(format!("EXPTIME out of range '{raw}'")));
+                }
+                create.exptime = Some(n as u32);
+            }
 
             other => return Err(Error::bad_request(format!("unknown option {other}"))),
         }
@@ -145,14 +159,9 @@ fn parse_add(tokens: &Tokens) -> Result<Add> {
     if tokens.len() < at::TAIL {
         return Err(malformed());
     }
-    let exptime: i64 = tokens.parse(at::EXPTIME, "expiry")?;
-    if !(0..=u32::MAX as i64).contains(&exptime) {
-        return Err(Error::bad_request("expiry out of range"));
-    }
     Ok(Add {
         index: tokens.text(at::INDEX)?.to_owned(),
         vkey: tokens.text(at::VKEY)?.to_owned(),
-        exptime: exptime as u32,
         attr: attr_clause(tokens, at::TAIL)?,
     })
 }
@@ -348,7 +357,7 @@ mod tests {
                 _ => None,
             }
         }
-        assert_eq!(body_len("vadd i d 28 7"), Some(28));
+        assert_eq!(body_len("vadd i d 28"), Some(28));
         assert_eq!(body_len("VSEARCH VECTOR docs 10 4096"), Some(4096));
         assert_eq!(body_len("VSEARCH KEY docs v1 10"), None);
         assert_eq!(body_len("vlist"), None);
@@ -358,12 +367,12 @@ mod tests {
 
     #[test]
     fn a_body_length_survives_an_unusable_remainder() {
-        tokens!(t = "vadd i d 28 abc");
+        tokens!(t = "vadd i d 28 nope");
         let Ok(Parsed::Body { len, request }) = parse(&t) else {
             panic!("expected a body-carrying command")
         };
         assert_eq!(len, 28);
-        assert!(request.unwrap_err().to_string().contains("expiry"));
+        assert!(request.unwrap_err().to_string().contains("expected attr"));
     }
 
     #[test]
@@ -419,11 +428,22 @@ mod tests {
     }
 
     #[test]
-    fn vcreate_takes_no_size_or_expiry_option() {
-        // 둘 다 명령에서 빠졌다. 크기 상한은 이제 `vcreate`가 정하지 않고,
-        // 만료는 벡터마다 `vadd`가 받는다.
-        assert!(err("vcreate docs 8 MAXCOUNT 100").contains("unknown option"));
-        assert!(err("vcreate docs 8 EXPTIME 60").contains("unknown option"));
+    fn vcreate_takes_a_size_and_an_expiry() {
+        // 둘 다 인덱스 Map의 속성이다. 요소에는 만료가 따로 없어서, 만료는
+        // `vadd`가 아니라 여기서 인덱스 전체에 붙는다.
+        tokens!(t = "vcreate docs 8 MAXCOUNT 100 EXPTIME 60");
+        let c = parse_create(&t).unwrap();
+        assert_eq!(c.maxcount, Some(100));
+        assert_eq!(c.exptime, Some(60));
+
+        tokens!(t = "vcreate docs 8");
+        let c = parse_create(&t).unwrap();
+        assert_eq!(c.maxcount, None, "이름을 안 하면 서버의 상한을 쓴다");
+        assert_eq!(c.exptime, None);
+
+        assert!(err("vcreate docs 8 MAXCOUNT 0").contains("MAXCOUNT"));
+        assert!(err("vcreate docs 8 MAXCOUNT -1").contains("MAXCOUNT"));
+        assert!(err("vcreate docs 8 EXPTIME abc").contains("EXPTIME"));
     }
 
     #[test]
@@ -436,33 +456,30 @@ mod tests {
 
     #[test]
     fn vadd_yields_index_id_dimension_and_attr() {
-        let Body::Add(a) = on_line(
-            r#"vadd index doc1 7 0 attr {"abc":123,"def":"abc"}"#,
-            body_of,
-        )
-        .unwrap() else {
+        let Body::Add(a) =
+            on_line(r#"vadd index doc1 7 attr {"abc":123,"def":"abc"}"#, body_of).unwrap()
+        else {
             panic!("expected an Add")
         };
         assert_eq!(a.index, "index");
         assert_eq!(a.vkey, "doc1");
-        assert_eq!(a.exptime, 0);
         assert_eq!(a.attr, br#"{"abc":123,"def":"abc"}"#);
     }
 
     #[test]
     fn vadd_attr_is_optional() {
-        let Body::Add(a) = on_line("vadd index doc1 7 2", body_of).unwrap() else {
+        let Body::Add(a) = on_line("vadd index doc1 7", body_of).unwrap() else {
             panic!("expected an Add")
         };
-        assert_eq!(a.exptime, 2);
         assert!(a.attr.is_empty());
     }
 
     #[test]
-    fn vadd_needs_an_expiry() {
-        assert!(err("vadd index doc1 28").contains("bad command line format"));
-        assert!(err("vadd index doc1 28 abc").contains("expiry"));
-        assert!(err("vadd index doc1 28 -1").contains("expiry"));
+    fn vadd_takes_no_expiry() {
+        // 만료는 인덱스 단위로 `vcreate`가 받는다. 예전 자리에 숫자를 주면
+        // attr 키워드 자리로 읽혀 거절된다.
+        assert!(err("vadd index doc1").contains("bad command line format"));
+        assert!(err("vadd index doc1 28 0").contains("expected attr"));
     }
 
     fn attr_of(line: &str) -> Result<Vec<u8>> {
@@ -472,7 +489,7 @@ mod tests {
     #[test]
     fn attr_json_must_be_one_token() {
         let json = r#"{"cat": "tech"}"#;
-        let msg = attr_of(&format!("vadd docs v1 16 0 attr {json}"))
+        let msg = attr_of(&format!("vadd docs v1 16 attr {json}"))
             .unwrap_err()
             .to_string();
         assert!(msg.contains("no spaces in it"), "{msg}");
@@ -489,16 +506,16 @@ mod tests {
         );
         assert!(json.len() <= ATTR_BYTES);
         assert_eq!(
-            attr_of(&format!("vadd docs v1 16 0 attr {json}")).unwrap(),
+            attr_of(&format!("vadd docs v1 16 attr {json}")).unwrap(),
             json.as_bytes()
         );
     }
 
     #[test]
     fn the_attr_keyword_and_its_json_are_validated() {
-        assert!(attr_of("vadd docs v1 16 0 attr {}").is_ok());
+        assert!(attr_of("vadd docs v1 16 attr {}").is_ok());
         assert!(
-            attr_of("vadd docs v1 16 0 ATTRS {}")
+            attr_of("vadd docs v1 16 ATTRS {}")
                 .unwrap_err()
                 .to_string()
                 .contains("expected attr")
@@ -506,14 +523,14 @@ mod tests {
         // 길이를 따로 받지 않으니, 한도를 넘는지는 실제 바이트 수로 본다.
         let over = format!(r#"{{"k":"{}"}}"#, "x".repeat(250));
         assert!(
-            attr_of(&format!("vadd docs v1 16 0 attr {over}"))
+            attr_of(&format!("vadd docs v1 16 attr {over}"))
                 .unwrap_err()
                 .to_string()
                 .contains("over the 255-byte limit")
         );
         // JSON은 토큰 하나여야 한다. 공백이 들어가면 두 토큰이 된다.
         assert!(
-            attr_of(r#"vadd docs v1 16 0 attr {"a": 1}"#)
+            attr_of(r#"vadd docs v1 16 attr {"a": 1}"#)
                 .unwrap_err()
                 .to_string()
                 .contains("single argument")
@@ -524,7 +541,7 @@ mod tests {
     fn an_attr_exactly_at_the_limit_is_accepted() {
         let json = format!(r#"{{"k":"{}"}}"#, "x".repeat(247));
         assert_eq!(json.len(), ATTR_BYTES);
-        assert!(attr_of(&format!("vadd docs v1 16 0 attr {json}")).is_ok());
+        assert!(attr_of(&format!("vadd docs v1 16 attr {json}")).is_ok());
     }
 
     #[test]

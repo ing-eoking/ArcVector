@@ -473,9 +473,12 @@ extern "C" {
 
     /* Event types for item lifecycle events */
     typedef enum {
-        EVENT_LINK,
-        EVENT_UNLINK,
-        EVENT_REPLACE,
+        EVENT_LINK_ITEM,
+        EVENT_UNLINK_ITEM,
+        EVENT_REPLACE_ITEM,
+        EVENT_LINK_ELEM,
+        EVENT_UNLINK_ELEM,
+        EVENT_REPLACE_ELEM,
     } event_type_t;
 
     typedef struct {
@@ -483,6 +486,7 @@ extern "C" {
         ENGINE_ERROR_CODE *ret;
         item *new_it;
         item *old_it;
+        item *coll_it; /* the collection an element belongs to; NULL for item events */
     } event_data_t;
 
     /* Forward declaration of the server handle -- to be filled in later */

@@ -26,31 +26,6 @@ fn core() -> *const SERVER_CORE_API {
     unsafe { (*server).core }
 }
 
-/// The server's clock, in the same units an item's `exptime` is written in.
-///
-/// Both are `rel_time_t` -- seconds since the process started -- so an item is
-/// expired exactly when its `exptime` has fallen behind this. Nothing here
-/// converts to or from wall time; that is `realtime`'s job, and only a caller
-/// setting an expiry needs it.
-///
-/// `0` when the server API is out of reach, which
-/// [`crate::handler::arcus::engine::is_expired`] reads as "expire nothing".
-/// Callers take this **once** per command rather than per item: a search that
-/// asked twice could accept a vector early in its traversal and reject the same
-/// one later, and the extra indirect call would land in the hottest loop there
-/// is.
-pub fn current_time() -> rel_time_t {
-    let core = core();
-    if core.is_null() {
-        return 0;
-    }
-
-    match unsafe { (*core).get_current_time } {
-        Some(now) => unsafe { now() },
-        None => 0,
-    }
-}
-
 /// Tells the core this connection has one more answer outstanding.
 ///
 /// **Called before the work is handed to the pool, never after.** The core

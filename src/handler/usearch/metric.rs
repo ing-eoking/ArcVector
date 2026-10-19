@@ -46,12 +46,23 @@ impl Metric {
 
     /// The similarity a caller sees, from the distance usearch reports.
     ///
-    /// All scores are calculated as `1.0 - distance` according to the new design,
-    /// where L2 uses the euclidean distance (`sqrt` of the squared distance reported by usearch).
-    pub fn score(self, distance: f32, _dim: usize) -> f32 {
+    /// Every score runs 0 ..= 1 and an identical vector scores 1, as Redis
+    /// vector sets do:
+    ///
+    /// - cos: usearch reports `1 - cos` (0 ..= 2), so `1 - d/2` = `(1 + cos)/2`
+    /// - ip: usearch reports `1 - dot`, mapped the same way as cos. That stays
+    ///   in 0 ..= 1 only for normalized vectors; unbounded dot products are
+    ///   left unclamped so the ranking survives.
+    /// - l2: usearch reports the squared distance, so `1 / (1 + sqrt(d))`
+    /// - hamming: usearch reports the differing bit count; `dim` is the bit count
+    /// - tanimoto: usearch reports `1 - jaccard`, already 0 ..= 1
+    pub fn score(self, distance: f32, dim: usize) -> f32 {
         match self {
-            Self::L2 => 1.0 - distance.max(0.0).sqrt(),
-            _ => 1.0 - distance,
+            Self::Cos => (1.0 - distance / 2.0).clamp(0.0, 1.0),
+            Self::IP => 1.0 - distance / 2.0,
+            Self::L2 => 1.0 / (1.0 + distance.max(0.0).sqrt()),
+            Self::Hamming => (1.0 - distance / dim as f32).clamp(0.0, 1.0),
+            Self::Tanimoto => (1.0 - distance).clamp(0.0, 1.0),
         }
     }
 
@@ -103,8 +114,40 @@ mod tests {
     #[test]
     fn l2_undoes_the_squaring() {
         // (0,0) to (3,4): usearch reports 25, the euclidean distance is 5
-        // 1 - 5 = -4
-        assert!((Metric::L2.score(25.0, 2) + 4.0).abs() < 1e-6);
+        // 1 / (1 + 5)
+        assert!((Metric::L2.score(25.0, 2) - 1.0 / 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cos_maps_onto_zero_to_one() {
+        // usearch cos distance is 1 - cos, 0 ..= 2
+        assert!((Metric::Cos.score(1.0, 4) - 0.5).abs() < 1e-6); // orthogonal
+        assert!(Metric::Cos.score(2.0, 4).abs() < 1e-6); // opposite
+    }
+
+    #[test]
+    fn hamming_divides_by_the_bit_count() {
+        assert!((Metric::Hamming.score(4.0, 16) - 0.75).abs() < 1e-6);
+        assert!(Metric::Hamming.score(16.0, 16).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bounded_metrics_stay_in_zero_to_one() {
+        // a hair past either end from float error must not leak out
+        for (metric, distance) in [
+            (Metric::Cos, -1e-6),
+            (Metric::Cos, 2.0 + 1e-6),
+            (Metric::Tanimoto, -1e-6),
+            (Metric::Tanimoto, 1.0 + 1e-6),
+            (Metric::Hamming, 17.0),
+            (Metric::L2, 1e30),
+        ] {
+            let score = metric.score(distance, 16);
+            assert!(
+                (0.0..=1.0).contains(&score),
+                "{metric} scored {score} for distance {distance}"
+            );
+        }
     }
 
     #[test]
@@ -116,8 +159,8 @@ mod tests {
             Metric::Hamming,
             Metric::Tanimoto,
         ] {
-            let near = metric.score(1.0, 64);
-            let far = metric.score(4.0, 64);
+            let near = metric.score(0.5, 64);
+            let far = metric.score(1.0, 64);
             assert!(
                 near > far,
                 "{metric} ranked a farther vector at least as high: {near} vs {far}"

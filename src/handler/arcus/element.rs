@@ -201,18 +201,27 @@ pub struct MetaRecord {
     pub connectivity: usize,
     pub expansion_add: usize,
     pub expansion_search: usize,
+
+    /// How many vectors the index accepts.
+    ///
+    /// The engine enforces it, as the Map's own `maxcount` -- one more than
+    /// this, since the metadata takes a slot of the same Map. It is recorded
+    /// here as well so a replica, which learns of an index only from this
+    /// record, can report it.
+    pub maxcount: u32,
 }
 
 impl MetaRecord {
     pub fn encode(&self, layout: Layout) -> Vec<u8> {
         format!(
-            r#"{{"dim":{},"quant":"{}","metric":"{}","m":{},"efc":{},"efs":{}}}"#,
+            r#"{{"dim":{},"quant":"{}","metric":"{}","m":{},"efc":{},"efs":{},"max":{}}}"#,
             layout.dim,
             layout.quant,
             self.metric,
             self.connectivity,
             self.expansion_add,
             self.expansion_search,
+            self.maxcount,
         )
         .into_bytes()
     }
@@ -238,6 +247,7 @@ impl MetaRecord {
                 connectivity: num("m")?,
                 expansion_add: num("efc")?,
                 expansion_search: num("efs")?,
+                maxcount: u32::try_from(num("max")?).unwrap_or(u32::MAX),
             },
             Layout::new(
                 num("dim")?,
@@ -421,6 +431,7 @@ mod tests {
             connectivity: u32::MAX as usize,
             expansion_add: u32::MAX as usize,
             expansion_search: u32::MAX as usize,
+            maxcount: u32::MAX,
         };
         let encoded = meta.encode(layout);
         let (back, back_layout) = MetaRecord::decode(&encoded).unwrap();
@@ -539,14 +550,15 @@ mod meta_tests {
             connectivity: 16,
             expansion_add: 128,
             expansion_search: 64,
+            maxcount: 50_000,
         }
     }
 
     #[test]
     fn the_metadata_decodes_with_the_terminator_the_store_adds() {
-        // `Store::add_meta` ends the body with CRLF because the daemon asserts
-        // on it when a client `get`s the key. Decoding has to survive that or
-        // an index cannot be read back.
+        // `Store::insert_elem` ends every element value with CRLF, which the
+        // engine expects. Decoding has to survive that or an index cannot be
+        // read back.
         let layout = Layout::new(4, Quant::F32);
         let mut body = record().encode(layout);
         body.extend_from_slice(b"\r\n");
@@ -554,6 +566,7 @@ mod meta_tests {
         let (meta, decoded) = MetaRecord::decode(&body).expect("the stored shape decodes");
         assert_eq!(meta.metric, "l2");
         assert_eq!(meta.connectivity, 16);
+        assert_eq!(meta.maxcount, 50_000);
         assert_eq!(decoded.dim, 4);
     }
 }

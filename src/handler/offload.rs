@@ -20,7 +20,8 @@
 //! 스레드에서 `store`를 부르면 복제 훅을 그냥 지나친다.
 //!
 //! 읽기는 자유롭다. `ACTION_BEFORE_READ`는 `ENABLE_MIGRATION` 안에만 있고 그건
-//! 꺼져 있다. 그래서 검색은 통째로 풀에서 돌고, `vadd`는 준비까지만 풀이 한다.
+//! 꺼져 있다. 그래서 검색은 통째로 풀에서 돌고, `vadd`는 워커가 쓰고 난 뒤의
+//! HNSW 삽입만 풀이 한다.
 //!
 //! # 쿠키를 들고 있어도 되는 이유
 //!
@@ -49,8 +50,8 @@ use crate::server::{self, Responder, ResponseHandler};
 /// 빌려 쓰고, 그 버퍼는 `execute`가 돌아오면 다음 명령이 덮어쓴다. `Add`와
 /// `Sim`은 이미 소유 타입이라 그대로 옮겨 온다.
 pub(crate) enum Task {
-    /// 워커가 이미 할당까지 마친 추가. 풀은 자리표만 넣는다.
-    Add(cmd::AddPlan),
+    /// 워커가 이미 엔진에 쓴 추가. 풀은 그래프에 넣기만 한다.
+    Add(cmd::Added),
     Sim(Sim, Vec<u8>),
     SimKey {
         index: String,
@@ -67,8 +68,8 @@ impl Task {
     /// 검색은 순회가 길고, 추가는 양자화와 본문 구성이 있다. 나머지는 상수
     /// 시간에 가까워 넘기는 값이 오히려 비싸다.
     ///
-    /// `vadd`는 여기 없다. 아이템 할당이 먼저여야 하고 그것은 엔진 쓰기라
-    /// 워커 스레드의 일이다 -- [`Task::adding`]이 그 뒤를 잇는다.
+    /// `vadd`는 여기 없다. 요소 쓰기가 먼저여야 하고 그것은 엔진 쓰기라
+    /// 워커 스레드의 일이다 -- [`Task::Add`]가 그 뒤를 잇는다.
     pub(crate) fn from_request(request: Request) -> std::result::Result<Self, Request> {
         match request {
             Request::Body(Body::Sim(spec), bytes) => Ok(Task::Sim(spec, bytes)),
@@ -86,10 +87,10 @@ impl Task {
     /// 엔진을 **읽기만** 하는 부분. 풀 스레드에서 돈다.
     fn work(self, store: &Store) -> Done {
         match self {
-            // 할당은 워커가 이미 했다. 풀 몫은 자리표 삽입 하나다.
-            Task::Add(mut plan) => {
-                let staged = cmd::vadd_stage(&mut plan);
-                Done::Prepared(staged.map(|()| plan))
+            // 쓰기는 워커가 이미 했다. 풀 몫은 HNSW 삽입이다.
+            Task::Add(mut added) => {
+                let inserted = cmd::vadd_insert(&mut added);
+                Done::Inserted(added, inserted)
             }
             Task::Sim(spec, bytes) => Done::Answered(cmd::vsim_vector(store, &spec, &bytes)),
             Task::SimKey {
@@ -112,19 +113,12 @@ impl Task {
     }
 }
 
-impl Task {
-    /// 워커가 할당을 마친 뒤, 풀에 넘길 추가 작업을 만든다.
-    pub(crate) fn adding(plan: cmd::AddPlan) -> Self {
-        Task::Add(plan)
-    }
-}
-
-/// 풀이 끝낸 일. 검색은 답까지, 추가는 엔진 직전까지.
+/// 풀이 끝낸 일. 검색은 답까지, 추가는 삽입까지.
 pub(crate) enum Done {
     /// 답이 다 됐다. 워커는 문자열만 만들면 된다.
     Answered(Result<Reply>),
-    /// 엔진에 쓸 준비가 끝났다. 워커가 `vadd_commit`으로 마친다.
-    Prepared(Result<cmd::AddPlan>),
+    /// 그래프에 넣었다. 워커가 `vadd_finish`로 답한다.
+    Inserted(cmd::Added, Result<()>),
 }
 
 /// 풀이 받아가는 일감.
@@ -193,8 +187,7 @@ fn submit(cookie: *const c_void, handler: ResponseHandler, task: Task) -> Submit
                 return Submitted::Handed;
             }
             // 매달 자리가 없다. 풀은 이미 받아 갔으므로 결과는 채널에 남고,
-            // 아무도 받지 않으면 `Done`이 그대로 버려진다 -- `PreparedAdd`가
-            // 자리표와 아이템을 그때 거둔다.
+            // 아무도 받지 않으면 `Done`이 그대로 버려진다. 삽입은 그래도 끝난다.
             unsafe { server::notify_io_complete(cookie, 0) };
             return Submitted::Lost;
         }
@@ -218,21 +211,23 @@ pub(crate) unsafe fn begin(
     handler: ResponseHandler,
     request: Request,
 ) -> Option<Result<Reply>> {
-    // 추가는 할당이 먼저다. 주소가 정해져야 풀이 그 주소에 자리표를 넣는다.
+    // 추가는 엔진 쓰기가 먼저다. 쓰는 동안 링크 콜백이 주소를 이 명령에게
+    // 돌려주고, 풀이 그것을 그래프에 넣은 뒤에 답한다.
     if let Request::Body(Body::Add(spec), bytes) = &request {
         let store = match unsafe { Store::for_cookie(cookie) } {
             Some(store) => store,
             None => return Some(Err(Error::Store(StoreError::Unavailable))),
         };
-        return Some(match cmd::vadd_allocate(&store, spec, bytes) {
-            Err(e) => Err(e),
-            Ok(plan) => match submit(cookie, handler, Task::adding(plan)) {
-                Submitted::Handed => return None,
-                // 대기열이 가득 찼다. 자리표까지 이 스레드에서 넣는다.
-                Submitted::Rejected(task) => unsafe { run_here(task, cookie) },
-                Submitted::Lost => Err(Error::Store(StoreError::Unavailable)),
+        return match cmd::vadd_write(&store, spec, bytes) {
+            Err(e) => Some(Err(e)),
+            Ok(cmd::AddPlan::Answered(reply)) => Some(Ok(reply)),
+            Ok(cmd::AddPlan::Insert(added)) => match submit(cookie, handler, Task::Add(added)) {
+                Submitted::Handed => None,
+                // 대기열이 가득 찼다. 삽입까지 이 스레드에서 한다.
+                Submitted::Rejected(task) => Some(unsafe { run_here(task, cookie) }),
+                Submitted::Lost => Some(Err(Error::Store(StoreError::Unavailable))),
             },
-        });
+        };
     }
 
     match Task::from_request(request) {
@@ -277,10 +272,9 @@ pub(crate) unsafe fn wake(cookie: *const c_void) {
 unsafe fn finish(done: Done, cookie: *const c_void) -> Result<Reply> {
     match done {
         Done::Answered(reply) => reply,
-        Done::Prepared(Err(e)) => Err(e),
-        Done::Prepared(Ok(plan)) => match unsafe { Store::for_cookie(cookie) } {
-            // 엔진 쓰기는 반드시 이 스레드에서. 모듈 주석의 `tls_cookie`.
-            Some(store) => cmd::vadd_commit(&store, plan),
+        Done::Inserted(added, inserted) => match unsafe { Store::for_cookie(cookie) } {
+            // 실패한 삽입을 되돌리는 삭제도 엔진 쓰기다. 모듈 주석의 `tls_cookie`.
+            Some(store) => cmd::vadd_finish(&store, added, inserted),
             None => Err(Error::Store(StoreError::Unavailable)),
         },
     }

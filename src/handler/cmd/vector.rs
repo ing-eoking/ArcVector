@@ -1,70 +1,57 @@
-use std::sync::Arc;
-
 use super::coords::coords;
 use crate::command::request::Add;
-use crate::engine_api::ENGINE_STORE_OPERATION_OPERATION_SET;
 use crate::error::{Error, Reply, Result};
 use crate::handler::access::{for_read, for_write, map_is_gone};
 use crate::handler::arcus::element::Layout;
 use crate::handler::arcus::engine::{Store, StoreError};
 use crate::handler::quant;
-use crate::handler::registry::{self, VectorIndex};
+use crate::handler::registry;
+use crate::trigger::{event, key, recover};
 
-/// `vadd`가 세 단계로 나뉜 상태.
+/// `vadd`가 엔진에 쓴 뒤, 그래프에 넣기를 기다리는 것.
 ///
-/// 문서의 순서 그대로다 -- 아이템을 먼저 할당해 주소를 확정하고, 그 주소에
-/// 자리표 노드를 넣고, 마지막에 링크한다. 갈라 둔 이유는 가운데 단계만 무거운
-/// 데다 나머지 둘은 엔진 쓰기라서다. 엔진 쓰기는 워커 스레드에 있어야 한다 --
-/// 복제가 `rp_before_check`에서 스레드 로컬(`tls_cookie`)을 세운다.
+/// 쓰기는 워커가 하고, 넣기는 풀이 하고, 답은 다시 워커가 한다.
 ///
 /// ```text
-/// [워커] allocate  주소 확정. 아직 아무도 못 본다
-/// [풀]   stage     addr|STAGED 로 HNSW 삽입. 락 없음. 무거운 일은 여기뿐
-/// [워커] link      콜백이 addr|STAGED → addr 로 옮긴다. 해시 항목 하나
+/// [워커] write   요소를 Map에 넣는다. 링크 콜백이 주소를 `Reserved`로 적어
+///                이 명령에게 돌려준다. cache lock 아래의 일은 그것뿐이다
+/// [풀]   insert  그 주소의 벡터를 HNSW에 넣는다. 락 없음. 무거운 일은 여기뿐
+/// [워커] finish  답한다. 넣기가 실패했으면 저장소에서도 지워 둘을 맞춘다
 /// ```
-pub struct PreparedAdd {
-    /// For `store_failed`, which needs to know whose index went away.
+///
+/// 엔진 쓰기가 워커에 있어야 하는 것은 복제가 `rp_before_check`에서 스레드
+/// 로컬(`tls_cookie`)을 세우기 때문이다.
+pub struct Added {
     name: String,
-    stamp: u64,
-
-    /// 할당해 둔 아이템. 링크하면 0이 되어 이 구조체의 소유를 벗어난다.
-    addr: u64,
-    /// 자리표가 그래프에 들어가 있나.
-    staged: bool,
-
-    vector: Vec<u8>,
-    index: Arc<VectorIndex>,
+    id: String,
+    /// 링크 콜백이 돌려준 주소. 넣은 것은 빠진다.
+    linked: event::Linked,
 }
 
-impl Drop for PreparedAdd {
-    /// 링크까지 못 간 모든 길에서 여기로 모인다 -- 풀이 결과를 못 건넸거나,
-    /// 엔진 쓰기가 거부됐거나, 연결이 먼저 끊겼거나.
+impl Drop for Added {
+    /// 넣지 못한 채 버려지면 -- 풀이 결과를 못 건넸거나 연결이 먼저 끊겼거나 --
+    /// 여기서 넣는다. `Reserved`로 남겨 두면 adopt도 건드리지 않아 그 벡터가
+    /// 영영 그래프 밖에 남는다.
     fn drop(&mut self) {
-        if self.addr == 0 {
-            return;
-        }
-        if self.staged {
-            self.index.ann.drop_staged(self.addr);
-        }
-        // 링크된 적이 없으니 unlink도 오지 않는다. 참조를 직접 돌려준다.
-        if let Some(store) = Store::background() {
-            store.discard_allocated(self.addr);
+        for (index, addr) in self.linked.drain(..) {
+            let _ = recover::insert_reserved(&index, addr);
         }
     }
 }
 
 /// What the first half decided.
 pub enum AddPlan {
-    /// 할당까지 끝났다. 풀이 자리표를 넣고, 워커가 링크한다.
-    Write(PreparedAdd),
+    /// 그래프에 넣을 것이 없다. 이 답을 그대로 준다.
+    Answered(Reply),
+    /// 쓰기는 끝났다. 풀이 넣고, 워커가 답한다.
+    Insert(Added),
 }
 
-/// **워커 스레드.** 검증하고, 본문을 만들고, 아이템을 할당한다.
-pub fn vadd_allocate(store: &Store, spec: &Add, body: &[u8]) -> Result<AddPlan> {
+/// **워커 스레드.** 검증하고, 본문을 만들고, 요소를 Map에 쓴다.
+pub fn vadd_write(store: &Store, spec: &Add, body: &[u8]) -> Result<AddPlan> {
     let Add {
         index: name,
         vkey,
-        exptime,
         attr,
     } = spec;
     let attr = attr.as_slice();
@@ -75,60 +62,70 @@ pub fn vadd_allocate(store: &Store, spec: &Add, body: &[u8]) -> Result<AddPlan> 
     // 맞는지는 여기서 본다.
     let vector = coords(body, layout.dim, "vector")?;
 
+    check_id(vkey)?;
     check_attr(attr)?;
     check_still_fits(store, layout)?;
 
     let stamp = registry::now();
     let quantized = quant::encode(&vector, layout.quant)?;
-    let vkey = crate::trigger::key::vector_key(name, vkey);
+    let value = build_body(layout, &quantized, attr)?;
 
-    let item = build_body(layout, &quantized, attr)?;
-
-    // 클라이언트의 초를 엔진의 시계로 옮긴다. 그대로 넘기면 기동 기준 상대
-    // 시각으로 읽혀 대부분 이미 지난 값이 된다.
-    let addr = store.allocate_kv(&vkey, &item, crate::server::realtime(*exptime))?;
-
-    Ok(AddPlan::Write(PreparedAdd {
-        name: name.to_string(),
-        stamp,
-        addr,
-        staged: false,
-        vector: quantized,
-        index,
-    }))
+    write(store, name, vkey, &value, stamp)
 }
 
-/// **풀 스레드.** 무거운 일은 이 한 줄이다.
-pub fn vadd_stage(plan: &mut AddPlan) -> Result<()> {
-    let AddPlan::Write(prepared) = plan;
-    prepared
-        .index
-        .ann
-        .stage_at(prepared.addr, &prepared.vector)?;
-    prepared.staged = true;
-    Ok(())
+/// 요소를 쓰고, 링크 콜백이 돌려준 주소를 챙긴다.
+fn write(store: &Store, name: &str, id: &str, value: &[u8], stamp: u64) -> Result<AddPlan> {
+    let (written, linked) =
+        event::capture(|| store.insert_elem(&key::map_key(name), id, value, true, None));
+    let added = Added {
+        name: name.to_owned(),
+        id: id.to_owned(),
+        linked,
+    };
+
+    if let Err(e) = written {
+        // 실패한 쓰기는 아무것도 링크하지 않는다. 혹시 남은 것이 있으면
+        // `Added`가 버려지면서 넣는다.
+        return store_failed(name, stamp, e).map(AddPlan::Answered);
+    }
+    if added.linked.is_empty() {
+        // 콜백이 그래프를 이미 맞췄다(attr만 바뀐 교체), 또는 평소 길로 넘겼다.
+        return Ok(AddPlan::Answered(Reply::Stored));
+    }
+    Ok(AddPlan::Insert(added))
 }
 
-/// **워커 스레드.** 링크하면 콜백이 자리표를 실제 주소로 올린다.
-pub fn vadd_commit(store: &Store, plan: AddPlan) -> Result<Reply> {
-    let AddPlan::Write(mut prepared) = plan;
-
-    // 링크가 콜백을 부르고, 콜백이 `unstage`로 자리표를 제자리에 올린다.
-    match store.link_allocated(prepared.addr, ENGINE_STORE_OPERATION_OPERATION_SET) {
-        Ok(()) => {
-            // 아이템도 자리표도 이제 이 구조체 것이 아니다.
-            prepared.addr = 0;
-            Ok(Reply::Stored)
+/// **풀 스레드.** 무거운 일은 이것뿐이다.
+pub fn vadd_insert(added: &mut Added) -> Result<()> {
+    let mut outcome = Ok(());
+    for (index, addr) in added.linked.drain(..) {
+        if let Err(e) = recover::insert_reserved(&index, addr)
+            && outcome.is_ok()
+        {
+            outcome = Err(e);
         }
+    }
+    outcome
+}
+
+/// **워커 스레드.** 넣기의 결과로 답한다.
+///
+/// 그래프가 받지 못했으면 저장소에서도 지운다. 남겨 두면 저장소에는 있는데
+/// 검색에는 영영 안 나오는 벡터가 된다 -- 실패를 답한 쓰기가 반쯤 남는 것보다
+/// 없던 일이 되는 편이 낫다.
+pub fn vadd_finish(store: &Store, added: Added, inserted: Result<()>) -> Result<Reply> {
+    match inserted {
+        Ok(()) => Ok(Reply::Stored),
         Err(e) => {
-            if prepared.staged {
-                prepared.index.ann.drop_staged(prepared.addr);
-                prepared.staged = false;
+            if let Err(gone) = store.delete_elem(&key::map_key(&added.name), &added.id)
+                && gone != StoreError::ElemGone
+            {
+                eprintln!(
+                    "ArcVector: '{}' in '{}' is stored but not indexed: {gone}",
+                    added.id, added.name
+                );
             }
-            // `link_allocated`가 실패하면서 참조는 이미 돌려줬다. `Drop`이
-            // 한 번 더 돌려주지 않도록 여기서 손을 뗀다.
-            prepared.addr = 0;
-            store_failed(&prepared.name, prepared.stamp, e)
+            Err(e)
         }
     }
 }
@@ -137,13 +134,22 @@ pub fn vadd_commit(store: &Store, plan: AddPlan) -> Result<Reply> {
 ///
 /// 풀에 못 넘겼을 때 쓰인다. 워커 스레드이므로 엔진 쓰기도 여기서 해도 된다.
 pub fn vadd(store: &Store, spec: &Add, body: &[u8]) -> Result<Reply> {
-    let mut plan = vadd_allocate(store, spec, body)?;
-    vadd_stage(&mut plan)?;
-    vadd_commit(store, plan)
+    finish_here(store, vadd_write(store, spec, body)?)
+}
+
+fn finish_here(store: &Store, plan: AddPlan) -> Result<Reply> {
+    match plan {
+        AddPlan::Answered(reply) => Ok(reply),
+        AddPlan::Insert(mut added) => {
+            let inserted = vadd_insert(&mut added);
+            vadd_finish(store, added, inserted)
+        }
+    }
 }
 
 fn store_failed(name: &str, stamp: u64, e: StoreError) -> Result<Reply> {
     match e {
+        StoreError::Overflow => Ok(Reply::Overflowed),
         StoreError::KeyGone => {
             map_is_gone(name, stamp);
             Err(Error::IndexEvicted)
@@ -152,16 +158,22 @@ fn store_failed(name: &str, stamp: u64, e: StoreError) -> Result<Reply> {
     }
 }
 
-/// 아이템 본문 하나. 길이 바이트, attr, 벡터, 그리고 `\r\n`.
-///
-/// 종단자가 붙는 것은 이 키들이 ASCII 프로토콜로 읽히기 때문이다 -- 데몬은
-/// 아이템 본문을 클라이언트에게 그대로 넘긴다.
+/// 요소 값 하나. 길이 바이트, attr, 벡터. 종단자는 `insert_elem`이 붙인다.
 fn build_body(layout: Layout, vector: &[u8], attr: &[u8]) -> Result<Vec<u8>> {
-    let mut body = crate::room::zeroed(layout.stored_len(attr.len()))?;
-    let split = layout.element_len(attr.len());
-    layout.write(&mut body[..split], vector, attr)?;
-    body[split..].copy_from_slice(b"\r\n");
+    let mut body = crate::room::zeroed(layout.element_len(attr.len()))?;
+    layout.write(&mut body, vector, attr)?;
     Ok(body)
+}
+
+fn check_id(id: &str) -> Result<()> {
+    if id.len() > key::MAX_ID {
+        return Err(Error::bad_request(format!(
+            "vector key is {} bytes, over the {}-byte limit",
+            id.len(),
+            key::MAX_ID
+        )));
+    }
+    Ok(())
 }
 
 fn check_attr(attr: &[u8]) -> Result<()> {
@@ -176,12 +188,12 @@ fn check_attr(attr: &[u8]) -> Result<()> {
 }
 
 fn check_still_fits(store: &Store, layout: Layout) -> Result<()> {
-    let limit = store.max_item_size() as usize;
+    let limit = store.max_element_bytes() as usize;
     if layout.max_stored_len() <= limit {
         return Ok(());
     }
     Err(Error::bad_request(format!(
-        "element is {} bytes ({} header+ATTR + {} vector), over max_item_size {limit}",
+        "element is {} bytes ({} header+ATTR + {} vector), over max_element_bytes {limit}",
         layout.max_stored_len(),
         Layout::vector_offset(crate::handler::arcus::element::ATTR_BYTES),
         layout.vector_bytes(),
@@ -193,14 +205,12 @@ pub fn vgetattr(store: &Store, name: &str, id: &str) -> Result<Reply> {
     let stamp = registry::now();
 
     let layout = index.ann.layout;
-    match store
-        .get_kv(&crate::trigger::key::vector_key(name, id))
-        .and_then(|body| {
-            layout
-                .attr_of(&body)
-                .map(<[u8]>::to_vec)
-                .map_err(|_| StoreError::CorruptElement)
-        }) {
+    match store.get_elem(&key::map_key(name), id).and_then(|body| {
+        layout
+            .attr_of(&body)
+            .map(<[u8]>::to_vec)
+            .map_err(|_| StoreError::CorruptElement)
+    }) {
         Ok(attr) => {
             // attr은 공백 없는 JSON 한 덩어리라 길이를 앞세울 필요가 없다.
             let json = String::from_utf8_lossy(&attr);
@@ -209,7 +219,7 @@ pub fn vgetattr(store: &Store, name: &str, id: &str) -> Result<Reply> {
         Err(StoreError::ElemGone) => Ok(Reply::NotFound),
 
         Err(StoreError::CorruptElement) => {
-            // 그래프에서 빼지 않는다. 이 아이템이 실제로 사라질 때 unlink
+            // 그래프에서 빼지 않는다. 이 요소가 실제로 사라질 때 unlink
             // 이벤트가 오고, 그때 콜백이 노드를 뺀다.
             eprintln!("ArcVector: element '{id}' of index '{name}' is unreadable");
             Err(StoreError::CorruptElement.into())
@@ -228,23 +238,18 @@ pub fn vsetattr(store: &Store, name: &str, id: &str, attr: &[u8]) -> Result<Repl
     let stamp = registry::now();
     check_attr(attr)?;
     let layout = index.ann.layout;
-    let vkey = crate::trigger::key::vector_key(name, id);
 
     // 지금 값을 읽어 attr만 갈아 끼우고 다시 쓴다. 그래프는 건드리지 않는다 --
-    // 이 쓰기가 엔진의 replace 이벤트를 부르고, 그 콜백이 노드를 새 주소로 옮긴다.
-    let addr = match store.hold_kv(&vkey) {
-        Ok(addr) => addr,
+    // 이 쓰기가 엔진의 replace 이벤트를 부르고, 벡터가 같으니 콜백이 노드를 새
+    // 주소로 옮긴다.
+    let value = match store.get_elem(&key::map_key(name), id) {
+        Ok(value) => value,
+        Err(StoreError::ElemGone) => return Ok(Reply::NotFound),
         Err(StoreError::KeyGone) => {
             map_is_gone(name, stamp);
             return Ok(Reply::NotFound);
         }
         Err(e) => return Err(e.into()),
-    };
-    let value = store.with_item_at(addr, |_key, value| value.to_vec());
-    store.release_items(&[addr]);
-
-    let Some(value) = value else {
-        return Ok(Reply::NotFound);
     };
     // attr 길이가 바뀌면 벡터가 앉는 자리도 바뀐다. 제자리 수정이 불가능하니
     // 벡터를 꺼내 새 길이로 다시 만든다.
@@ -253,30 +258,27 @@ pub fn vsetattr(store: &Store, name: &str, id: &str, attr: &[u8]) -> Result<Repl
     };
     let body = build_body(layout, vector, attr).map_err(|_| StoreError::CorruptElement)?;
 
-    match store.set_kv(&vkey, &body) {
-        Ok(_) => Ok(Reply::Stored),
-        Err(StoreError::KeyGone) => {
-            map_is_gone(name, stamp);
-            Ok(Reply::NotFound)
-        }
-        Err(e) => Err(e.into()),
+    match write(store, name, id, &body, stamp) {
+        Err(Error::IndexEvicted) => Ok(Reply::NotFound),
+        Err(e) => Err(e),
+        // 아직 그래프에 들어가지 않았던 벡터면 콜백이 이 명령에게 넘긴다.
+        // 드문 길이라 이 스레드에서 마저 넣는다.
+        Ok(plan) => finish_here(store, plan),
     }
 }
 
 pub fn vdel(store: &Store, name: &str, id: &str) -> Result<Reply> {
     let _index = for_write(store, name)?;
     let stamp = registry::now();
-    let vkey = crate::trigger::key::vector_key(name, id);
 
     // 그래프는 건드리지 않는다. 이 삭제가 엔진의 unlink 이벤트를 부르고, 그
     // 콜백이 노드를 빼고 참조를 sweeper에게 넘긴다.
-    match store.delete_kv(&vkey) {
+    match store.delete_elem(&key::map_key(name), id) {
         Ok(()) => Ok(Reply::Deleted),
-        // 인덱스는 있다 -- `for_write`가 방금 확인했다. 없는 것은 이 이름의
-        // 벡터뿐이다.
+        Err(StoreError::ElemGone) => Ok(Reply::NotFoundVector),
         Err(StoreError::KeyGone) => {
             map_is_gone(name, stamp);
-            Ok(Reply::NotFoundVector)
+            Ok(Reply::NotFound)
         }
         Err(e) => Err(e.into()),
     }

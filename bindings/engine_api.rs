@@ -575,9 +575,12 @@ pub struct auth_data_t {
     pub username: *const ::std::os::raw::c_char,
     pub config: *const ::std::os::raw::c_char,
 }
-pub const event_type_t_EVENT_LINK: event_type_t = 0;
-pub const event_type_t_EVENT_UNLINK: event_type_t = 1;
-pub const event_type_t_EVENT_REPLACE: event_type_t = 2;
+pub const event_type_t_EVENT_LINK_ITEM: event_type_t = 0;
+pub const event_type_t_EVENT_UNLINK_ITEM: event_type_t = 1;
+pub const event_type_t_EVENT_REPLACE_ITEM: event_type_t = 2;
+pub const event_type_t_EVENT_LINK_ELEM: event_type_t = 3;
+pub const event_type_t_EVENT_UNLINK_ELEM: event_type_t = 4;
+pub const event_type_t_EVENT_REPLACE_ELEM: event_type_t = 5;
 pub type event_type_t = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -586,6 +589,7 @@ pub struct event_data_t {
     pub ret: *mut ENGINE_ERROR_CODE,
     pub new_it: *mut item,
     pub old_it: *mut item,
+    pub coll_it: *mut item,
 }
 pub type SERVER_HANDLE_V1 = server_handle_v1_t;
 pub const protocol_binary_magic_PROTOCOL_BINARY_REQ: protocol_binary_magic = 128;

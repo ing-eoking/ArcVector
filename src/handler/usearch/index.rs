@@ -199,8 +199,7 @@ impl Shards {
     }
 
     /// Keys spread by hash, not by count, so a shard can run somewhat over an
-    /// even split; an eighth on top covers that spread many times out, and the
-    /// staged placeholders ride in the same slack they always did.
+    /// even split; an eighth on top covers that spread many times out.
     fn reserve_capacity_and_threads(&self, capacity: usize, threads: usize) -> Result<()> {
         let n = self.shards.len();
         let per_shard = capacity / n + capacity / (8 * n) + THREAD_SLOTS;
@@ -415,9 +414,6 @@ impl AnnIndex {
     }
 
     /// 그래프에 선 노드 수. usearch가 세고 있으므로 따로 세지 않는다.
-    ///
-    /// 자리표(staged) 노드도 여기 포함된다 -- 잠깐이고, `maxcount` 게이트가
-    /// 조금 보수적으로 도는 편이 넘치는 것보다 낫다.
     pub fn len(&self) -> usize {
         self.inner
             .read()
@@ -427,46 +423,6 @@ impl AnnIndex {
 
     /// 이 그래프가 그 주소를 들고 있나. unlink 콜백이 "내가 받은 것인가"를
     /// 이것으로 답한다.
-    /// 아직 링크되지 않은 아이템의 주소에 `STAGED` 비트를 세운 키.
-    ///
-    /// 사용자 영역 포인터는 최상위 비트가 언제나 0이라, 이 비트가 선 값은
-    /// 정상 주소가 될 수 없다. 그래서 역참조 없이 비트 하나로 "아직 링크 전"을
-    /// 가려낼 수 있고, 링크가 끝나면 같은 주소로 되돌리기만 하면 된다.
-    pub const STAGED: u64 = 1 << 63;
-
-    /// 자리표 키인가.
-    ///
-    /// 검색이 노드마다 묻고 만료와 같은 자리에서 거절한다. 거절은 순회 안에서
-    /// 일어나므로 usearch가 k를 채울 때까지 더 걸어간다 -- 자리표 수를 따로
-    /// 세어 요청 개수에 더할 이유가 없다.
-    pub fn is_staged(key: u64) -> bool {
-        key & Self::STAGED != 0
-    }
-
-    /// 링크 전인 아이템의 벡터를 미리 그래프에 넣는다.
-    ///
-    /// **HNSW 삽입을 cache lock 밖으로 빼기 위한 것이다.** `vadd`의 무거운 일은
-    /// 이 삽입 하나인데, 아이템을 링크하면 엔진이 cache lock을 쥔 채 콜백을
-    /// 부르고 거기서 삽입하면 그동안 데몬 전체가 선다. 먼저 넣어 두면 콜백이
-    /// 할 일은 [`AnnIndex::unstage`] 하나 -- 해시 항목을 옮기는 것뿐이라
-    /// 그래프는 건드리지 않는다.
-    pub fn stage_at(&self, addr: u64, vector: &[u8]) -> Result<()> {
-        self.link_node(addr | Self::STAGED, vector)
-    }
-
-    /// 자리표를 실제 주소로 올린다. 링크 콜백이 부른다.
-    pub fn unstage(&self, addr: u64) -> bool {
-        self.rename_node(addr | Self::STAGED, addr)
-    }
-
-    /// 링크하지 못한 자리표를 그래프에서 거둔다.
-    ///
-    /// 놓아줄 참조가 없다 -- 그 아이템은 링크된 적이 없어 unlink도 오지
-    /// 않는다. 호출자가 `discard_allocated`로 따로 돌려준다.
-    pub fn drop_staged(&self, addr: u64) {
-        self.drop_node(addr | Self::STAGED);
-    }
-
     pub fn holds(&self, addr: u64) -> bool {
         self.inner
             .read()
@@ -563,14 +519,13 @@ impl AnnIndex {
         self.halt.halt();
     }
 
-    /// 아이템이 링크됐다. 그 주소를 키로 그래프에 넣는다.
+    /// 요소가 링크됐다. 그 주소를 키로 그래프에 넣는다.
     ///
     /// 엔진이 이미 우리 몫의 참조를 잡아뒀으므로, 넣는 데 성공하면 그대로 들고
-    /// 있으면 된다. 실패하면 호출자가 거절해서 엔진이 회수하게 한다.
+    /// 있으면 된다. 실패하면 호출자가 그 참조를 놓아준다.
     ///
-    /// **엔진의 cache lock 아래에서 불린다.** `ensure_capacity`가 usearch의
-    /// 그래프를 늘릴 수 있고 삽입 자체도 탐색을 수반하므로, 이 함수가 도는 동안
-    /// 데몬 전체가 선다. 큐를 없앤 대가이고 설계로는 피할 수 없다.
+    /// **풀 스레드에서 불린다.** 링크 콜백은 주소만 적고, 무거운 삽입은 cache
+    /// lock 밖에서 여기서 한다.
     pub fn link_node(&self, addr: u64, vector: &[u8]) -> Result<()> {
         self.check_vector(vector)?;
         self.ensure_capacity(self.live() + 1)?;
@@ -586,10 +541,7 @@ impl AnnIndex {
         self.unlink_node(addr)
     }
 
-    /// 아이템이 새것으로 교체된다. 그래프를 `new`로 옮긴다.
-    ///
-    /// **언제나 이것이 먼저다.** 엔진이 해시테이블을 바꾸기 전에 그래프가 새
-    /// 주소를 가리켜야, 그 사이의 조회가 사라질 주소를 안 따라간다.
+    /// 요소가 같은 벡터의 새것으로 교체된다. 그래프를 `new`로 옮긴다.
     pub fn rename_node(&self, old: u64, new: u64) -> bool {
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         match index.rename(old, new) {

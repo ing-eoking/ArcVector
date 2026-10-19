@@ -97,6 +97,10 @@ pub struct Create<'a> {
     pub connectivity: usize,
     pub expansion_add: usize,
     pub expansion_search: usize,
+    /// How many vectors the index takes. `None` is the server's `max_map_size`.
+    pub maxcount: Option<u32>,
+    /// Seconds until the whole index expires. `None` never does.
+    pub exptime: Option<u32>,
 }
 
 impl Create<'_> {
@@ -109,6 +113,8 @@ impl Create<'_> {
             connectivity: 0,
             expansion_add: 0,
             expansion_search: 0,
+            maxcount: None,
+            exptime: None,
         }
     }
 }
@@ -158,9 +164,6 @@ pub enum Line<'a> {
 pub struct Add {
     pub index: String,
     pub vkey: String,
-
-    /// 이 벡터 하나의 만료 시간(초). 0이면 만료되지 않는다.
-    pub exptime: u32,
     pub attr: Vec<u8>,
 }
 

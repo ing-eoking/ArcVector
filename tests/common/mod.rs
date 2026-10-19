@@ -6,7 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-const TERMINATORS: [&str; 8] = [
+const TERMINATORS: [&str; 11] = [
     "END\r\n",
     "STORED\r\n",
     "CREATED\r\n",
@@ -15,6 +15,9 @@ const TERMINATORS: [&str; 8] = [
     "DROPPED\r\n",
     "NOT_FOUND\r\n",
     "OVERFLOWED\r\n",
+    "NOT_FOUND_ELEMENT\r\n",
+    "NOT_FOUND_VECTOR\r\n",
+    "TYPE_MISMATCH\r\n",
 ];
 
 const ERROR_PREFIXES: [&str; 3] = ["CLIENT_ERROR", "SERVER_ERROR", "ERROR"];
@@ -196,99 +199,6 @@ impl Server {
             .expect("the read timeout is settable");
         Client { stream }
     }
-
-    /// A connection that speaks the binary protocol.
-    ///
-    /// The one way a test can address a key the ascii protocol cannot spell.
-    /// An index's metadata lives under an id with a space in it, which the
-    /// ascii tokeniser would split -- that is exactly why no client `vadd` can
-    /// collide with it. The binary protocol takes a key as a length and bytes,
-    /// so it has no such trouble.
-    ///
-    /// A separate connection, because the server picks a protocol per
-    /// connection from the first byte it sees (`negotiating_prot`).
-    pub fn connect_binary(&self) -> BinaryClient {
-        let stream = UnixStream::connect(&self.socket).expect("the server is listening");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("the read timeout is settable");
-        BinaryClient { stream }
-    }
-}
-
-/// Just enough of the binary protocol to move one item around.
-pub struct BinaryClient {
-    stream: UnixStream,
-}
-
-impl BinaryClient {
-    const MAGIC_REQUEST: u8 = 0x80;
-    const OP_GET: u8 = 0x00;
-    const OP_SET: u8 = 0x01;
-
-    pub fn get(&mut self, key: &str) -> Option<Vec<u8>> {
-        self.request(Self::OP_GET, key, &[], &[]);
-        let (status, body, extlen) = self.response();
-        // 4 bytes of flags come before the value.
-        (status == 0).then(|| body[extlen..].to_vec())
-    }
-
-    pub fn set(&mut self, key: &str, value: &[u8]) -> bool {
-        // extras: flags then expiry, both zero.
-        self.request(Self::OP_SET, key, &[0u8; 8], value);
-        self.response().0 == 0
-    }
-
-    fn request(&mut self, opcode: u8, key: &str, extras: &[u8], value: &[u8]) {
-        let key = key.as_bytes();
-        let total = extras.len() + key.len() + value.len();
-
-        let mut out = Vec::with_capacity(24 + total);
-        out.push(Self::MAGIC_REQUEST);
-        out.push(opcode);
-        out.extend_from_slice(&(key.len() as u16).to_be_bytes());
-        out.push(extras.len() as u8);
-        out.push(0); // datatype
-        out.extend_from_slice(&0u16.to_be_bytes()); // vbucket
-        out.extend_from_slice(&(total as u32).to_be_bytes());
-        out.extend_from_slice(&0u32.to_be_bytes()); // opaque
-        out.extend_from_slice(&0u64.to_be_bytes()); // cas
-        out.extend_from_slice(extras);
-        out.extend_from_slice(key);
-        out.extend_from_slice(value);
-
-        self.stream
-            .write_all(&out)
-            .expect("the connection accepts writes");
-        self.stream.flush().expect("the connection flushes");
-    }
-
-    /// `(status, body, extlen)`.
-    fn response(&mut self) -> (u16, Vec<u8>, usize) {
-        let mut header = [0u8; 24];
-        self.stream
-            .read_exact(&mut header)
-            .expect("the server answers with a binary header");
-
-        let extlen = header[4] as usize;
-        let status = u16::from_be_bytes([header[6], header[7]]);
-        let bodylen = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
-
-        let mut body = vec![0u8; bodylen];
-        self.stream
-            .read_exact(&mut body)
-            .expect("the server answers with the body it declared");
-        (status, body, extlen)
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.socket);
-        let _ = std::fs::remove_file(&self.log);
-    }
 }
 
 fn extra_args() -> Vec<String> {
@@ -322,21 +232,13 @@ impl Client {
         self.read_reply()
     }
 
-    /// `vadd <index> <vkey> <veclen> <exptime>`
+    /// `vadd <index> <vkey> <veclen>`
     ///
     /// 차원은 인덱스가 정하므로 명령이 받지 않는다. 헬퍼가 그 자리에 있던
     /// 인자를 계속 받는 것은 호출부가 전부 차원을 적어 두었기 때문이고, 그
     /// 값은 이제 좌표 개수를 스스로 확인하는 데만 쓴다.
     pub fn vadd(&mut self, index: &str, vkey: &str, _dim: usize, coords: &str) -> String {
-        self.send_body(&format!("vadd {index} {vkey} {} 0", coords.len()), coords)
-    }
-
-    /// 만료 시간을 주는 `vadd`.
-    pub fn vadd_exp(&mut self, index: &str, vkey: &str, exptime: u32, coords: &str) -> String {
-        self.send_body(
-            &format!("vadd {index} {vkey} {} {exptime}", coords.len()),
-            coords,
-        )
+        self.send_body(&format!("vadd {index} {vkey} {}", coords.len()), coords)
     }
 
     pub fn vadd_attr(
@@ -348,7 +250,7 @@ impl Client {
         attr: &str,
     ) -> String {
         self.send_body(
-            &format!("vadd {index} {vkey} {} 0 attr {attr}", coords.len()),
+            &format!("vadd {index} {vkey} {} attr {attr}", coords.len()),
             coords,
         )
     }
@@ -414,28 +316,28 @@ impl Client {
     /// The bodies this crate stores are binary -- a length header, the
     /// attribute bytes, then the packed vector -- so a test that replays one
     /// cannot go through `String`.
-    pub fn get_value(&mut self, key: &str) -> Option<Vec<u8>> {
-        self.write(&format!("get {key}\r\n"));
+    /// The value of one Map element, read with a plain `mop get`, bypassing
+    /// this crate's commands.
+    pub fn elem_value(&mut self, key: &str, field: &str) -> Option<Vec<u8>> {
+        self.write(&format!("mop get {key} {} 1\r\n{field}\r\n", field.len()));
         let reply = self.read_raw();
+        // VALUE <flags> <count>\r\n<field> <bytes> <data>\r\nEND\r\n
         let head = reply.windows(2).position(|w| w == b"\r\n")?;
-        let header = std::str::from_utf8(&reply[..head]).ok()?;
-        let len: usize = header.rsplit(' ').next()?.parse().ok()?;
-        let from = head + 2;
-        reply.get(from..from + len).map(<[u8]>::to_vec)
+        if !reply.starts_with(b"VALUE") {
+            return None;
+        }
+        let rest = &reply[head + 2..];
+        let prefix = format!("{field} ");
+        let rest = rest.strip_prefix(prefix.as_bytes())?;
+        let space = rest.iter().position(|b| *b == b' ')?;
+        let len: usize = std::str::from_utf8(&rest[..space]).ok()?.parse().ok()?;
+        rest.get(space + 1..space + 1 + len).map(<[u8]>::to_vec)
     }
 
-    /// Writes a body verbatim with a plain `set`, bypassing this crate's
-    /// commands. Replaying an item the way replication delivers it.
-    pub fn set_value(&mut self, key: &str, body: &[u8]) -> String {
-        self.set_value_exptime(key, 0, body)
-    }
-
-    /// [`Client::set_value`] with an expiry, for the one thing this crate's own
-    /// commands cannot express: a *vector* that expires. `vcreate` takes an
-    /// `EXPTIME` for the index, `vadd` takes none, so a test that wants an
-    /// expired vector has to write the item itself.
-    pub fn set_value_exptime(&mut self, key: &str, exptime: u32, body: &[u8]) -> String {
-        let mut raw = format!("set {key} 0 {exptime} {}\r\n", body.len()).into_bytes();
+    /// Writes one Map element verbatim with a plain `mop insert`, bypassing
+    /// this crate's commands -- the way replication delivers one.
+    pub fn insert_elem(&mut self, key: &str, field: &str, body: &[u8]) -> String {
+        let mut raw = format!("mop insert {key} {field} {}\r\n", body.len()).into_bytes();
         raw.extend_from_slice(body);
         raw.extend_from_slice(b"\r\n");
         self.stream
@@ -443,6 +345,11 @@ impl Client {
             .expect("the connection accepts writes");
         self.stream.flush().expect("the connection flushes");
         String::from_utf8_lossy(&self.read_raw()).into_owned()
+    }
+
+    /// Removes one Map element with a plain `mop delete`.
+    pub fn delete_elem(&mut self, key: &str, field: &str) -> String {
+        self.send(&format!("mop delete {key} {} 1\r\n{field}", field.len()))
     }
 
     fn write(&mut self, raw: &str) {

@@ -130,10 +130,10 @@ mod tests {
 
     /// Renamed from `check_only_accepts_success`, which was never what `check`
     /// did -- `completed` has always taken `ENGINE_EWOULDBLOCK` as well -- and
-    /// which asserted nothing about that code either way. It matters now that
-    /// `Store::set_kv`'s store call goes through here: a sync-replication
-    /// master waiting on a slave gets EWOULDBLOCK from an accepted write, and
-    /// `repl::role::probe_once` would read an error there as "not master".
+    /// which asserted nothing about that code either way. It matters because
+    /// every write goes through here: a sync-replication master waiting on a
+    /// slave gets EWOULDBLOCK from an accepted write, and reading that as an
+    /// error would refuse a write the engine took.
     #[test]
     fn check_accepts_a_write_that_is_still_waiting_on_a_slave() {
         assert!(check(ENGINE_ERROR_CODE_ENGINE_SUCCESS).is_ok());
