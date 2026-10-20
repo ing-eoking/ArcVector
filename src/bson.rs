@@ -1,17 +1,17 @@
 //! 벡터 속성과 인덱스 설정을 담는 BSON 코덱.
 //!
-//! 인코딩·디코딩과 필드 조회는 `bson` 크레이트(MongoDB 공식 구현)가 한다. 여기서
-//! 직접 하는 것은 JSON 값을 BSON 값으로 옮기는 매핑 하나뿐이다 -- 크레이트의
-//! `TryFrom<serde_json::Value>`는 확장 JSON을 해석해서 `{"$date":...}` 같은
-//! 사용자 속성을 다른 타입으로 바꿔 버린다. 속성은 클라이언트가 준 그대로여야 한다.
+//! 변환, 인코딩·디코딩, 필드 조회를 전부 `bson` 크레이트(MongoDB 공식 구현)가 한다.
 //!
-//! 지원 타입은 double, string, 객체, 배열, bool, null, int32, int64뿐이다.
+//! JSON → BSON은 크레이트의 확장 JSON 규칙을 따른다. 필드 값에 `{"$numberLong":"5"}`
+//! 같은 약속된 표기가 오면 그 타입(int64 5)으로 저장한다. 최상위 객체의 키는 언제나
+//! 필드 이름으로 읽는다 -- 최상위까지 해석하면 `{"$date":..,"a":..}` 같은 속성 전체가
+//! 날짜로 읽히다 거절된다.
 
 use std::fmt;
 
 use bson::raw::RawBsonRef;
 use bson::{Bson, Document, RawDocument};
-use serde_json::{Map, Value as Json};
+use serde_json::Value as Json;
 
 /// 중첩(객체/배열) 깊이 상한.
 pub const MAX_DEPTH: usize = 32;
@@ -85,53 +85,21 @@ pub fn from_json(json: &[u8]) -> Result<Vec<u8>, BsonError> {
     let Json::Object(map) = parsed else {
         return Err(BsonError::NotAnObject);
     };
-    let doc = to_doc(map, 1)?;
-    // 키에 NUL이 있으면 BSON의 cstring 키로 쓸 수 없어 여기서 거절된다.
+    if map.values().any(|v| depth(v) >= MAX_DEPTH) {
+        return Err(BsonError::TooDeep);
+    }
+    // 키에 NUL이 있거나 약속된 표기가 틀리면(`{"$numberLong":"x"}`) 여기서 거절된다.
+    let doc = Document::try_from(map).map_err(|e| BsonError::BadJson(e.to_string()))?;
     doc.to_vec().map_err(|e| BsonError::BadJson(e.to_string()))
 }
 
-/// `depth`는 이 문서가 몇 번째 중첩인지(최상위 = 1).
-fn to_doc(map: Map<String, Json>, depth: usize) -> Result<Document, BsonError> {
-    if depth > MAX_DEPTH {
-        return Err(BsonError::TooDeep);
+/// 값 하나의 중첩 깊이. 스칼라는 0, 객체·배열은 안쪽 최대 + 1.
+fn depth(v: &Json) -> usize {
+    match v {
+        Json::Object(m) => 1 + m.values().map(depth).max().unwrap_or(0),
+        Json::Array(a) => 1 + a.iter().map(depth).max().unwrap_or(0),
+        _ => 0,
     }
-    let mut doc = Document::new();
-    for (k, v) in map {
-        doc.insert(k, to_bson(v, depth)?);
-    }
-    Ok(doc)
-}
-
-/// 정수는 i32에 들면 int32, 아니면 int64, 그 밖은 double. 크레이트의 규칙과 같지만
-/// 객체를 확장 JSON으로 읽지 않는다.
-fn to_bson(v: Json, depth: usize) -> Result<Bson, BsonError> {
-    Ok(match v {
-        Json::Null => Bson::Null,
-        Json::Bool(b) => Bson::Boolean(b),
-        Json::Number(n) => match n.as_i64() {
-            Some(i) => match i32::try_from(i) {
-                Ok(i) => Bson::Int32(i),
-                Err(_) => Bson::Int64(i),
-            },
-            None => Bson::Double(
-                n.as_f64()
-                    .ok_or_else(|| BsonError::BadJson("number out of range".into()))?,
-            ),
-        },
-        Json::String(s) => Bson::String(s),
-        Json::Object(m) => Bson::Document(to_doc(m, depth + 1)?),
-        Json::Array(items) => {
-            if depth + 1 > MAX_DEPTH {
-                return Err(BsonError::TooDeep);
-            }
-            Bson::Array(
-                items
-                    .into_iter()
-                    .map(|v| to_bson(v, depth + 1))
-                    .collect::<Result<_, _>>()?,
-            )
-        }
-    })
 }
 
 // ---------------------------------------------------------------- BSON -> JSON
@@ -240,13 +208,25 @@ mod tests {
     }
 
     #[test]
-    fn extended_json_keys_stay_plain_fields() {
-        // 크레이트의 변환이었다면 `$date`는 날짜, `$numberLong`은 int64가 됐다.
-        let s = r#"{"$date":1,"m":{"$numberLong":"5"},"$oid":"x"}"#;
+    fn extended_json_values_take_their_type() {
+        // `{"$numberLong":"5"}`는 int64 5라는 약속이다.
+        let d = from_json(br#"{"price":{"$numberLong":"5"},"n":1}"#).unwrap();
+        assert_eq!(lookup(&d, b"price"), Some(Value::Num(5.0)));
+        assert_eq!(to_json(&d).unwrap(), r#"{"price":5,"n":1}"#);
+    }
+
+    #[test]
+    fn top_level_keys_are_always_field_names() {
+        let s = r#"{"$date":1,"a":2}"#;
         assert_eq!(rt(s), s);
-        let d = from_json(s.as_bytes()).unwrap();
-        assert_eq!(lookup(&d, b"$date"), Some(Value::Num(1.0)));
-        assert_eq!(lookup(&d, b"m"), Some(Value::Other));
+    }
+
+    #[test]
+    fn a_malformed_extended_json_value_is_refused() {
+        assert!(matches!(
+            from_json(br#"{"price":{"$numberLong":"x"}}"#),
+            Err(BsonError::BadJson(_))
+        ));
     }
 
     #[test]

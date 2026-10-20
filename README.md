@@ -63,6 +63,9 @@ rather than crashing the server. See [docs/내부구조.md §11](docs/내부구�
 - Metadata is a **JSON object** on the wire and **BSON** in the engine. `getmeta` and
   `withmeta` emit compact JSON (no spaces, key order kept, numbers normalized);
   `metabytes` is the byte length of the JSON line.
+- A field **value** may use MongoDB extended JSON to pick a BSON type:
+  `{"price":{"$numberLong":"5"}}` stores `price` as int64 5, so `getmeta` returns
+  `{"price":5}` and `price = 5` matches. Top-level keys are always plain field names.
 - Every body section ends with its own `\r\n`. A section that does not is
   `CLIENT_ERROR bad data chunk`.
 - Errors are `CLIENT_ERROR <reason>` when the request was at fault,
