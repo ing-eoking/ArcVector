@@ -1,11 +1,16 @@
-//! 벡터 속성과 인덱스 설정을 담는 최소 BSON 코덱.
+//! 벡터 속성과 인덱스 설정을 담는 BSON 코덱.
 //!
-//! JSON 객체 <-> BSON 문서 변환과, 필터가 쓰는 최상위 필드 조회만 갖춘다.
+//! 인코딩·디코딩과 필드 조회는 `bson` 크레이트(MongoDB 공식 구현)가 한다. 여기서
+//! 직접 하는 것은 JSON 값을 BSON 값으로 옮기는 매핑 하나뿐이다 -- 크레이트의
+//! `TryFrom<serde_json::Value>`는 확장 JSON을 해석해서 `{"$date":...}` 같은
+//! 사용자 속성을 다른 타입으로 바꿔 버린다. 속성은 클라이언트가 준 그대로여야 한다.
+//!
 //! 지원 타입은 double, string, 객체, 배열, bool, null, int32, int64뿐이다.
-//! 디코더는 모든 읽기를 바운드 검사하고, 어긋나면 패닉 대신 `Malformed`를 낸다.
 
 use std::fmt;
 
+use bson::raw::RawBsonRef;
+use bson::{Bson, Document, RawDocument};
 use serde_json::{Map, Value as Json};
 
 /// 중첩(객체/배열) 깊이 상한.
@@ -13,15 +18,6 @@ pub const MAX_DEPTH: usize = 32;
 
 /// 속성이 없는 요소가 쓰는 빈 문서.
 pub const EMPTY: [u8; 5] = [5, 0, 0, 0, 0];
-
-const T_DOUBLE: u8 = 0x01;
-const T_STRING: u8 = 0x02;
-const T_DOC: u8 = 0x03;
-const T_ARRAY: u8 = 0x04;
-const T_BOOL: u8 = 0x08;
-const T_NULL: u8 = 0x0A;
-const T_INT32: u8 = 0x10;
-const T_INT64: u8 = 0x12;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BsonError {
@@ -61,13 +57,22 @@ pub enum Value<'a> {
 }
 
 /// 첫 4바이트(LE i32)가 가리키는 문서 길이. 5 이상이고 버퍼 안에 들 때만 `Some`.
+///
+/// 요소 값은 문서 뒤에 벡터가 붙어 있으므로, 크레이트에 넘기기 전에 이 길이로
+/// 문서만 잘라낸다.
 pub fn doc_len(buf: &[u8]) -> Option<usize> {
     let head: [u8; 4] = buf.get(..4)?.try_into().ok()?;
     let n = usize::try_from(i32::from_le_bytes(head)).ok()?;
     (n >= 5 && n <= buf.len()).then_some(n)
 }
 
-// ---------------------------------------------------------------- 인코더
+/// 앞머리의 문서 하나를 검증해 연다. 뒤에 붙은 바이트(벡터)는 보지 않는다.
+fn raw(buf: &[u8]) -> Option<&RawDocument> {
+    let n = doc_len(buf)?;
+    RawDocument::from_bytes(&buf[..n]).ok()
+}
+
+// ---------------------------------------------------------------- JSON -> BSON
 
 pub fn from_json(json: &[u8]) -> Result<Vec<u8>, BsonError> {
     let parsed: Json = serde_json::from_slice(json).map_err(|e| {
@@ -80,276 +85,81 @@ pub fn from_json(json: &[u8]) -> Result<Vec<u8>, BsonError> {
     let Json::Object(map) = parsed else {
         return Err(BsonError::NotAnObject);
     };
-    let mut out = Vec::new();
-    enc_doc(&map, 1, &mut out)?;
-    Ok(out)
+    let doc = to_doc(map, 1)?;
+    // 키에 NUL이 있으면 BSON의 cstring 키로 쓸 수 없어 여기서 거절된다.
+    doc.to_vec().map_err(|e| BsonError::BadJson(e.to_string()))
 }
 
-fn enc_cstr(s: &str, out: &mut Vec<u8>) -> Result<(), BsonError> {
-    if s.as_bytes().contains(&0) {
-        return Err(BsonError::BadJson("key contains NUL".into()));
-    }
-    out.extend_from_slice(s.as_bytes());
-    out.push(0);
-    Ok(())
-}
-
-fn enc_len(n: usize) -> Result<[u8; 4], BsonError> {
-    i32::try_from(n)
-        .map(i32::to_le_bytes)
-        .map_err(|_| BsonError::BadJson("document too large".into()))
-}
-
-/// 길이 자리를 비워 두고 쓴 뒤 채운다. `depth`는 이 문서가 몇 번째 중첩인지(최상위 = 1).
-fn enc_doc(map: &Map<String, Json>, depth: usize, out: &mut Vec<u8>) -> Result<(), BsonError> {
+/// `depth`는 이 문서가 몇 번째 중첩인지(최상위 = 1).
+fn to_doc(map: Map<String, Json>, depth: usize) -> Result<Document, BsonError> {
     if depth > MAX_DEPTH {
         return Err(BsonError::TooDeep);
     }
-    let start = out.len();
-    out.extend_from_slice(&[0; 4]);
+    let mut doc = Document::new();
     for (k, v) in map {
-        enc_elem(k, v, depth, out)?;
+        doc.insert(k, to_bson(v, depth)?);
     }
-    out.push(0);
-    let len = enc_len(out.len() - start)?;
-    out[start..start + 4].copy_from_slice(&len);
-    Ok(())
+    Ok(doc)
 }
 
-fn enc_array(items: &[Json], depth: usize, out: &mut Vec<u8>) -> Result<(), BsonError> {
-    if depth > MAX_DEPTH {
-        return Err(BsonError::TooDeep);
-    }
-    let start = out.len();
-    out.extend_from_slice(&[0; 4]);
-    for (i, v) in items.iter().enumerate() {
-        enc_elem(&i.to_string(), v, depth, out)?;
-    }
-    out.push(0);
-    let len = enc_len(out.len() - start)?;
-    out[start..start + 4].copy_from_slice(&len);
-    Ok(())
-}
-
-fn enc_elem(key: &str, v: &Json, depth: usize, out: &mut Vec<u8>) -> Result<(), BsonError> {
-    let tag_at = out.len();
-    out.push(0);
-    enc_cstr(key, out)?;
-    let tag = match v {
-        Json::Null => T_NULL,
-        Json::Bool(b) => {
-            out.push(u8::from(*b));
-            T_BOOL
-        }
-        Json::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                if let Ok(i) = i32::try_from(i) {
-                    out.extend_from_slice(&i.to_le_bytes());
-                    T_INT32
-                } else {
-                    out.extend_from_slice(&i.to_le_bytes());
-                    T_INT64
-                }
-            } else {
-                let f = n
-                    .as_f64()
-                    .ok_or_else(|| BsonError::BadJson("number out of range".into()))?;
-                out.extend_from_slice(&f.to_le_bytes());
-                T_DOUBLE
+/// 정수는 i32에 들면 int32, 아니면 int64, 그 밖은 double. 크레이트의 규칙과 같지만
+/// 객체를 확장 JSON으로 읽지 않는다.
+fn to_bson(v: Json, depth: usize) -> Result<Bson, BsonError> {
+    Ok(match v {
+        Json::Null => Bson::Null,
+        Json::Bool(b) => Bson::Boolean(b),
+        Json::Number(n) => match n.as_i64() {
+            Some(i) => match i32::try_from(i) {
+                Ok(i) => Bson::Int32(i),
+                Err(_) => Bson::Int64(i),
+            },
+            None => Bson::Double(
+                n.as_f64()
+                    .ok_or_else(|| BsonError::BadJson("number out of range".into()))?,
+            ),
+        },
+        Json::String(s) => Bson::String(s),
+        Json::Object(m) => Bson::Document(to_doc(m, depth + 1)?),
+        Json::Array(items) => {
+            if depth + 1 > MAX_DEPTH {
+                return Err(BsonError::TooDeep);
             }
+            Bson::Array(
+                items
+                    .into_iter()
+                    .map(|v| to_bson(v, depth + 1))
+                    .collect::<Result<_, _>>()?,
+            )
         }
-        Json::String(s) => {
-            out.extend_from_slice(&enc_len(s.len() + 1)?);
-            out.extend_from_slice(s.as_bytes());
-            out.push(0);
-            T_STRING
-        }
-        Json::Object(m) => {
-            enc_doc(m, depth + 1, out)?;
-            T_DOC
-        }
-        Json::Array(a) => {
-            enc_array(a, depth + 1, out)?;
-            T_ARRAY
-        }
-    };
-    out[tag_at] = tag;
-    Ok(())
-}
-
-// ---------------------------------------------------------------- 디코더
-
-/// 바운드 검사를 거치는 바이트 리더.
-struct Reader<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], BsonError> {
-        let end = self.pos.checked_add(n).ok_or(BsonError::Malformed)?;
-        let s = self.buf.get(self.pos..end).ok_or(BsonError::Malformed)?;
-        self.pos = end;
-        Ok(s)
-    }
-
-    fn byte(&mut self) -> Result<u8, BsonError> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn i32(&mut self) -> Result<i32, BsonError> {
-        let b: [u8; 4] = self.take(4)?.try_into().map_err(|_| BsonError::Malformed)?;
-        Ok(i32::from_le_bytes(b))
-    }
-
-    fn i64(&mut self) -> Result<i64, BsonError> {
-        let b: [u8; 8] = self.take(8)?.try_into().map_err(|_| BsonError::Malformed)?;
-        Ok(i64::from_le_bytes(b))
-    }
-
-    fn f64(&mut self) -> Result<f64, BsonError> {
-        Ok(f64::from_bits(self.i64()? as u64))
-    }
-
-    /// NUL로 끝나는 키. NUL은 읽되 돌려주지 않는다.
-    fn cstr(&mut self) -> Result<&'a [u8], BsonError> {
-        let rest = self.buf.get(self.pos..).ok_or(BsonError::Malformed)?;
-        let n = rest
-            .iter()
-            .position(|&b| b == 0)
-            .ok_or(BsonError::Malformed)?;
-        self.pos += n + 1;
-        Ok(&rest[..n])
-    }
-
-    /// 길이 접두 문자열(끝 NUL 포함 길이). 본문만 돌려준다.
-    fn string(&mut self) -> Result<&'a [u8], BsonError> {
-        let n = usize::try_from(self.i32()?).map_err(|_| BsonError::Malformed)?;
-        if n == 0 {
-            return Err(BsonError::Malformed);
-        }
-        let s = self.take(n)?;
-        let (last, body) = s.split_last().ok_or(BsonError::Malformed)?;
-        if *last != 0 {
-            return Err(BsonError::Malformed);
-        }
-        Ok(body)
-    }
-
-    /// 중첩 문서/배열의 본문 범위(앞 4바이트 길이 포함)를 잘라 새 리더로 준다.
-    fn subdoc(&mut self) -> Result<&'a [u8], BsonError> {
-        let rest = self.buf.get(self.pos..).ok_or(BsonError::Malformed)?;
-        let n = doc_len(rest).ok_or(BsonError::Malformed)?;
-        self.take(n)
-    }
-}
-
-/// 문서 하나를 `[4바이트 길이][요소...][0]`으로 검증하며 열고 요소 영역 리더를 준다.
-fn open(doc: &[u8]) -> Result<Reader<'_>, BsonError> {
-    let n = doc_len(doc).ok_or(BsonError::Malformed)?;
-    if doc[n - 1] != 0 {
-        return Err(BsonError::Malformed);
-    }
-    Ok(Reader {
-        buf: &doc[..n - 1],
-        pos: 4,
     })
 }
 
+// ---------------------------------------------------------------- BSON -> JSON
+
+/// 공백 없는 JSON. 크레이트의 relaxed 확장 JSON이라, 우리가 만드는 타입은 평범한
+/// JSON으로 나온다(double은 `1.0`처럼 소수점이 붙는다).
 pub fn to_json(doc: &[u8]) -> Result<String, BsonError> {
-    let mut out = String::new();
-    dec_doc(doc, false, 1, &mut out)?;
-    Ok(out)
+    let raw = raw(doc).ok_or(BsonError::Malformed)?;
+    let doc = Document::try_from(raw).map_err(|_| BsonError::Malformed)?;
+    serde_json::to_string(&Bson::Document(doc).into_relaxed_extjson())
+        .map_err(|_| BsonError::Malformed)
 }
 
-fn dec_doc(doc: &[u8], array: bool, depth: usize, out: &mut String) -> Result<(), BsonError> {
-    if depth > MAX_DEPTH {
-        return Err(BsonError::TooDeep);
-    }
-    let mut r = open(doc)?;
-    out.push(if array { '[' } else { '{' });
-    let mut first = true;
-    while r.pos < r.buf.len() {
-        let tag = r.byte()?;
-        let key = std::str::from_utf8(r.cstr()?).map_err(|_| BsonError::Malformed)?;
-        if !first {
-            out.push(',');
-        }
-        first = false;
-        if !array {
-            push_str(key, out)?;
-            out.push(':');
-        }
-        match tag {
-            T_DOUBLE => push_f64(r.f64()?, out),
-            T_STRING => {
-                let s = std::str::from_utf8(r.string()?).map_err(|_| BsonError::Malformed)?;
-                push_str(s, out)?;
-            }
-            T_DOC | T_ARRAY => dec_doc(r.subdoc()?, tag == T_ARRAY, depth + 1, out)?,
-            T_BOOL => match r.byte()? {
-                0 => out.push_str("false"),
-                1 => out.push_str("true"),
-                _ => return Err(BsonError::Malformed),
-            },
-            T_NULL => out.push_str("null"),
-            T_INT32 => out.push_str(&r.i32()?.to_string()),
-            T_INT64 => out.push_str(&r.i64()?.to_string()),
-            _ => return Err(BsonError::Malformed),
-        }
-    }
-    out.push(if array { ']' } else { '}' });
-    Ok(())
-}
-
-fn push_str(s: &str, out: &mut String) -> Result<(), BsonError> {
-    let quoted = serde_json::to_string(s).map_err(|_| BsonError::Malformed)?;
-    out.push_str(&quoted);
-    Ok(())
-}
-
-/// 정수값이면 `1.0`, 아니면 Rust `{}` 표기. JSON에 없는 NaN/무한대는 null로 낸다.
-fn push_f64(f: f64, out: &mut String) {
-    if !f.is_finite() {
-        out.push_str("null");
-        return;
-    }
-    let s = f.to_string();
-    out.push_str(&s);
-    if !s.contains('.') {
-        out.push_str(".0");
-    }
-}
-
-/// 최상위 필드 하나를 찾는다. 잘못된 문서이거나 모르는 타입을 만나면 `None`.
+/// 최상위 필드 하나를 찾는다. 잘못된 문서이거나 그 필드가 없으면 `None`.
+///
+/// 문서를 풀어 복사하지 않고 원래 바이트 위에서 찾는다 -- 필터가 검색 중 노드마다
+/// 부르는 자리다.
 pub fn lookup<'a>(doc: &'a [u8], field: &[u8]) -> Option<Value<'a>> {
-    let mut r = open(doc).ok()?;
-    while r.pos < r.buf.len() {
-        let tag = r.byte().ok()?;
-        let key = r.cstr().ok()?;
-        let hit = key == field;
-        let v = match tag {
-            T_DOUBLE => Value::Num(r.f64().ok()?),
-            T_STRING => Value::Str(r.string().ok()?),
-            T_DOC | T_ARRAY => {
-                r.subdoc().ok()?;
-                Value::Other
-            }
-            T_BOOL => Value::Bool(match r.byte().ok()? {
-                0 => false,
-                1 => true,
-                _ => return None,
-            }),
-            T_NULL => Value::Null,
-            T_INT32 => Value::Num(f64::from(r.i32().ok()?)),
-            T_INT64 => Value::Num(r.i64().ok()? as f64),
-            _ => return None,
-        };
-        if hit {
-            return Some(v);
-        }
-    }
-    None
+    let key = std::str::from_utf8(field).ok()?;
+    Some(match raw(doc)?.get(key).ok()?? {
+        RawBsonRef::Double(f) => Value::Num(f),
+        RawBsonRef::Int32(i) => Value::Num(f64::from(i)),
+        RawBsonRef::Int64(i) => Value::Num(i as f64),
+        RawBsonRef::String(s) => Value::Str(s.as_bytes()),
+        RawBsonRef::Boolean(b) => Value::Bool(b),
+        RawBsonRef::Null => Value::Null,
+        _ => Value::Other,
+    })
 }
 
 #[cfg(test)]
@@ -427,5 +237,32 @@ mod tests {
         assert!(from_json(ok.as_bytes()).is_ok());
         let bad = format!(r#"{{"a":{}}}"#, deep(MAX_DEPTH));
         assert_eq!(from_json(bad.as_bytes()), Err(BsonError::TooDeep));
+    }
+
+    #[test]
+    fn extended_json_keys_stay_plain_fields() {
+        // 크레이트의 변환이었다면 `$date`는 날짜, `$numberLong`은 int64가 됐다.
+        let s = r#"{"$date":1,"m":{"$numberLong":"5"},"$oid":"x"}"#;
+        assert_eq!(rt(s), s);
+        let d = from_json(s.as_bytes()).unwrap();
+        assert_eq!(lookup(&d, b"$date"), Some(Value::Num(1.0)));
+        assert_eq!(lookup(&d, b"m"), Some(Value::Other));
+    }
+
+    #[test]
+    fn a_nul_in_a_key_is_refused() {
+        assert!(matches!(
+            from_json(b"{\"a\\u0000b\":1}"),
+            Err(BsonError::BadJson(_))
+        ));
+    }
+
+    #[test]
+    fn bytes_after_the_document_are_ignored() {
+        // 요소 값은 문서 뒤에 벡터가 붙는다.
+        let mut v = from_json(br#"{"a":7}"#).unwrap();
+        v.extend_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(lookup(&v, b"a"), Some(Value::Num(7.0)));
+        assert_eq!(to_json(&v).unwrap(), r#"{"a":7}"#);
     }
 }
