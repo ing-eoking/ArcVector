@@ -227,7 +227,7 @@ impl Client {
         self.read_reply()
     }
 
-    /// 줄 끝 `\r\n`을 덧붙이지 않고 그대로 보낸다.
+    /// Sends `raw` as is, without appending a trailing `\r\n`.
     pub fn send_raw(&mut self, raw: &str) -> String {
         self.write(raw);
         self.read_reply()
@@ -238,7 +238,7 @@ impl Client {
         self.read_reply()
     }
 
-    /// `vop upsert <index> <vkey> <len> str` -- 좌표를 텍스트로 보낸다.
+    /// `vop upsert <index> <vkey> <len> str` -- coordinates sent as text.
     pub fn upsert(&mut self, index: &str, vkey: &str, coords: &str) -> String {
         self.send_body(
             &format!("vop upsert {index} {vkey} {} str", coords.len()),
@@ -246,7 +246,7 @@ impl Client {
         )
     }
 
-    /// `vop upsert ... meta <m> str` -- 본문은 메타데이터 줄, 벡터 줄 순서다.
+    /// `vop upsert ... meta <m> str` -- the body is the metadata line, then the vector line.
     pub fn upsert_meta(&mut self, index: &str, vkey: &str, coords: &str, json: &str) -> String {
         self.send_body(
             &format!(
@@ -258,7 +258,7 @@ impl Client {
         )
     }
 
-    /// `vop upsert` with `bin` (little-endian f32) 벡터.
+    /// `vop upsert` with a `bin` (little-endian f32) vector.
     pub fn upsert_bin(&mut self, index: &str, vkey: &str, coords: &[f32]) -> String {
         let bytes: Vec<u8> = coords.iter().flat_map(|c| c.to_le_bytes()).collect();
         self.send_bytes(
@@ -321,7 +321,7 @@ impl Client {
         self.send(&format!("vop getmeta {index} {vkey}"))
     }
 
-    /// 헤더 줄과 이진 본문(끝 `\r\n` 포함 전송)을 보낸다.
+    /// Sends a header line and a binary body (followed by `\r\n`).
     pub fn send_bytes(&mut self, line: &str, body: &[u8]) -> String {
         let mut raw = format!("{line}\r\n").into_bytes();
         raw.extend_from_slice(body);
@@ -364,7 +364,7 @@ impl Client {
 }
 
 fn is_complete(reply: &[u8]) -> bool {
-    // META <vkey> <metabytes>\r\n<json>\r\n 은 고정 종결 문자열이 없다.
+    // `META <vkey> <metabytes>\r\n<json>\r\n` has no fixed terminator string.
     if reply.starts_with(b"META ") {
         let Some(head) = reply.windows(2).position(|w| w == b"\r\n") else {
             return false;

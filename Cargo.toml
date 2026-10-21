@@ -2,11 +2,18 @@
 name = "arcusv"
 version = "0.2.0"
 edition = "2024"
+# let-chains (`if let .. && let ..`).
+rust-version = "1.88"
 
 [lib]
-# cdylib: memcached loads this as an ASCII protocol extension.
-# rlib:   lets `cargo test` exercise the pure modules (codec/quant/filter).
-crate-type = ["cdylib", "rlib"]
+# memcached loads this as an ASCII protocol extension. Nothing links it as a
+# Rust library -- the integration tests drive a server that loads it -- so the
+# whole crate is private and the compiler reports what nothing uses.
+crate-type = ["cdylib"]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_qualifications = "warn"
 
 [features]
 # --- How the server was configured ------------------------------------------

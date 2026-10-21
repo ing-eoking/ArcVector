@@ -15,7 +15,7 @@
 pub const MAX_INDEX_NAME: usize = 250;
 
 /// `MAX_FIELD_LENG` in the daemon. A vector id is a Map field, so this is
-/// the longest id a `vadd` can store.
+/// the longest id a `vop upsert` can store.
 pub const MAX_ID: usize = 250;
 
 /// Rejects names the key shape cannot carry.
@@ -42,14 +42,11 @@ mod tests {
     #[test]
     fn an_index_name_is_its_own_key() {
         assert_eq!(parse(b"photos"), Some("photos"));
-        // 접두사가 없다. 콜론이 들어도 이름의 일부다.
+        // No prefix: colons are part of the name.
         assert_eq!(parse(b"a:b:c"), Some("a:b:c"));
         assert_eq!(parse(b"arcus_event:photos"), Some("arcus_event:photos"));
-        assert!(parse(b"").is_none(), "빈 이름은 없다");
-        assert!(
-            parse(b"\xff\xfe").is_none(),
-            "UTF-8이 아닌 키는 이름이 아니다"
-        );
+        assert!(parse(b"").is_none(), "an empty key is not a name");
+        assert!(parse(b"\xff\xfe").is_none(), "a non-UTF-8 key is not a name");
     }
 
     #[test]

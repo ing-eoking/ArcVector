@@ -1,8 +1,8 @@
 use std::fmt;
 
-use crate::command::filter::ParseError;
-use crate::handler::arcus::element::CodecError;
-use crate::handler::arcus::engine::StoreError;
+use crate::engine::StoreError;
+use crate::engine::element::CodecError;
+use crate::protocol::filter::ParseError;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Blame {
@@ -24,13 +24,10 @@ pub enum Error {
     BadRequest(String),
     NoSuchIndex,
 
-    /// 키는 있는데 우리 인덱스가 아니다. 인덱스와 일반 키가 한 키 공간을 쓴다.
+    /// The key exists but is not one of our indexes; indexes share the key space with plain keys.
     TypeMismatch,
 
-    IndexEvicted,
-
-    Unreadable,
-    Rebuilding,
+    /// The index is locked (`Halt`); it unlocks once the sweeper drains the backlog.
     Busy,
     Codec(CodecError),
     Filter(ParseError),
@@ -45,18 +42,16 @@ impl Error {
 
     pub fn blame(&self) -> Blame {
         match self {
-            Self::BadRequest(_)
-            | Self::NoSuchIndex
-            | Self::TypeMismatch
-            | Self::IndexEvicted
-            | Self::Filter(_) => Blame::Client,
+            Self::BadRequest(_) | Self::NoSuchIndex | Self::TypeMismatch | Self::Filter(_) => {
+                Blame::Client
+            }
 
             Self::Codec(e) => match e {
                 CodecError::VectorLenMismatch { .. } => Blame::Client,
                 _ => Blame::Server,
             },
 
-            Self::Unreadable | Self::Rebuilding | Self::Busy => Blame::Server,
+            Self::Busy => Blame::Server,
             Self::Store(_) | Self::Index(_) => Blame::Server,
         }
     }
@@ -68,9 +63,6 @@ impl fmt::Display for Error {
             Self::BadRequest(m) | Self::Index(m) => f.write_str(m),
             Self::NoSuchIndex => f.write_str("index not found"),
             Self::TypeMismatch => f.write_str("the key holds something that is not an index"),
-            Self::IndexEvicted => f.write_str("index was evicted"),
-            Self::Unreadable => f.write_str("index is unreadable while it rebuilds from Map"),
-            Self::Rebuilding => f.write_str("index is being released for a rebuild; retry"),
             Self::Busy => write!(
                 f,
                 "the index is releasing memory and cannot take new searches"
@@ -119,27 +111,41 @@ pub enum Reply {
     Deleted,
     Dropped,
     NotFound,
-    /// 인덱스는 있는데 그 벡터 이름이 없다.
+    /// The index exists but has no vector with that name.
     NotFoundVector,
-    /// 그 키가 우리 인덱스가 아니다.
+    /// The key is not one of our indexes.
     TypeMismatch,
-    /// 있던 vkey를 덮어썼다(`vop upsert`).
+    /// An existing vkey was overwritten (`vop upsert`).
     Replaced,
 
     Body(String),
 }
 
 impl Error {
-    /// 이 오류가 회선에 나가는 모양.
+    /// The wire form of this error.
     ///
-    /// 인덱스가 없다는 것은 클라이언트의 잘못이 아니라 **결과**라, 접두사 없이
-    /// `NOT_FOUND`로 나간다. 키가 인덱스가 아닌 것(`TYPE_MISMATCH`)도 같다.
-    /// 나머지는 책임 소재를 앞세운다.
+    /// A missing index is a **result**, not a client mistake, so it goes out as a bare
+    /// `NOT_FOUND` with no prefix. The same holds for a key that is not an index
+    /// (`TYPE_MISMATCH`). Everything else is prefixed with who is to blame.
     pub fn wire(&self) -> String {
         match self {
-            Self::NoSuchIndex | Self::IndexEvicted => Reply::NotFound.as_str().to_owned(),
+            Self::NoSuchIndex => Reply::NotFound.as_str().to_owned(),
             Self::TypeMismatch => Reply::TypeMismatch.as_str().to_owned(),
-            e => format!("{} {e}\r\n", e.blame().prefix()),
+            // The message may carry client-sent bytes (filter fragments, etc.). A raw CR/LF
+            // would split the reply line and the client would read the rest as the next
+            // reply, so control characters are escaped.
+            e => {
+                let mut line = format!("{} ", e.blame().prefix());
+                for c in e.to_string().chars() {
+                    if c.is_control() {
+                        line.extend(c.escape_default());
+                    } else {
+                        line.push(c);
+                    }
+                }
+                line.push_str("\r\n");
+                line
+            }
         }
     }
 }
@@ -166,6 +172,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_characters_in_a_message_cannot_split_the_reply() {
+        let e = Error::bad_request("near 'a\r\nEND\r\n'");
+        assert_eq!(e.wire(), "CLIENT_ERROR near 'a\\r\\nEND\\r\\n'\r\n");
+    }
 
     #[test]
     fn blame_picks_the_ascii_prefix() {
@@ -206,8 +218,8 @@ mod tests {
 
     #[test]
     fn a_key_that_is_not_an_index_answers_type_mismatch() {
-        // 인덱스와 일반 키가 한 키 공간을 쓴다. 키가 있는데 우리 것이 아니면
-        // 결과이지 잘못이 아니라, 접두사 없이 나간다.
+        // Indexes share the key space with plain keys. A key that exists but isn't ours is a
+        // result, not a mistake, so it goes out without a prefix.
         assert_eq!(Error::TypeMismatch.wire(), "TYPE_MISMATCH\r\n");
         assert_eq!(Error::TypeMismatch.blame(), Blame::Client);
     }
@@ -216,7 +228,7 @@ mod tests {
     fn replaced_and_not_found_vector_are_wire_lines() {
         assert_eq!(Reply::Replaced.as_str(), "REPLACED\r\n");
         assert_eq!(Reply::NotFoundVector.as_str(), "NOT_FOUND_VECTOR\r\n");
-        // maxcount에 닿은 것은 별도 응답이 아니라 서버 오류다.
+        // Hitting maxcount is a server error, not a dedicated reply.
         assert_eq!(
             Error::Index("index is full".into()).wire(),
             "SERVER_ERROR index is full\r\n"

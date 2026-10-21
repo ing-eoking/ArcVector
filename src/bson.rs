@@ -1,11 +1,12 @@
-//! 벡터 속성과 인덱스 설정을 담는 BSON 코덱.
+//! BSON codec for vector attributes and index settings.
 //!
-//! 변환, 인코딩·디코딩, 필드 조회를 전부 `bson` 크레이트(MongoDB 공식 구현)가 한다.
+//! Conversion, encoding/decoding and field lookup are all done by the `bson` crate (the official
+//! MongoDB implementation).
 //!
-//! JSON → BSON은 크레이트의 확장 JSON 규칙을 따른다. 필드 값에 `{"$numberLong":"5"}`
-//! 같은 약속된 표기가 오면 그 타입(int64 5)으로 저장한다. 최상위 객체의 키는 언제나
-//! 필드 이름으로 읽는다 -- 최상위까지 해석하면 `{"$date":..,"a":..}` 같은 속성 전체가
-//! 날짜로 읽히다 거절된다.
+//! JSON → BSON follows the crate's extended JSON rules: a field value written in a reserved form
+//! such as `{"$numberLong":"5"}` is stored as that type (int64 5). Keys of the top-level object
+//! are always read as field names -- interpreting the top level too would make attributes like
+//! `{"$date":..,"a":..}` parse as a date and get rejected.
 
 use std::fmt;
 
@@ -13,10 +14,10 @@ use bson::raw::RawBsonRef;
 use bson::{Bson, Document, RawDocument};
 use serde_json::Value as Json;
 
-/// 중첩(객체/배열) 깊이 상한.
+/// Maximum nesting depth of objects/arrays.
 pub const MAX_DEPTH: usize = 32;
 
-/// 속성이 없는 요소가 쓰는 빈 문서.
+/// The empty document used by elements without attributes.
 pub const EMPTY: [u8; 5] = [5, 0, 0, 0, 0];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +47,7 @@ impl From<BsonError> for crate::error::Error {
     }
 }
 
-/// 최상위 필드 하나의 값. 필터 비교에 필요한 것만 구분한다.
+/// The value of a top-level field, distinguishing only what filter comparisons need.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value<'a> {
     Num(f64),
@@ -56,23 +57,22 @@ pub enum Value<'a> {
     Other,
 }
 
-/// 첫 4바이트(LE i32)가 가리키는 문서 길이. 5 이상이고 버퍼 안에 들 때만 `Some`.
+/// The document length given by the first 4 bytes (LE i32). `Some` only if it is at least 5 and
+/// fits in the buffer.
 ///
-/// 요소 값은 문서 뒤에 벡터가 붙어 있으므로, 크레이트에 넘기기 전에 이 길이로
-/// 문서만 잘라낸다.
+/// Element values carry the vector right after the document, so this length is used to slice out
+/// just the document before handing it to the crate.
 pub fn doc_len(buf: &[u8]) -> Option<usize> {
     let head: [u8; 4] = buf.get(..4)?.try_into().ok()?;
     let n = usize::try_from(i32::from_le_bytes(head)).ok()?;
     (n >= 5 && n <= buf.len()).then_some(n)
 }
 
-/// 앞머리의 문서 하나를 검증해 연다. 뒤에 붙은 바이트(벡터)는 보지 않는다.
+/// Validates and opens the leading document, ignoring any trailing bytes (the vector).
 fn raw(buf: &[u8]) -> Option<&RawDocument> {
     let n = doc_len(buf)?;
     RawDocument::from_bytes(&buf[..n]).ok()
 }
-
-// ---------------------------------------------------------------- JSON -> BSON
 
 pub fn from_json(json: &[u8]) -> Result<Vec<u8>, BsonError> {
     let parsed: Json = serde_json::from_slice(json).map_err(|e| {
@@ -88,12 +88,12 @@ pub fn from_json(json: &[u8]) -> Result<Vec<u8>, BsonError> {
     if map.values().any(|v| depth(v) >= MAX_DEPTH) {
         return Err(BsonError::TooDeep);
     }
-    // 키에 NUL이 있거나 약속된 표기가 틀리면(`{"$numberLong":"x"}`) 여기서 거절된다.
+    // Rejects NUL in keys and malformed reserved forms (`{"$numberLong":"x"}`).
     let doc = Document::try_from(map).map_err(|e| BsonError::BadJson(e.to_string()))?;
     doc.to_vec().map_err(|e| BsonError::BadJson(e.to_string()))
 }
 
-/// 값 하나의 중첩 깊이. 스칼라는 0, 객체·배열은 안쪽 최대 + 1.
+/// Nesting depth of a value: 0 for scalars, 1 + the deepest child for objects and arrays.
 fn depth(v: &Json) -> usize {
     match v {
         Json::Object(m) => 1 + m.values().map(depth).max().unwrap_or(0),
@@ -102,10 +102,8 @@ fn depth(v: &Json) -> usize {
     }
 }
 
-// ---------------------------------------------------------------- BSON -> JSON
-
-/// 공백 없는 JSON. 크레이트의 relaxed 확장 JSON이라, 우리가 만드는 타입은 평범한
-/// JSON으로 나온다(double은 `1.0`처럼 소수점이 붙는다).
+/// Compact JSON. Uses the crate's relaxed extended JSON, so the types we produce come out as
+/// plain JSON (doubles keep a fraction, e.g. `1.0`).
 pub fn to_json(doc: &[u8]) -> Result<String, BsonError> {
     let raw = raw(doc).ok_or(BsonError::Malformed)?;
     let doc = Document::try_from(raw).map_err(|_| BsonError::Malformed)?;
@@ -113,10 +111,10 @@ pub fn to_json(doc: &[u8]) -> Result<String, BsonError> {
         .map_err(|_| BsonError::Malformed)
 }
 
-/// 최상위 필드 하나를 찾는다. 잘못된 문서이거나 그 필드가 없으면 `None`.
+/// Looks up a top-level field. `None` if the document is malformed or lacks the field.
 ///
-/// 문서를 풀어 복사하지 않고 원래 바이트 위에서 찾는다 -- 필터가 검색 중 노드마다
-/// 부르는 자리다.
+/// Searches the raw bytes without decoding or copying the document -- the filter calls this for
+/// every node visited during a search.
 pub fn lookup<'a>(doc: &'a [u8], field: &[u8]) -> Option<Value<'a>> {
     let key = std::str::from_utf8(field).ok()?;
     Some(match raw(doc)?.get(key).ok()?? {
@@ -209,7 +207,7 @@ mod tests {
 
     #[test]
     fn extended_json_values_take_their_type() {
-        // `{"$numberLong":"5"}`는 int64 5라는 약속이다.
+        // `{"$numberLong":"5"}` means int64 5.
         let d = from_json(br#"{"price":{"$numberLong":"5"},"n":1}"#).unwrap();
         assert_eq!(lookup(&d, b"price"), Some(Value::Num(5.0)));
         assert_eq!(to_json(&d).unwrap(), r#"{"price":5,"n":1}"#);
@@ -239,7 +237,7 @@ mod tests {
 
     #[test]
     fn bytes_after_the_document_are_ignored() {
-        // 요소 값은 문서 뒤에 벡터가 붙는다.
+        // Element values carry the vector after the document.
         let mut v = from_json(br#"{"a":7}"#).unwrap();
         v.extend_from_slice(&[1, 2, 3, 4]);
         assert_eq!(lookup(&v, b"a"), Some(Value::Num(7.0)));

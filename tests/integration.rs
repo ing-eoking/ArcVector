@@ -9,7 +9,7 @@ macro_rules! session {
     };
 }
 
-/// `VECTORS <n>` 응답의 (vkey, score) 목록. withmeta 줄의 JSON은 건너뛴다.
+/// Parses (vkey, score) pairs from `VECTORS <n>` reply, skipping any metadata JSON lines.
 fn hits(reply: &str) -> Vec<(String, f64)> {
     let mut lines = reply.split("\r\n");
     let head = lines.next().expect("a reply has a first line");
@@ -68,7 +68,6 @@ fn upsert_stores_then_replaces() {
     create_l2(&mut client, &ix, 2);
     assert_reply(&client.upsert(&ix, "v1", "0.1 0.2"), "STORED\r\n");
     assert_reply(&client.upsert(&ix, "v1", "5.0 5.0"), "REPLACED\r\n");
-    // 바꾼 벡터가 검색에 보인다: 새 좌표와의 거리가 0이다.
     let found = hits(&client.search_vector(&ix, 1, "5.0 5.0", None, false));
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].0, "v1");
@@ -91,12 +90,10 @@ fn bin_and_str_vectors_find_the_same_neighbour() {
     assert_reply(&client.upsert_bin(&ix, "b", &[1.0, 2.0]), "STORED\r\n");
     assert_reply(&client.upsert(&ix, "s", "9.0 9.0"), "STORED\r\n");
 
-    // str 질의가 bin으로 넣은 벡터를 찾는다.
     let by_str = hits(&client.search_vector(&ix, 1, "1.0 2.0", None, false));
     assert_eq!(by_str[0].0, "b");
     assert!(by_str[0].1.abs() < 1e-6);
 
-    // bin 질의가 str로 넣은 벡터를 찾는다.
     let bytes: Vec<u8> = [9.0f32, 9.0].iter().flat_map(|c| c.to_le_bytes()).collect();
     let reply = client.send_bytes(&format!("vop search {ix} vector 1 {}", bytes.len()), &bytes);
     assert_eq!(hits(&reply)[0].0, "s");
@@ -143,7 +140,6 @@ fn setmeta_changes_what_a_filter_matches() {
     let both = vkeys(&client.search_vector(&ix, 5, "1.0 0.0", tech, false));
     assert_eq!(both, ["v1", "v2"]);
 
-    // 벡터는 그대로다: v2에 정확히 맞는 질의가 거리 0으로 v2를 찾는다.
     let found = hits(&client.search_vector(&ix, 1, "0.0 1.0", None, false));
     assert_eq!(found[0].0, "v2");
     assert!(found[0].1.abs() < 1e-6);
@@ -245,13 +241,36 @@ fn a_filter_with_or_and_quoted_spaces_selects_the_right_rows() {
     };
     assert_eq!(by("city = 'new york'"), ["a"]);
     assert_eq!(by("city = seoul or city = busan"), ["b", "c"]);
-    // and가 or보다 먼저 묶인다: (n >= 2 and city = busan) or city = 'new york'
     assert_eq!(
         by("n >= 2 and city = busan or city = 'new york'"),
         ["a", "c"]
     );
     assert_eq!(by("n!=2"), ["a", "c"]);
     assert!(by("missing = 1").is_empty());
+    client.send(&format!("vop drop {ix}"));
+}
+
+#[test]
+fn every_write_shows_in_the_next_search_on_the_same_connection() {
+    session!(_server, client);
+    let ix = index_name("read-your-writes");
+    create_l2(&mut client, &ix, 2);
+    for round in 0..20 {
+        let vkey = format!("v{round}");
+        assert_reply(&client.upsert(&ix, &vkey, "1.0 0.0"), "STORED\r\n");
+        let found = client.search_vector(&ix, 1, "1.0 0.0", None, false);
+        assert_contains(&found, &vkey);
+
+        assert_reply(
+            &client.send(&format!("vop delete {ix} {vkey}")),
+            "DELETED\r\n",
+        );
+        let gone = client.search_vector(&ix, 1, "1.0 0.0", None, false);
+        assert!(
+            gone.starts_with("VECTORS 0\r\n"),
+            "round {round}: the deleted vector is still found: {gone}"
+        );
+    }
     client.send(&format!("vop drop {ix}"));
 }
 
@@ -270,7 +289,6 @@ fn delete_then_delete_again_is_not_found_vector() {
         &client.send(&format!("vop delete {} v1", index_name("delete-none"))),
         "NOT_FOUND\r\n",
     );
-    // 답 직후의 검색도 지운 벡터를 내지 않는다.
     assert_reply(
         &client.search_vector(&ix, 5, "1.0 0.0", None, false),
         "VECTORS 0\r\nEND\r\n",
@@ -290,16 +308,36 @@ fn drop_then_upsert_is_not_found() {
 }
 
 #[test]
+fn an_index_recreated_under_a_dropped_name_starts_empty_with_its_own_shape() {
+    session!(_server, client);
+    let ix = index_name("recreated");
+    create_l2(&mut client, &ix, 2);
+    for n in 0..50 {
+        client.upsert(&ix, &format!("old{n}"), "1.0 0.0");
+    }
+    assert_reply(&client.send(&format!("vop drop {ix}")), "DROPPED\r\n");
+
+    create_l2(&mut client, &ix, 3);
+    assert_reply(&client.upsert(&ix, "new", "0.0 1.0 0.0"), "STORED\r\n");
+    let reply = client.search_vector(&ix, 10, "0.0 1.0 0.0", None, false);
+    assert!(reply.starts_with("VECTORS 1\r\n"), "{reply}");
+    assert_contains(&reply, "new");
+    assert!(
+        !reply.contains("old"),
+        "the old index's vectors stay out: {reply}"
+    );
+    client.send(&format!("vop drop {ix}"));
+}
+
+#[test]
 fn a_short_body_is_a_bad_data_chunk_and_the_connection_survives() {
     session!(_server, client);
     let ix = index_name("badchunk");
     create_l2(&mut client, &ix, 2);
-    // 선언한 길이(7)대로 자르면 끝 두 바이트가 `\r\n`이 아니다.
     assert_contains(
         &client.send_raw(&format!("vop upsert {ix} v1 7 str\r\n1.0 0.0XX")),
         "CLIENT_ERROR bad data chunk",
     );
-    // 연결은 살아 있고 아무것도 저장되지 않았다.
     assert_reply(&client.upsert(&ix, "v1", "1.0 0.0"), "STORED\r\n");
     client.send(&format!("vop drop {ix}"));
 }
@@ -318,7 +356,6 @@ fn maxcount_full_is_a_server_error() {
         &client.upsert(&ix, "c", "1.0 1.0"),
         "SERVER_ERROR index is full\r\n",
     );
-    // 이미 있는 vkey의 교체는 인덱스를 키우지 않는다.
     assert_reply(&client.upsert(&ix, "a", "0.5 0.0"), "REPLACED\r\n");
     assert_reply(&client.send(&format!("vop delete {ix} b")), "DELETED\r\n");
     assert_reply(&client.upsert(&ix, "c", "1.0 1.0"), "STORED\r\n");
@@ -355,7 +392,6 @@ fn concurrent_upserts_of_one_vkey_all_answer() {
         (0..8).any(|t| meta == format!("META same 7\r\n{{\"t\":{t}}}\r\n")),
         "{meta:?}"
     );
-    // 그래프에는 하나만 있다.
     assert_eq!(
         vkeys(&setup.search_vector(&ix, 5, "1.0 1.0", None, false)),
         ["same"]
@@ -396,8 +432,7 @@ fn many_connections_search_the_same_index_at_once() {
 
 #[test]
 fn a_flush_takes_the_index_with_it() {
-    // `flush_all`은 오래된 아이템을 곧바로 지우지 않고 만료 표시만 남긴다. 명령이
-    // 인덱스 키를 조회하는 순간 그 표시가 처리되어 인덱스가 사라진 것으로 보여야 한다.
+    // `flush_all` marks items expired; index disappears on subsequent lookups.
     session!(_server, client);
     let ix = index_name("flushed");
     create_l2(&mut client, &ix, 2);
@@ -413,7 +448,6 @@ fn a_flush_takes_the_index_with_it() {
     assert_reply(&client.getmeta(&ix, "a"), "NOT_FOUND\r\n");
     assert_reply(&client.upsert(&ix, "b", "0.5 0.5"), "NOT_FOUND\r\n");
     assert_reply(&client.send(&format!("vop delete {ix} a")), "NOT_FOUND\r\n");
-    // 이름은 다시 쓸 수 있다.
     create_l2(&mut client, &ix, 2);
     client.send(&format!("vop drop {ix}"));
 }
@@ -439,7 +473,6 @@ fn an_index_expires_as_a_whole() {
     client.send(&format!("vop drop {ix}"));
 }
 
-/// `<num>`에 프로토콜이 허용하는 가장 큰 값을 줘도 데몬이 살아남아 가진 만큼만 답한다.
 #[test]
 fn a_huge_result_count_answers_what_the_index_holds() {
     session!(_server, client);
